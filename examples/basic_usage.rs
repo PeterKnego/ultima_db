@@ -2,18 +2,32 @@ use ultima_db::Store;
 
 fn main() {
     let mut store = Store::new();
-    let table = store.open_table::<String>("notes").unwrap();
 
-    let id = table.insert("Hello, UltimaDB!".to_string());
-    println!("Inserted note with id={id}");
+    // Write transaction: insert, update, delete
+    let version = {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<String>("notes").unwrap();
 
-    if let Some(note) = table.get(id) {
-        println!("Retrieved: {note}");
-    }
+        let id = table.insert("Hello, UltimaDB!".to_string());
+        println!("Inserted note with id={id}");
 
-    table.update(id, "Hello, updated!".to_string()).unwrap();
-    println!("Updated note: {}", table.get(id).unwrap());
+        if let Some(note) = table.get(id) {
+            println!("Retrieved: {note}");
+        }
 
-    table.delete(id).unwrap();
-    println!("Deleted. Table empty: {}", table.is_empty());
+        table.update(id, "Hello, updated!".to_string()).unwrap();
+        println!("Updated note: {}", table.get(id).unwrap());
+
+        table.delete(id).unwrap();
+        println!("Deleted. Table empty: {}", table.is_empty());
+
+        wtx.commit(&mut store).unwrap()
+    };
+
+    println!("Committed as version {version}");
+
+    // Read transaction: verify state
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<String>("notes").unwrap();
+    println!("Notes after commit: {} record(s)", table.len());
 }

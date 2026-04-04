@@ -1,14 +1,137 @@
-# UltimaDB Task 2: CRUD Operations Implementation Plan
+# UltimaDB Task 2: CRUD Operations
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+## Goal
 
-**Goal:** Add named tables with typed CRUD + range scan to `ultima-db` — `Store::open_table::<R>(name)` returns a `Table<R>` backed by `BTreeMap<u64, R>` with auto-increment primary keys.
+Add named tables and basic CRUD + range scan to `ultima-db`. Each table is an independent, typed, in-memory B-tree keyed by auto-increment `u64`. No serialization, no secondary indexes, no MVCC — those come in later tasks.
 
-**Architecture:** `Table<R>` is a new generic type in `src/table.rs` owning a `BTreeMap<u64, R>` and a `next_id` counter. `Store` in `src/store.rs` is fully replaced — it now holds `HashMap<String, Box<dyn Any>>` and exposes `open_table`. No serialization, no secondary indexes, no MVCC. `std::BTreeMap` is the backing store throughout.
+---
+
+## Architecture
+
+`Store` holds a map of named tables. Each table is a `Table<R>` generic over any Rust type `R`. `Store` uses `HashMap<String, Box<dyn Any>>` to store heterogeneous table types under string names. `open_table::<R>` creates the table on first call and returns a mutable reference to it on subsequent calls; if the same name is opened with a different `R`, it returns `Error::TypeMismatch`.
+
+`Table<R>` owns a `BTreeMap<u64, R>` and a `next_id: u64` counter starting at 1. Inserts assign the current `next_id`, increment it, and store the record. Reads borrow from the map. Updates and deletes return `Error::KeyNotFound` if the ID does not exist. Range scan delegates to `BTreeMap::range`, yielding `(u64, &R)` pairs in ascending ID order.
 
 **Tech Stack:** Rust 2024 edition, `std::collections::{BTreeMap, HashMap}`, `std::any::Any`, `thiserror` (existing).
 
-**Spec:** `docs/superpowers/specs/2026-03-20-task2-crud-design.md`
+---
+
+## Components
+
+### `src/table.rs` (new)
+
+```rust
+pub struct Table<R> {
+    data: BTreeMap<u64, R>,
+    next_id: u64,
+}
+
+impl<R> Table<R> {
+    pub fn new() -> Self
+    pub fn insert(&mut self, record: R) -> u64
+    pub fn get(&self, id: u64) -> Option<&R>
+    pub fn update(&mut self, id: u64, record: R) -> Result<()>
+    pub fn delete(&mut self, id: u64) -> Result<()>
+    pub fn range(&self, range: impl RangeBounds<u64>) -> impl Iterator<Item = (u64, &R)>
+    pub fn len(&self) -> usize
+    pub fn is_empty(&self) -> bool
+}
+```
+
+**Implementation notes:**
+
+- `next_id` starts at `1`. On overflow (`next_id == u64::MAX` before increment), panic — inserting 2^64 records into a single in-memory table is not a supported use case.
+- `insert` always succeeds; returns the assigned ID.
+- `update` / `delete` return `Err(Error::KeyNotFound)` if ID is absent.
+- `range` uses `BTreeMap::range` which yields `(&u64, &R)`. Map the key with `.map(|(&k, v)| (k, v))` to yield owned `u64` keys. The concrete return type is a `Map` adaptor, so `impl Iterator<Item = (u64, &R)>` is the correct signature.
+- No `Clone` bound — all reads are borrows.
+
+### `src/store.rs` (replace)
+
+Replace the existing `Store` struct (which held `BTreeMap<Vec<u8>, Vec<u8>>`) entirely:
+
+```rust
+pub struct Store {
+    tables: HashMap<String, Box<dyn Any>>,
+}
+
+impl Store {
+    pub fn new() -> Self
+    pub fn open_table<R: 'static>(&mut self, name: &str) -> Result<&mut Table<R>>
+}
+
+impl Default for Store { ... }  // delegates to new()
+```
+
+**`open_table` implementation note:** The borrow checker rejects simultaneously checking and mutably borrowing the map in one pass. Use a two-phase approach: if the key is absent, insert a fresh `Box<Table<R>>`; then call `get_mut` and downcast. This requires two map lookups but compiles safely without the nightly raw-entry API.
+
+```rust
+pub fn open_table<R: 'static>(&mut self, name: &str) -> Result<&mut Table<R>> {
+    if !self.tables.contains_key(name) {
+        self.tables.insert(name.to_string(), Box::new(Table::<R>::new()));
+    }
+    self.tables
+        .get_mut(name)
+        .unwrap()
+        .downcast_mut::<Table<R>>()
+        .ok_or_else(|| Error::TypeMismatch(name.to_string()))
+}
+```
+
+**Existing `Store` methods:** `is_empty()` and `len()` on `Store` now reflect the number of named tables (not rows). The existing unit tests `new_store_is_empty` and `store_reports_len_zero` should be **deleted** — they tested the old placeholder and are no longer meaningful. New tests cover `open_table` behaviour instead.
+
+**Stale doc comment:** Remove the existing doc comment on `Store` that says "backing structure will be replaced with a custom B-tree in Task 2" — the custom B-tree is deferred to Task 3.
+
+### `src/error.rs` (extend)
+
+Add one variant:
+
+```rust
+#[error("table '{0}' was opened with a different type")]
+TypeMismatch(String),
+```
+
+### `src/lib.rs` (extend)
+
+Add `pub mod table;` and `pub use table::Table;`.
+
+---
+
+## Data Flow
+
+```
+caller
+  │
+  ▼
+store.open_table::<User>("users")   →  &mut Table<User>
+  │
+  ├── table.insert(user)            →  u64 (assigned id, starts at 1)
+  ├── table.get(id)                 →  Option<&User>
+  ├── table.update(id, user)        →  Result<()>
+  ├── table.delete(id)              →  Result<()>
+  └── table.range(1..=100)          →  Iterator<(u64, &User)>
+```
+
+---
+
+## Error Handling
+
+| Operation | Error condition | Error variant |
+|---|---|---|
+| `open_table` | Name exists with different type | `TypeMismatch(name)` |
+| `get` | ID absent | `None` (not an error) |
+| `update` | ID absent | `KeyNotFound` |
+| `delete` | ID absent | `KeyNotFound` |
+| `insert` | `next_id` overflow | panic (unsupported) |
+
+---
+
+## What This Is Not
+
+- No serialization — records are stored as owned Rust values in memory
+- No secondary indexes — only primary key (u64) access
+- No MVCC — single-writer, no transactions (Task 3)
+- No custom B-tree node implementation — `std::BTreeMap` is the backing store; the custom B-tree node structure will be introduced alongside MVCC in Task 3
 
 ---
 
@@ -26,14 +149,13 @@
 
 ---
 
+## Implementation Plan
+
 ### Task 1: Add `TypeMismatch` to Error
 
-**Files:**
-- Modify: `src/error.rs`
+**Files:** `src/error.rs`
 
-- [ ] **Step 1: Write the failing test** — add only the test, no implementation yet
-
-  Inside the existing `mod tests` block in `src/error.rs`, add after the two existing tests:
+- [ ] **Step 1: Write the failing test** — add to the existing `mod tests` block:
 
   ```rust
   #[test]
@@ -43,51 +165,26 @@
   }
   ```
 
-- [ ] **Step 2: Run — verify compile error**
-
-  ```bash
-  cargo test error
-  ```
-
-  Expected: compile error — `TypeMismatch` variant does not exist.
-
-- [ ] **Step 3: Add the variant to the `Error` enum** in `src/error.rs`
-
-  After the `WriteConflict` variant:
+- [ ] **Step 2: Run — verify compile error** (`cargo test error`)
+- [ ] **Step 3: Add the variant** after `WriteConflict`:
 
   ```rust
   #[error("table '{0}' was opened with a different type")]
   TypeMismatch(String),
   ```
 
-- [ ] **Step 4: Run — verify 3 tests pass**
-
-  ```bash
-  cargo test error
-  ```
-
-  Expected: 3 tests pass.
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add src/error.rs
-  git commit -m "feat: add TypeMismatch error variant"
-  ```
+- [ ] **Step 4: Run — verify 3 tests pass** (`cargo test error`)
+- [ ] **Step 5: Commit** — `feat: add TypeMismatch error variant`
 
 ---
 
 ### Task 2: Create `Table<R>` — insert and get
 
-**Files:**
-- Create: `src/table.rs`
-- Modify: `src/lib.rs`
+**Files:** `src/table.rs` (create), `src/lib.rs` (modify)
 
 Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed in a broken state — `table.rs` and the `lib.rs` change land in the same commit.
 
 - [ ] **Step 1: Write failing tests in new `src/table.rs`**
-
-  Create `src/table.rs` with tests only (no implementation):
 
   ```rust
   #[cfg(test)]
@@ -123,9 +220,7 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 2: Add `pub mod table` to `src/lib.rs`**
-
-  Replace the entire file:
+- [ ] **Step 2: Add `pub mod table` to `src/lib.rs`** — replace entire file:
 
   ```rust
   pub mod error;
@@ -137,15 +232,8 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   pub use table::Table;
   ```
 
-- [ ] **Step 3: Run — verify compile error**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: compile error — `Table` not defined (the module exists but has no struct yet).
-
-- [ ] **Step 4: Add implementation above `#[cfg(test)]` in `src/table.rs`**
+- [ ] **Step 3: Run — verify compile error** (`cargo test table`)
+- [ ] **Step 4: Add implementation above `#[cfg(test)]`**
 
   ```rust
   use std::collections::BTreeMap;
@@ -183,29 +271,16 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 5: Run — verify 4 table tests pass**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: 4 tests pass.
-
-- [ ] **Step 6: Commit both files together**
-
-  ```bash
-  git add src/table.rs src/lib.rs
-  git commit -m "feat: add Table<R> with insert and get"
-  ```
+- [ ] **Step 5: Run — verify 4 table tests pass** (`cargo test table`)
+- [ ] **Step 6: Commit** — `feat: add Table<R> with insert and get`
 
 ---
 
 ### Task 3: Add `update` and `delete` to `Table`
 
-**Files:**
-- Modify: `src/table.rs`
+**Files:** `src/table.rs`
 
-- [ ] **Step 1: Add failing tests** inside the existing `mod tests` block (after the `get` tests)
+- [ ] **Step 1: Add failing tests** inside `mod tests`:
 
   ```rust
   #[test]
@@ -239,25 +314,16 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 2: Run — verify compile error**
+- [ ] **Step 2: Run — verify compile error** (`cargo test table`)
+- [ ] **Step 3: Add imports and methods**
 
-  ```bash
-  cargo test table
-  ```
-
-  Expected: compile error — `update` and `delete` not defined.
-
-- [ ] **Step 3: Add imports and methods to `src/table.rs`**
-
-  Add these two `use` lines at the top of `src/table.rs` (after `use std::collections::BTreeMap;`):
-
+  Add imports:
   ```rust
   use crate::Error;
   use crate::Result;
   ```
 
-  Add `update` and `delete` to `impl<R> Table<R>` (after `get`):
-
+  Add methods to `impl<R> Table<R>`:
   ```rust
   pub fn update(&mut self, id: u64, record: R) -> Result<()> {
       if self.data.contains_key(&id) {
@@ -273,29 +339,16 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 4: Run — verify all 8 table tests pass**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: 8 tests pass.
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add src/table.rs
-  git commit -m "feat: add Table update and delete"
-  ```
+- [ ] **Step 4: Run — verify 8 table tests pass** (`cargo test table`)
+- [ ] **Step 5: Commit** — `feat: add Table update and delete`
 
 ---
 
 ### Task 4: Add `range` to `Table`
 
-**Files:**
-- Modify: `src/table.rs`
+**Files:** `src/table.rs`
 
-- [ ] **Step 1: Add failing tests** inside `mod tests`
+- [ ] **Step 1: Add failing tests**
 
   ```rust
   #[test]
@@ -326,23 +379,12 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 2: Run — verify compile error**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: compile error — `range` not defined.
-
-- [ ] **Step 3: Add import and method to `src/table.rs`**
-
-  Add after the existing `use` lines at the top:
+- [ ] **Step 2: Run — verify compile error** (`cargo test table`)
+- [ ] **Step 3: Add import and method**
 
   ```rust
   use std::ops::RangeBounds;
   ```
-
-  Add `range` to `impl<R> Table<R>` (after `delete`):
 
   ```rust
   pub fn range(&self, range: impl RangeBounds<u64>) -> impl Iterator<Item = (u64, &R)> {
@@ -350,31 +392,16 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-  Note: `BTreeMap::range` yields `(&u64, &R)`. The `.map(|(&k, v)| (k, v))` copies the key by value (u64 is `Copy`), giving the `(u64, &R)` signature in the spec.
-
-- [ ] **Step 4: Run — verify all 11 table tests pass**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: 11 tests pass.
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add src/table.rs
-  git commit -m "feat: add Table range scan"
-  ```
+- [ ] **Step 4: Run — verify 11 table tests pass** (`cargo test table`)
+- [ ] **Step 5: Commit** — `feat: add Table range scan`
 
 ---
 
 ### Task 5: Add `len` and `is_empty` to `Table`
 
-**Files:**
-- Modify: `src/table.rs`
+**Files:** `src/table.rs`
 
-- [ ] **Step 1: Add failing tests** inside `mod tests`
+- [ ] **Step 1: Add failing tests**
 
   ```rust
   #[test]
@@ -395,15 +422,8 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 2: Run — verify compile error**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: compile error — `len` and `is_empty` not defined on `Table`.
-
-- [ ] **Step 3: Add methods to `impl<R> Table<R>`** (after `range`)
+- [ ] **Step 2: Run — verify compile error** (`cargo test table`)
+- [ ] **Step 3: Add methods**
 
   ```rust
   #[must_use]
@@ -417,33 +437,18 @@ Note: `src/lib.rs` is updated in this task (not Task 1) so it is never committed
   }
   ```
 
-- [ ] **Step 4: Run — verify all 13 table tests pass**
-
-  ```bash
-  cargo test table
-  ```
-
-  Expected: 13 tests pass.
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add src/table.rs
-  git commit -m "feat: add Table len and is_empty"
-  ```
+- [ ] **Step 4: Run — verify 13 table tests pass** (`cargo test table`)
+- [ ] **Step 5: Commit** — `feat: add Table len and is_empty`
 
 ---
 
 ### Task 6: Replace `Store` with `open_table`
 
-**Files:**
-- Modify: `src/store.rs`
+**Files:** `src/store.rs`
 
-This task **completely replaces** `src/store.rs`. The old `Store` struct (which held `BTreeMap<Vec<u8>, Vec<u8>>`), its `is_empty`, `len`, `new`, `Default` methods, and its two unit tests (`new_store_is_empty`, `store_reports_len_zero`) are all removed. Nothing from the old file is kept.
+This task **completely replaces** `src/store.rs`. The old `Store` struct, its methods, and its unit tests are all removed.
 
-- [ ] **Step 1: Overwrite `src/store.rs` entirely** with tests only
-
-  The new file is:
+- [ ] **Step 1: Overwrite `src/store.rs` entirely** with tests only:
 
   ```rust
   #[cfg(test)]
@@ -464,7 +469,6 @@ This task **completely replaces** `src/store.rs`. The old `Store` struct (which 
               let table = store.open_table::<String>("users").unwrap();
               table.insert("alice".to_string())
           };
-          // First borrow ended at the closing brace above.
           let table = store.open_table::<String>("users").unwrap();
           assert_eq!(table.get(id), Some(&"alice".to_string()));
       }
@@ -479,96 +483,21 @@ This task **completely replaces** `src/store.rs`. The old `Store` struct (which 
   }
   ```
 
-- [ ] **Step 2: Run — verify compile error**
-
-  ```bash
-  cargo test store
-  ```
-
-  Expected: compile error — `Store` not defined.
-
-- [ ] **Step 3: Add implementation above `#[cfg(test)]`**
-
-  ```rust
-  use std::any::Any;
-  use std::collections::HashMap;
-  use crate::{Error, Result};
-  use crate::table::Table;
-
-  /// An in-memory store holding named typed tables.
-  ///
-  /// Each table is a [`Table<R>`] keyed by auto-increment `u64`.
-  /// The backing B-tree implementation will be replaced in Task 3 (MVCC).
-  pub struct Store {
-      tables: HashMap<String, Box<dyn Any>>,
-  }
-
-  impl Store {
-      pub fn new() -> Self {
-          Self {
-              tables: HashMap::new(),
-          }
-      }
-
-      /// Open a named table for records of type `R`.
-      ///
-      /// Creates the table if it does not exist. Returns
-      /// [`Error::TypeMismatch`] if the name was previously opened
-      /// with a different type.
-      pub fn open_table<R: 'static>(&mut self, name: &str) -> Result<&mut Table<R>> {
-          if !self.tables.contains_key(name) {
-              self.tables.insert(name.to_string(), Box::new(Table::<R>::new()));
-          }
-          self.tables
-              .get_mut(name)
-              .unwrap()
-              .downcast_mut::<Table<R>>()
-              .ok_or_else(|| Error::TypeMismatch(name.to_string()))
-      }
-  }
-
-  impl Default for Store {
-      fn default() -> Self {
-          Self::new()
-      }
-  }
-  ```
-
-  Note: the new `Store` has **no** `is_empty` or `len` methods — those belonged to the old placeholder and are not part of the spec. Do not add them.
-
-- [ ] **Step 4: Run store tests — verify 3 pass**
-
-  ```bash
-  cargo test store
-  ```
-
-  Expected: 3 tests pass.
-
-- [ ] **Step 5: Run full test suite**
-
-  ```bash
-  cargo test
-  ```
-
-  Expected: all unit tests pass. The integration test `store_is_empty_on_creation` will **fail** because `Store::is_empty` no longer exists — this is expected and will be fixed in Task 7.
-
-- [ ] **Step 6: Commit**
-
-  ```bash
-  git add src/store.rs
-  git commit -m "feat: replace Store with open_table backed by HashMap<String, Box<dyn Any>>"
-  ```
+- [ ] **Step 2: Run — verify compile error** (`cargo test store`)
+- [ ] **Step 3: Add implementation** (see `open_table` implementation in Components section above)
+- [ ] **Step 4: Run — verify 3 store tests pass** (`cargo test store`)
+- [ ] **Step 5: Run full test suite** — integration test will fail (expected, fixed in Task 7)
+- [ ] **Step 6: Commit** — `feat: replace Store with open_table backed by HashMap<String, Box<dyn Any>>`
 
 ---
 
 ### Task 7: Replace integration test
 
-**Files:**
-- Modify: `tests/store_integration.rs`
+**Files:** `tests/store_integration.rs`
 
-This task **completely replaces** `tests/store_integration.rs`. The old `store_is_empty_on_creation` test is removed.
+This task **completely replaces** `tests/store_integration.rs`.
 
-- [ ] **Step 1: Overwrite `tests/store_integration.rs` entirely**
+- [ ] **Step 1: Overwrite `tests/store_integration.rs`**
 
   ```rust
   use ultima_db::{Error, Store};
@@ -603,7 +532,7 @@ This task **completely replaces** `tests/store_integration.rs`. The old `store_i
       assert_eq!(table.len(), 1);
       assert!(matches!(table.delete(99), Err(Error::KeyNotFound)));
 
-      // Range scan — id2 was deleted, so only id1 and id3 appear
+      // Range scan
       let id3 = table.insert("third note".to_string());
       let results: Vec<_> = table.range(id1..=id3).collect();
       assert_eq!(results.len(), 2);
@@ -615,7 +544,6 @@ This task **completely replaces** `tests/store_integration.rs`. The old `store_i
   fn two_tables_are_independent() {
       let mut store = Store::new();
 
-      // Use statement-level borrows (temporary &mut ends at each semicolon)
       store.open_table::<String>("users").unwrap().insert("alice".to_string());
       store.open_table::<u64>("posts").unwrap().insert(42u64);
 
@@ -632,36 +560,15 @@ This task **completely replaces** `tests/store_integration.rs`. The old `store_i
   }
   ```
 
-- [ ] **Step 2: Run integration tests**
-
-  ```bash
-  cargo test --test store_integration
-  ```
-
-  Expected: 2 tests pass.
-
-- [ ] **Step 3: Run full test suite**
-
-  ```bash
-  cargo test
-  ```
-
-  Expected: all tests pass.
-
-- [ ] **Step 4: Commit**
-
-  ```bash
-  git add tests/store_integration.rs
-  git commit -m "test: replace integration tests with end-to-end CRUD suite"
-  ```
+- [ ] **Step 2: Run integration tests** (`cargo test --test store_integration`) — 2 pass
+- [ ] **Step 3: Run full test suite** (`cargo test`) — all pass
+- [ ] **Step 4: Commit** — `test: replace integration tests with end-to-end CRUD suite`
 
 ---
 
 ### Task 8: Update examples
 
-**Files:**
-- Modify: `examples/basic_usage.rs`
-- Create: `examples/multi_store.rs`
+**Files:** `examples/basic_usage.rs`, `examples/multi_store.rs`
 
 - [ ] **Step 1: Replace `examples/basic_usage.rs`**
 
@@ -712,75 +619,41 @@ This task **completely replaces** `tests/store_integration.rs`. The old `store_i
   }
   ```
 
-- [ ] **Step 3: Run both examples — verify output**
-
-  ```bash
-  cargo run --example basic_usage
-  ```
-
-  Expected:
-  ```
-  Inserted note with id=1
-  Retrieved: Hello, UltimaDB!
-  Updated note: Hello, updated!
-  Deleted. Table empty: true
-  ```
-
-  ```bash
-  cargo run --example multi_store
-  ```
-
-  Expected:
-  ```
-  users table:
-    1: alice
-    2: bob
-  scores table:
-    1: 100
-    2: 200
-  ```
-
-- [ ] **Step 4: Commit**
-
-  ```bash
-  git add examples/basic_usage.rs examples/multi_store.rs
-  git commit -m "feat: update examples for CRUD API"
-  ```
+- [ ] **Step 3: Run both examples** — verify output
+- [ ] **Step 4: Commit** — `feat: update examples for CRUD API`
 
 ---
 
 ### Task 9: Final verification
 
-- [ ] **Step 1: Full test suite**
+- [ ] **Step 1: Full test suite** (`cargo test`) — all pass
+- [ ] **Step 2: Clippy** (`cargo clippy -- -D warnings`) — zero warnings
+- [ ] **Step 3: Docs** (`cargo doc --no-deps`) — clean
+- [ ] **Step 4: Commit if any fixes were needed** — `chore: fix clippy/doc warnings`
 
-  ```bash
-  cargo test
-  ```
+---
 
-  Expected: all tests pass.
+## Testing
 
-- [ ] **Step 2: Clippy — zero warnings**
+**Unit tests in `src/table.rs`:**
+- Insert returns IDs starting at 1, incrementing by 1
+- Get returns a reference to the inserted record
+- Get on absent ID returns None
+- Update replaces the record; get after update returns new value
+- Update on absent ID returns `Error::KeyNotFound`
+- Delete removes the record; get after delete returns None
+- Delete on absent ID returns `Error::KeyNotFound`
+- Range yields `(id, &record)` pairs in ascending order for the specified bounds
+- Range on empty table yields nothing
+- `is_empty` and `len` reflect current record count
 
-  ```bash
-  cargo clippy -- -D warnings
-  ```
+**Unit tests in `src/store.rs`:**
+- `open_table` creates a new table on first call (table is empty)
+- `open_table` returns the same table on second call: insert a record via the first reference, re-open the same name, verify the record is still present
+- `open_table` returns `Error::TypeMismatch` when same name is opened with a different `R`
 
-  Expected: clean. Both `Table::len` and `Table::is_empty` have `#[must_use]`, satisfying `must_use_candidate` and `len_without_is_empty`.
-
-- [ ] **Step 3: Docs**
-
-  ```bash
-  cargo doc --no-deps
-  ```
-
-  Expected: clean.
-
-- [ ] **Step 4: Commit if any fixes were needed**
-
-  ```bash
-  git add -p
-  git commit -m "chore: fix clippy/doc warnings"
-  ```
+**Integration test in `tests/store_integration.rs`:**
+- End-to-end: `open_table`, insert multiple records, get, update, delete, range scan — verify results at each step
 
 ---
 

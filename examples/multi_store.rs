@@ -3,18 +3,32 @@ use ultima_db::Store;
 fn main() {
     let mut store = Store::new();
 
-    store.open_table::<String>("users").unwrap().insert("alice".to_string());
-    store.open_table::<String>("users").unwrap().insert("bob".to_string());
-    store.open_table::<u32>("scores").unwrap().insert(100u32);
-    store.open_table::<u32>("scores").unwrap().insert(200u32);
+    // Populate two typed tables in separate write transactions
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let users = wtx.open_table::<String>("users").unwrap();
+        users.insert("alice".to_string());
+        users.insert("bob".to_string());
+        wtx.commit(&mut store).unwrap();
+    }
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let scores = wtx.open_table::<u32>("scores").unwrap();
+        scores.insert(100u32);
+        scores.insert(200u32);
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // Read both tables from the latest snapshot
+    let rtx = store.begin_read(None).unwrap();
 
     println!("users table:");
-    for (id, name) in store.open_table::<String>("users").unwrap().range(..) {
+    for (id, name) in rtx.open_table::<String>("users").unwrap().range(..) {
         println!("  {id}: {name}");
     }
 
     println!("scores table:");
-    for (id, score) in store.open_table::<u32>("scores").unwrap().range(..) {
+    for (id, score) in rtx.open_table::<u32>("scores").unwrap().range(..) {
         println!("  {id}: {score}");
     }
 }

@@ -4,6 +4,10 @@ use thiserror::Error;
 pub enum Error {
     #[error("key not found")]
     KeyNotFound,
+    /// Returned when `begin_write` is called with a version ≤ the latest
+    /// committed version. In a future multi-writer implementation this will
+    /// also be returned when a write transaction conflicts with a concurrent
+    /// commit.
     #[error("write conflict")]
     WriteConflict,
     #[error("table '{0}' was opened with a different type")]

@@ -25,7 +25,12 @@
       "Bash(cargo run:*)",
       "Bash(cargo bench:*)",
       "Bash(cargo clippy:*)",
-      "Bash(cargo doc:*)"
+      "Bash(cargo doc:*)",
+      "Bash(git rm:*)",
+      "Skill(commit-commands:commit)",
+      "Skill(code-review:code-review)",
+      "Bash(gh repo:*)",
+      "Bash(python3:*)"
     ]
   }
 }

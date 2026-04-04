@@ -1,51 +1,46 @@
-use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
+use crate::btree::{BTree, BTreeRange};
 use crate::Error;
 use crate::Result;
 
 pub struct Table<R> {
-    data: BTreeMap<u64, R>,
+    data: BTree<R>,
     next_id: u64,
 }
 
 impl<R> Table<R> {
     pub fn new() -> Self {
-        Self {
-            data: BTreeMap::new(),
-            next_id: 1,
-        }
+        Self { data: BTree::new(), next_id: 1 }
     }
 
     pub fn insert(&mut self, record: R) -> u64 {
         assert!(self.next_id < u64::MAX, "Table ID overflow");
         let id = self.next_id;
         self.next_id += 1;
-        self.data.insert(id, record);
+        self.data = self.data.insert(id, record);
         id
     }
 
     pub fn get(&self, id: u64) -> Option<&R> {
-        self.data.get(&id)
+        self.data.get(id)
     }
 
     pub fn update(&mut self, id: u64, record: R) -> Result<()> {
-        use std::collections::btree_map::Entry;
-        match self.data.entry(id) {
-            Entry::Occupied(mut e) => {
-                e.insert(record);
-                Ok(())
-            }
-            Entry::Vacant(_) => Err(Error::KeyNotFound),
+        if self.data.get(id).is_none() {
+            return Err(Error::KeyNotFound);
         }
+        self.data = self.data.insert(id, record);
+        Ok(())
     }
 
     pub fn delete(&mut self, id: u64) -> Result<()> {
-        self.data.remove(&id).map(|_| ()).ok_or(Error::KeyNotFound)
+        self.data = self.data.remove(id)?;
+        Ok(())
     }
 
-    pub fn range(&self, range: impl RangeBounds<u64>) -> impl Iterator<Item = (u64, &R)> {
-        self.data.range(range).map(|(&k, v)| (k, v))
+    pub fn range<'a>(&'a self, range: impl RangeBounds<u64> + 'a) -> BTreeRange<'a, R> {
+        self.data.range(range)
     }
 
     #[must_use]
@@ -56,6 +51,13 @@ impl<R> Table<R> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+}
+
+impl<R> Clone for Table<R> {
+    /// O(1): shares the underlying BTree root via Arc.
+    fn clone(&self) -> Self {
+        Table { data: self.data.clone(), next_id: self.next_id }
     }
 }
 
@@ -168,5 +170,30 @@ mod tests {
         assert_eq!(table.len(), 1);
         table.delete(id).unwrap();
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn table_clone_is_independent() {
+        let mut original: Table<String> = Table::new();
+        original.insert("alice".to_string());
+        let clone = original.clone();
+        original.insert("bob".to_string()); // mutate original after clone
+        // Clone is unaffected
+        assert_eq!(clone.len(), 1);
+        assert_eq!(clone.get(2), None);
+    }
+
+    #[test]
+    fn table_clone_preserves_next_id() {
+        let mut original: Table<String> = Table::new();
+        original.insert("a".to_string()); // id 1
+        original.insert("b".to_string()); // id 2
+        let mut clone = original.clone();
+        // Next insert in clone should continue from id 3
+        let id = clone.insert("c".to_string());
+        assert_eq!(id, 3);
+        // Verify no ID collision
+        assert_eq!(clone.get(1), Some(&"a".to_string()));
+        assert_eq!(clone.get(3), Some(&"c".to_string()));
     }
 }
