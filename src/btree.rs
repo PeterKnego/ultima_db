@@ -769,6 +769,131 @@ mod tests {
         assert_eq!(results, vec![6, 7]);
     }
 
+    // -------------------------------------------------------------------
+    // Deep-tree tests for internal-node deletion paths and rebalancing.
+    // With T=32, a 3-level tree requires ~64*32 = 2048+ keys so that
+    // the root has children that themselves have children.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn deep_tree_get_arc_traverses_internal_nodes() {
+        // get_arc recursion into children (line 264)
+        let t = insert_range(1, 5000);
+        // Keys in the middle are guaranteed to be in non-root nodes
+        assert_eq!(t.get_arc(&2500).map(|v| *v), Some(25000));
+        assert!(t.get_arc(&9999).is_none());
+    }
+
+    #[test]
+    fn deep_tree_delete_internal_node_key() {
+        // Forces the Ok(i) branch in delete_from_node for internal nodes
+        // (lines 355-370) + remove_leftmost (lines 398-415).
+        // Strategy: build a large tree, then find keys that are internal
+        // separators by checking the tree structure indirectly — deleting
+        // keys near the middle of the range exercises internal-node hits.
+        let mut t = insert_range(1, 5000);
+        let before_len = t.len();
+
+        // Delete keys spread across the range to hit internal separators.
+        // With T=32, root separators are roughly evenly spaced.
+        let keys_to_delete: Vec<u64> = (1..=5000).step_by(64).collect();
+        for &k in &keys_to_delete {
+            t = t.remove(&k).unwrap();
+        }
+        assert_eq!(t.len(), before_len - keys_to_delete.len());
+
+        // Verify remaining keys are intact
+        for i in 1..=5000 {
+            if keys_to_delete.contains(&i) {
+                assert!(t.get(&i).is_none());
+            } else {
+                assert_eq!(t.get(&i), Some(&(i * 10)));
+            }
+        }
+    }
+
+    #[test]
+    fn deep_tree_heavy_deletion_triggers_all_rebalance_paths() {
+        // Insert enough to build 3+ levels, then delete in patterns that
+        // trigger rotate_right, rotate_left, merge_with_left, merge_with_right.
+        let mut t = insert_range(1, 5000);
+
+        // Delete from the left side heavily to force right-to-left rebalancing
+        for i in 1..=2000 {
+            t = t.remove(&i).unwrap();
+        }
+        assert_eq!(t.len(), 3000);
+
+        // Verify range still works (exercises descend_leftmost for internal nodes)
+        let all: Vec<u64> = t.range(..).map(|(k, _)| *k).collect();
+        assert_eq!(all.len(), 3000);
+        assert_eq!(*all.first().unwrap(), 2001);
+        assert_eq!(*all.last().unwrap(), 5000);
+
+        // Now delete from the right side
+        for i in (4001..=5000).rev() {
+            t = t.remove(&i).unwrap();
+        }
+        assert_eq!(t.len(), 2000);
+
+        // Delete alternating keys from what remains to trigger merges
+        let remaining: Vec<u64> = (2001..=4000).collect();
+        for &k in remaining.iter().step_by(2) {
+            t = t.remove(&k).unwrap();
+        }
+        assert_eq!(t.len(), 1000);
+
+        // Verify tree integrity
+        let final_keys: Vec<u64> = t.range(..).map(|(k, _)| *k).collect();
+        assert_eq!(final_keys.len(), 1000);
+        for k in &final_keys {
+            assert_eq!(t.get(k), Some(&(k * 10)));
+        }
+    }
+
+    #[test]
+    fn deep_tree_delete_all_exercises_merge_paths() {
+        // Delete all 5000 keys in forward order — this heavily exercises
+        // the left-side merge/rotate paths as the leftmost children
+        // repeatedly become underfull.
+        let mut t = insert_range(1, 5000);
+        for i in 1..=5000 {
+            t = t.remove(&i).unwrap();
+        }
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn deep_tree_delete_all_reverse_exercises_right_merge_paths() {
+        // Delete all keys in reverse order — exercises right-side
+        // merge/rotate paths as rightmost children become underfull.
+        let mut t = insert_range(1, 5000);
+        for i in (1..=5000).rev() {
+            t = t.remove(&i).unwrap();
+        }
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn deep_tree_range_unbounded_start() {
+        // Exercises descend_leftmost (line 176-182) via range(..)
+        // on a multi-level tree — the Unbounded start case in
+        // descend_left_from also works, but descend_leftmost is only
+        // called during iteration when advancing to the next subtree.
+        let t = insert_range(1, 5000);
+        let all: Vec<u64> = t.range(..).map(|(k, _)| *k).collect();
+        assert_eq!(all.len(), 5000);
+        assert_eq!(all[0], 1);
+        assert_eq!(all[4999], 5000);
+    }
+
+    #[test]
+    fn default_creates_empty_tree() {
+        let t: BTree<u64, u64> = BTree::default();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+    }
+
     #[test]
     fn string_keys_work() {
         let mut t: BTree<String, u64> = BTree::new();

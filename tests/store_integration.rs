@@ -1090,3 +1090,162 @@ fn compound_index_on_multiple_fields() {
     wtx.commit(&mut store).unwrap();
 }
 
+// ===========================================================================
+// Batch operation integration tests
+// ===========================================================================
+
+#[test]
+fn batch_insert_visible_after_commit() {
+    let mut store = Store::new();
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        let ids = table
+            .insert_batch(vec![
+                User { email: "a@x.com".into(), age: 30, name: "A".into() },
+                User { email: "b@x.com".into(), age: 25, name: "B".into() },
+                User { email: "c@x.com".into(), age: 30, name: "C".into() },
+            ])
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        wtx.commit(&mut store).unwrap();
+    }
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 3);
+    assert!(table.get_unique::<String>("by_email", &"b@x.com".to_string()).unwrap().is_some());
+}
+
+#[test]
+fn batch_update_visible_after_commit() {
+    let mut store = Store::new();
+    let id1;
+    let id2;
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        id1 = table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+        id2 = table.insert(User { email: "b@x.com".into(), age: 25, name: "B".into() }).unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .update_batch(vec![
+                (id1, User { email: "a_new@x.com".into(), age: 31, name: "A".into() }),
+                (id2, User { email: "b_new@x.com".into(), age: 26, name: "B".into() }),
+            ])
+            .unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.get(id1).unwrap().email, "a_new@x.com");
+    assert!(table.get_unique::<String>("by_email", &"a@x.com".to_string()).unwrap().is_none());
+    assert!(table.get_unique::<String>("by_email", &"a_new@x.com".to_string()).unwrap().is_some());
+}
+
+#[test]
+fn batch_delete_visible_after_commit() {
+    let mut store = Store::new();
+    let id1;
+    let id2;
+    let id3;
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        id1 = table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+        id2 = table.insert(User { email: "b@x.com".into(), age: 25, name: "B".into() }).unwrap();
+        id3 = table.insert(User { email: "c@x.com".into(), age: 20, name: "C".into() }).unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table.delete_batch(&[id1, id3]).unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 1);
+    assert_eq!(table.get(id2).unwrap().email, "b@x.com");
+    assert!(table.get_unique::<String>("by_email", &"a@x.com".to_string()).unwrap().is_none());
+}
+
+#[test]
+fn batch_insert_rollback_on_constraint() {
+    let mut store = Store::new();
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        table.insert(User { email: "taken@x.com".into(), age: 30, name: "A".into() }).unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        let res = table.insert_batch(vec![
+            User { email: "new@x.com".into(), age: 25, name: "B".into() },
+            User { email: "taken@x.com".into(), age: 20, name: "C".into() },
+        ]);
+        assert!(matches!(res, Err(Error::DuplicateKey(_))));
+        // Table in this write tx should be unchanged
+        assert_eq!(table.len(), 1);
+    }
+    // Store should still be at the original version
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn batch_ops_mvcc_isolation() {
+    let mut store = Store::new();
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // Open a read tx before the batch mutation
+    let rtx_before = store.begin_read(None).unwrap();
+
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .insert_batch(vec![
+                User { email: "b@x.com".into(), age: 25, name: "B".into() },
+                User { email: "c@x.com".into(), age: 20, name: "C".into() },
+            ])
+            .unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // The pre-batch read tx should still see only the original record
+    let table_before = rtx_before.open_table::<User>("users").unwrap();
+    assert_eq!(table_before.len(), 1);
+
+    // A new read tx should see all 3 records
+    let rtx_after = store.begin_read(None).unwrap();
+    let table_after = rtx_after.open_table::<User>("users").unwrap();
+    assert_eq!(table_after.len(), 3);
+}
+
