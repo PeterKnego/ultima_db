@@ -3,7 +3,7 @@ use pprof::criterion::{Output, PProfProfiler};
 use ultima_db::Store;
 
 fn bench_create(c: &mut Criterion) {
-    c.bench_function("store_create", |b| b.iter(Store::new));
+    c.bench_function("store_create", |b| b.iter(Store::default));
 }
 
 criterion_group! {

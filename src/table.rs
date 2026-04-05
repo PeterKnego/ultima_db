@@ -1008,6 +1008,142 @@ mod tests {
         assert_eq!(table.get_by_index::<u32>("by_age", &25).unwrap().len(), 1);
     }
 
+    // -------------------------------------------------------------------
+    // Coverage: get_by_key, index_range, single-op index rollback
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn get_by_key_on_unique_index() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+
+        let results = table.get_by_key::<String>("by_email", &"a@x.com".to_string()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.email, "a@x.com");
+
+        let results = table.get_by_key::<String>("by_email", &"missing@x.com".to_string()).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn get_by_key_on_non_unique_index() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_age", IndexKind::NonUnique, |u: &User| u.age).unwrap();
+        table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+        table.insert(User { email: "b@x.com".into(), age: 30, name: "B".into() }).unwrap();
+        table.insert(User { email: "c@x.com".into(), age: 25, name: "C".into() }).unwrap();
+
+        let results = table.get_by_key::<u32>("by_age", &30).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = table.get_by_key::<u32>("by_age", &99).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn get_by_key_nonexistent_index() {
+        let table: Table<User> = Table::new();
+        let res = table.get_by_key::<String>("nope", &"x".to_string());
+        assert!(matches!(res, Err(crate::Error::IndexNotFound(_))));
+    }
+
+    #[test]
+    fn get_by_key_wrong_key_type() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        // Query String index with u32 key
+        let res = table.get_by_key::<u32>("by_email", &42);
+        assert!(matches!(res, Err(crate::Error::IndexTypeMismatch(_))));
+    }
+
+    #[test]
+    fn index_range_unique() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_age", IndexKind::Unique, |u: &User| u.age).unwrap();
+        table.insert(User { email: "a@x.com".into(), age: 20, name: "A".into() }).unwrap();
+        table.insert(User { email: "b@x.com".into(), age: 30, name: "B".into() }).unwrap();
+        table.insert(User { email: "c@x.com".into(), age: 40, name: "C".into() }).unwrap();
+
+        let results = table.index_range::<u32>("by_age", 25..=35).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.age, 30);
+
+        // Full range
+        let results = table.index_range::<u32>("by_age", ..).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn index_range_non_unique() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_age", IndexKind::NonUnique, |u: &User| u.age).unwrap();
+        table.insert(User { email: "a@x.com".into(), age: 20, name: "A".into() }).unwrap();
+        table.insert(User { email: "b@x.com".into(), age: 30, name: "B".into() }).unwrap();
+        table.insert(User { email: "c@x.com".into(), age: 30, name: "C".into() }).unwrap();
+        table.insert(User { email: "d@x.com".into(), age: 40, name: "D".into() }).unwrap();
+
+        let results = table.index_range::<u32>("by_age", 25..=35).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = table.index_range::<u32>("by_age", ..30).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.age, 20);
+    }
+
+    #[test]
+    fn index_range_nonexistent_index() {
+        let table: Table<User> = Table::new();
+        let res = table.index_range::<u32>("nope", ..);
+        assert!(matches!(res, Err(crate::Error::IndexNotFound(_))));
+    }
+
+    #[test]
+    fn single_insert_multi_index_rollback() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        table.define_index("by_name", IndexKind::Unique, |u: &User| u.name.clone()).unwrap();
+
+        table.insert(User { email: "a@x.com".into(), age: 30, name: "Alice".into() }).unwrap();
+
+        // Conflict on one index — both indexes should roll back the failed insert
+        let res = table.insert(User { email: "b@x.com".into(), age: 25, name: "Alice".into() });
+        assert!(res.is_err());
+        assert_eq!(table.len(), 1);
+        // The non-conflicting index should NOT contain the failed record's email
+        assert!(table.get_unique::<String>("by_email", &"b@x.com".to_string()).unwrap().is_none());
+    }
+
+    #[test]
+    fn single_update_multi_index_rollback() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        table.define_index("by_name", IndexKind::Unique, |u: &User| u.name.clone()).unwrap();
+
+        let id1 = table.insert(User { email: "a@x.com".into(), age: 30, name: "Alice".into() }).unwrap();
+        let _id2 = table.insert(User { email: "b@x.com".into(), age: 25, name: "Bob".into() }).unwrap();
+
+        // Update id1 to collide with id2 on name — should roll back email index change too
+        let res = table.update(id1, User { email: "a_new@x.com".into(), age: 30, name: "Bob".into() });
+        assert!(res.is_err());
+        // Email index should still have old value, not new
+        assert!(table.get_unique::<String>("by_email", &"a@x.com".to_string()).unwrap().is_some());
+        assert!(table.get_unique::<String>("by_email", &"a_new@x.com".to_string()).unwrap().is_none());
+    }
+
+    #[test]
+    fn single_delete_removes_index_entries() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        table.define_index("by_age", IndexKind::NonUnique, |u: &User| u.age).unwrap();
+
+        let id = table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+        table.delete(id).unwrap();
+
+        assert!(table.get_unique::<String>("by_email", &"a@x.com".to_string()).unwrap().is_none());
+        assert!(table.get_by_index::<u32>("by_age", &30).unwrap().is_empty());
+    }
+
     #[test]
     fn insert_batch_large() {
         let mut table: Table<User> = Table::new();
