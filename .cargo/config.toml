@@ -1,0 +1,3 @@
+# Keep debug symbols in bench builds for useful flamegraphs
+[profile.bench]
+debug = true

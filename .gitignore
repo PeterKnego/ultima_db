@@ -4,3 +4,8 @@
 
 /.claude/settings.local.json
 
+# Flamegraph artifacts
+flamegraph.svg
+perf.data
+perf.data.old
+
