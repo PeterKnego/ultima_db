@@ -45,6 +45,7 @@ pub struct Store {
 }
 
 impl Store {
+    /// Creates a new, empty store. The initial version is 0.
     pub fn new() -> Self {
         let empty =
             Arc::new(Snapshot { version: 0, tables: HashMap::new() });
@@ -101,6 +102,15 @@ impl Store {
         if v > self.latest_version {
             self.latest_version = v;
         }
+    }
+
+    /// Garbage collect old snapshots that are no longer referenced by any [`ReadTx`].
+    /// Always keeps the latest committed snapshot.
+    pub fn gc(&mut self) {
+        let latest = self.latest_version;
+        self.snapshots.retain(|&v, snapshot| {
+            v == latest || Arc::strong_count(snapshot) > 1
+        });
     }
 }
 
@@ -172,7 +182,7 @@ impl WriteTx {
     /// the same mutable copy.
     ///
     /// Creates an empty table if `name` does not exist in the base snapshot.
-    pub fn open_table<R: 'static>(&mut self, name: &str) -> Result<&mut Table<R>> {
+    pub fn open_table<R: Send + Sync + 'static>(&mut self, name: &str) -> Result<&mut Table<R>> {
         if !self.dirty.contains_key(name) {
             let table: Table<R> = match self.base.tables.get(name) {
                 Some(arc_any) => arc_any
@@ -212,7 +222,7 @@ impl WriteTx {
         Ok(self.version)
     }
 
-    /// Discard this transaction without modifying the store.
+    /// Discards this transaction without modifying the store.
     pub fn rollback(self) {
         // Dropping self is sufficient; no store mutation needed.
     }
@@ -308,7 +318,7 @@ mod tests {
         let mut store = Store::new();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("hi".to_string());
+            wtx.open_table::<String>("t").unwrap().insert("hi".to_string()).unwrap();
             wtx.commit(&mut store).unwrap();
         }
         let rtx = store.begin_read(None).unwrap();
@@ -330,7 +340,7 @@ mod tests {
         let mut store = Store::new();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("notes").unwrap().insert("hello".to_string());
+            wtx.open_table::<String>("notes").unwrap().insert("hello".to_string()).unwrap();
             wtx.commit(&mut store).unwrap();
         }
         let mut wtx2 = store.begin_write(None).unwrap();
@@ -343,7 +353,7 @@ mod tests {
         let mut store = Store::new();
         let rtx = store.begin_read(None).unwrap(); // snapshot v0
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("secret".to_string());
+        wtx.open_table::<String>("t").unwrap().insert("secret".to_string()).unwrap();
         // Do NOT commit yet — rtx should still see empty
         assert!(matches!(rtx.open_table::<String>("t"), Err(Error::KeyNotFound)));
         wtx.rollback();
@@ -354,7 +364,7 @@ mod tests {
         let mut store = Store::new();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("msgs").unwrap().insert("hello".to_string());
+            wtx.open_table::<String>("msgs").unwrap().insert("hello".to_string()).unwrap();
             wtx.commit(&mut store).unwrap();
         }
         let rtx = store.begin_read(None).unwrap();
@@ -376,5 +386,34 @@ mod tests {
         let wtx = store.begin_write(None).unwrap();
         wtx.rollback();
         assert_eq!(store.latest_version(), 0);
+    }
+
+    #[test]
+    fn gc_removes_old_snapshots_except_latest_and_active_rtx() {
+        let mut store = Store::new();
+        // Commit v1
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        // Commit v2
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        // Current snapshots: 0, 1, 2. Latest is 2.
+        assert_eq!(store.snapshots.len(), 3);
+
+        // Open read tx on v1
+        let rtx1 = store.begin_read(Some(1)).unwrap();
+        
+        // Run GC
+        store.gc();
+
+        // Should keep 2 (latest) and 1 (referenced by rtx1). Snapshot 0 should be gone.
+        assert_eq!(store.snapshots.len(), 2);
+        assert!(store.snapshots.contains_key(&2));
+        assert!(store.snapshots.contains_key(&1));
+        assert!(!store.snapshots.contains_key(&0));
+
+        drop(rtx1);
+        store.gc();
+        // Now snapshot 1 should be gone, only 2 remains.
+        assert_eq!(store.snapshots.len(), 1);
+        assert!(store.snapshots.contains_key(&2));
     }
 }

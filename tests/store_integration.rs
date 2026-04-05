@@ -1,4 +1,4 @@
-use ultima_db::{Error, Store};
+use ultima_db::{Error, IndexKind, Store};
 
 // ---------------------------------------------------------------------------
 // Full CRUD via transactions
@@ -12,8 +12,8 @@ fn end_to_end_write_commit_read() {
         let mut wtx = store.begin_write(None).unwrap();
         let table = wtx.open_table::<String>("notes").unwrap();
 
-        let id1 = table.insert("first note".to_string());
-        let id2 = table.insert("second note".to_string());
+        let id1 = table.insert("first note".to_string()).unwrap();
+        let id2 = table.insert("second note".to_string()).unwrap();
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
 
@@ -28,7 +28,7 @@ fn end_to_end_write_commit_read() {
         assert_eq!(table.len(), 1);
         assert!(matches!(table.delete(99), Err(Error::KeyNotFound)));
 
-        let id3 = table.insert("third note".to_string());
+        let id3 = table.insert("third note".to_string()).unwrap();
         let results: Vec<_> = table.range(id1..=id3).collect();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], (id1, &"updated first".to_string()));
@@ -55,7 +55,7 @@ fn snapshot_isolation() {
 
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("users").unwrap().insert("alice".to_string());
+        wtx.open_table::<String>("users").unwrap().insert("alice".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -63,7 +63,7 @@ fn snapshot_isolation() {
 
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("users").unwrap().insert("bob".to_string());
+        wtx.open_table::<String>("users").unwrap().insert("bob".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -90,12 +90,12 @@ fn rollback_leaves_store_unchanged() {
 
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("keep".to_string());
+        wtx.open_table::<String>("t").unwrap().insert("keep".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("discard".to_string());
+        wtx.open_table::<String>("t").unwrap().insert("discard".to_string()).unwrap();
         wtx.rollback();
     }
 
@@ -116,12 +116,12 @@ fn multiple_read_tx_coexist_at_different_versions() {
 
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<u32>("scores").unwrap().insert(10u32);
+        wtx.open_table::<u32>("scores").unwrap().insert(10u32).unwrap();
         wtx.commit(&mut store).unwrap();
     }
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<u32>("scores").unwrap().insert(20u32);
+        wtx.open_table::<u32>("scores").unwrap().insert(20u32).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -142,12 +142,12 @@ fn two_tables_independent_across_versions() {
 
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("users").unwrap().insert("alice".to_string());
+        wtx.open_table::<String>("users").unwrap().insert("alice".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<u64>("posts").unwrap().insert(42u64);
+        wtx.open_table::<u64>("posts").unwrap().insert(42u64).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -186,15 +186,15 @@ fn auto_increment_ids_continue_from_base() {
     {
         let mut wtx = store.begin_write(None).unwrap();
         let t = wtx.open_table::<String>("t").unwrap();
-        t.insert("a".to_string()); // id 1
-        t.insert("b".to_string()); // id 2
-        t.insert("c".to_string()); // id 3
+        t.insert("a".to_string()).unwrap(); // id 1
+        t.insert("b".to_string()).unwrap(); // id 2
+        t.insert("c".to_string()).unwrap(); // id 3
         wtx.commit(&mut store).unwrap();
     }
     {
         let mut wtx = store.begin_write(None).unwrap();
         let t = wtx.open_table::<String>("t").unwrap();
-        let id = t.insert("d".to_string());
+        let id = t.insert("d".to_string()).unwrap();
         assert_eq!(id, 4);
         wtx.commit(&mut store).unwrap();
     }
@@ -211,8 +211,8 @@ fn multi_table_write_is_atomic() {
     // Commit "users" and "posts" in a single write transaction.
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("users").unwrap().insert("alice".to_string());
-        wtx.open_table::<u64>("posts").unwrap().insert(42u64);
+        wtx.open_table::<String>("users").unwrap().insert("alice".to_string()).unwrap();
+        wtx.open_table::<u64>("posts").unwrap().insert(42u64).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -236,14 +236,14 @@ fn untouched_tables_survive_commit() {
     // v1: create "users"
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("users").unwrap().insert("alice".to_string());
+        wtx.open_table::<String>("users").unwrap().insert("alice".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
     // v2: write only to "logs" — do NOT open "users"
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("logs").unwrap().insert("event".to_string());
+        wtx.open_table::<String>("logs").unwrap().insert("event".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -264,7 +264,7 @@ fn two_overlapping_write_txs_each_see_their_own_base() {
     // Seed v1
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<u32>("counter").unwrap().insert(0u32);
+        wtx.open_table::<u32>("counter").unwrap().insert(0u32).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -273,8 +273,8 @@ fn two_overlapping_write_txs_each_see_their_own_base() {
     let mut wtx_b = store.begin_write(Some(3)).unwrap(); // will be v3
 
     // Each writer sees only the v1 base — not the other writer's changes.
-    wtx_a.open_table::<u32>("counter").unwrap().insert(100u32);
-    wtx_b.open_table::<u32>("counter").unwrap().insert(200u32);
+    wtx_a.open_table::<u32>("counter").unwrap().insert(100u32).unwrap();
+    wtx_b.open_table::<u32>("counter").unwrap().insert(200u32).unwrap();
 
     let v_a = wtx_a.commit(&mut store).unwrap();
     let v_b = wtx_b.commit(&mut store).unwrap();
@@ -307,7 +307,7 @@ fn empty_commit_produces_new_version_with_same_data() {
     // Seed with one table
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("hello".to_string());
+        wtx.open_table::<String>("t").unwrap().insert("hello".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -335,7 +335,7 @@ fn read_at_version_zero_sees_empty_store() {
     // Commit something so the store advances past v0
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("data".to_string());
+        wtx.open_table::<String>("t").unwrap().insert("data".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -355,7 +355,7 @@ fn old_read_snapshot_survives_many_writes() {
     // Commit v1 with a known record
     {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("original".to_string());
+        wtx.open_table::<String>("t").unwrap().insert("original".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
@@ -381,3 +381,712 @@ fn old_read_snapshot_survives_many_writes() {
     let latest = store.begin_read(None).unwrap();
     assert_eq!(latest.open_table::<String>("t").unwrap().get(1), Some(&"version 10".to_string()));
 }
+
+// ===========================================================================
+// Index integration tests
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+struct User {
+    email: String,
+    age: u32,
+    name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Basic unique index CRUD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unique_index_insert_and_lookup() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+
+    let id = table
+        .insert(User {
+            email: "alice@example.com".into(),
+            age: 30,
+            name: "Alice".into(),
+        })
+        .unwrap();
+
+    let result = table
+        .get_unique::<String>("by_email", &"alice@example.com".to_string())
+        .unwrap();
+    assert_eq!(result.unwrap().0, id);
+    assert_eq!(result.unwrap().1.name, "Alice");
+
+    // Absent key returns None
+    let absent = table
+        .get_unique::<String>("by_email", &"nobody@example.com".to_string())
+        .unwrap();
+    assert!(absent.is_none());
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Unique index rejects duplicates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unique_index_rejects_duplicate() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+
+    table
+        .insert(User {
+            email: "alice@example.com".into(),
+            age: 30,
+            name: "Alice".into(),
+        })
+        .unwrap();
+
+    let result = table.insert(User {
+        email: "alice@example.com".into(),
+        age: 25,
+        name: "Evil Alice".into(),
+    });
+    assert!(matches!(result, Err(Error::DuplicateKey(_))));
+
+    // Table should still have only 1 record
+    assert_eq!(table.len(), 1);
+
+    wtx.rollback();
+}
+
+// ---------------------------------------------------------------------------
+// Non-unique index: multiple records per key
+// ---------------------------------------------------------------------------
+
+#[test]
+fn non_unique_index_groups_by_key() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+        .unwrap();
+
+    table
+        .insert(User { email: "a@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    table
+        .insert(User { email: "b@x.com".into(), age: 30, name: "Bob".into() })
+        .unwrap();
+    table
+        .insert(User { email: "c@x.com".into(), age: 25, name: "Charlie".into() })
+        .unwrap();
+
+    let age_30 = table.get_by_index::<u32>("by_age", &30).unwrap();
+    assert_eq!(age_30.len(), 2);
+    let names: Vec<&str> = age_30.iter().map(|(_, u)| u.name.as_str()).collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Bob"));
+
+    let age_25 = table.get_by_index::<u32>("by_age", &25).unwrap();
+    assert_eq!(age_25.len(), 1);
+    assert_eq!(age_25[0].1.name, "Charlie");
+
+    let age_99 = table.get_by_index::<u32>("by_age", &99).unwrap();
+    assert!(age_99.is_empty());
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Index maintained on update
+// ---------------------------------------------------------------------------
+
+#[test]
+fn index_updated_on_record_update() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+
+    let id = table
+        .insert(User { email: "old@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+
+    table
+        .update(id, User { email: "new@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+
+    // Old key gone
+    assert!(table
+        .get_unique::<String>("by_email", &"old@x.com".to_string())
+        .unwrap()
+        .is_none());
+    // New key present
+    assert_eq!(
+        table
+            .get_unique::<String>("by_email", &"new@x.com".to_string())
+            .unwrap()
+            .unwrap()
+            .0,
+        id
+    );
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Index maintained on delete
+// ---------------------------------------------------------------------------
+
+#[test]
+fn index_cleaned_on_delete() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+
+    let id = table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+
+    table.delete(id).unwrap();
+
+    assert!(table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .is_none());
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Index survives MVCC snapshots
+// ---------------------------------------------------------------------------
+
+#[test]
+fn index_works_across_snapshots() {
+    let mut store = Store::new();
+
+    // v1: insert alice with index
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        table
+            .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+            .unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // Pin reader at v1
+    let rtx_v1 = store.begin_read(Some(1)).unwrap();
+
+    // v2: insert bob
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        // Index definition is preserved from v1 (via Table clone)
+        table
+            .insert(User { email: "bob@x.com".into(), age: 25, name: "Bob".into() })
+            .unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // v1 reader: only sees alice
+    let t_v1 = rtx_v1.open_table::<User>("users").unwrap();
+    assert!(t_v1
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .is_some());
+    assert!(t_v1
+        .get_unique::<String>("by_email", &"bob@x.com".to_string())
+        .unwrap()
+        .is_none());
+
+    // Latest reader: sees both
+    let rtx_latest = store.begin_read(None).unwrap();
+    let t_latest = rtx_latest.open_table::<User>("users").unwrap();
+    assert!(t_latest
+        .get_unique::<String>("by_email", &"bob@x.com".to_string())
+        .unwrap()
+        .is_some());
+    assert_eq!(t_latest.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Multiple indexes on same table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multiple_indexes_on_same_table() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+    table
+        .define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+        .unwrap();
+
+    table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    table
+        .insert(User { email: "bob@x.com".into(), age: 30, name: "Bob".into() })
+        .unwrap();
+
+    // Unique lookup by email
+    let alice = table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice.1.name, "Alice");
+
+    // Non-unique lookup by age
+    let age_30 = table.get_by_index::<u32>("by_age", &30).unwrap();
+    assert_eq!(age_30.len(), 2);
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Backfill: define_index on non-empty table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn define_index_backfills_existing_data() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    // Insert data BEFORE defining index
+    table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    table
+        .insert(User { email: "bob@x.com".into(), age: 25, name: "Bob".into() })
+        .unwrap();
+
+    // Define index — should backfill
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+
+    // Lookup works on pre-existing data
+    let alice = table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice.1.name, "Alice");
+
+    let bob = table
+        .get_unique::<String>("by_email", &"bob@x.com".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(bob.1.name, "Bob");
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Index range scan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn index_range_scan() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+        .unwrap();
+
+    table
+        .insert(User { email: "a@x.com".into(), age: 20, name: "A".into() })
+        .unwrap();
+    table
+        .insert(User { email: "b@x.com".into(), age: 25, name: "B".into() })
+        .unwrap();
+    table
+        .insert(User { email: "c@x.com".into(), age: 30, name: "C".into() })
+        .unwrap();
+    table
+        .insert(User { email: "d@x.com".into(), age: 35, name: "D".into() })
+        .unwrap();
+
+    // Range: ages 25..=30
+    let results = table.index_range::<u32>("by_age", 25..=30).unwrap();
+    assert_eq!(results.len(), 2);
+    let names: Vec<&str> = results.iter().map(|(_, u)| u.name.as_str()).collect();
+    assert!(names.contains(&"B"));
+    assert!(names.contains(&"C"));
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// IndexNotFound error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lookup_on_undefined_index_returns_error() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    let result = table.get_unique::<String>("nonexistent", &"x".to_string());
+    assert!(matches!(result, Err(Error::IndexNotFound(_))));
+
+    wtx.rollback();
+}
+
+// ---------------------------------------------------------------------------
+// IndexTypeMismatch error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lookup_with_wrong_key_type_returns_error() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+
+    // Try to look up with wrong key type (u32 instead of String)
+    let result = table.get_unique::<u32>("by_email", &42u32);
+    assert!(matches!(result, Err(Error::IndexTypeMismatch(_))));
+
+    wtx.rollback();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-index: insert rollback when second unique index fails
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_index_insert_rollback_on_second_index_failure() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+    table
+        .define_index("by_name", IndexKind::Unique, |u: &User| u.name.clone())
+        .unwrap();
+
+    // Insert first user
+    table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+
+    // Insert user with unique email but duplicate name — should fail
+    let result = table.insert(User {
+        email: "different@x.com".into(),
+        age: 25,
+        name: "Alice".into(), // duplicate name
+    });
+    assert!(matches!(result, Err(Error::DuplicateKey(_))));
+
+    // Table should still have exactly 1 record
+    assert_eq!(table.len(), 1);
+
+    // The email index should NOT have "different@x.com" (rollback must have cleaned it)
+    assert!(table
+        .get_unique::<String>("by_email", &"different@x.com".to_string())
+        .unwrap()
+        .is_none());
+
+    // The original alice should still be intact in both indexes
+    assert!(table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .is_some());
+    assert!(table
+        .get_unique::<String>("by_name", &"Alice".to_string())
+        .unwrap()
+        .is_some());
+
+    wtx.rollback();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-index: update rollback when second index fails
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_index_update_rollback_on_second_index_failure() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+    table
+        .define_index("by_name", IndexKind::Unique, |u: &User| u.name.clone())
+        .unwrap();
+
+    let id1 = table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    let _id2 = table
+        .insert(User { email: "bob@x.com".into(), age: 25, name: "Bob".into() })
+        .unwrap();
+
+    // Try updating alice's name to "Bob" — conflicts with by_name index
+    let result = table.update(
+        id1,
+        User { email: "alice@x.com".into(), age: 30, name: "Bob".into() },
+    );
+    assert!(matches!(result, Err(Error::DuplicateKey(_))));
+
+    // Alice should still be findable by original email and name
+    let alice = table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice.1.name, "Alice");
+
+    let alice_by_name = table
+        .get_unique::<String>("by_name", &"Alice".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice_by_name.0, id1);
+
+    wtx.rollback();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-index: delete removes from all indexes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_index_delete_cleans_all_indexes() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+    table
+        .define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+        .unwrap();
+
+    let id = table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    table
+        .insert(User { email: "bob@x.com".into(), age: 30, name: "Bob".into() })
+        .unwrap();
+
+    table.delete(id).unwrap();
+
+    // Email index: alice gone
+    assert!(table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .is_none());
+
+    // Age index: only bob remains for age 30
+    let age_30 = table.get_by_index::<u32>("by_age", &30).unwrap();
+    assert_eq!(age_30.len(), 1);
+    assert_eq!(age_30[0].1.name, "Bob");
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-index: MVCC isolation — clone has independent indexes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_index_mvcc_clone_isolation() {
+    let mut store = Store::new();
+
+    // v1: insert alice with two indexes
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+            .unwrap();
+        table
+            .define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+            .unwrap();
+        table
+            .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+            .unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // Pin reader at v1
+    let rtx_v1 = store.begin_read(Some(1)).unwrap();
+
+    // v2: insert bob and update alice's age
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let table = wtx.open_table::<User>("users").unwrap();
+        table
+            .insert(User { email: "bob@x.com".into(), age: 30, name: "Bob".into() })
+            .unwrap();
+        table
+            .update(1, User { email: "alice@x.com".into(), age: 31, name: "Alice".into() })
+            .unwrap();
+        wtx.commit(&mut store).unwrap();
+    }
+
+    // v1 snapshot: alice at age 30, no bob
+    let t_v1 = rtx_v1.open_table::<User>("users").unwrap();
+    let age_30_v1 = t_v1.get_by_index::<u32>("by_age", &30).unwrap();
+    assert_eq!(age_30_v1.len(), 1);
+    assert_eq!(age_30_v1[0].1.name, "Alice");
+    assert!(t_v1
+        .get_unique::<String>("by_email", &"bob@x.com".to_string())
+        .unwrap()
+        .is_none());
+
+    // v2 snapshot: alice at age 31, bob at age 30
+    let rtx_v2 = store.begin_read(None).unwrap();
+    let t_v2 = rtx_v2.open_table::<User>("users").unwrap();
+    let age_30_v2 = t_v2.get_by_index::<u32>("by_age", &30).unwrap();
+    assert_eq!(age_30_v2.len(), 1);
+    assert_eq!(age_30_v2[0].1.name, "Bob");
+    let age_31_v2 = t_v2.get_by_index::<u32>("by_age", &31).unwrap();
+    assert_eq!(age_31_v2.len(), 1);
+    assert_eq!(age_31_v2[0].1.name, "Alice");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-index: update with mixed unique + non-unique
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_index_update_mixed_unique_and_non_unique() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+        .unwrap();
+    table
+        .define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+        .unwrap();
+
+    let id = table
+        .insert(User { email: "alice@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    table
+        .insert(User { email: "bob@x.com".into(), age: 30, name: "Bob".into() })
+        .unwrap();
+
+    // Update alice: change email and age
+    table
+        .update(
+            id,
+            User { email: "alice_new@x.com".into(), age: 25, name: "Alice".into() },
+        )
+        .unwrap();
+
+    // Unique index updated
+    assert!(table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap()
+        .is_none());
+    assert!(table
+        .get_unique::<String>("by_email", &"alice_new@x.com".to_string())
+        .unwrap()
+        .is_some());
+
+    // Non-unique index updated: age 30 now only has bob
+    let age_30 = table.get_by_index::<u32>("by_age", &30).unwrap();
+    assert_eq!(age_30.len(), 1);
+    assert_eq!(age_30[0].1.name, "Bob");
+
+    // age 25 has alice
+    let age_25 = table.get_by_index::<u32>("by_age", &25).unwrap();
+    assert_eq!(age_25.len(), 1);
+    assert_eq!(age_25[0].1.name, "Alice");
+
+    wtx.commit(&mut store).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Compound index (tuple keys)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compound_index_on_multiple_fields() {
+    let mut store = Store::new();
+    let mut wtx = store.begin_write(None).unwrap();
+    let table = wtx.open_table::<User>("users").unwrap();
+
+    // Index on (age, name)
+    table
+        .define_index("by_age_name", IndexKind::Unique, |u: &User| (u.age, u.name.clone()))
+        .unwrap();
+
+    table
+        .insert(User { email: "a@x.com".into(), age: 30, name: "Alice".into() })
+        .unwrap();
+    table
+        .insert(User { email: "b@x.com".into(), age: 30, name: "Bob".into() })
+        .unwrap();
+    table
+        .insert(User { email: "c@x.com".into(), age: 25, name: "Alice".into() })
+        .unwrap();
+
+    // Lookup by (30, "Alice")
+    let alice_30 = table
+        .get_unique::<(u32, String)>("by_age_name", &(30, "Alice".to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice_30.1.email, "a@x.com");
+
+    // Lookup by (25, "Alice")
+    let alice_25 = table
+        .get_unique::<(u32, String)>("by_age_name", &(25, "Alice".to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice_25.1.email, "c@x.com");
+
+    // Reject duplicate (30, "Alice")
+    let dup = table.insert(User { email: "d@x.com".into(), age: 30, name: "Alice".into() });
+    assert!(matches!(dup, Err(Error::DuplicateKey(_))));
+
+    // Range scan on compound index: all users aged 30
+    let age_30 = table
+        .index_range::<(u32, String)>("by_age_name", (30, "".into())..=(30, "\u{ffff}".into()))
+        .unwrap();
+    assert_eq!(age_30.len(), 2);
+    let names: Vec<String> = age_30.iter().map(|(_, u)| u.name.clone()).collect();
+    assert!(names.contains(&"Alice".to_string()));
+    assert!(names.contains(&"Bob".to_string()));
+
+    wtx.commit(&mut store).unwrap();
+}
+

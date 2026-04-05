@@ -7,15 +7,15 @@ fn main() {
     {
         let mut wtx = store.begin_write(None).unwrap();
         let users = wtx.open_table::<String>("users").unwrap();
-        users.insert("alice".to_string());
-        users.insert("bob".to_string());
+        users.insert("alice".to_string()).unwrap();
+        users.insert("bob".to_string()).unwrap();
         wtx.commit(&mut store).unwrap();
     }
     {
         let mut wtx = store.begin_write(None).unwrap();
         let scores = wtx.open_table::<u32>("scores").unwrap();
-        scores.insert(100u32);
-        scores.insert(200u32);
+        scores.insert(100u32).unwrap();
+        scores.insert(200u32).unwrap();
         wtx.commit(&mut store).unwrap();
     }
 
