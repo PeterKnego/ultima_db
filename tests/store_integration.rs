@@ -6,7 +6,7 @@ use ultima_db::{Error, IndexKind, Store};
 
 #[test]
 fn end_to_end_write_commit_read() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     let v = {
         let mut wtx = store.begin_write(None).unwrap();
@@ -51,7 +51,7 @@ fn end_to_end_write_commit_read() {
 
 #[test]
 fn snapshot_isolation() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     {
         let mut wtx = store.begin_write(None).unwrap();
@@ -86,7 +86,7 @@ fn snapshot_isolation() {
 
 #[test]
 fn rollback_leaves_store_unchanged() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     {
         let mut wtx = store.begin_write(None).unwrap();
@@ -112,7 +112,7 @@ fn rollback_leaves_store_unchanged() {
 
 #[test]
 fn multiple_read_tx_coexist_at_different_versions() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     {
         let mut wtx = store.begin_write(None).unwrap();
@@ -138,7 +138,7 @@ fn multiple_read_tx_coexist_at_different_versions() {
 
 #[test]
 fn two_tables_independent_across_versions() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     {
         let mut wtx = store.begin_write(None).unwrap();
@@ -166,7 +166,7 @@ fn two_tables_independent_across_versions() {
 
 #[test]
 fn write_conflict_on_stale_explicit_version() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     {
         let wtx = store.begin_write(Some(3)).unwrap();
         wtx.commit(&mut store).unwrap();
@@ -181,7 +181,7 @@ fn write_conflict_on_stale_explicit_version() {
 
 #[test]
 fn auto_increment_ids_continue_from_base() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     {
         let mut wtx = store.begin_write(None).unwrap();
@@ -206,7 +206,7 @@ fn auto_increment_ids_continue_from_base() {
 
 #[test]
 fn multi_table_write_is_atomic() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // Commit "users" and "posts" in a single write transaction.
     {
@@ -231,7 +231,7 @@ fn multi_table_write_is_atomic() {
 
 #[test]
 fn untouched_tables_survive_commit() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // v1: create "users"
     {
@@ -259,7 +259,7 @@ fn untouched_tables_survive_commit() {
 
 #[test]
 fn two_overlapping_write_txs_each_see_their_own_base() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // Seed v1
     {
@@ -302,7 +302,7 @@ fn two_overlapping_write_txs_each_see_their_own_base() {
 
 #[test]
 fn empty_commit_produces_new_version_with_same_data() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // Seed with one table
     {
@@ -330,7 +330,7 @@ fn empty_commit_produces_new_version_with_same_data() {
 
 #[test]
 fn read_at_version_zero_sees_empty_store() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // Commit something so the store advances past v0
     {
@@ -350,7 +350,7 @@ fn read_at_version_zero_sees_empty_store() {
 
 #[test]
 fn old_read_snapshot_survives_many_writes() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // Commit v1 with a known record
     {
@@ -399,7 +399,7 @@ struct User {
 
 #[test]
 fn unique_index_insert_and_lookup() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -436,7 +436,7 @@ fn unique_index_insert_and_lookup() {
 
 #[test]
 fn unique_index_rejects_duplicate() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -471,7 +471,7 @@ fn unique_index_rejects_duplicate() {
 
 #[test]
 fn non_unique_index_groups_by_key() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -511,7 +511,7 @@ fn non_unique_index_groups_by_key() {
 
 #[test]
 fn index_updated_on_record_update() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -551,7 +551,7 @@ fn index_updated_on_record_update() {
 
 #[test]
 fn index_cleaned_on_delete() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -579,7 +579,7 @@ fn index_cleaned_on_delete() {
 
 #[test]
 fn index_works_across_snapshots() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // v1: insert alice with index
     {
@@ -635,7 +635,7 @@ fn index_works_across_snapshots() {
 
 #[test]
 fn multiple_indexes_on_same_table() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -673,7 +673,7 @@ fn multiple_indexes_on_same_table() {
 
 #[test]
 fn define_index_backfills_existing_data() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -712,7 +712,7 @@ fn define_index_backfills_existing_data() {
 
 #[test]
 fn index_range_scan() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -749,7 +749,7 @@ fn index_range_scan() {
 
 #[test]
 fn lookup_on_undefined_index_returns_error() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -765,7 +765,7 @@ fn lookup_on_undefined_index_returns_error() {
 
 #[test]
 fn lookup_with_wrong_key_type_returns_error() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -786,7 +786,7 @@ fn lookup_with_wrong_key_type_returns_error() {
 
 #[test]
 fn multi_index_insert_rollback_on_second_index_failure() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -838,7 +838,7 @@ fn multi_index_insert_rollback_on_second_index_failure() {
 
 #[test]
 fn multi_index_update_rollback_on_second_index_failure() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -885,7 +885,7 @@ fn multi_index_update_rollback_on_second_index_failure() {
 
 #[test]
 fn multi_index_delete_cleans_all_indexes() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -925,7 +925,7 @@ fn multi_index_delete_cleans_all_indexes() {
 
 #[test]
 fn multi_index_mvcc_clone_isolation() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // v1: insert alice with two indexes
     {
@@ -986,7 +986,7 @@ fn multi_index_mvcc_clone_isolation() {
 
 #[test]
 fn multi_index_update_mixed_unique_and_non_unique() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -1041,7 +1041,7 @@ fn multi_index_update_mixed_unique_and_non_unique() {
 
 #[test]
 fn compound_index_on_multiple_fields() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
     let table = wtx.open_table::<User>("users").unwrap();
 
@@ -1096,7 +1096,7 @@ fn compound_index_on_multiple_fields() {
 
 #[test]
 fn batch_insert_visible_after_commit() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     {
         let mut wtx = store.begin_write(None).unwrap();
         let table = wtx.open_table::<User>("users").unwrap();
@@ -1121,7 +1121,7 @@ fn batch_insert_visible_after_commit() {
 
 #[test]
 fn batch_update_visible_after_commit() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let id1;
     let id2;
     {
@@ -1154,7 +1154,7 @@ fn batch_update_visible_after_commit() {
 
 #[test]
 fn batch_delete_visible_after_commit() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     let id1;
     let id2;
     let id3;
@@ -1184,7 +1184,7 @@ fn batch_delete_visible_after_commit() {
 
 #[test]
 fn batch_insert_rollback_on_constraint() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     {
         let mut wtx = store.begin_write(None).unwrap();
         let table = wtx.open_table::<User>("users").unwrap();
@@ -1213,7 +1213,7 @@ fn batch_insert_rollback_on_constraint() {
 
 #[test]
 fn batch_ops_mvcc_isolation() {
-    let mut store = Store::new();
+    let mut store = Store::default();
     {
         let mut wtx = store.begin_write(None).unwrap();
         let table = wtx.open_table::<User>("users").unwrap();

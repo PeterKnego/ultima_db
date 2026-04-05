@@ -30,6 +30,25 @@ pub(crate) struct Snapshot {
 // Store — manages version history
 // ---------------------------------------------------------------------------
 
+/// Configuration for [`Store`] behavior.
+#[derive(Debug, Clone)]
+pub struct StoreConfig {
+    /// How many most-recent snapshots to retain during [`Store::gc()`]. Default: 10.
+    /// The latest snapshot is always retained regardless of this value.
+    pub num_snapshots_retained: usize,
+    /// Whether [`Store::gc()`] runs automatically after each [`WriteTx::commit()`]. Default: true.
+    pub auto_snapshot_gc: bool,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            num_snapshots_retained: 10,
+            auto_snapshot_gc: true,
+        }
+    }
+}
+
 /// An in-memory store with MVCC snapshot isolation.
 ///
 /// Every committed write produces a new numbered snapshot stored in the
@@ -42,16 +61,17 @@ pub struct Store {
     latest_version: u64,
     /// Next auto-assigned write version. Always > `latest_version`.
     next_version: u64,
+    config: StoreConfig,
 }
 
 impl Store {
     /// Creates a new, empty store. The initial version is 0.
-    pub fn new() -> Self {
+    pub fn new(config: StoreConfig) -> Self {
         let empty =
             Arc::new(Snapshot { version: 0, tables: HashMap::new() });
         let mut snapshots = HashMap::new();
         snapshots.insert(0, empty);
-        Self { snapshots, latest_version: 0, next_version: 1 }
+        Self { snapshots, latest_version: 0, next_version: 1, config }
     }
 
     /// The version number of the most recently committed snapshot.
@@ -116,7 +136,7 @@ impl Store {
 
 impl Default for Store {
     fn default() -> Self {
-        Self::new()
+        Self::new(StoreConfig::default())
     }
 }
 
@@ -240,46 +260,46 @@ mod tests {
 
     #[test]
     fn new_store_has_version_zero() {
-        let store = Store::new();
+        let store = Store::default();
         assert_eq!(store.latest_version(), 0);
     }
 
     #[test]
     fn begin_read_none_returns_version_zero_on_fresh_store() {
-        let store = Store::new();
+        let store = Store::default();
         let rtx = store.begin_read(None).unwrap();
         assert_eq!(rtx.version(), 0);
     }
 
     #[test]
     fn begin_read_nonexistent_version_errors() {
-        let store = Store::new();
+        let store = Store::default();
         assert!(matches!(store.begin_read(Some(99)), Err(Error::KeyNotFound)));
     }
 
     #[test]
     fn begin_write_none_assigns_version_1() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let wtx = store.begin_write(None).unwrap();
         assert_eq!(wtx.version(), 1);
     }
 
     #[test]
     fn begin_write_explicit_version_gt_latest_succeeds() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let wtx = store.begin_write(Some(5)).unwrap();
         assert_eq!(wtx.version(), 5);
     }
 
     #[test]
     fn begin_write_explicit_version_equal_latest_is_conflict() {
-        let mut store = Store::new(); // latest = 0
+        let mut store = Store::default(); // latest = 0
         assert!(matches!(store.begin_write(Some(0)), Err(Error::WriteConflict)));
     }
 
     #[test]
     fn begin_write_explicit_version_less_than_latest_is_conflict() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         // Commit version 3 first
         let wtx = store.begin_write(Some(3)).unwrap();
         wtx.commit(&mut store).unwrap();
@@ -289,7 +309,7 @@ mod tests {
 
     #[test]
     fn commit_updates_latest_version() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let wtx = store.begin_write(None).unwrap();
         let v = wtx.commit(&mut store).unwrap();
         assert_eq!(v, 1);
@@ -298,7 +318,7 @@ mod tests {
 
     #[test]
     fn rollback_does_not_change_store() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let wtx = store.begin_write(None).unwrap();
         wtx.rollback();
         assert_eq!(store.latest_version(), 0);
@@ -308,14 +328,14 @@ mod tests {
 
     #[test]
     fn read_tx_open_nonexistent_table_errors() {
-        let store = Store::new();
+        let store = Store::default();
         let rtx = store.begin_read(None).unwrap();
         assert!(matches!(rtx.open_table::<String>("nope"), Err(Error::KeyNotFound)));
     }
 
     #[test]
     fn read_tx_open_table_type_mismatch_errors() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("t").unwrap().insert("hi".to_string()).unwrap();
@@ -329,7 +349,7 @@ mod tests {
 
     #[test]
     fn write_tx_open_new_table_creates_empty() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let mut wtx = store.begin_write(None).unwrap();
         let table = wtx.open_table::<String>("new").unwrap();
         assert!(table.is_empty());
@@ -337,7 +357,7 @@ mod tests {
 
     #[test]
     fn write_tx_open_existing_table_sees_base_data() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("notes").unwrap().insert("hello".to_string()).unwrap();
@@ -350,7 +370,7 @@ mod tests {
 
     #[test]
     fn write_tx_mutations_invisible_to_concurrent_read_tx() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let rtx = store.begin_read(None).unwrap(); // snapshot v0
         let mut wtx = store.begin_write(None).unwrap();
         wtx.open_table::<String>("t").unwrap().insert("secret".to_string()).unwrap();
@@ -361,7 +381,7 @@ mod tests {
 
     #[test]
     fn write_tx_commit_makes_data_visible_to_new_read_tx() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("msgs").unwrap().insert("hello".to_string()).unwrap();
@@ -373,7 +393,7 @@ mod tests {
 
     #[test]
     fn write_tx_type_mismatch_on_dirty_reopen() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let mut wtx = store.begin_write(None).unwrap();
         wtx.open_table::<String>("t").unwrap();
         assert!(matches!(wtx.open_table::<u64>("t"), Err(Error::TypeMismatch(_))));
@@ -382,7 +402,7 @@ mod tests {
 
     #[test]
     fn rollback_leaves_store_at_prior_version() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         let wtx = store.begin_write(None).unwrap();
         wtx.rollback();
         assert_eq!(store.latest_version(), 0);
@@ -390,7 +410,7 @@ mod tests {
 
     #[test]
     fn gc_removes_old_snapshots_except_latest_and_active_rtx() {
-        let mut store = Store::new();
+        let mut store = Store::default();
         // Commit v1
         store.begin_write(None).unwrap().commit(&mut store).unwrap();
         // Commit v2

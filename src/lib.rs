@@ -7,6 +7,6 @@ pub mod transaction;
 
 pub use error::{Error, Result};
 pub use index::IndexKind;
-pub use store::Store;
+pub use store::{Store, StoreConfig};
 pub use table::Table;
 pub use transaction::{ReadTx, WriteTx};

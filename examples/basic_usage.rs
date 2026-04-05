@@ -1,7 +1,7 @@
 use ultima_db::Store;
 
 fn main() {
-    let mut store = Store::new();
+    let mut store = Store::default();
 
     // Write transaction: insert, update, delete
     let version = {
