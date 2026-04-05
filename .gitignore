@@ -1,4 +1,6 @@
 /target
 *.iml
 /.idea
-.claude/settings.local.json
+
+/.claude/settings.local.json
+
