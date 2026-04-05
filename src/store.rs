@@ -122,14 +122,28 @@ impl Store {
         if v > self.latest_version {
             self.latest_version = v;
         }
+        if self.config.auto_snapshot_gc {
+            self.gc();
+        }
     }
 
     /// Garbage collect old snapshots that are no longer referenced by any [`ReadTx`].
-    /// Always keeps the latest committed snapshot.
+    /// Always keeps the `num_snapshots_retained` most recent snapshots, plus any
+    /// snapshot held by an active [`ReadTx`]. The latest snapshot is always kept
+    /// even if `num_snapshots_retained` is 0.
     pub fn gc(&mut self) {
-        let latest = self.latest_version;
+        let mut versions: Vec<u64> = self.snapshots.keys().copied().collect();
+        versions.sort_unstable();
+
+        // The N most recent versions to retain unconditionally.
+        // latest_version is always kept (even if num_snapshots_retained is 0).
+        let retain_count = self.config.num_snapshots_retained.max(1);
+        let cutoff_idx = versions.len().saturating_sub(retain_count);
+        let protected: std::collections::HashSet<u64> =
+            versions[cutoff_idx..].iter().copied().collect();
+
         self.snapshots.retain(|&v, snapshot| {
-            v == latest || Arc::strong_count(snapshot) > 1
+            protected.contains(&v) || Arc::strong_count(snapshot) > 1
         });
     }
 }
@@ -410,7 +424,11 @@ mod tests {
 
     #[test]
     fn gc_removes_old_snapshots_except_latest_and_active_rtx() {
-        let mut store = Store::default();
+        let mut store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        });
         // Commit v1
         store.begin_write(None).unwrap().commit(&mut store).unwrap();
         // Commit v2
@@ -420,11 +438,11 @@ mod tests {
 
         // Open read tx on v1
         let rtx1 = store.begin_read(Some(1)).unwrap();
-        
+
         // Run GC
         store.gc();
 
-        // Should keep 2 (latest) and 1 (referenced by rtx1). Snapshot 0 should be gone.
+        // Should keep 2 (latest, within N=1) and 1 (referenced by rtx1). Snapshot 0 should be gone.
         assert_eq!(store.snapshots.len(), 2);
         assert!(store.snapshots.contains_key(&2));
         assert!(store.snapshots.contains_key(&1));
@@ -435,5 +453,94 @@ mod tests {
         // Now snapshot 1 should be gone, only 2 remains.
         assert_eq!(store.snapshots.len(), 1);
         assert!(store.snapshots.contains_key(&2));
+    }
+
+    #[test]
+    fn gc_retains_n_most_recent_snapshots() {
+        let mut store = Store::new(StoreConfig {
+            num_snapshots_retained: 2,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        });
+        // Commit v1, v2, v3
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        // Snapshots: 0, 1, 2, 3. Latest is 3.
+        assert_eq!(store.snapshots.len(), 4);
+
+        store.gc();
+        // Should keep 2 most recent: 2, 3. Snapshots 0 and 1 dropped.
+        assert_eq!(store.snapshots.len(), 2);
+        assert!(store.snapshots.contains_key(&2));
+        assert!(store.snapshots.contains_key(&3));
+    }
+
+    #[test]
+    fn gc_retains_snapshots_with_active_readers_beyond_n() {
+        let mut store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        });
+        // Commit v1, v2
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+
+        // Hold a reader on v1
+        let _rtx = store.begin_read(Some(1)).unwrap();
+
+        store.gc();
+        // Should keep v2 (latest, within N=1) and v1 (active reader)
+        assert_eq!(store.snapshots.len(), 2);
+        assert!(store.snapshots.contains_key(&1));
+        assert!(store.snapshots.contains_key(&2));
+    }
+
+    #[test]
+    fn gc_zero_retained_keeps_only_latest_and_active() {
+        let mut store = Store::new(StoreConfig {
+            num_snapshots_retained: 0,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        });
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        // Snapshots: 0, 1, 2
+        assert_eq!(store.snapshots.len(), 3);
+
+        store.gc();
+        // num_snapshots_retained=0 but latest is always kept
+        assert_eq!(store.snapshots.len(), 1);
+        assert!(store.snapshots.contains_key(&2));
+    }
+
+    #[test]
+    fn auto_gc_on_commit() {
+        let mut store = Store::new(StoreConfig {
+            num_snapshots_retained: 2,
+            auto_snapshot_gc: true,
+        });
+        // Commit 5 versions
+        for _ in 0..5 {
+            store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        }
+        // Auto GC should have pruned to 2 most recent: v4, v5
+        assert_eq!(store.snapshots.len(), 2);
+        assert!(store.snapshots.contains_key(&4));
+        assert!(store.snapshots.contains_key(&5));
+    }
+
+    #[test]
+    fn auto_gc_disabled() {
+        let mut store = Store::new(StoreConfig {
+            num_snapshots_retained: 2,
+            auto_snapshot_gc: false,
+        });
+        for _ in 0..5 {
+            store.begin_write(None).unwrap().commit(&mut store).unwrap();
+        }
+        // No auto GC — all 6 snapshots remain (v0..v5)
+        assert_eq!(store.snapshots.len(), 6);
     }
 }
