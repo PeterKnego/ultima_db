@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/save bench/compare bench/flamegraph
+.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/save bench/compare bench/flamegraph
 
 build:
 	cargo build
@@ -51,6 +51,28 @@ bench/ycsb/compare:
 	cargo bench --bench ycsb_redb_bench -- --save-baseline redb
 	critcmp -g '(.+)/[^/]+' ultima fjall rocksdb redb
 
+# Multi-writer contention benchmarks
+# Use bench/multiwriter/clean to remove stale criterion data before comparing
+
+bench/multiwriter/clean:
+	rm -rf target/criterion/multiwriter*
+
+bench/multiwriter:
+	cargo bench --bench ycsb_multiwriter_bench
+
+bench/multiwriter/rocksdb:
+	cargo bench --bench ycsb_multiwriter_rocksdb_bench
+
+bench/multiwriter/fjall:
+	cargo bench --bench ycsb_multiwriter_fjall_bench
+
+bench/multiwriter/compare:
+	$(call check_cmd,critcmp)
+	cargo bench --bench ycsb_multiwriter_bench -- --save-baseline mw-ultima
+	cargo bench --bench ycsb_multiwriter_rocksdb_bench -- --save-baseline mw-rocksdb
+	cargo bench --bench ycsb_multiwriter_fjall_bench -- --save-baseline mw-fjall
+	critcmp mw-ultima mw-rocksdb mw-fjall
+
 # Save a named baseline (usage: make bench/save NAME=main)
 bench/save:
 	cargo bench -- --save-baseline $(NAME)
@@ -62,5 +84,5 @@ bench/compare:
 
 # Generate per-benchmark flamegraphs via pprof (no Xcode/dtrace needed)
 bench/flamegraph:
-	cargo bench --bench store_bench -- --profile-time 5
+	cargo bench --bench ycsb_bench -- --profile-time 5
 	@echo "Flamegraphs: target/criterion/*/profile/flamegraph.svg"

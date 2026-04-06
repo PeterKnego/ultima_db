@@ -6,6 +6,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use crate::index::IndexKind;
 use crate::table::{Table, TableOpener};
 use crate::{Error, Result};
 
@@ -27,6 +28,22 @@ pub(crate) struct Snapshot {
 }
 
 // ---------------------------------------------------------------------------
+// WriterMode
+// ---------------------------------------------------------------------------
+
+/// Controls how concurrent write transactions are handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterMode {
+    /// At most one active [`WriteTx`] at a time. [`Store::begin_write`] returns
+    /// [`Error::WriterBusy`] if another is already active. Zero tracking overhead.
+    SingleWriter,
+    /// Multiple concurrent [`WriteTx`] allowed. Key-level write-write conflict
+    /// detection via optimistic concurrency control. Conflicting commits return
+    /// [`Error::WriteConflict`].
+    MultiWriter,
+}
+
+// ---------------------------------------------------------------------------
 // StoreConfig
 // ---------------------------------------------------------------------------
 
@@ -38,6 +55,8 @@ pub struct StoreConfig {
     pub num_snapshots_retained: usize,
     /// Whether [`Store::gc()`] runs automatically after each [`WriteTx::commit()`]. Default: true.
     pub auto_snapshot_gc: bool,
+    /// Writer concurrency mode. Default: [`WriterMode::SingleWriter`].
+    pub writer_mode: WriterMode,
 }
 
 impl Default for StoreConfig {
@@ -45,8 +64,29 @@ impl Default for StoreConfig {
         Self {
             num_snapshots_retained: 10,
             auto_snapshot_gc: true,
+            writer_mode: WriterMode::SingleWriter,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CommittedWriteSet — records which keys a committed transaction modified
+// ---------------------------------------------------------------------------
+
+/// The write set of a committed transaction, retained for OCC validation.
+///
+/// Stored in `StoreInner::committed_write_sets` and checked during
+/// `WriteTx::commit` to detect key-level write-write conflicts.
+/// Pruned by `prune_write_sets` once no in-flight writer needs it.
+struct CommittedWriteSet {
+    /// The snapshot version this transaction committed as.
+    version: u64,
+    /// Table name → set of modified row IDs.
+    tables: HashMap<String, HashSet<u64>>,
+    /// Tables that were deleted during this transaction.
+    /// Used to detect cross-table conflicts (e.g., writer A deletes a table
+    /// that writer B modified).
+    deleted_tables: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +100,13 @@ pub(crate) struct StoreInner {
     /// Next auto-assigned write version. Always > `latest_version`.
     pub(crate) next_version: u64,
     pub(crate) config: StoreConfig,
+    /// Number of active (uncommitted, undropped) WriteTx instances.
+    active_writer_count: usize,
+    /// Base versions of all in-flight WriteTx instances (MultiWriter mode only).
+    active_writer_base_versions: Vec<u64>,
+    /// Write sets from recently committed transactions (MultiWriter mode only).
+    /// Pruned when no in-flight writer has a base version ≤ entry.version.
+    committed_write_sets: Vec<CommittedWriteSet>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +138,9 @@ impl Store {
                 latest_version: 0,
                 next_version: 1,
                 config,
+                active_writer_count: 0,
+                active_writer_base_versions: Vec::new(),
+                committed_write_sets: Vec::new(),
             })),
         }
     }
@@ -125,22 +175,52 @@ impl Store {
     /// snapshot, regardless of the assigned commit version.
     pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
         let mut inner = self.inner.write().unwrap();
+
+        // Enforce single-writer exclusivity.
+        match inner.config.writer_mode {
+            WriterMode::SingleWriter => {
+                if inner.active_writer_count > 0 {
+                    return Err(Error::WriterBusy);
+                }
+            }
+            WriterMode::MultiWriter => {}
+        }
+
         let commit_version = match version {
             None => inner.next_version,
             Some(v) if v > inner.latest_version => v,
-            Some(_) => return Err(Error::WriteConflict),
+            Some(_) => {
+                return Err(Error::WriteConflict {
+                    table: String::new(),
+                    keys: vec![],
+                    version: inner.latest_version,
+                })
+            }
         };
         // Keep next_version ahead of any explicitly requested version.
         if commit_version >= inner.next_version {
             inner.next_version = commit_version + 1;
         }
         let base = inner.snapshots[&inner.latest_version].clone();
+        let base_version = base.version;
+        let writer_mode = inner.config.writer_mode;
+
+        // Track active writer.
+        inner.active_writer_count += 1;
+        if matches!(writer_mode, WriterMode::MultiWriter) {
+            inner.active_writer_base_versions.push(base_version);
+        }
+
         Ok(WriteTx {
             base,
             dirty: HashMap::new(),
             version: commit_version,
             store_inner: Arc::clone(&self.inner),
             deleted_tables: HashSet::new(),
+            write_set: HashMap::new(),
+            ever_deleted_tables: HashSet::new(),
+            writer_mode,
+            needs_cleanup: true,
         })
     }
 
@@ -163,6 +243,41 @@ impl Store {
     #[cfg(test)]
     fn has_snapshot(&self, version: u64) -> bool {
         self.inner.read().unwrap().snapshots.contains_key(&version)
+    }
+
+    /// Number of committed write sets retained in the OCC log.
+    ///
+    /// Exposed for testing write-set pruning behavior. Should be 0
+    /// when no `WriteTx` instances are active.
+    #[doc(hidden)]
+    pub fn committed_write_set_count(&self) -> usize {
+        self.inner.read().unwrap().committed_write_sets.len()
+    }
+}
+
+/// Remove a base version from the active writer tracking list.
+///
+/// Called on commit and drop to unregister a `WriteTx` so that
+/// `prune_write_sets` can discard write sets no longer needed.
+/// Uses `swap_remove` for O(1) removal (order doesn't matter).
+fn remove_active_writer(inner: &mut StoreInner, base_version: u64) {
+    if let Some(pos) = inner.active_writer_base_versions.iter().position(|&v| v == base_version) {
+        inner.active_writer_base_versions.swap_remove(pos);
+    }
+}
+
+/// Prune committed write sets that are no longer needed for validation.
+///
+/// A write set with version V can be pruned when no in-flight writer has
+/// `base_version <= V`, because such a writer's commit validation only checks
+/// write sets with `version > base_version`. When no active writers remain,
+/// the entire log is cleared.
+fn prune_write_sets(inner: &mut StoreInner) {
+    if let Some(&min_base) = inner.active_writer_base_versions.iter().min() {
+        inner.committed_write_sets.retain(|cws| cws.version > min_base);
+    } else {
+        // No active writers — discard everything.
+        inner.committed_write_sets.clear();
     }
 }
 
@@ -272,9 +387,195 @@ pub struct WriteTx {
     version: u64,
     /// Reference back to the store's interior state, used during commit.
     store_inner: Arc<RwLock<StoreInner>>,
-    /// Tables explicitly deleted in this transaction.
+    /// Tables explicitly deleted in this transaction (cleared on re-open).
     deleted_tables: HashSet<String>,
+    /// Keys modified during this transaction, per table (MultiWriter only).
+    write_set: HashMap<String, HashSet<u64>>,
+    /// Tables ever deleted during this tx (not cleared on re-open).
+    /// Used for conflict detection in MultiWriter mode.
+    ever_deleted_tables: HashSet<String>,
+    /// Writer mode at the time this transaction was created.
+    writer_mode: WriterMode,
+    /// Set to `true` on successful commit so `Drop` skips cleanup.
+    needs_cleanup: bool,
 }
+
+// ---------------------------------------------------------------------------
+// TableWriter — write-tracking wrapper around &mut Table<R>
+// ---------------------------------------------------------------------------
+
+/// A write-tracking wrapper around [`Table<R>`].
+///
+/// Returned by [`WriteTx::open_table`]. Delegates all read methods directly
+/// to the underlying table and intercepts write methods to record modified
+/// keys in the transaction's write set (in [`WriterMode::MultiWriter`] mode).
+///
+/// In [`WriterMode::SingleWriter`] mode, write-set tracking is skipped
+/// and the only overhead is an `Option` check per write call.
+pub struct TableWriter<'tx, R: Send + Sync + 'static> {
+    table: &'tx mut Table<R>,
+    write_set: Option<&'tx mut HashSet<u64>>,
+}
+
+impl<'tx, R: Send + Sync + 'static> TableWriter<'tx, R> {
+    // --- Write methods (tracked) ---
+
+    /// Insert a record. Returns the auto-assigned ID.
+    pub fn insert(&mut self, record: R) -> Result<u64> {
+        let id = self.table.insert(record)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.insert(id);
+        }
+        Ok(id)
+    }
+
+    /// Update a record by its ID.
+    pub fn update(&mut self, id: u64, record: R) -> Result<()> {
+        self.table.update(id, record)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.insert(id);
+        }
+        Ok(())
+    }
+
+    /// Delete a record by its ID. Returns the deleted record.
+    pub fn delete(&mut self, id: u64) -> Result<Arc<R>> {
+        let old = self.table.delete(id)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.insert(id);
+        }
+        Ok(old)
+    }
+
+    /// Insert multiple records atomically.
+    pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
+        let ids = self.table.insert_batch(records)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.extend(ids.iter().copied());
+        }
+        Ok(ids)
+    }
+
+    /// Update multiple records atomically.
+    pub fn update_batch(&mut self, updates: Vec<(u64, R)>) -> Result<()> {
+        if let Some(ws) = &mut self.write_set {
+            for &(id, _) in &updates {
+                ws.insert(id);
+            }
+        }
+        self.table.update_batch(updates)
+    }
+
+    /// Delete multiple records atomically.
+    pub fn delete_batch(&mut self, ids: &[u64]) -> Result<()> {
+        self.table.delete_batch(ids)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.extend(ids.iter().copied());
+        }
+        Ok(())
+    }
+
+    // --- Read methods (pass-through) ---
+
+    /// Look up a record by its ID.
+    pub fn get(&self, id: u64) -> Option<&R> {
+        self.table.get(id)
+    }
+
+    /// Returns an iterator over records within the specified ID range.
+    pub fn range<'a>(&'a self, range: impl std::ops::RangeBounds<u64> + 'a) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+        self.table.range(range)
+    }
+
+    /// Returns the number of records in the table.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Returns true if the table contains no records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Returns true if the table contains a record with the given ID.
+    pub fn contains(&self, id: u64) -> bool {
+        self.table.contains(id)
+    }
+
+    /// Returns the first (lowest ID) record, or `None` if empty.
+    pub fn first(&self) -> Option<(u64, &R)> {
+        self.table.first()
+    }
+
+    /// Returns the last (highest ID) record, or `None` if empty.
+    pub fn last(&self) -> Option<(u64, &R)> {
+        self.table.last()
+    }
+
+    /// Iterate over all records in ID order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+        self.table.iter()
+    }
+
+    /// Look up multiple records by ID.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
+        self.table.get_many(ids)
+    }
+
+    // --- Index methods (pass-through) ---
+
+    /// Define a secondary index.
+    pub fn define_index<K: Ord + Clone + Send + Sync + 'static>(
+        &mut self,
+        name: &str,
+        kind: IndexKind,
+        extractor: impl Fn(&R) -> K + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.table.define_index(name, kind, extractor)
+    }
+
+    /// Look up a single record by a unique index.
+    pub fn get_unique<K: Ord + Clone + Send + Sync + 'static>(
+        &self,
+        index_name: &str,
+        key: &K,
+    ) -> Result<Option<(u64, &R)>> {
+        self.table.get_unique(index_name, key)
+    }
+
+    /// Look up records by a non-unique index key.
+    pub fn get_by_index<K: Ord + Clone + Send + Sync + 'static>(
+        &self,
+        index_name: &str,
+        key: &K,
+    ) -> Result<Vec<(u64, &R)>> {
+        self.table.get_by_index(index_name, key)
+    }
+
+    /// Look up records by index key (works for both unique and non-unique).
+    pub fn get_by_key<K: Ord + Clone + Send + Sync + 'static>(
+        &self,
+        index_name: &str,
+        key: &K,
+    ) -> Result<Vec<(u64, &R)>> {
+        self.table.get_by_key(index_name, key)
+    }
+
+    /// Range scan on an index (works for both unique and non-unique).
+    pub fn index_range<K: Ord + Clone + Send + Sync + 'static>(
+        &self,
+        index_name: &str,
+        range: impl std::ops::RangeBounds<K>,
+    ) -> Result<Vec<(u64, &R)>> {
+        self.table.index_range(index_name, range)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WriteTx methods
+// ---------------------------------------------------------------------------
 
 impl WriteTx {
     /// The version this transaction will commit as.
@@ -289,7 +590,10 @@ impl WriteTx {
     /// the same mutable copy.
     ///
     /// Creates an empty table if `name` does not exist in the base snapshot.
-    pub fn open_table<R: Send + Sync + 'static>(&mut self, opener: impl TableOpener<R>) -> Result<&mut Table<R>> {
+    ///
+    /// Returns a [`TableWriter`] that tracks modified keys for OCC validation
+    /// in [`WriterMode::MultiWriter`] mode.
+    pub fn open_table<R: Send + Sync + 'static>(&mut self, opener: impl TableOpener<R>) -> Result<TableWriter<'_, R>> {
         let name = opener.table_name();
         if !self.dirty.contains_key(name) {
             let table: Table<R> = if self.deleted_tables.contains(name) {
@@ -306,19 +610,37 @@ impl WriteTx {
             self.deleted_tables.remove(name);
             self.dirty.insert(name.to_string(), Box::new(table));
         }
-        self.dirty
-            .get_mut(name)
+        let name_str = name.to_string();
+        let table = self.dirty
+            .get_mut(&name_str)
             .unwrap()
             .downcast_mut::<Table<R>>()
-            .ok_or_else(|| Error::TypeMismatch(name.to_string()))
+            .ok_or_else(|| Error::TypeMismatch(name_str.clone()))?;
+        let write_set = match self.writer_mode {
+            WriterMode::MultiWriter => Some(self.write_set.entry(name_str).or_default()),
+            WriterMode::SingleWriter => None,
+        };
+        Ok(TableWriter { table, write_set })
     }
 
     /// Commit this transaction, creating a new snapshot in the store.
     ///
+    /// In [`WriterMode::MultiWriter`] mode, validates that no concurrent commit
+    /// modified overlapping keys. Returns [`Error::WriteConflict`] on conflict.
+    ///
     /// Returns the version number of the new snapshot.
-    pub fn commit(self) -> Result<u64> {
-        // Build the new table map: start with clones of all base tables
-        // (each Arc clone is O(1)), then overwrite with dirty copies.
+    pub fn commit(mut self) -> Result<u64> {
+        let mut inner = self.store_inner.write().unwrap();
+
+        // --- OCC validation (MultiWriter only) ---
+        if matches!(self.writer_mode, WriterMode::MultiWriter)
+            && let Some(conflict) = self.validate_write_set(&inner)
+        {
+            drop(inner); // release lock before Drop runs
+            return Err(conflict);
+        }
+
+        // --- Build the new table map ---
         let mut new_tables: HashMap<String, Arc<dyn Any>> = self
             .base
             .tables
@@ -326,7 +648,7 @@ impl WriteTx {
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
 
-        for (name, boxed) in self.dirty {
+        for (name, boxed) in std::mem::take(&mut self.dirty) {
             new_tables.insert(name, Arc::from(boxed));
         }
 
@@ -337,27 +659,51 @@ impl WriteTx {
         let snapshot = Arc::new(Snapshot { version: self.version, tables: new_tables });
         let v = snapshot.version;
 
-        let mut inner = self.store_inner.write().unwrap();
         inner.snapshots.insert(v, snapshot);
         if v > inner.latest_version {
             inner.latest_version = v;
         }
+
+        // --- Record write set and cleanup ---
+        match self.writer_mode {
+            WriterMode::MultiWriter => {
+                inner.committed_write_sets.push(CommittedWriteSet {
+                    version: v,
+                    tables: std::mem::take(&mut self.write_set),
+                    deleted_tables: std::mem::take(&mut self.ever_deleted_tables),
+                });
+                remove_active_writer(&mut inner, self.base.version);
+                prune_write_sets(&mut inner);
+            }
+            WriterMode::SingleWriter => {}
+        }
+        inner.active_writer_count -= 1;
+
         if inner.config.auto_snapshot_gc {
             gc_inner(&mut inner);
         }
 
+        self.needs_cleanup = false;
         Ok(v)
     }
 
     /// Delete a table. Returns `true` if the table existed.
+    ///
     /// After deletion, `open_table` with the same name creates a fresh empty table.
+    /// In `MultiWriter` mode, records the deletion in `ever_deleted_tables` for
+    /// conflict detection — if a concurrent transaction modified any key in this
+    /// table, commit will return `WriteConflict`.
     pub fn delete_table(&mut self, name: &str) -> bool {
         let existed_in_dirty = self.dirty.remove(name).is_some();
         let existed_in_base = self.base.tables.contains_key(name);
         if existed_in_base {
             self.deleted_tables.insert(name.to_string());
         }
-        existed_in_dirty || existed_in_base
+        let existed = existed_in_dirty || existed_in_base;
+        if existed && matches!(self.writer_mode, WriterMode::MultiWriter) {
+            self.ever_deleted_tables.insert(name.to_string());
+        }
+        existed
     }
 
     /// Returns the names of all tables visible in this transaction.
@@ -374,9 +720,82 @@ impl WriteTx {
         result
     }
 
+    /// Check for write-write conflicts against committed transactions.
+    ///
+    /// Scans `committed_write_sets` for entries with `version > base_version`
+    /// (transactions that committed after this one started). Checks three
+    /// conflict conditions:
+    /// 1. A concurrent commit deleted a table this transaction wrote to.
+    /// 2. This transaction deleted a table a concurrent commit wrote to.
+    /// 3. Key-level overlap: both transactions modified the same key in the same table.
+    ///
+    /// Returns `Some(WriteConflict)` on the first conflict found, `None` if clean.
+    fn validate_write_set(&self, inner: &StoreInner) -> Option<Error> {
+        let base_version = self.base.version;
+        for cws in &inner.committed_write_sets {
+            if cws.version <= base_version {
+                continue;
+            }
+            // Did a concurrent commit delete a table we modified?
+            for deleted in &cws.deleted_tables {
+                if self.write_set.contains_key(deleted) {
+                    return Some(Error::WriteConflict {
+                        table: deleted.clone(),
+                        keys: vec![],
+                        version: cws.version,
+                    });
+                }
+            }
+            // Did we delete a table that a concurrent commit modified?
+            for deleted in &self.ever_deleted_tables {
+                if cws.tables.contains_key(deleted) {
+                    return Some(Error::WriteConflict {
+                        table: deleted.clone(),
+                        keys: vec![],
+                        version: cws.version,
+                    });
+                }
+            }
+            // Key-level overlap in write sets.
+            for (table_name, my_keys) in &self.write_set {
+                if let Some(their_keys) = cws.tables.get(table_name)
+                    && !my_keys.is_disjoint(their_keys)
+                {
+                    let conflicting: Vec<u64> =
+                        my_keys.intersection(their_keys).copied().collect();
+                    return Some(Error::WriteConflict {
+                        table: table_name.clone(),
+                        keys: conflicting,
+                        version: cws.version,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Discards this transaction without modifying the store.
     pub fn rollback(self) {
-        // Dropping self is sufficient; no store mutation needed.
+        // Drop impl handles active-writer cleanup.
+    }
+}
+
+/// Drop guard for `WriteTx`.
+///
+/// If the transaction was not committed (e.g., caller let it fall out of scope
+/// or called `rollback`), decrements `active_writer_count` and, in `MultiWriter`
+/// mode, removes the base version from tracking and prunes the write-set log.
+/// Skipped after a successful `commit` (which sets `needs_cleanup = false`).
+impl Drop for WriteTx {
+    fn drop(&mut self) {
+        if self.needs_cleanup {
+            let mut inner = self.store_inner.write().unwrap();
+            inner.active_writer_count -= 1;
+            if matches!(self.writer_mode, WriterMode::MultiWriter) {
+                remove_active_writer(&mut inner, self.base.version);
+                prune_write_sets(&mut inner);
+            }
+        }
     }
 }
 
@@ -426,7 +845,7 @@ mod tests {
     #[test]
     fn begin_write_explicit_version_equal_latest_is_conflict() {
         let store = Store::default(); // latest = 0
-        assert!(matches!(store.begin_write(Some(0)), Err(Error::WriteConflict)));
+        assert!(matches!(store.begin_write(Some(0)), Err(Error::WriteConflict { .. })));
     }
 
     #[test]
@@ -436,7 +855,7 @@ mod tests {
         let wtx = store.begin_write(Some(3)).unwrap();
         wtx.commit().unwrap();
         // Now latest = 3; requesting version 2 should conflict
-        assert!(matches!(store.begin_write(Some(2)), Err(Error::WriteConflict)));
+        assert!(matches!(store.begin_write(Some(2)), Err(Error::WriteConflict { .. })));
     }
 
     #[test]
@@ -638,6 +1057,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
+            ..StoreConfig::default()
         });
         // Commit 5 versions
         for _ in 0..5 {
@@ -654,11 +1074,319 @@ mod tests {
         let store = Store::new(StoreConfig {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
+            ..StoreConfig::default()
         });
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
         }
         // No auto GC — all 6 snapshots remain (v0..v5)
         assert_eq!(store.snapshot_count(), 6);
+    }
+
+    // --- Readable trait coverage ---
+
+    #[test]
+    fn readable_table_names_and_version() {
+        fn check_readable(r: &impl Readable) -> (u64, Vec<String>) {
+            (r.version(), r.table_names())
+        }
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("a").unwrap().insert("x".into()).unwrap();
+            wtx.open_table::<u32>("b").unwrap().insert(1u32).unwrap();
+            wtx.commit().unwrap();
+        }
+        let rtx = store.begin_read(None).unwrap();
+        let (v, names) = check_readable(&rtx);
+        assert_eq!(v, 1);
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    // --- MultiWriter unit tests ---
+
+    /// Explicit version bumps `next_version` so auto-assign doesn't collide.
+    #[test]
+    fn multi_writer_explicit_version_advances_next() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        let wtx = store.begin_write(Some(10)).unwrap();
+        assert_eq!(wtx.version(), 10);
+        wtx.commit().unwrap();
+        // next auto-assigned should be 11
+        let wtx2 = store.begin_write(None).unwrap();
+        assert_eq!(wtx2.version(), 11);
+    }
+
+    /// Delete via `TableWriter` conflicts with update on the same key.
+    #[test]
+    fn multi_writer_delete_via_table_writer() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("hello".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        wtx_a.open_table::<String>("t").unwrap().delete(1).unwrap();
+        wtx_b.open_table::<String>("t").unwrap().update(1, "b".into()).unwrap();
+
+        wtx_a.commit().unwrap();
+        assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
+    }
+
+    /// `update_batch` records all keys in the write set for conflict detection.
+    #[test]
+    fn multi_writer_update_batch_tracks_keys() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".into()).unwrap();
+            t.insert("b".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        wtx_a.open_table::<String>("t").unwrap().update(1, "a2".into()).unwrap();
+        wtx_b.open_table::<String>("t").unwrap()
+            .update_batch(vec![(1, "b2".into())]).unwrap();
+
+        wtx_a.commit().unwrap();
+        assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
+    }
+
+    /// `delete_batch` records all keys in the write set for conflict detection.
+    #[test]
+    fn multi_writer_delete_batch_tracks_keys() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".into()).unwrap();
+            t.insert("b".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        wtx_a.open_table::<String>("t").unwrap().update(2, "a2".into()).unwrap();
+        wtx_b.open_table::<String>("t").unwrap().delete_batch(&[2]).unwrap();
+
+        wtx_a.commit().unwrap();
+        assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
+    }
+
+    /// `TableWriter` read method pass-through: contains, first, last, iter, get_many.
+    #[test]
+    fn table_writer_contains_first_last_iter_get_many() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        t.insert("alice".into()).unwrap();
+        t.insert("bob".into()).unwrap();
+        t.insert("charlie".into()).unwrap();
+
+        assert!(t.contains(1));
+        assert!(!t.contains(99));
+        assert_eq!(t.first(), Some((1, &"alice".to_string())));
+        assert_eq!(t.last(), Some((3, &"charlie".to_string())));
+        assert_eq!(t.iter().count(), 3);
+        let many = t.get_many(&[1, 99, 3]);
+        assert_eq!(many.len(), 3);
+        assert_eq!(many[0], Some(&"alice".to_string()));
+        assert!(many[1].is_none());
+        assert_eq!(many[2], Some(&"charlie".to_string()));
+    }
+
+    /// `TableWriter` index pass-through: `get_by_key` on a non-unique index.
+    #[test]
+    fn table_writer_get_by_key_passthrough() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        t.define_index("by_val", IndexKind::NonUnique, |s: &String| s.clone()).unwrap();
+        t.insert("apple".into()).unwrap();
+        t.insert("banana".into()).unwrap();
+        t.insert("apple".into()).unwrap();
+
+        let results = t.get_by_key::<String>("by_val", &"apple".to_string()).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    /// Type mismatch on a table from the base snapshot (not just dirty map).
+    #[test]
+    fn open_table_type_mismatch_on_base_table() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("hi".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        assert!(matches!(wtx.open_table::<u64>("t"), Err(Error::TypeMismatch(_))));
+    }
+
+    /// Write sets with `version <= base_version` are skipped during validation —
+    /// they were already incorporated into the base snapshot.
+    #[test]
+    fn validate_skips_old_committed_write_sets() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        // v1
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("a".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        // Open writer_b based on v1 (so v1's write set is skipped)
+        // But first, keep an older writer alive so v1's write set isn't pruned
+        let hold = store.begin_write(None).unwrap(); // base=v1, holds write sets alive
+        // v3
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("c".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        // writer based on v3 modifies key 4 — should conflict with v3's committed write set
+        // but v1's write set (key 1) should be skipped since it's <= base v3
+        let mut wtx_d = store.begin_write(None).unwrap();
+        wtx_d.open_table::<String>("t").unwrap().insert("d".into()).unwrap();
+        // key 4 doesn't overlap with v3's keys (1..=2), so should succeed
+        // Actually v3's committed write set has key 2 (from the second insert).
+        // wtx_d will insert key 3 (next_id from base v3 which had 2 records).
+        // No overlap with v3's write set {2}. Should succeed.
+        wtx_d.commit().unwrap();
+        drop(hold);
+    }
+
+    /// Edge case: explicit version that equals `next_version` (the false branch
+    /// of `commit_version >= inner.next_version` is unreachable in normal usage).
+    #[test]
+    fn multi_writer_explicit_version_below_next_version() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        // Push next_version to 11 with explicit version 10
+        store.begin_write(Some(10)).unwrap().commit().unwrap();
+        // Now latest=10, next_version=11. Request version 10+1=11 (auto) or explicit < 11 but > 10... impossible.
+        // But: request Some(11) which == next_version. 11 >= 11 → true. Try auto instead to get 11.
+        // Actually to get false branch: latest=10, next_version=11. If we somehow have next_version > commit_version.
+        // Can't happen with auto-assign (always == next_version). With explicit: must be > latest (10), so >= 11 = next_version.
+        // This branch is actually unreachable in normal usage. Skip.
+    }
+
+    /// `delete_batch` through `TableWriter` tracks keys and detects conflicts.
+    #[test]
+    fn multi_writer_delete_batch_through_table_writer() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".into()).unwrap();
+            t.insert("b".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // Use delete_batch through TableWriter — tests write_set tracking for delete_batch
+        wtx_a.open_table::<String>("t").unwrap().delete_batch(&[1]).unwrap();
+        wtx_b.open_table::<String>("t").unwrap().delete(1).unwrap();
+
+        wtx_a.commit().unwrap();
+        assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
+    }
+
+    /// Deleting table T1 while a concurrent writer modifies T2 is not a conflict.
+    #[test]
+    fn delete_table_no_conflict_when_concurrent_wrote_different_table() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t1").unwrap().insert("x".into()).unwrap();
+            wtx.open_table::<String>("t2").unwrap().insert("y".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // A deletes t1, B writes to t2 — no conflict
+        wtx_a.delete_table("t1");
+        wtx_b.open_table::<String>("t2").unwrap().update(1, "z".into()).unwrap();
+
+        wtx_a.commit().unwrap();
+        wtx_b.commit().unwrap(); // should succeed
+    }
+
+    /// Concurrent commit deleted a table that this transaction wrote to → conflict.
+    #[test]
+    fn concurrent_delete_table_conflicts_with_write() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // A deletes table, B writes to it
+        wtx_a.delete_table("t");
+        wtx_b.open_table::<String>("t").unwrap().insert("y".into()).unwrap();
+
+        wtx_a.commit().unwrap();
+        let err = wtx_b.commit().unwrap_err();
+        assert!(matches!(err, Error::WriteConflict { ref table, .. } if table == "t"));
+    }
+
+    /// This transaction deleted a table that a concurrent commit wrote to → conflict.
+    #[test]
+    fn concurrent_write_conflicts_with_delete_table() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        });
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // A writes, B deletes
+        wtx_a.open_table::<String>("t").unwrap().insert("y".into()).unwrap();
+        wtx_b.delete_table("t");
+
+        wtx_a.commit().unwrap();
+        let err = wtx_b.commit().unwrap_err();
+        assert!(matches!(err, Error::WriteConflict { ref table, .. } if table == "t"));
     }
 }

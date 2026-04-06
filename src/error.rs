@@ -8,12 +8,19 @@ pub enum Error {
     /// Requested snapshot version does not exist.
     #[error("snapshot version {0} not found")]
     VersionNotFound(u64),
-    /// Returned when `begin_write` is called with a version ≤ the latest
-    /// committed version. In a future multi-writer implementation this will
-    /// also be returned when a write transaction conflicts with a concurrent
-    /// commit.
-    #[error("write conflict")]
-    WriteConflict,
+    /// Returned when a write transaction conflicts with a concurrent commit
+    /// (overlapping keys or table deletion), or when `begin_write` is called
+    /// with an explicit version ≤ the latest committed version.
+    #[error("write conflict on table '{table}', keys {keys:?} (conflicting version {version})")]
+    WriteConflict {
+        table: String,
+        keys: Vec<u64>,
+        version: u64,
+    },
+    /// Returned when `begin_write` is called while another write transaction
+    /// is active in [`WriterMode::SingleWriter`] mode.
+    #[error("another write transaction is active (SingleWriter mode)")]
+    WriterBusy,
     /// Table opened with a different record type than its original creation.
     #[error("table '{0}' was opened with a different type")]
     TypeMismatch(String),
@@ -42,8 +49,18 @@ mod tests {
 
     #[test]
     fn error_write_conflict_displays() {
-        let e = Error::WriteConflict;
-        assert_eq!(e.to_string(), "write conflict");
+        let e = Error::WriteConflict {
+            table: "users".to_string(),
+            keys: vec![1, 2],
+            version: 3,
+        };
+        assert_eq!(e.to_string(), "write conflict on table 'users', keys [1, 2] (conflicting version 3)");
+    }
+
+    #[test]
+    fn error_writer_busy_displays() {
+        let e = Error::WriterBusy;
+        assert_eq!(e.to_string(), "another write transaction is active (SingleWriter mode)");
     }
 
     #[test]

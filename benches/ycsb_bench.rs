@@ -20,10 +20,11 @@ impl UltimaEngine {
         let store = Store::new(StoreConfig {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
+            ..StoreConfig::default()
         });
         let mut wtx = store.begin_write(None).unwrap();
         {
-            let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
+            let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
             for i in 1..=NUM_RECORDS {
                 table.insert(YcsbRecord::new(i)).unwrap();
             }
@@ -48,13 +49,13 @@ impl YcsbEngine for UltimaEngine {
                 }
                 YcsbOp::Update(key) => {
                     let mut wtx = self.store.begin_write(None).unwrap();
-                    let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
+                    let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
                     let _ = table.update(*key, YcsbRecord::new(key.wrapping_add(1)));
                     wtx.commit().unwrap();
                 }
                 YcsbOp::Insert => {
                     let mut wtx = self.store.begin_write(None).unwrap();
-                    let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
+                    let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
                     let id = table.insert(YcsbRecord::new(0)).unwrap();
                     black_box(id);
                     wtx.commit().unwrap();
@@ -75,7 +76,7 @@ impl YcsbEngine for UltimaEngine {
                     if let Some(mut rec) = record {
                         rec.field0 = std::iter::repeat_n('X', FIELD_SIZE).collect();
                         let mut wtx = self.store.begin_write(None).unwrap();
-                        let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
+                        let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
                         let _ = table.update(*key, rec);
                         wtx.commit().unwrap();
                     }

@@ -6,7 +6,7 @@ fn main() {
     // Write transaction: insert, update, delete
     let version = {
         let mut wtx = store.begin_write(None).unwrap();
-        let table = wtx.open_table::<String>("notes").unwrap();
+        let mut table = wtx.open_table::<String>("notes").unwrap();
 
         let id = table.insert("Hello, UltimaDB!".to_string()).unwrap();
         println!("Inserted note with id={id}");

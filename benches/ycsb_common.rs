@@ -1,6 +1,11 @@
+// Included via `#[path]` in multiple bench binaries, each using a different subset.
+#![allow(dead_code, unused_imports)]
+
+use std::cell::Cell;
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
@@ -249,7 +254,7 @@ pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
         let mut rng = StdRng::seed_from_u64(42);
         let mut group = c.benchmark_group("ycsb_a_update_heavy");
         group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function(&name, |b| {
+        group.bench_function("burst", |b| {
             b.iter_batched_ref(
                 || gen_workload_a(&mut rng, &zipf),
                 |ops| engine.execute(ops),
@@ -265,7 +270,7 @@ pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
         let mut rng = StdRng::seed_from_u64(43);
         let mut group = c.benchmark_group("ycsb_b_read_mostly");
         group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function(&name, |b| {
+        group.bench_function("burst", |b| {
             b.iter_batched_ref(
                 || gen_workload_b(&mut rng, &zipf),
                 |ops| engine.execute(ops),
@@ -281,7 +286,7 @@ pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
         let mut rng = StdRng::seed_from_u64(44);
         let mut group = c.benchmark_group("ycsb_c_read_only");
         group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function(&name, |b| {
+        group.bench_function("burst", |b| {
             b.iter_batched_ref(
                 || gen_workload_c(&mut rng, &zipf),
                 |ops| engine.execute(ops),
@@ -297,7 +302,7 @@ pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
         let mut rng = StdRng::seed_from_u64(45);
         let mut group = c.benchmark_group("ycsb_d_read_latest");
         group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function(&name, |b| {
+        group.bench_function("burst", |b| {
             b.iter_batched_ref(
                 || gen_workload_d(&mut rng, &latest),
                 |ops| engine.execute(ops),
@@ -313,7 +318,7 @@ pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
         let mut rng = StdRng::seed_from_u64(46);
         let mut group = c.benchmark_group("ycsb_e_short_ranges");
         group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function(&name, |b| {
+        group.bench_function("burst", |b| {
             b.iter_batched_ref(
                 || gen_workload_e(&mut rng, &zipf),
                 |ops| engine.execute(ops),
@@ -329,7 +334,7 @@ pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
         let mut rng = StdRng::seed_from_u64(47);
         let mut group = c.benchmark_group("ycsb_f_read_modify_write");
         group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function(&name, |b| {
+        group.bench_function("burst", |b| {
             b.iter_batched_ref(
                 || gen_workload_f(&mut rng, &zipf),
                 |ops| engine.execute(ops),
@@ -345,4 +350,177 @@ pub fn ycsb_criterion() -> Criterion {
     Criterion::default()
         .sample_size(50)
         .measurement_time(Duration::from_secs(10))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-writer engine trait — implement per database for contention benchmarks
+// ---------------------------------------------------------------------------
+
+/// Result of a single burst of concurrent writers.
+pub struct BurstResult {
+    pub committed: u64,
+    pub conflicts: u64,
+}
+
+/// Engine trait for multi-writer contention benchmarks.
+///
+/// Each engine opens N concurrent transactions, executes updates for each
+/// writer's key set, commits in sequence, and retries on conflict.
+pub trait MultiWriterEngine {
+    /// Short prefix for benchmark names (e.g. "ultima", "rocksdb").
+    fn name(&self) -> &str;
+
+    /// Execute a burst of concurrent writers. Each inner `Vec<u64>` is one
+    /// writer's set of keys to update. The engine should:
+    /// 1. Open one transaction per writer
+    /// 2. Execute updates for each writer's keys
+    /// 3. Commit in sequence, retrying on conflict
+    fn execute_burst(&mut self, key_sets: &[Vec<u64>]) -> BurstResult;
+
+    /// Read back a key and return true if it exists with a valid value.
+    /// Used by the smoke test to verify correctness after a burst.
+    fn verify_key(&self, key: u64) -> bool;
+}
+
+/// Number of concurrent writers in a burst (for low/high contention).
+pub const MW_WRITERS: usize = 4;
+/// Operations each writer performs per burst.
+pub const MW_OPS_PER_WRITER: usize = 50;
+
+/// Register multi-writer contention benchmarks for the given engine.
+///
+/// Benchmark IDs use the format `multiwriter_{scenario}/{engine}` so that
+/// `critcmp` groups scenarios together across engines.
+pub fn bench_multiwriter_workloads(c: &mut Criterion, engine: &mut impl MultiWriterEngine) {
+    let name = engine.name().to_owned();
+
+    // Smoke test: run one burst and verify all keys are readable afterward
+    {
+        let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
+        let mut rng = StdRng::seed_from_u64(999);
+        let key_sets: Vec<Vec<u64>> = (0..MW_WRITERS)
+            .map(|_| {
+                (0..MW_OPS_PER_WRITER)
+                    .map(|_| zipf.next(&mut rng))
+                    .collect()
+            })
+            .collect();
+        let result = engine.execute_burst(&key_sets);
+        assert_eq!(
+            result.committed, MW_WRITERS as u64,
+            "{name}: expected all {MW_WRITERS} writers to commit (with retries), got {}",
+            result.committed
+        );
+        for key_set in &key_sets {
+            for &key in key_set {
+                assert!(
+                    engine.verify_key(key),
+                    "{name}: key {key} not found after burst commit"
+                );
+            }
+        }
+    }
+
+    // Low contention: Zipfian keys, 4 writers, same table
+    {
+        let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
+        let mut rng = StdRng::seed_from_u64(300);
+        let total_ops = (MW_WRITERS * MW_OPS_PER_WRITER) as u64;
+        let burst_conflicts = Cell::new(0u64);
+        let burst_count = Cell::new(0u64);
+
+        let mut group = c.benchmark_group("multiwriter_low_contention");
+        group.throughput(Throughput::Elements(total_ops));
+        group.bench_function("burst", |b| {
+            b.iter(|| {
+                let key_sets: Vec<Vec<u64>> = (0..MW_WRITERS)
+                    .map(|_| {
+                        (0..MW_OPS_PER_WRITER)
+                            .map(|_| zipf.next(&mut rng))
+                            .collect()
+                    })
+                    .collect();
+                let result = engine.execute_burst(&key_sets);
+                burst_conflicts.set(burst_conflicts.get() + result.conflicts);
+                burst_count.set(burst_count.get() + 1);
+                black_box(result)
+            });
+        });
+        group.finish();
+        report_conflicts(&name, "low_contention", burst_count.get(), burst_conflicts.get(), MW_WRITERS);
+    }
+
+    // High contention: hot keys 1..=10, 4 writers
+    {
+        let mut rng = StdRng::seed_from_u64(400);
+        let total_ops = (MW_WRITERS * MW_OPS_PER_WRITER) as u64;
+        let burst_conflicts = Cell::new(0u64);
+        let burst_count = Cell::new(0u64);
+
+        let mut group = c.benchmark_group("multiwriter_high_contention");
+        group.throughput(Throughput::Elements(total_ops));
+        group.bench_function("burst", |b| {
+            b.iter(|| {
+                let key_sets: Vec<Vec<u64>> = (0..MW_WRITERS)
+                    .map(|_| {
+                        (0..MW_OPS_PER_WRITER)
+                            .map(|_| rng.random_range(1..=10u64))
+                            .collect()
+                    })
+                    .collect();
+                let result = engine.execute_burst(&key_sets);
+                burst_conflicts.set(burst_conflicts.get() + result.conflicts);
+                burst_count.set(burst_count.get() + 1);
+                black_box(result)
+            });
+        });
+        group.finish();
+        report_conflicts(&name, "high_contention", burst_count.get(), burst_conflicts.get(), MW_WRITERS);
+    }
+
+    // Scaling: vary number of concurrent writers (1, 2, 4, 8)
+    {
+        let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
+        let mut rng = StdRng::seed_from_u64(500);
+
+        let mut group = c.benchmark_group("multiwriter_scaling");
+        for num_writers in [1, 2, 4, 8] {
+            let total_ops = (num_writers * MW_OPS_PER_WRITER) as u64;
+            group.throughput(Throughput::Elements(total_ops));
+            let burst_conflicts = Cell::new(0u64);
+            let burst_count = Cell::new(0u64);
+            group.bench_with_input(
+                BenchmarkId::from_parameter(num_writers),
+                &num_writers,
+                |b, &nw| {
+                    b.iter(|| {
+                        let key_sets: Vec<Vec<u64>> = (0..nw)
+                            .map(|_| {
+                                (0..MW_OPS_PER_WRITER)
+                                    .map(|_| zipf.next(&mut rng))
+                                    .collect()
+                            })
+                            .collect();
+                        let result = engine.execute_burst(&key_sets);
+                        burst_conflicts.set(burst_conflicts.get() + result.conflicts);
+                        burst_count.set(burst_count.get() + 1);
+                        black_box(result)
+                    });
+                },
+            );
+            report_conflicts(&name, &format!("scaling/{num_writers}w"), burst_count.get(), burst_conflicts.get(), num_writers);
+        }
+        group.finish();
+    }
+}
+
+fn report_conflicts(engine: &str, scenario: &str, bursts: u64, conflicts: u64, writers: usize) {
+    if bursts > 0 {
+        let avg_conflicts = conflicts as f64 / bursts as f64;
+        let conflict_rate = avg_conflicts / writers as f64 * 100.0;
+        eprintln!(
+            "  [{engine}] {scenario}: {bursts} bursts, {conflicts} total conflicts, \
+             avg {avg_conflicts:.1}/burst ({conflict_rate:.1}% of commits)"
+        );
+    }
 }
