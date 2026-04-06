@@ -1,7 +1,7 @@
 use ultima_db::Store;
 
 fn main() {
-    let mut store = Store::default();
+    let store = Store::default();
 
     // Write transaction: insert, update, delete
     let version = {
@@ -21,7 +21,7 @@ fn main() {
         table.delete(id).unwrap();
         println!("Deleted. Table empty: {}", table.is_empty());
 
-        wtx.commit(&mut store).unwrap()
+        wtx.commit().unwrap()
     };
 
     println!("Committed as version {version}");

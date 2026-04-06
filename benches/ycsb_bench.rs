@@ -157,7 +157,7 @@ enum YcsbOp {
 // ---------------------------------------------------------------------------
 
 fn preload_store() -> Store {
-    let mut store = Store::new(StoreConfig {
+    let store = Store::new(StoreConfig {
         num_snapshots_retained: 2,
         auto_snapshot_gc: true,
     });
@@ -168,7 +168,7 @@ fn preload_store() -> Store {
             table.insert(YcsbRecord::new(i)).unwrap();
         }
     }
-    wtx.commit(&mut store).unwrap();
+    wtx.commit().unwrap();
     store
 }
 
@@ -176,7 +176,7 @@ fn preload_store() -> Store {
 // Operation executor
 // ---------------------------------------------------------------------------
 
-fn execute_ops(store: &mut Store, ops: &[YcsbOp]) {
+fn execute_ops(store: &Store, ops: &[YcsbOp]) {
     for op in ops {
         match op {
             YcsbOp::Read(key) => {
@@ -188,14 +188,14 @@ fn execute_ops(store: &mut Store, ops: &[YcsbOp]) {
                 let mut wtx = store.begin_write(None).unwrap();
                 let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
                 let _ = table.update(*key, YcsbRecord::new(key.wrapping_add(1)));
-                wtx.commit(store).unwrap();
+                wtx.commit().unwrap();
             }
             YcsbOp::Insert => {
                 let mut wtx = store.begin_write(None).unwrap();
                 let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
                 let id = table.insert(YcsbRecord::new(0)).unwrap();
                 black_box(id);
-                wtx.commit(store).unwrap();
+                wtx.commit().unwrap();
             }
             YcsbOp::Scan(start, count) => {
                 let rtx = store.begin_read(None).unwrap();
@@ -217,7 +217,7 @@ fn execute_ops(store: &mut Store, ops: &[YcsbOp]) {
                     let mut wtx = store.begin_write(None).unwrap();
                     let table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
                     let _ = table.update(*key, rec);
-                    wtx.commit(store).unwrap();
+                    wtx.commit().unwrap();
                 }
             }
         }
@@ -304,84 +304,84 @@ fn gen_workload_f(rng: &mut impl Rng, zipf: &ZipfianGenerator) -> Vec<YcsbOp> {
 // ---------------------------------------------------------------------------
 
 fn bench_workload_a(c: &mut Criterion) {
-    let mut store = preload_store();
+    let store = preload_store();
     let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
     let mut rng = StdRng::seed_from_u64(42);
 
     c.bench_function("ycsb_a_update_heavy", |b| {
         b.iter_batched_ref(
             || gen_workload_a(&mut rng, &zipf),
-            |ops| execute_ops(&mut store, ops),
+            |ops| execute_ops(&store, ops),
             BatchSize::SmallInput,
         );
     });
 }
 
 fn bench_workload_b(c: &mut Criterion) {
-    let mut store = preload_store();
+    let store = preload_store();
     let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
     let mut rng = StdRng::seed_from_u64(43);
 
     c.bench_function("ycsb_b_read_mostly", |b| {
         b.iter_batched_ref(
             || gen_workload_b(&mut rng, &zipf),
-            |ops| execute_ops(&mut store, ops),
+            |ops| execute_ops(&store, ops),
             BatchSize::SmallInput,
         );
     });
 }
 
 fn bench_workload_c(c: &mut Criterion) {
-    let mut store = preload_store();
+    let store = preload_store();
     let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
     let mut rng = StdRng::seed_from_u64(44);
 
     c.bench_function("ycsb_c_read_only", |b| {
         b.iter_batched_ref(
             || gen_workload_c(&mut rng, &zipf),
-            |ops| execute_ops(&mut store, ops),
+            |ops| execute_ops(&store, ops),
             BatchSize::SmallInput,
         );
     });
 }
 
 fn bench_workload_d(c: &mut Criterion) {
-    let mut store = preload_store();
+    let store = preload_store();
     let latest = LatestGenerator::new(NUM_RECORDS);
     let mut rng = StdRng::seed_from_u64(45);
 
     c.bench_function("ycsb_d_read_latest", |b| {
         b.iter_batched_ref(
             || gen_workload_d(&mut rng, &latest),
-            |ops| execute_ops(&mut store, ops),
+            |ops| execute_ops(&store, ops),
             BatchSize::SmallInput,
         );
     });
 }
 
 fn bench_workload_e(c: &mut Criterion) {
-    let mut store = preload_store();
+    let store = preload_store();
     let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
     let mut rng = StdRng::seed_from_u64(46);
 
     c.bench_function("ycsb_e_short_ranges", |b| {
         b.iter_batched_ref(
             || gen_workload_e(&mut rng, &zipf),
-            |ops| execute_ops(&mut store, ops),
+            |ops| execute_ops(&store, ops),
             BatchSize::SmallInput,
         );
     });
 }
 
 fn bench_workload_f(c: &mut Criterion) {
-    let mut store = preload_store();
+    let store = preload_store();
     let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
     let mut rng = StdRng::seed_from_u64(47);
 
     c.bench_function("ycsb_f_read_modify_write", |b| {
         b.iter_batched_ref(
             || gen_workload_f(&mut rng, &zipf),
-            |ops| execute_ops(&mut store, ops),
+            |ops| execute_ops(&store, ops),
             BatchSize::SmallInput,
         );
     });

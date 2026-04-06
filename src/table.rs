@@ -1,10 +1,45 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::btree::BTree;
 use crate::index::{IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage, UniqueStorage};
 use crate::{Error, Result};
+
+/// A compile-time table definition binding a name to a record type.
+#[derive(Copy, Clone)]
+pub struct TableDef<R: 'static> {
+    name: &'static str,
+    _phantom: PhantomData<R>,
+}
+
+impl<R: 'static> TableDef<R> {
+    pub const fn new(name: &'static str) -> Self {
+        Self { name, _phantom: PhantomData }
+    }
+
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// Trait for types that can identify a table and its record type.
+pub trait TableOpener<R> {
+    fn table_name(&self) -> &str;
+}
+
+impl<R> TableOpener<R> for &str {
+    fn table_name(&self) -> &str {
+        self
+    }
+}
+
+impl<R: 'static> TableOpener<R> for TableDef<R> {
+    fn table_name(&self) -> &str {
+        self.name
+    }
+}
 
 pub struct Table<R> {
     data: BTree<u64, R>,
@@ -96,15 +131,15 @@ impl<R: Send + Sync + 'static> Table<R> {
         Ok(())
     }
 
-    /// Delete a record by its ID. Returns an error if the ID does not exist.
-    pub fn delete(&mut self, id: u64) -> Result<()> {
+    /// Delete a record by its ID. Returns the deleted record, or an error if the ID does not exist.
+    pub fn delete(&mut self, id: u64) -> Result<Arc<R>> {
         let old = self.data.get_arc(&id).ok_or(Error::KeyNotFound)?;
         // Remove from all indexes before removing from data tree.
         for idx in self.indexes.values_mut() {
             idx.on_delete(id, &old);
         }
         self.data = self.data.remove(&id)?;
-        Ok(())
+        Ok(old)
     }
 
     // -----------------------------------------------------------------------
@@ -277,6 +312,31 @@ impl<R: Send + Sync + 'static> Table<R> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Returns true if the table contains a record with the given ID.
+    pub fn contains(&self, id: u64) -> bool {
+        self.data.get(&id).is_some()
+    }
+
+    /// Returns the first (lowest ID) record, or `None` if empty.
+    pub fn first(&self) -> Option<(u64, &R)> {
+        self.data.range(..).next().map(|(&k, v)| (k, v))
+    }
+
+    /// Returns the last (highest ID) record, or `None` if empty.
+    pub fn last(&self) -> Option<(u64, &R)> {
+        self.data.range(..).next_back().map(|(&k, v)| (k, v))
+    }
+
+    /// Iterate over all records in ID order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+        self.range(..)
+    }
+
+    /// Look up multiple records by ID.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
+        ids.iter().map(|&id| self.data.get(&id)).collect()
     }
 
     // -----------------------------------------------------------------------
@@ -1167,5 +1227,84 @@ mod tests {
         assert!(table.get_unique::<String>("by_email", &"user499@x.com".to_string()).unwrap().is_some());
         // age 0 should have 10 records (0, 50, 100, ..., 450)
         assert_eq!(table.get_by_index::<u32>("by_age", &0).unwrap().len(), 10);
+    }
+
+    // -------------------------------------------------------------------
+    // Convenience method tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn delete_returns_old_record() {
+        let mut table: Table<String> = Table::new();
+        let id = table.insert("hello".to_string()).unwrap();
+        let old = table.delete(id).unwrap();
+        assert_eq!(*old, "hello".to_string());
+    }
+
+    #[test]
+    fn contains_true_for_existing_id() {
+        let mut table: Table<String> = Table::new();
+        let id = table.insert("x".to_string()).unwrap();
+        assert!(table.contains(id));
+    }
+
+    #[test]
+    fn contains_false_for_absent_id() {
+        let table: Table<String> = Table::new();
+        assert!(!table.contains(99));
+    }
+
+    #[test]
+    fn first_returns_min_id_record() {
+        let mut table: Table<String> = Table::new();
+        table.insert("a".to_string()).unwrap();
+        table.insert("b".to_string()).unwrap();
+        let (id, val) = table.first().unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(val, &"a".to_string());
+    }
+
+    #[test]
+    fn first_on_empty_returns_none() {
+        let table: Table<String> = Table::new();
+        assert!(table.first().is_none());
+    }
+
+    #[test]
+    fn last_returns_max_id_record() {
+        let mut table: Table<String> = Table::new();
+        table.insert("a".to_string()).unwrap();
+        table.insert("b".to_string()).unwrap();
+        let (id, val) = table.last().unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(val, &"b".to_string());
+    }
+
+    #[test]
+    fn last_on_empty_returns_none() {
+        let table: Table<String> = Table::new();
+        assert!(table.last().is_none());
+    }
+
+    #[test]
+    fn iter_yields_all_in_order() {
+        let mut table: Table<&str> = Table::new();
+        table.insert("a").unwrap();
+        table.insert("b").unwrap();
+        table.insert("c").unwrap();
+        let results: Vec<_> = table.iter().collect();
+        assert_eq!(results, vec![(1, &"a"), (2, &"b"), (3, &"c")]);
+    }
+
+    #[test]
+    fn get_many_returns_matching_records() {
+        let mut table: Table<String> = Table::new();
+        table.insert("a".to_string()).unwrap();
+        table.insert("b".to_string()).unwrap();
+        table.insert("c".to_string()).unwrap();
+        let results = table.get_many(&[1, 3, 99]);
+        assert_eq!(results[0], Some(&"a".to_string()));
+        assert_eq!(results[1], Some(&"c".to_string()));
+        assert_eq!(results[2], None);
     }
 }

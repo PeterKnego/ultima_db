@@ -5,6 +5,9 @@ pub enum Error {
     /// Requested key or version does not exist.
     #[error("key not found")]
     KeyNotFound,
+    /// Requested snapshot version does not exist.
+    #[error("snapshot version {0} not found")]
+    VersionNotFound(u64),
     /// Returned when `begin_write` is called with a version ≤ the latest
     /// committed version. In a future multi-writer implementation this will
     /// also be returned when a write transaction conflicts with a concurrent
@@ -65,5 +68,11 @@ mod tests {
     fn error_index_type_mismatch_displays() {
         let e = Error::IndexTypeMismatch("by_email".to_string());
         assert_eq!(e.to_string(), "index 'by_email' queried with wrong key type");
+    }
+
+    #[test]
+    fn error_version_not_found_displays() {
+        let e = Error::VersionNotFound(42);
+        assert_eq!(e.to_string(), "snapshot version 42 not found");
     }
 }

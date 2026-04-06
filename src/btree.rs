@@ -126,8 +126,17 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     pub fn range<'a>(&'a self, range: impl RangeBounds<K> + 'a) -> BTreeRange<'a, K, V> {
         let start = range.start_bound().cloned();
         let end = range.end_bound().cloned();
-        let mut iter = BTreeRange { stack: vec![], end };
+        let mut iter = BTreeRange {
+            stack: vec![],
+            back_stack: vec![],
+            start: start.clone(),
+            end: end.clone(),
+            done: false,
+            last_forward: None,
+            last_backward: None,
+        };
         iter.descend_left_from(&self.root, &start);
+        iter.descend_right_from(&self.root, &end);
         iter
     }
 }
@@ -150,11 +159,25 @@ impl<K: Ord + Clone, V> Default for BTree<K, V> {
 // ---------------------------------------------------------------------------
 
 /// Iterator over key-value pairs in a `BTree<K, V>` within a key range.
+///
+/// Supports both forward (`Iterator`) and backward (`DoubleEndedIterator`) traversal,
+/// as well as mixed forward/backward iteration.
 pub struct BTreeRange<'a, K, V> {
-    /// Stack of (node, next-entry-index-to-yield) frames. Stack grows upward;
-    /// the top frame is the current position.
+    /// Stack of (node, next-entry-index-to-yield) frames for forward traversal.
     stack: Vec<(&'a BTreeNode<K, V>, usize)>,
+    /// Stack of (node, one-past-last-entry-index) frames for backward traversal.
+    back_stack: Vec<(&'a BTreeNode<K, V>, usize)>,
+    /// Start bound (needed for backward bound checking).
+    start: Bound<K>,
+    /// End bound (needed for forward bound checking).
     end: Bound<K>,
+    /// Set to true when the forward and backward iterators have met, or a bound
+    /// is violated — no further items should be yielded.
+    done: bool,
+    /// Last key yielded by `next()` — used for overlap detection with `next_back()`.
+    last_forward: Option<&'a K>,
+    /// Last key yielded by `next_back()` — used for overlap detection with `next()`.
+    last_backward: Option<&'a K>,
 }
 
 impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
@@ -188,15 +211,51 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
             Bound::Excluded(k) => key < k,
         }
     }
+
+    /// Push back_stack frames for the rightmost path that is <= `end`.
+    fn descend_right_from(&mut self, node: &'a Arc<BTreeNode<K, V>>, end: &Bound<K>) {
+        let n = node.as_ref();
+        // `entry_end` = one past the last valid index for backward iteration.
+        let entry_end = match end {
+            Bound::Unbounded => n.entries.len(),
+            Bound::Included(k) => n.entries.partition_point(|(ek, _)| ek <= k),
+            Bound::Excluded(k) => n.entries.partition_point(|(ek, _)| ek < k),
+        };
+        self.back_stack.push((n, entry_end));
+        if !n.children.is_empty() && entry_end < n.children.len() {
+            self.descend_right_from(&n.children[entry_end], end);
+        }
+    }
+
+    /// Push back_stack frames for the rightmost leaf of `node` (no range restriction).
+    fn descend_rightmost(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
+        let n = node.as_ref();
+        self.back_stack.push((n, n.entries.len()));
+        if !n.children.is_empty() {
+            self.descend_rightmost(n.children.last().unwrap());
+        }
+    }
+
+    fn in_start_bound(&self, key: &K) -> bool {
+        match &self.start {
+            Bound::Unbounded => true,
+            Bound::Included(k) => key >= k,
+            Bound::Excluded(k) => key > k,
+        }
+    }
 }
 
 impl<'a, K: Ord + Clone, V> Iterator for BTreeRange<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
         loop {
             let stack_len = self.stack.len();
             if stack_len == 0 {
+                self.done = true;
                 return None;
             }
 
@@ -214,6 +273,16 @@ impl<'a, K: Ord + Clone, V> Iterator for BTreeRange<'a, K, V> {
 
             if !self.in_end_bound(key) {
                 self.stack.clear();
+                self.done = true;
+                return None;
+            }
+
+            // Overlap detection: stop if we've reached or passed a key already
+            // yielded by next_back().
+            if let Some(bk) = self.last_backward
+                && key >= bk
+            {
+                self.done = true;
                 return None;
             }
 
@@ -230,6 +299,60 @@ impl<'a, K: Ord + Clone, V> Iterator for BTreeRange<'a, K, V> {
                 }
             }
 
+            self.last_forward = Some(key);
+            return Some((key, val));
+        }
+    }
+}
+
+impl<'a, K: Ord + Clone, V> DoubleEndedIterator for BTreeRange<'a, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let stack_len = self.back_stack.len();
+            if stack_len == 0 {
+                self.done = true;
+                return None;
+            }
+
+            let (node, entry_idx) = self.back_stack[stack_len - 1];
+
+            if entry_idx == 0 {
+                self.back_stack.pop();
+                continue;
+            }
+
+            let actual_idx = entry_idx - 1;
+            let key = &node.entries[actual_idx].0;
+            let val = &*node.entries[actual_idx].1;
+
+            if !self.in_start_bound(key) {
+                self.back_stack.clear();
+                self.done = true;
+                return None;
+            }
+
+            // Overlap detection: stop if we've reached or passed a key already
+            // yielded by next().
+            if let Some(fk) = self.last_forward
+                && key <= fk
+            {
+                self.done = true;
+                return None;
+            }
+
+            // Retreat the current frame to point at `actual_idx`.
+            self.back_stack[stack_len - 1].1 = actual_idx;
+
+            // For internal nodes, before yielding entries[actual_idx] we must
+            // visit the rightmost path of children[actual_idx].
+            if !node.children.is_empty() && actual_idx < node.children.len() {
+                self.descend_rightmost(&node.children[actual_idx]);
+            }
+
+            self.last_backward = Some(key);
             return Some((key, val));
         }
     }
@@ -926,5 +1049,67 @@ mod tests {
             ))
             .collect();
         assert_eq!(results.len(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // DoubleEndedIterator / reverse iteration tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn range_full_reverse_yields_all_keys_descending() {
+        let t = insert_range(1, 10);
+        let results: Vec<u64> = t.range(..).rev().map(|(k, _)| *k).collect();
+        assert_eq!(results, vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn range_bounded_reverse() {
+        let t = insert_range(1, 10);
+        let results: Vec<u64> = t.range(3u64..=7).rev().map(|(k, _)| *k).collect();
+        assert_eq!(results, vec![7, 6, 5, 4, 3]);
+    }
+
+    #[test]
+    fn range_reverse_empty_tree() {
+        let t: BTree<u64, u64> = BTree::new();
+        let results: Vec<u64> = t.range(..).rev().map(|(k, _)| *k).collect();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn range_reverse_single_element() {
+        let t = BTree::new().insert(5u64, 50u64);
+        let results: Vec<u64> = t.range(..).rev().map(|(k, _)| *k).collect();
+        assert_eq!(results, vec![5]);
+    }
+
+    #[test]
+    fn range_reverse_across_split_boundary() {
+        let t = insert_range(1, 200);
+        let results: Vec<u64> = t.range(50u64..=150).rev().map(|(k, _)| *k).collect();
+        let expected: Vec<u64> = (50..=150).rev().collect();
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn range_mixed_forward_and_reverse() {
+        let t = insert_range(1, 10);
+        let mut iter = t.range(3u64..=8);
+        assert_eq!(iter.next().map(|(k, _)| *k), Some(3));
+        assert_eq!(iter.next_back().map(|(k, _)| *k), Some(8));
+        assert_eq!(iter.next().map(|(k, _)| *k), Some(4));
+        assert_eq!(iter.next_back().map(|(k, _)| *k), Some(7));
+        assert_eq!(iter.next().map(|(k, _)| *k), Some(5));
+        assert_eq!(iter.next_back().map(|(k, _)| *k), Some(6));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next_back(), None);
+    }
+
+    #[test]
+    fn range_reverse_large_tree() {
+        let t = insert_range(1, 5000);
+        let results: Vec<u64> = t.range(..).rev().map(|(k, _)| *k).collect();
+        let expected: Vec<u64> = (1..=5000).rev().collect();
+        assert_eq!(results, expected);
     }
 }
