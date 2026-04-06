@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage clean bench bench/save bench/compare bench/flamegraph
+.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/save bench/compare bench/flamegraph
 
 build:
 	cargo build
@@ -29,6 +29,9 @@ endef
 
 bench:
 	cargo bench
+
+bench/ycsb:
+	cargo bench --bench ycsb_bench
 
 # Save a named baseline (usage: make bench/save NAME=main)
 bench/save:

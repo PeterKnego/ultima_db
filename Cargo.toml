@@ -10,7 +10,12 @@ thiserror = "2"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
+rand = "0.9"
 
 [[bench]]
 name = "store_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_bench"
 harness = false
