@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/save bench/compare bench/flamegraph
+.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/save bench/compare bench/flamegraph
 
 build:
 	cargo build
@@ -32,6 +32,24 @@ bench:
 
 bench/ycsb:
 	cargo bench --bench ycsb_bench
+
+bench/ycsb/fjall:
+	cargo bench --bench ycsb_fjall_bench
+
+bench/ycsb/rocksdb:
+	cargo bench --bench ycsb_rocksdb_bench
+
+bench/ycsb/redb:
+	cargo bench --bench ycsb_redb_bench
+
+# Run all YCSB suites with named baselines and compare side-by-side
+bench/ycsb/compare:
+	$(call check_cmd,critcmp)
+	cargo bench --bench ycsb_bench -- --save-baseline ultima
+	cargo bench --bench ycsb_fjall_bench -- --save-baseline fjall
+	cargo bench --bench ycsb_rocksdb_bench -- --save-baseline rocksdb
+	cargo bench --bench ycsb_redb_bench -- --save-baseline redb
+	critcmp -g '(.+)/[^/]+' ultima fjall rocksdb redb
 
 # Save a named baseline (usage: make bench/save NAME=main)
 bench/save:
