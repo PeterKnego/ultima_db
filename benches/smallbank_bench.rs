@@ -1,3 +1,5 @@
+#![allow(clippy::drop_non_drop)] // drop(TableWriter) releases borrow, needed for multi-table txns
+
 //! SmallBank benchmark — a multi-table transactional workload.
 //!
 //! Models a banking application with 3 tables (accounts, savings, checking)
@@ -13,7 +15,6 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-use std::cell::Cell;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
@@ -275,20 +276,6 @@ impl SmallBankConfig {
         }
     }
 
-    #[cfg(feature = "persistence")]
-    fn smr() -> Self {
-        Self {
-            name: "smr".into(),
-            store_config: StoreConfig {
-                num_snapshots_retained: 2,
-                auto_snapshot_gc: true,
-                ..StoreConfig::default()
-            },
-            persistence: ultima_db::Persistence::Smr {
-                dir: std::path::PathBuf::new(), // placeholder, set at runtime
-            },
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,17 +306,11 @@ impl SmallBankEngine {
                     let dir = tempfile::tempdir().unwrap();
                     store_config.persistence = ultima_db::Persistence::Standalone {
                         dir: dir.path().to_path_buf(),
-                        durability: durability.clone(),
+                        durability: *durability,
                     };
                     Some(dir)
                 }
-                ultima_db::Persistence::Smr { .. } => {
-                    let dir = tempfile::tempdir().unwrap();
-                    store_config.persistence = ultima_db::Persistence::Smr {
-                        dir: dir.path().to_path_buf(),
-                    };
-                    Some(dir)
-                }
+                ultima_db::Persistence::Smr { .. } => None
             };
         }
         #[cfg(not(feature = "persistence"))]
@@ -545,22 +526,21 @@ impl SmallBankEngine {
                         let mut checking = wtx.open_table::<Checking>("checking").unwrap();
                         if let Some((src_id, src_rec)) =
                             checking.get_unique::<u64>("customer_id", source).unwrap()
+                            && src_rec.balance >= *amount
                         {
-                            if src_rec.balance >= *amount {
-                                let src_new = Checking {
-                                    balance: src_rec.balance - amount,
-                                    ..*src_rec
+                            let src_new = Checking {
+                                balance: src_rec.balance - amount,
+                                ..*src_rec
+                            };
+                            if let Some((dst_id, dst_rec)) =
+                                checking.get_unique::<u64>("customer_id", dest).unwrap()
+                            {
+                                let dst_new = Checking {
+                                    balance: dst_rec.balance + amount,
+                                    ..*dst_rec
                                 };
-                                if let Some((dst_id, dst_rec)) =
-                                    checking.get_unique::<u64>("customer_id", dest).unwrap()
-                                {
-                                    let dst_new = Checking {
-                                        balance: dst_rec.balance + amount,
-                                        ..*dst_rec
-                                    };
-                                    let _ = checking.update(src_id, src_new);
-                                    let _ = checking.update(dst_id, dst_new);
-                                }
+                                let _ = checking.update(src_id, src_new);
+                                let _ = checking.update(dst_id, dst_new);
                             }
                         }
                     }
@@ -726,22 +706,21 @@ impl SmallBankEngine {
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
                     if let Some((src_id, src_rec)) =
                         checking.get_unique::<u64>("customer_id", source).unwrap()
+                        && src_rec.balance >= *amount
                     {
-                        if src_rec.balance >= *amount {
-                            let src_new = Checking {
-                                balance: src_rec.balance - amount,
-                                ..*src_rec
+                        let src_new = Checking {
+                            balance: src_rec.balance - amount,
+                            ..*src_rec
+                        };
+                        if let Some((dst_id, dst_rec)) =
+                            checking.get_unique::<u64>("customer_id", dest).unwrap()
+                        {
+                            let dst_new = Checking {
+                                balance: dst_rec.balance + amount,
+                                ..*dst_rec
                             };
-                            if let Some((dst_id, dst_rec)) =
-                                checking.get_unique::<u64>("customer_id", dest).unwrap()
-                            {
-                                let dst_new = Checking {
-                                    balance: dst_rec.balance + amount,
-                                    ..*dst_rec
-                                };
-                                let _ = checking.update(src_id, src_new);
-                                let _ = checking.update(dst_id, dst_new);
-                            }
+                            let _ = checking.update(src_id, src_new);
+                            let _ = checking.update(dst_id, dst_new);
                         }
                     }
                 }
@@ -824,8 +803,6 @@ fn bench_contention(c: &mut Criterion, config: &SmallBankConfig) {
         let mut mw_config = config.clone();
         mw_config.store_config.writer_mode = WriterMode::MultiWriter;
         let mut engine = SmallBankEngine::new(&mw_config);
-        let burst_aborts = Cell::new(0u64);
-        let burst_count = Cell::new(0u64);
 
         let mut group = c.benchmark_group(format!("smallbank_contention_low/{cfg_name}"));
         group.throughput(Throughput::Elements(total_ops));
@@ -833,16 +810,12 @@ fn bench_contention(c: &mut Criterion, config: &SmallBankConfig) {
             b.iter_batched_ref(
                 || gen_contention_ops(&mut rng, &zipf),
                 |op_sets| {
-                    let result = engine.execute_burst(op_sets);
-                    burst_aborts.set(burst_aborts.get() + result.aborted);
-                    burst_count.set(burst_count.get() + 1);
-                    black_box(result);
+                    black_box(engine.execute_burst(op_sets));
                 },
                 BatchSize::SmallInput,
             );
         });
         group.finish();
-        report_abort_rate(cfg_name, "low_contention", burst_count.get(), burst_aborts.get());
     }
 
     // High contention: hot accounts 1..=10
@@ -851,8 +824,6 @@ fn bench_contention(c: &mut Criterion, config: &SmallBankConfig) {
         let mut mw_config = config.clone();
         mw_config.store_config.writer_mode = WriterMode::MultiWriter;
         let mut engine = SmallBankEngine::new(&mw_config);
-        let burst_aborts = Cell::new(0u64);
-        let burst_count = Cell::new(0u64);
 
         let mut group = c.benchmark_group(format!("smallbank_contention_high/{cfg_name}"));
         group.throughput(Throughput::Elements(total_ops));
@@ -860,27 +831,12 @@ fn bench_contention(c: &mut Criterion, config: &SmallBankConfig) {
             b.iter_batched_ref(
                 || gen_high_contention_ops(&mut rng),
                 |op_sets| {
-                    let result = engine.execute_burst(op_sets);
-                    burst_aborts.set(burst_aborts.get() + result.aborted);
-                    burst_count.set(burst_count.get() + 1);
-                    black_box(result);
+                    black_box(engine.execute_burst(op_sets));
                 },
                 BatchSize::SmallInput,
             );
         });
         group.finish();
-        report_abort_rate(cfg_name, "high_contention", burst_count.get(), burst_aborts.get());
-    }
-}
-
-fn report_abort_rate(config: &str, scenario: &str, bursts: u64, aborts: u64) {
-    if bursts > 0 {
-        let avg_aborts = aborts as f64 / bursts as f64;
-        let abort_rate = avg_aborts / NUM_WRITERS as f64 * 100.0;
-        eprintln!(
-            "  [{config}] {scenario}: {bursts} bursts, {aborts} total aborts, \
-             avg {avg_aborts:.2}/burst ({abort_rate:.1}% abort rate)"
-        );
     }
 }
 
@@ -950,8 +906,6 @@ fn bench_smallbank(c: &mut Criterion) {
         SmallBankConfig::standalone_consistent(),
         #[cfg(feature = "persistence")]
         SmallBankConfig::standalone_eventual(),
-        #[cfg(feature = "persistence")]
-        SmallBankConfig::smr(),
     ];
 
     for config in &configs {

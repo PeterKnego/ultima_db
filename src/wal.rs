@@ -286,7 +286,9 @@ pub(crate) enum WalWriter {
 
 /// Handle for the background WAL writer thread.
 pub(crate) struct WalHandle {
-    pub writer: WalWriter,
+    /// The writer is wrapped in Option so Drop can take ownership of the sender
+    /// and drop it before joining the background thread.
+    pub writer: Option<WalWriter>,
     /// Join handle for the background thread (Eventual mode only).
     bg_thread: Option<thread::JoinHandle<()>>,
     /// Number of WAL entries sent but not yet fsynced (Eventual mode only).
@@ -310,7 +312,7 @@ impl WalHandle {
                 .open(&wal_path)
                 .map_err(|e| Error::Persistence(e.to_string()))?;
             Ok(Self {
-                writer: WalWriter::Consistent { file },
+                writer: Some(WalWriter::Consistent { file }),
                 bg_thread: None,
                 in_flight,
             })
@@ -323,17 +325,25 @@ impl WalHandle {
                     .append(true)
                     .open(&wal_path)
                     .expect("failed to open WAL file in background thread");
-                for entry in rx {
-                    if write_entry_to_file(&mut file, &entry).is_err() {
-                        bg_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
+                // Block on the first entry, then drain all queued entries
+                // so they share a single fsync.
+                while let Ok(first) = rx.recv() {
+                    let mut count = 1u64;
+                    if write_entry_to_file(&mut file, &first).is_err() {
+                        count = 0;
+                    }
+                    while let Ok(entry) = rx.try_recv() {
+                        count += 1;
+                        if write_entry_to_file(&mut file, &entry).is_err() {
+                            count -= 1;
+                        }
                     }
                     let _ = file.sync_all();
-                    bg_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    bg_in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
                 }
             });
             Ok(Self {
-                writer: WalWriter::Eventual { sender: tx },
+                writer: Some(WalWriter::Eventual { sender: tx }),
                 bg_thread: Some(handle),
                 in_flight,
             })
@@ -342,7 +352,7 @@ impl WalHandle {
 
     /// Write a WAL entry. Blocks for Consistent, returns immediately for Eventual.
     pub fn write(&mut self, entry: WalEntry) -> Result<()> {
-        match &mut self.writer {
+        match self.writer.as_mut().expect("WalHandle used after drop") {
             WalWriter::Consistent { file } => {
                 write_entry_to_file(file, &entry)?;
                 file.sync_all()
@@ -365,11 +375,15 @@ impl WalHandle {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Shut down the background thread (if any), waiting for it to drain.
-    pub fn shutdown(self) {
-        // Drop the writer (and its sender) first.
-        drop(self.writer);
-        if let Some(handle) = self.bg_thread {
+}
+
+impl Drop for WalHandle {
+    fn drop(&mut self) {
+        // Drop the writer (and its channel sender) first so the background
+        // thread's `for entry in rx` loop exits after draining pending entries.
+        self.writer.take();
+        // Join the background thread to ensure all entries are fsynced.
+        if let Some(handle) = self.bg_thread.take() {
             let _ = handle.join();
         }
     }
@@ -547,7 +561,6 @@ mod tests {
 
         let entries = read_wal(&wal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 2);
-        handle.shutdown();
     }
 
     #[test]
@@ -555,8 +568,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut handle = WalHandle::new(dir.path(), false).unwrap();
         handle.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
-        // Shutdown to ensure background thread flushes.
-        handle.shutdown();
+        // Drop flushes the background thread.
+        drop(handle);
 
         let entries = read_wal(&wal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 1);

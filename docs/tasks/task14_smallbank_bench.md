@@ -50,18 +50,19 @@ SmallBank's original purpose is studying contention. The benchmark includes a bu
 - **Low contention**: Zipfian across full 10,000-account keyspace
 - **High contention**: Zipfian across only 10 hot accounts (maximizes conflicts)
 
-Abort rates are reported at the end of each contention scenario. The burst pattern is an artifact of single-threaded execution (`WriteTx` is not `Send`) — all 4 writers fully overlap, producing ~75% abort rate at high contention.
+The burst pattern is an artifact of single-threaded execution (`WriteTx` is not `Send`) — all 4 writers fully overlap, producing ~75% abort rate at high contention. Abort rate reporting was removed since it's a structural constant of the burst pattern, not a meaningful metric.
 
 ### Parameterizable configs
 
-`SmallBankConfig` controls the store configuration. Four presets:
+`SmallBankConfig` controls the store configuration. Three presets:
 
 | Config                   | Feature gate   | Persistence mode | Durability |
 |--------------------------|---------------|------------------|------------|
 | `inmemory`               | always         | None             | N/A        |
 | `standalone_consistent`  | `persistence`  | Standalone       | Consistent (sync fsync) |
 | `standalone_eventual`    | `persistence`  | Standalone       | Eventual (async fsync) |
-| `smr`                    | `persistence`  | SMR              | Checkpoint-only |
+
+SMR was removed — without checkpoint calls during the benchmark it takes the identical code path as inmemory, producing no useful comparison.
 
 Each config runs all three workloads plus both contention scenarios.
 
@@ -83,7 +84,7 @@ For Eventual durability, the benchmark samples `Store::pending_wal_writes()` aft
 
 ### Supporting changes
 
-- **`src/wal.rs`**: Added `in_flight: Arc<AtomicU64>` to `WalHandle`, `pending_writes()` method. Made `WalOp`, `WalEntry`, `read_wal` public for integration tests.
+- **`src/wal.rs`**: Added `in_flight: Arc<AtomicU64>` to `WalHandle`, `pending_writes()` method. Made `WalOp`, `WalEntry`, `read_wal` public for integration tests. `WalHandle` implements `Drop` to flush pending writes and join the background thread on store shutdown. Eventual mode background thread batches queued entries via `try_recv` before fsyncing.
 - **`src/store.rs`**: Added `wal_enabled: bool` to `WriteTx` to avoid persistence overhead on non-persistent stores. Moved serialization inside the `if let Some(w) = &mut self.wal_ops` guard with early-return pattern. Added `pending_wal_writes()` public method on `Store`.
 
 ### Running

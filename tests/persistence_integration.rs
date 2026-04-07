@@ -282,3 +282,44 @@ fn wal_delete_table_recovery() {
     let rtx = store2.begin_read(None).unwrap();
     assert!(rtx.open_table::<User>("users").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Eventual: drop flushes all pending WAL writes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn eventual_drop_flushes_all_pending_wal_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Eventual);
+    let num_records = 5_000;
+
+    // Write thousands of records in Eventual mode, then immediately drop.
+    {
+        let store = open_store(config.clone());
+        for i in 0..num_records {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User {
+                    name: format!("User_{i}"),
+                    age: i,
+                })
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        // Drop store immediately — pending WAL writes must be flushed.
+    }
+
+    // Recover and verify every record survived.
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(rtx.version(), num_records as u64);
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), num_records as usize);
+    for i in 0..num_records {
+        let id = (i + 1) as u64;
+        let user = table.get(id).unwrap();
+        assert_eq!(user.name, format!("User_{i}"));
+        assert_eq!(user.age, i);
+    }
+}
