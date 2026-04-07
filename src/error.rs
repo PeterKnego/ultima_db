@@ -33,6 +33,10 @@ pub enum Error {
     /// Index queried with a different key type than its definition.
     #[error("index '{0}' queried with wrong key type")]
     IndexTypeMismatch(String),
+    /// Returned when `begin_write(None)` is called but
+    /// [`StoreConfig::require_explicit_version`] is `true`.
+    #[error("explicit version required (require_explicit_version is enabled)")]
+    ExplicitVersionRequired,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -91,5 +95,14 @@ mod tests {
     fn error_version_not_found_displays() {
         let e = Error::VersionNotFound(42);
         assert_eq!(e.to_string(), "snapshot version 42 not found");
+    }
+
+    #[test]
+    fn error_explicit_version_required_displays() {
+        let e = Error::ExplicitVersionRequired;
+        assert_eq!(
+            e.to_string(),
+            "explicit version required (require_explicit_version is enabled)"
+        );
     }
 }

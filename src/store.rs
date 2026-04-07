@@ -3,7 +3,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::index::IndexKind;
@@ -24,7 +24,7 @@ use crate::{Error, Result};
 /// required.
 pub(crate) struct Snapshot {
     pub(crate) version: u64,
-    pub(crate) tables: HashMap<String, Arc<dyn Any>>,
+    pub(crate) tables: BTreeMap<String, Arc<dyn Any>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,13 @@ pub struct StoreConfig {
     pub auto_snapshot_gc: bool,
     /// Writer concurrency mode. Default: [`WriterMode::SingleWriter`].
     pub writer_mode: WriterMode,
+    /// When `true`, [`Store::begin_write`] requires an explicit version
+    /// (`Some(v)`). Calling `begin_write(None)` returns
+    /// [`Error::ExplicitVersionRequired`]. Default: `false`.
+    ///
+    /// Enable this in SMR (state machine replication) deployments where the
+    /// consensus layer assigns log indices as version numbers.
+    pub require_explicit_version: bool,
 }
 
 impl Default for StoreConfig {
@@ -65,6 +72,7 @@ impl Default for StoreConfig {
             num_snapshots_retained: 10,
             auto_snapshot_gc: true,
             writer_mode: WriterMode::SingleWriter,
+            require_explicit_version: false,
         }
     }
 }
@@ -82,11 +90,11 @@ struct CommittedWriteSet {
     /// The snapshot version this transaction committed as.
     version: u64,
     /// Table name → set of modified row IDs.
-    tables: HashMap<String, HashSet<u64>>,
+    tables: BTreeMap<String, BTreeSet<u64>>,
     /// Tables that were deleted during this transaction.
     /// Used to detect cross-table conflicts (e.g., writer A deletes a table
     /// that writer B modified).
-    deleted_tables: HashSet<String>,
+    deleted_tables: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +103,7 @@ struct CommittedWriteSet {
 
 pub(crate) struct StoreInner {
     /// All committed snapshots keyed by version. Version 0 = empty store.
-    pub(crate) snapshots: HashMap<u64, Arc<Snapshot>>,
+    pub(crate) snapshots: BTreeMap<u64, Arc<Snapshot>>,
     pub(crate) latest_version: u64,
     /// Next auto-assigned write version. Always > `latest_version`.
     pub(crate) next_version: u64,
@@ -129,8 +137,8 @@ pub struct Store {
 impl Store {
     /// Creates a new, empty store. The initial version is 0.
     pub fn new(config: StoreConfig) -> Self {
-        let empty = Arc::new(Snapshot { version: 0, tables: HashMap::new() });
-        let mut snapshots = HashMap::new();
+        let empty = Arc::new(Snapshot { version: 0, tables: BTreeMap::new() });
+        let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
         Self {
             inner: Arc::new(RwLock::new(StoreInner {
@@ -176,6 +184,10 @@ impl Store {
     pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
         let mut inner = self.inner.write().unwrap();
 
+        if inner.config.require_explicit_version && version.is_none() {
+            return Err(Error::ExplicitVersionRequired);
+        }
+
         // Enforce single-writer exclusivity.
         match inner.config.writer_mode {
             WriterMode::SingleWriter => {
@@ -213,12 +225,12 @@ impl Store {
 
         Ok(WriteTx {
             base,
-            dirty: HashMap::new(),
+            dirty: BTreeMap::new(),
             version: commit_version,
             store_inner: Arc::clone(&self.inner),
-            deleted_tables: HashSet::new(),
-            write_set: HashMap::new(),
-            ever_deleted_tables: HashSet::new(),
+            deleted_tables: BTreeSet::new(),
+            write_set: BTreeMap::new(),
+            ever_deleted_tables: BTreeSet::new(),
             writer_mode,
             needs_cleanup: true,
         })
@@ -283,14 +295,13 @@ fn prune_write_sets(inner: &mut StoreInner) {
 
 /// Run GC on an already-locked `StoreInner`.
 fn gc_inner(inner: &mut StoreInner) {
-    let mut versions: Vec<u64> = inner.snapshots.keys().copied().collect();
-    versions.sort_unstable();
+    let versions: Vec<u64> = inner.snapshots.keys().copied().collect();
 
     // The N most recent versions to retain unconditionally.
     // latest_version is always kept (even if num_snapshots_retained is 0).
     let retain_count = inner.config.num_snapshots_retained.max(1);
     let cutoff_idx = versions.len().saturating_sub(retain_count);
-    let protected: HashSet<u64> = versions[cutoff_idx..].iter().copied().collect();
+    let protected: BTreeSet<u64> = versions[cutoff_idx..].iter().copied().collect();
 
     inner.snapshots.retain(|&v, snapshot| {
         protected.contains(&v) || Arc::strong_count(snapshot) > 1
@@ -382,18 +393,18 @@ impl Readable for ReadTx {
 pub struct WriteTx {
     base: Arc<Snapshot>,
     /// Mutable working copies of tables opened for writing.
-    dirty: HashMap<String, Box<dyn Any>>,
+    dirty: BTreeMap<String, Box<dyn Any>>,
     /// The version number that will be assigned to the new snapshot on commit.
     version: u64,
     /// Reference back to the store's interior state, used during commit.
     store_inner: Arc<RwLock<StoreInner>>,
     /// Tables explicitly deleted in this transaction (cleared on re-open).
-    deleted_tables: HashSet<String>,
+    deleted_tables: BTreeSet<String>,
     /// Keys modified during this transaction, per table (MultiWriter only).
-    write_set: HashMap<String, HashSet<u64>>,
+    write_set: BTreeMap<String, BTreeSet<u64>>,
     /// Tables ever deleted during this tx (not cleared on re-open).
     /// Used for conflict detection in MultiWriter mode.
-    ever_deleted_tables: HashSet<String>,
+    ever_deleted_tables: BTreeSet<String>,
     /// Writer mode at the time this transaction was created.
     writer_mode: WriterMode,
     /// Set to `true` on successful commit so `Drop` skips cleanup.
@@ -414,7 +425,7 @@ pub struct WriteTx {
 /// and the only overhead is an `Option` check per write call.
 pub struct TableWriter<'tx, R: Send + Sync + 'static> {
     table: &'tx mut Table<R>,
-    write_set: Option<&'tx mut HashSet<u64>>,
+    write_set: Option<&'tx mut BTreeSet<u64>>,
 }
 
 impl<'tx, R: Send + Sync + 'static> TableWriter<'tx, R> {
@@ -641,7 +652,7 @@ impl WriteTx {
         }
 
         // --- Build the new table map ---
-        let mut new_tables: HashMap<String, Arc<dyn Any>> = self
+        let mut new_tables: BTreeMap<String, Arc<dyn Any>> = self
             .base
             .tables
             .iter()
@@ -708,16 +719,14 @@ impl WriteTx {
 
     /// Returns the names of all tables visible in this transaction.
     pub fn table_names(&self) -> Vec<String> {
-        let mut names: std::collections::HashSet<String> = self.base.tables.keys().cloned().collect();
+        let mut names: BTreeSet<String> = self.base.tables.keys().cloned().collect();
         for name in self.dirty.keys() {
             names.insert(name.clone());
         }
         for name in &self.deleted_tables {
             names.remove(name);
         }
-        let mut result: Vec<String> = names.into_iter().collect();
-        result.sort();
-        result
+        names.into_iter().collect()
     }
 
     /// Check for write-write conflicts against committed transactions.
@@ -1388,5 +1397,65 @@ mod tests {
         wtx_a.commit().unwrap();
         let err = wtx_b.commit().unwrap_err();
         assert!(matches!(err, Error::WriteConflict { ref table, .. } if table == "t"));
+    }
+
+    #[test]
+    fn require_explicit_version_rejects_none() {
+        let store = Store::new(StoreConfig {
+            require_explicit_version: true,
+            ..StoreConfig::default()
+        });
+        let result = store.begin_write(None);
+        assert!(matches!(result, Err(Error::ExplicitVersionRequired)));
+    }
+
+    #[test]
+    fn require_explicit_version_accepts_explicit() {
+        let store = Store::new(StoreConfig {
+            require_explicit_version: true,
+            ..StoreConfig::default()
+        });
+        let wtx = store.begin_write(Some(1)).unwrap();
+        assert_eq!(wtx.version(), 1);
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn require_explicit_version_default_is_false() {
+        let config = StoreConfig::default();
+        assert!(!config.require_explicit_version);
+    }
+
+    /// Snapshot table iteration is deterministic (alphabetical by name).
+    #[test]
+    fn snapshot_tables_iterate_in_deterministic_order() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("zebra").unwrap().insert("z".into()).unwrap();
+            wtx.open_table::<String>("apple").unwrap().insert("a".into()).unwrap();
+            wtx.open_table::<String>("mango").unwrap().insert("m".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let rtx = store.begin_read(None).unwrap();
+        let names = rtx.table_names();
+        assert_eq!(names, vec!["apple", "mango", "zebra"]);
+    }
+
+    /// GC operates on versions in deterministic order.
+    #[test]
+    fn gc_version_ordering_is_deterministic() {
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 2,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        });
+        for _ in 0..5 {
+            store.begin_write(None).unwrap().commit().unwrap();
+        }
+        store.gc();
+        assert!(store.has_snapshot(4));
+        assert!(store.has_snapshot(5));
+        assert!(!store.has_snapshot(3));
     }
 }

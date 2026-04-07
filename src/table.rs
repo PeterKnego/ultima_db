@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -44,20 +44,20 @@ impl<R: 'static> TableOpener<R> for TableDef<R> {
 pub struct Table<R> {
     data: BTree<u64, R>,
     next_id: u64,
-    indexes: HashMap<String, Box<dyn IndexMaintainer<R>>>,
+    indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>>,
 }
 
 /// Captured table state for atomic batch rollback.
 struct TableSnapshot<R> {
     data: BTree<u64, R>,
     next_id: u64,
-    indexes: HashMap<String, Box<dyn IndexMaintainer<R>>>,
+    indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>>,
 }
 
 impl<R: Send + Sync + 'static> Table<R> {
     /// Creates a new, empty table with auto-incrementing IDs starting at 1.
     pub fn new() -> Self {
-        Self { data: BTree::new(), next_id: 1, indexes: HashMap::new() }
+        Self { data: BTree::new(), next_id: 1, indexes: BTreeMap::new() }
     }
 
     /// Insert a record. Returns the auto-assigned ID, or an error if a unique
@@ -1306,5 +1306,31 @@ mod tests {
         assert_eq!(results[0], Some(&"a".to_string()));
         assert_eq!(results[1], Some(&"c".to_string()));
         assert_eq!(results[2], None);
+    }
+
+    /// Indexes are maintained in deterministic (alphabetical) order.
+    /// This ensures identical error messages across replicas when a
+    /// constraint violation occurs.
+    #[test]
+    fn index_maintenance_order_is_deterministic() {
+        let mut table: Table<(String, String)> = Table::new();
+        table
+            .define_index("zzz_idx", IndexKind::Unique, |r: &(String, String)| {
+                r.0.clone()
+            })
+            .unwrap();
+        table
+            .define_index("aaa_idx", IndexKind::Unique, |r: &(String, String)| {
+                r.1.clone()
+            })
+            .unwrap();
+        table.insert(("x".into(), "y".into())).unwrap();
+
+        // This violates both indexes. With BTreeMap, "aaa_idx" is checked first.
+        let err = table.insert(("x".into(), "y".into())).unwrap_err();
+        assert!(
+            matches!(err, Error::DuplicateKey(ref name) if name == "aaa_idx"),
+            "expected DuplicateKey(aaa_idx), got: {err:?}"
+        );
     }
 }
