@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/save bench/compare bench/flamegraph
+.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph
 
 build:
 	cargo build
@@ -72,6 +72,18 @@ bench/multiwriter/compare:
 	cargo bench --bench ycsb_multiwriter_rocksdb_bench -- --save-baseline mw-rocksdb
 	cargo bench --bench ycsb_multiwriter_fjall_bench -- --save-baseline mw-fjall
 	critcmp mw-ultima mw-rocksdb mw-fjall
+
+# SmallBank multi-table transactional benchmark
+
+bench/smallbank:
+	$(call check_cmd,critcmp)
+	cargo bench --bench smallbank_bench
+	critcmp smallbank -g '([^/]+)/[^/]+' -f smallbank
+
+bench/smallbank/persistent:
+	$(call check_cmd,critcmp)
+	cargo bench --bench smallbank_bench --features persistence -- --save-baseline smallbank
+	critcmp smallbank -g '([^/]+)/[^/]+' -f smallbank
 
 # Save a named baseline (usage: make bench/save NAME=main)
 bench/save:

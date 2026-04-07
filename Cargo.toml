@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "ycsb_multiwriter_fjall_bench"
 harness = false
+
+[[bench]]
+name = "smallbank_bench"
+harness = false

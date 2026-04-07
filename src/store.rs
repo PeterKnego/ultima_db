@@ -262,6 +262,8 @@ impl Store {
             needs_cleanup: true,
             #[cfg(feature = "persistence")]
             wal_ops: Vec::new(),
+            #[cfg(feature = "persistence")]
+            wal_enabled: inner.wal_handle.is_some(),
         })
     }
 
@@ -275,6 +277,14 @@ impl Store {
     }
 
     // --- Persistence methods (feature-gated) ---
+
+    /// Returns the number of WAL entries sent but not yet fsynced.
+    /// Only meaningful in Eventual durability mode; returns 0 otherwise.
+    #[cfg(feature = "persistence")]
+    pub fn pending_wal_writes(&self) -> u64 {
+        let inner = self.inner.read().unwrap();
+        inner.wal_handle.as_ref().map_or(0, |h| h.pending_writes())
+    }
 
     /// Register a table type for persistence. Must be called before any
     /// transactions that touch this table, and before [`Store::open`] or
@@ -611,6 +621,9 @@ pub struct WriteTx {
     /// WAL operations accumulated during this transaction (persistence only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_ops: Vec<crate::wal::WalOp>,
+    /// Whether WAL tracking is active (true only when a WAL handle exists).
+    #[cfg(feature = "persistence")]
+    wal_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -645,14 +658,16 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Insert a record. Returns the auto-assigned ID.
     pub fn insert(&mut self, record: R) -> Result<u64> {
         #[cfg(feature = "persistence")]
-        let data = self.serialize_record(&record)?;
+        if let Some(w) = &mut self.wal_ops {
+            let data = Self::serialize_record(&record)?;
+            let id = self.table.insert(record)?;
+            if let Some(ws) = &mut self.write_set { ws.insert(id); }
+            w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data });
+            return Ok(id);
+        }
         let id = self.table.insert(record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
-        }
-        #[cfg(feature = "persistence")]
-        if let Some(w) = &mut self.wal_ops {
-            w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data });
         }
         Ok(id)
     }
@@ -660,14 +675,16 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Update a record by its ID.
     pub fn update(&mut self, id: u64, record: R) -> Result<()> {
         #[cfg(feature = "persistence")]
-        let data = self.serialize_record(&record)?;
+        if let Some(w) = &mut self.wal_ops {
+            let data = Self::serialize_record(&record)?;
+            self.table.update(id, record)?;
+            if let Some(ws) = &mut self.write_set { ws.insert(id); }
+            w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
+            return Ok(());
+        }
         self.table.update(id, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
-        }
-        #[cfg(feature = "persistence")]
-        if let Some(w) = &mut self.wal_ops {
-            w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
         }
         Ok(())
     }
@@ -688,18 +705,20 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Insert multiple records atomically.
     pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
         #[cfg(feature = "persistence")]
-        let data_list: Vec<Vec<u8>> = records.iter()
-            .map(|r| self.serialize_record(r))
-            .collect::<Result<_>>()?;
-        let ids = self.table.insert_batch(records)?;
-        if let Some(ws) = &mut self.write_set {
-            ws.extend(ids.iter().copied());
-        }
-        #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
+            let data_list: Vec<Vec<u8>> = records.iter()
+                .map(|r| Self::serialize_record(r))
+                .collect::<Result<_>>()?;
+            let ids = self.table.insert_batch(records)?;
+            if let Some(ws) = &mut self.write_set { ws.extend(ids.iter().copied()); }
             for (id, data) in ids.iter().zip(data_list) {
                 w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id: *id, data });
             }
+            return Ok(ids);
+        }
+        let ids = self.table.insert_batch(records)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.extend(ids.iter().copied());
         }
         Ok(ids)
     }
@@ -712,16 +731,17 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             }
         }
         #[cfg(feature = "persistence")]
-        let ops_data: Vec<(u64, Vec<u8>)> = updates.iter()
-            .map(|(id, r)| self.serialize_record(r).map(|d| (*id, d)))
-            .collect::<Result<_>>()?;
-        self.table.update_batch(updates)?;
-        #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
+            let ops_data: Vec<(u64, Vec<u8>)> = updates.iter()
+                .map(|(id, r)| Self::serialize_record(r).map(|d| (*id, d)))
+                .collect::<Result<_>>()?;
+            self.table.update_batch(updates)?;
             for (id, data) in ops_data {
                 w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
             }
+            return Ok(());
         }
+        self.table.update_batch(updates)?;
         Ok(())
     }
 
@@ -741,7 +761,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     }
 
     #[cfg(feature = "persistence")]
-    fn serialize_record(&self, record: &R) -> Result<Vec<u8>> {
+    fn serialize_record(record: &R) -> Result<Vec<u8>> {
         bincode::serde::encode_to_vec(record, bincode::config::standard())
             .map_err(|e| Error::Persistence(e.to_string()))
     }
@@ -892,10 +912,14 @@ impl WriteTx {
             WriterMode::SingleWriter => None,
         };
         #[cfg(feature = "persistence")]
-        let wal_ops = Some(WalOpsWriter {
-            table_name: name_str,
-            ops: &mut self.wal_ops,
-        });
+        let wal_ops = if self.wal_enabled {
+            Some(WalOpsWriter {
+                table_name: name_str,
+                ops: &mut self.wal_ops,
+            })
+        } else {
+            None
+        };
         Ok(TableWriter {
             table,
             write_set,
@@ -995,7 +1019,7 @@ impl WriteTx {
             self.ever_deleted_tables.insert(name.to_string());
         }
         #[cfg(feature = "persistence")]
-        if existed {
+        if existed && self.wal_enabled {
             self.wal_ops.push(crate::wal::WalOp::DeleteTable { name: name.to_string() });
         }
         existed

@@ -10,6 +10,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
@@ -288,6 +289,9 @@ pub(crate) struct WalHandle {
     pub writer: WalWriter,
     /// Join handle for the background thread (Eventual mode only).
     bg_thread: Option<thread::JoinHandle<()>>,
+    /// Number of WAL entries sent but not yet fsynced (Eventual mode only).
+    /// Incremented on send, decremented by the background thread after fsync.
+    pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WalHandle {
@@ -296,6 +300,8 @@ impl WalHandle {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
+
+        let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         if consistent {
             let file = OpenOptions::new()
@@ -306,9 +312,11 @@ impl WalHandle {
             Ok(Self {
                 writer: WalWriter::Consistent { file },
                 bg_thread: None,
+                in_flight,
             })
         } else {
             let (tx, rx) = mpsc::channel::<WalEntry>();
+            let bg_in_flight = in_flight.clone();
             let handle = thread::spawn(move || {
                 let mut file = OpenOptions::new()
                     .create(true)
@@ -317,15 +325,17 @@ impl WalHandle {
                     .expect("failed to open WAL file in background thread");
                 for entry in rx {
                     if write_entry_to_file(&mut file, &entry).is_err() {
-                        // Log error but continue — eventual durability accepts loss.
+                        bg_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                     let _ = file.sync_all();
+                    bg_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
             Ok(Self {
                 writer: WalWriter::Eventual { sender: tx },
                 bg_thread: Some(handle),
+                in_flight,
             })
         }
     }
@@ -340,12 +350,19 @@ impl WalHandle {
                 Ok(())
             }
             WalWriter::Eventual { sender } => {
+                self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Channel send can only fail if the receiver is dropped (thread panicked).
                 sender.send(entry)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
                 Ok(())
             }
         }
+    }
+
+    /// Returns the number of WAL entries sent but not yet fsynced (Eventual mode).
+    /// Always 0 for Consistent mode.
+    pub fn pending_writes(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shut down the background thread (if any), waiting for it to drain.
@@ -378,9 +395,22 @@ mod tests {
         age: u32,
     }
 
+    /// Create a store with WAL enabled (Standalone/Consistent) so wal_ops are tracked.
+    fn wal_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(crate::StoreConfig {
+            persistence: crate::Persistence::Standalone {
+                dir: dir.path().to_path_buf(),
+                durability: crate::Durability::Consistent,
+            },
+            ..crate::StoreConfig::default()
+        });
+        (store, dir)
+    }
+
     #[test]
     fn wal_ops_captured_on_insert_update_delete() {
-        let store = Store::default();
+        let (store, _dir) = wal_store();
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut t = wtx.open_table::<User>("users").unwrap();
@@ -398,7 +428,7 @@ mod tests {
 
     #[test]
     fn wal_ops_captured_on_delete_table() {
-        let store = Store::default();
+        let (store, _dir) = wal_store();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
@@ -412,7 +442,7 @@ mod tests {
 
     #[test]
     fn wal_ops_captured_on_batch_operations() {
-        let store = Store::default();
+        let (store, _dir) = wal_store();
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut t = wtx.open_table::<User>("users").unwrap();
