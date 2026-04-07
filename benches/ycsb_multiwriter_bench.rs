@@ -31,6 +31,7 @@ fn make_store(mode: WriterMode) -> Store {
         num_snapshots_retained: 2,
         auto_snapshot_gc: true,
         writer_mode: mode,
+        require_explicit_version: false,
     });
     // Preload table with NUM_RECORDS rows
     let mut wtx = store.begin_write(None).unwrap();
@@ -153,6 +154,7 @@ fn bench_no_contention(c: &mut Criterion) {
         num_snapshots_retained: 2,
         auto_snapshot_gc: true,
         writer_mode: WriterMode::MultiWriter,
+        require_explicit_version: false,
     });
     // Preload each writer's table
     for w in 0..MW_WRITERS {
