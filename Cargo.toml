@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Embedded in-memory B-tree store with MVCC"
 
+[features]
+default = []
+persistence = ["dep:serde", "dep:bincode"]
+
 [dependencies]
 thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

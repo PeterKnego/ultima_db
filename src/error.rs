@@ -37,6 +37,18 @@ pub enum Error {
     /// [`StoreConfig::require_explicit_version`] is `true`.
     #[error("explicit version required (require_explicit_version is enabled)")]
     ExplicitVersionRequired,
+    /// An I/O or format error during persistence operations (WAL or checkpoint).
+    #[error("persistence error: {0}")]
+    Persistence(String),
+    /// Table not registered in the type registry (required for persistence).
+    #[error("table '{0}' not registered in type registry")]
+    TableNotRegistered(String),
+    /// WAL file is corrupted (bad CRC, truncated entry, etc.).
+    #[error("WAL corrupted: {0}")]
+    WalCorrupted(String),
+    /// Checkpoint file is corrupted (bad magic, bad CRC, truncated, etc.).
+    #[error("checkpoint corrupted: {0}")]
+    CheckpointCorrupted(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

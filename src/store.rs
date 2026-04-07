@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::index::IndexKind;
+use crate::persistence::Record;
 use crate::table::{Table, TableOpener};
 use crate::{Error, Result};
 
@@ -22,6 +23,7 @@ use crate::{Error, Result};
 /// `Snapshot` is not `Send + Sync` because `dyn Any` does not require those
 /// bounds. Task 4 will add `Send + Sync` bounds when multi-threaded access is
 /// required.
+#[derive(Clone)]
 pub(crate) struct Snapshot {
     pub(crate) version: u64,
     pub(crate) tables: BTreeMap<String, Arc<dyn Any>>,
@@ -64,6 +66,9 @@ pub struct StoreConfig {
     /// Enable this in SMR (state machine replication) deployments where the
     /// consensus layer assigns log indices as version numbers.
     pub require_explicit_version: bool,
+    /// Persistence mode. Default: [`Persistence::None`] (in-memory only).
+    #[cfg(feature = "persistence")]
+    pub persistence: crate::persistence::Persistence,
 }
 
 impl Default for StoreConfig {
@@ -73,6 +78,8 @@ impl Default for StoreConfig {
             auto_snapshot_gc: true,
             writer_mode: WriterMode::SingleWriter,
             require_explicit_version: false,
+            #[cfg(feature = "persistence")]
+            persistence: crate::persistence::Persistence::None,
         }
     }
 }
@@ -115,6 +122,12 @@ pub(crate) struct StoreInner {
     /// Write sets from recently committed transactions (MultiWriter mode only).
     /// Pruned when no in-flight writer has a base version ≤ entry.version.
     committed_write_sets: Vec<CommittedWriteSet>,
+    /// WAL writer handle (persistence feature, Standalone mode only).
+    #[cfg(feature = "persistence")]
+    pub(crate) wal_handle: Option<crate::wal::WalHandle>,
+    /// Type registry for serialization (persistence feature only).
+    #[cfg(feature = "persistence")]
+    pub(crate) registry: crate::registry::TableRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +150,16 @@ pub struct Store {
 impl Store {
     /// Creates a new, empty store. The initial version is 0.
     pub fn new(config: StoreConfig) -> Self {
+        #[cfg(feature = "persistence")]
+        let wal_handle = match &config.persistence {
+            crate::persistence::Persistence::Standalone { dir, durability } => {
+                let consistent = matches!(durability, crate::persistence::Durability::Consistent);
+                Some(crate::wal::WalHandle::new(dir, consistent)
+                    .expect("failed to initialize WAL"))
+            }
+            _ => None,
+        };
+
         let empty = Arc::new(Snapshot { version: 0, tables: BTreeMap::new() });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
@@ -149,6 +172,10 @@ impl Store {
                 active_writer_count: 0,
                 active_writer_base_versions: Vec::new(),
                 committed_write_sets: Vec::new(),
+                #[cfg(feature = "persistence")]
+                wal_handle,
+                #[cfg(feature = "persistence")]
+                registry: crate::registry::TableRegistry::default(),
             })),
         }
     }
@@ -233,6 +260,8 @@ impl Store {
             ever_deleted_tables: BTreeSet::new(),
             writer_mode,
             needs_cleanup: true,
+            #[cfg(feature = "persistence")]
+            wal_ops: Vec::new(),
         })
     }
 
@@ -245,7 +274,177 @@ impl Store {
         gc_inner(&mut inner);
     }
 
+    // --- Persistence methods (feature-gated) ---
+
+    /// Register a table type for persistence. Must be called before any
+    /// transactions that touch this table, and before [`Store::open`] or
+    /// [`Store::checkpoint`].
+    #[cfg(feature = "persistence")]
+    pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
+        let mut inner = self.inner.write().unwrap();
+        inner.registry.register::<R>(name)
+    }
+
+    /// Write a checkpoint of the latest snapshot to disk.
+    ///
+    /// Blocks the caller until the checkpoint is fully written and fsynced.
+    /// The store continues serving reads and writes during serialization
+    /// (only the caller thread blocks).
+    ///
+    /// In `Standalone` mode, the WAL is pruned after the checkpoint is written.
+    /// Returns the version of the checkpointed snapshot.
+    #[cfg(feature = "persistence")]
+    pub fn checkpoint(&self) -> Result<u64> {
+        let inner = self.inner.read().unwrap();
+        let dir = match &inner.config.persistence {
+            crate::persistence::Persistence::Standalone { dir, .. }
+            | crate::persistence::Persistence::Smr { dir } => dir.clone(),
+            crate::persistence::Persistence::None => {
+                return Err(Error::Persistence("checkpoint requires persistence to be configured".into()));
+            }
+        };
+        let snap = inner.snapshots[&inner.latest_version].clone();
+        let registry = &inner.registry;
+
+        let version = crate::checkpoint::write_checkpoint(&dir, &snap, registry)?;
+        drop(inner); // release read lock
+
+        // Prune WAL in Standalone mode
+        let inner = self.inner.read().unwrap();
+        if matches!(inner.config.persistence, crate::persistence::Persistence::Standalone { .. }) {
+            let wal_path = crate::wal::wal_path(&dir);
+            crate::wal::prune_wal(&wal_path, version)?;
+        }
+
+        // Clean up old checkpoints
+        crate::checkpoint::cleanup_old_checkpoints(&dir, version)?;
+
+        Ok(version)
+    }
+
+    /// Recover state from disk (checkpoint + WAL replay).
+    ///
+    /// Call this after creating the store with [`Store::new`] and registering
+    /// all table types with [`Store::register_table`].
+    ///
+    /// 1. Loads the latest checkpoint (if any).
+    /// 2. In Standalone mode, replays WAL entries after the checkpoint.
+    ///
+    /// For `Persistence::None`, this is a no-op.
+    #[cfg(feature = "persistence")]
+    pub fn recover(&self) -> Result<()> {
+        use crate::persistence::Persistence;
+
+        let dir = {
+            let inner = self.inner.read().unwrap();
+            match &inner.config.persistence {
+                Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
+                Persistence::None => return Ok(()),
+            }
+        };
+
+        // Load latest checkpoint if present.
+        if let Some(cp_path) = crate::checkpoint::find_latest_checkpoint(&dir)? {
+            let inner = self.inner.read().unwrap();
+            let snapshot = crate::checkpoint::load_checkpoint(&cp_path, &inner.registry)?;
+            drop(inner);
+
+            let mut inner = self.inner.write().unwrap();
+            let v = snapshot.version;
+            inner.snapshots.insert(v, Arc::new(snapshot));
+            inner.latest_version = v;
+            if v >= inner.next_version {
+                inner.next_version = v + 1;
+            }
+        }
+
+        // Replay WAL entries (Standalone mode only).
+        {
+            let inner = self.inner.read().unwrap();
+            if matches!(inner.config.persistence, Persistence::Standalone { .. }) {
+                let wal_path_buf = crate::wal::wal_path(&dir);
+                let entries = crate::wal::read_wal(&wal_path_buf)?;
+                let base_version = inner.latest_version;
+                drop(inner);
+
+                let to_replay: Vec<_> = entries.iter()
+                    .filter(|e| e.version > base_version)
+                    .collect();
+
+                if !to_replay.is_empty() {
+                    let mut inner = self.inner.write().unwrap();
+                    // Build a new table map with sole ownership of each Arc.
+                    // We re-wrap each table in a fresh Arc so Arc::get_mut succeeds during replay.
+                    let base_snap = &inner.snapshots[&inner.latest_version];
+                    let mut tables: BTreeMap<String, Arc<dyn Any>> = base_snap.tables.iter()
+                        .map(|(name, arc)| {
+                            let info = inner.registry.get(name).unwrap();
+                            let bytes = (info.serialize_table)(arc.as_ref()).unwrap();
+                            let new_table = (info.deserialize_table)(&bytes).unwrap();
+                            (name.clone(), Arc::from(new_table))
+                        })
+                        .collect();
+                    let mut latest_version = inner.latest_version;
+
+                    for entry in &to_replay {
+                        for op in &entry.ops {
+                            match op {
+                                crate::wal::WalOp::Insert { table, id, data }
+                                | crate::wal::WalOp::Update { table, id, data } => {
+                                    let info = inner.registry.get(table)
+                                        .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
+
+                                    if !tables.contains_key(table) {
+                                        tables.insert(table.clone(), Arc::from((info.new_empty_table)()));
+                                    }
+
+                                    let table_arc = tables.get_mut(table).unwrap();
+                                    let table_mut = Arc::get_mut(table_arc)
+                                        .ok_or_else(|| Error::Persistence(
+                                            "table Arc has multiple references during replay".into()
+                                        ))?;
+
+                                    if matches!(op, crate::wal::WalOp::Insert { .. }) {
+                                        (info.replay_insert)(table_mut, *id, data)?;
+                                    } else {
+                                        (info.replay_update)(table_mut, *id, data)?;
+                                    }
+                                }
+                                crate::wal::WalOp::Delete { table, id } => {
+                                    let info = inner.registry.get(table)
+                                        .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
+                                    if let Some(table_arc) = tables.get_mut(table) {
+                                        let table_mut = Arc::get_mut(table_arc)
+                                            .ok_or_else(|| Error::Persistence(
+                                                "table Arc has multiple references during replay".into()
+                                            ))?;
+                                        (info.replay_delete)(table_mut, *id)?;
+                                    }
+                                }
+                                crate::wal::WalOp::CreateTable { .. } => {}
+                                crate::wal::WalOp::DeleteTable { name } => {
+                                    tables.remove(name);
+                                }
+                            }
+                        }
+                        latest_version = entry.version;
+                    }
+
+                    let snapshot = Arc::new(Snapshot { version: latest_version, tables });
+                    inner.snapshots.insert(latest_version, snapshot);
+                    inner.latest_version = latest_version;
+                    if latest_version >= inner.next_version {
+                        inner.next_version = latest_version + 1;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     // --- Test helpers ---
+
 
     #[cfg(test)]
     fn snapshot_count(&self) -> usize {
@@ -333,7 +532,7 @@ pub struct ReadTx {
 /// accept `impl Readable` instead of a concrete transaction type.
 pub trait Readable {
     /// Borrow a table from this snapshot.
-    fn open_table<R: Send + Sync + 'static>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>>;
+    fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>>;
     /// Returns the names of all tables in this snapshot, sorted alphabetically.
     fn table_names(&self) -> Vec<String>;
     /// The version number this snapshot reads from.
@@ -358,7 +557,7 @@ impl ReadTx {
     /// Returns [`Error::KeyNotFound`] if the table does not exist in this
     /// snapshot, or [`Error::TypeMismatch`] if it was created with a different
     /// record type.
-    pub fn open_table<R: Send + Sync + 'static>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>> {
+    pub fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>> {
         let name = opener.table_name();
         self.snapshot
             .tables
@@ -370,7 +569,7 @@ impl ReadTx {
 }
 
 impl Readable for ReadTx {
-    fn open_table<R: Send + Sync + 'static>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>> {
+    fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>> {
         ReadTx::open_table(self, opener)
     }
 
@@ -409,6 +608,9 @@ pub struct WriteTx {
     writer_mode: WriterMode,
     /// Set to `true` on successful commit so `Drop` skips cleanup.
     needs_cleanup: bool,
+    /// WAL operations accumulated during this transaction (persistence only).
+    #[cfg(feature = "persistence")]
+    pub(crate) wal_ops: Vec<crate::wal::WalOp>,
 }
 
 // ---------------------------------------------------------------------------
@@ -423,28 +625,49 @@ pub struct WriteTx {
 ///
 /// In [`WriterMode::SingleWriter`] mode, write-set tracking is skipped
 /// and the only overhead is an `Option` check per write call.
-pub struct TableWriter<'tx, R: Send + Sync + 'static> {
+pub struct TableWriter<'tx, R: Record> {
     table: &'tx mut Table<R>,
     write_set: Option<&'tx mut BTreeSet<u64>>,
+    #[cfg(feature = "persistence")]
+    wal_ops: Option<WalOpsWriter<'tx>>,
 }
 
-impl<'tx, R: Send + Sync + 'static> TableWriter<'tx, R> {
+/// Bundles the table name and ops list for WAL tracking in TableWriter.
+#[cfg(feature = "persistence")]
+struct WalOpsWriter<'tx> {
+    table_name: String,
+    ops: &'tx mut Vec<crate::wal::WalOp>,
+}
+
+impl<'tx, R: Record> TableWriter<'tx, R> {
     // --- Write methods (tracked) ---
 
     /// Insert a record. Returns the auto-assigned ID.
     pub fn insert(&mut self, record: R) -> Result<u64> {
+        #[cfg(feature = "persistence")]
+        let data = self.serialize_record(&record)?;
         let id = self.table.insert(record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
+        }
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data });
         }
         Ok(id)
     }
 
     /// Update a record by its ID.
     pub fn update(&mut self, id: u64, record: R) -> Result<()> {
+        #[cfg(feature = "persistence")]
+        let data = self.serialize_record(&record)?;
         self.table.update(id, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
+        }
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
         }
         Ok(())
     }
@@ -455,14 +678,28 @@ impl<'tx, R: Send + Sync + 'static> TableWriter<'tx, R> {
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            w.ops.push(crate::wal::WalOp::Delete { table: w.table_name.clone(), id });
+        }
         Ok(old)
     }
 
     /// Insert multiple records atomically.
     pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
+        #[cfg(feature = "persistence")]
+        let data_list: Vec<Vec<u8>> = records.iter()
+            .map(|r| self.serialize_record(r))
+            .collect::<Result<_>>()?;
         let ids = self.table.insert_batch(records)?;
         if let Some(ws) = &mut self.write_set {
             ws.extend(ids.iter().copied());
+        }
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            for (id, data) in ids.iter().zip(data_list) {
+                w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id: *id, data });
+            }
         }
         Ok(ids)
     }
@@ -474,7 +711,18 @@ impl<'tx, R: Send + Sync + 'static> TableWriter<'tx, R> {
                 ws.insert(id);
             }
         }
-        self.table.update_batch(updates)
+        #[cfg(feature = "persistence")]
+        let ops_data: Vec<(u64, Vec<u8>)> = updates.iter()
+            .map(|(id, r)| self.serialize_record(r).map(|d| (*id, d)))
+            .collect::<Result<_>>()?;
+        self.table.update_batch(updates)?;
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            for (id, data) in ops_data {
+                w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
+            }
+        }
+        Ok(())
     }
 
     /// Delete multiple records atomically.
@@ -483,7 +731,19 @@ impl<'tx, R: Send + Sync + 'static> TableWriter<'tx, R> {
         if let Some(ws) = &mut self.write_set {
             ws.extend(ids.iter().copied());
         }
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            for &id in ids {
+                w.ops.push(crate::wal::WalOp::Delete { table: w.table_name.clone(), id });
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(feature = "persistence")]
+    fn serialize_record(&self, record: &R) -> Result<Vec<u8>> {
+        bincode::serde::encode_to_vec(record, bincode::config::standard())
+            .map_err(|e| Error::Persistence(e.to_string()))
     }
 
     // --- Read methods (pass-through) ---
@@ -604,7 +864,7 @@ impl WriteTx {
     ///
     /// Returns a [`TableWriter`] that tracks modified keys for OCC validation
     /// in [`WriterMode::MultiWriter`] mode.
-    pub fn open_table<R: Send + Sync + 'static>(&mut self, opener: impl TableOpener<R>) -> Result<TableWriter<'_, R>> {
+    pub fn open_table<R: Record>(&mut self, opener: impl TableOpener<R>) -> Result<TableWriter<'_, R>> {
         let name = opener.table_name();
         if !self.dirty.contains_key(name) {
             let table: Table<R> = if self.deleted_tables.contains(name) {
@@ -628,10 +888,20 @@ impl WriteTx {
             .downcast_mut::<Table<R>>()
             .ok_or_else(|| Error::TypeMismatch(name_str.clone()))?;
         let write_set = match self.writer_mode {
-            WriterMode::MultiWriter => Some(self.write_set.entry(name_str).or_default()),
+            WriterMode::MultiWriter => Some(self.write_set.entry(name_str.clone()).or_default()),
             WriterMode::SingleWriter => None,
         };
-        Ok(TableWriter { table, write_set })
+        #[cfg(feature = "persistence")]
+        let wal_ops = Some(WalOpsWriter {
+            table_name: name_str,
+            ops: &mut self.wal_ops,
+        });
+        Ok(TableWriter {
+            table,
+            write_set,
+            #[cfg(feature = "persistence")]
+            wal_ops,
+        })
     }
 
     /// Commit this transaction, creating a new snapshot in the store.
@@ -649,6 +919,16 @@ impl WriteTx {
         {
             drop(inner); // release lock before Drop runs
             return Err(conflict);
+        }
+
+        // --- Write WAL entry (persistence, Standalone mode only) ---
+        #[cfg(feature = "persistence")]
+        if let Some(wal) = &mut inner.wal_handle {
+            let ops = std::mem::take(&mut self.wal_ops);
+            if !ops.is_empty() {
+                let entry = crate::wal::WalEntry { version: self.version, ops };
+                wal.write(entry)?;
+            }
         }
 
         // --- Build the new table map ---
@@ -713,6 +993,10 @@ impl WriteTx {
         let existed = existed_in_dirty || existed_in_base;
         if existed && matches!(self.writer_mode, WriterMode::MultiWriter) {
             self.ever_deleted_tables.insert(name.to_string());
+        }
+        #[cfg(feature = "persistence")]
+        if existed {
+            self.wal_ops.push(crate::wal::WalOp::DeleteTable { name: name.to_string() });
         }
         existed
     }

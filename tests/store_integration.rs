@@ -380,6 +380,7 @@ fn old_read_snapshot_survives_many_writes() {
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 struct User {
     email: String,
     age: u32,
@@ -1381,6 +1382,7 @@ fn read_tx_table_names_empty_store() {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 #[allow(dead_code)]
 struct TestRecord {
     name: String,

@@ -2,6 +2,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::btree::BTree;
+use crate::persistence::Record;
 use crate::{Error, Result};
 
 /// Whether an index enforces uniqueness.
@@ -75,7 +76,7 @@ impl<R, K, S> IndexMaintainer<R> for ManagedIndex<R, K, S>
 where
     K: Ord + Clone + Send + Sync + 'static,
     S: IndexStorage<K> + Clone + 'static,
-    R: Send + Sync + 'static,
+    R: Record,
 {
     fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
         let key = self.extractor.extract(record);
@@ -220,6 +221,7 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Clone)]
+    #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
     struct User {
         email: String,
         age: u32,

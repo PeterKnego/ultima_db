@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::btree::BTree;
 use crate::index::{IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage, UniqueStorage};
+use crate::persistence::Record;
 use crate::{Error, Result};
 
 /// A compile-time table definition binding a name to a record type.
@@ -54,7 +55,7 @@ struct TableSnapshot<R> {
     indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>>,
 }
 
-impl<R: Send + Sync + 'static> Table<R> {
+impl<R: Record> Table<R> {
     /// Creates a new, empty table with auto-incrementing IDs starting at 1.
     pub fn new() -> Self {
         Self { data: BTree::new(), next_id: 1, indexes: BTreeMap::new() }
@@ -302,6 +303,51 @@ impl<R: Send + Sync + 'static> Table<R> {
         self.data.range(range).map(|(&k, v)| (k, v))
     }
 
+    /// Returns the next auto-increment ID (the ID that the next `insert` will assign).
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Insert a record with a specific ID, bypassing auto-increment.
+    /// Used during recovery to reconstruct table state from WAL/checkpoint.
+    /// Returns an error if the ID already exists or if a unique index
+    /// constraint is violated.
+    pub fn insert_with_id(&mut self, id: u64, record: R) -> Result<u64> {
+        if self.data.get(&id).is_some() {
+            return Err(Error::DuplicateKey(format!("id {id}")));
+        }
+
+        // Update all indexes; rollback on failure.
+        // SAFETY: Same invariants as `insert` — see comment there.
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> = self
+            .indexes
+            .values_mut()
+            .map(|v| v as *mut _)
+            .collect();
+        for (applied, ptr) in ptrs.iter().enumerate() {
+            let idx = unsafe { &mut **ptr };
+            if let Err(e) = idx.on_insert(id, &record) {
+                for prev_ptr in &ptrs[..applied] {
+                    let prev_idx = unsafe { &mut **prev_ptr };
+                    prev_idx.on_delete(id, &record);
+                }
+                return Err(e);
+            }
+        }
+
+        self.data = self.data.insert(id, record);
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+        Ok(id)
+    }
+
+    /// Set the next auto-increment ID. Used during recovery to restore the
+    /// counter after deserializing table state.
+    pub fn set_next_id(&mut self, next_id: u64) {
+        self.next_id = next_id;
+    }
+
     /// Returns the number of records in the table.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -500,7 +546,7 @@ impl<R> Clone for Table<R> {
     }
 }
 
-impl<R: Send + Sync + 'static> Default for Table<R> {
+impl<R: Record> Default for Table<R> {
     fn default() -> Self {
         Self::new()
     }
@@ -569,22 +615,22 @@ mod tests {
 
     #[test]
     fn range_yields_records_in_order() {
-        let mut table: Table<&str> = Table::new();
-        table.insert("a").unwrap();
-        table.insert("b").unwrap();
-        table.insert("c").unwrap();
+        let mut table: Table<String> = Table::new();
+        table.insert("a".into()).unwrap();
+        table.insert("b".into()).unwrap();
+        table.insert("c".into()).unwrap();
         let results: Vec<_> = table.range(1..=3).collect();
-        assert_eq!(results, vec![(1, &"a"), (2, &"b"), (3, &"c")]);
+        assert_eq!(results, vec![(1, &"a".to_string()), (2, &"b".to_string()), (3, &"c".to_string())]);
     }
 
     #[test]
     fn range_with_partial_bounds() {
-        let mut table: Table<&str> = Table::new();
-        table.insert("a").unwrap();
-        table.insert("b").unwrap();
-        table.insert("c").unwrap();
+        let mut table: Table<String> = Table::new();
+        table.insert("a".into()).unwrap();
+        table.insert("b".into()).unwrap();
+        table.insert("c".into()).unwrap();
         let results: Vec<_> = table.range(2..).collect();
-        assert_eq!(results, vec![(2, &"b"), (3, &"c")]);
+        assert_eq!(results, vec![(2, &"b".to_string()), (3, &"c".to_string())]);
     }
 
     #[test]
@@ -637,6 +683,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq)]
+    #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
     struct User {
         email: String,
         age: u32,
@@ -1288,12 +1335,12 @@ mod tests {
 
     #[test]
     fn iter_yields_all_in_order() {
-        let mut table: Table<&str> = Table::new();
-        table.insert("a").unwrap();
-        table.insert("b").unwrap();
-        table.insert("c").unwrap();
+        let mut table: Table<String> = Table::new();
+        table.insert("a".into()).unwrap();
+        table.insert("b".into()).unwrap();
+        table.insert("c".into()).unwrap();
         let results: Vec<_> = table.iter().collect();
-        assert_eq!(results, vec![(1, &"a"), (2, &"b"), (3, &"c")]);
+        assert_eq!(results, vec![(1, &"a".to_string()), (2, &"b".to_string()), (3, &"c".to_string())]);
     }
 
     #[test]
