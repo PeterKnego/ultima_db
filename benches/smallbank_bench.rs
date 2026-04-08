@@ -318,7 +318,7 @@ impl SmallBankEngine {
             tmpdir = None;
         }
 
-        let store = Store::new(store_config);
+        let store = Store::new(store_config).unwrap();
 
         #[cfg(feature = "persistence")]
         {

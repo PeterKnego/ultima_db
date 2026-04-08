@@ -66,7 +66,7 @@ fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Sto
         config.persistence = persistence;
     }
 
-    let store = Store::new(config);
+    let store = Store::new(config).unwrap();
     store.register_table::<Record>("data").unwrap();
     // Preload so updates don't collide on auto-increment IDs.
     // Each thread gets its own key range: thread i uses keys (i*1000+1)..=(i*1000+1000).

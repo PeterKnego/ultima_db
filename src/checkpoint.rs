@@ -81,7 +81,9 @@ fn deserialize_snapshot(
     data: &[u8],
     registry: &TableRegistry,
 ) -> Result<Snapshot> {
-    if data.len() < 4 + 4 + 8 + 4 + 4 {
+    // Minimum: 4 (magic) + 1 (format_version varint) + 1 (version varint)
+    //        + 1 (num_tables varint) + 4 (crc32) = 11 bytes
+    if data.len() < 4 + 1 + 1 + 1 + 4 {
         return Err(Error::CheckpointCorrupted("file too short".into()));
     }
 
@@ -186,6 +188,9 @@ pub(crate) fn find_latest_checkpoint(dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Write a checkpoint to disk.
+///
+/// Uses write-to-temp + atomic rename to avoid leaving a corrupt checkpoint
+/// file if the process crashes mid-write.
 pub(crate) fn write_checkpoint(
     dir: &Path,
     snapshot: &Snapshot,
@@ -195,13 +200,17 @@ pub(crate) fn write_checkpoint(
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     let data = serialize_snapshot(snapshot, registry)?;
-    let path = dir.join(checkpoint_filename(snapshot.version));
+    let final_path = dir.join(checkpoint_filename(snapshot.version));
+    let tmp_path = dir.join(format!("{}.tmp", checkpoint_filename(snapshot.version)));
 
-    let mut file = File::create(&path)
+    let mut file = File::create(&tmp_path)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     file.write_all(&data)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     file.sync_all()
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    drop(file);
+    std::fs::rename(&tmp_path, &final_path)
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     Ok(snapshot.version)
@@ -343,5 +352,197 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1);
         assert!(files[0].contains("checkpoint_42"));
+    }
+
+    #[test]
+    fn deserialize_too_short_errors() {
+        let reg = TableRegistry::default();
+        let data = vec![0u8; 5]; // too short for any valid checkpoint
+        let result = deserialize_snapshot(&data, &reg);
+        assert!(matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("too short")));
+    }
+
+    #[test]
+    fn deserialize_bad_magic_errors() {
+        let config = bincode::config::standard();
+        let reg = TableRegistry::default();
+        // Build a payload with wrong magic but valid structure and CRC
+        let mut data = Vec::new();
+        data.extend_from_slice(b"XXXX"); // bad magic
+        bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(1u64, &mut data, config).unwrap();
+        bincode::encode_into_std_write(0u32, &mut data, config).unwrap();
+        let checksum = crc32(&data);
+        data.extend_from_slice(&checksum.to_le_bytes());
+        let result = deserialize_snapshot(&data, &reg);
+        assert!(matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("bad magic")));
+    }
+
+    #[test]
+    fn deserialize_unsupported_format_version_errors() {
+        let config = bincode::config::standard();
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(999u32, &mut data, config).unwrap(); // bad format version
+        bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // snapshot version
+        bincode::encode_into_std_write(0u32, &mut data, config).unwrap(); // 0 tables
+        let checksum = crc32(&data);
+        data.extend_from_slice(&checksum.to_le_bytes());
+
+        let reg = TableRegistry::default();
+        let result = deserialize_snapshot(&data, &reg);
+        assert!(
+            matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("unsupported format")),
+        );
+    }
+
+    #[test]
+    fn deserialize_truncated_table_data_errors() {
+        let config = bincode::config::standard();
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
+        bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // 1 table
+
+        // Table name
+        bincode::encode_into_std_write("users", &mut data, config).unwrap();
+        // Claim data_len = 9999 but don't write that much data
+        bincode::encode_into_std_write(9999u64, &mut data, config).unwrap();
+
+        let checksum = crc32(&data);
+        data.extend_from_slice(&checksum.to_le_bytes());
+
+        let mut reg = TableRegistry::default();
+        reg.register::<User>("users").unwrap();
+        let result = deserialize_snapshot(&data, &reg);
+        assert!(matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("truncated")));
+    }
+
+    #[test]
+    fn deserialize_unregistered_table_errors() {
+        // Serialize a valid snapshot with a "users" table
+        let (snapshot, reg) = make_snapshot_with_users();
+        let data = serialize_snapshot(&snapshot, &reg).unwrap();
+
+        // Try to deserialize with an empty registry (no "users" registered)
+        let empty_reg = TableRegistry::default();
+        let result = deserialize_snapshot(&data, &empty_reg);
+        assert!(matches!(result, Err(Error::TableNotRegistered(ref name)) if name == "users"));
+    }
+
+    #[test]
+    fn find_latest_checkpoint_nonexistent_dir() {
+        let result = find_latest_checkpoint(std::path::Path::new("/nonexistent/path/that/does/not/exist")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_latest_checkpoint_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = find_latest_checkpoint(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_latest_checkpoint_ignores_non_checkpoint_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create non-checkpoint files
+        std::fs::write(dir.path().join("wal.bin"), b"data").unwrap();
+        std::fs::write(dir.path().join("random.txt"), b"data").unwrap();
+        let result = find_latest_checkpoint(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cleanup_old_checkpoints_nonexistent_dir() {
+        // Should not error on missing directory
+        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1).unwrap();
+    }
+
+    #[test]
+    fn empty_snapshot_roundtrip() {
+        let reg = TableRegistry::default();
+        let snapshot = Snapshot { version: 1, tables: std::collections::BTreeMap::new() };
+        let data = serialize_snapshot(&snapshot, &reg).unwrap();
+        let recovered = deserialize_snapshot(&data, &reg).unwrap();
+        assert_eq!(recovered.version, 1);
+        assert!(recovered.tables.is_empty());
+    }
+
+    #[test]
+    fn multi_table_snapshot_roundtrip() {
+        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Order { item: String, qty: u32 }
+
+        let mut reg = TableRegistry::default();
+        reg.register::<User>("users").unwrap();
+        reg.register::<Order>("orders").unwrap();
+
+        let mut user_table = Table::<User>::new();
+        user_table.insert(User { name: "Alice".into(), age: 30 }).unwrap();
+
+        let mut order_table = Table::<Order>::new();
+        order_table.insert(Order { item: "Widget".into(), qty: 5 }).unwrap();
+        order_table.insert(Order { item: "Gadget".into(), qty: 3 }).unwrap();
+
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any>);
+        tables.insert("orders".to_string(), std::sync::Arc::new(order_table) as std::sync::Arc<dyn std::any::Any>);
+
+        let snapshot = Snapshot { version: 7, tables };
+        let data = serialize_snapshot(&snapshot, &reg).unwrap();
+        let recovered = deserialize_snapshot(&data, &reg).unwrap();
+
+        assert_eq!(recovered.version, 7);
+        assert_eq!(recovered.tables.len(), 2);
+
+        let users = recovered.tables.get("users").unwrap()
+            .downcast_ref::<Table<User>>().unwrap();
+        assert_eq!(users.len(), 1);
+
+        let orders = recovered.tables.get("orders").unwrap()
+            .downcast_ref::<Table<Order>>().unwrap();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders.get(1).unwrap().item, "Widget");
+        assert_eq!(orders.get(2).unwrap().qty, 3);
+    }
+
+    #[test]
+    fn snapshot_with_unregistered_table_skips_it() {
+        // Snapshot has "users" and "logs", but only "users" is registered
+        let mut reg = TableRegistry::default();
+        reg.register::<User>("users").unwrap();
+
+        let mut user_table = Table::<User>::new();
+        user_table.insert(User { name: "Alice".into(), age: 30 }).unwrap();
+
+        let log_table = Table::<String>::new();
+
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any>);
+        tables.insert("logs".to_string(), std::sync::Arc::new(log_table) as std::sync::Arc<dyn std::any::Any>);
+
+        let snapshot = Snapshot { version: 1, tables };
+        let data = serialize_snapshot(&snapshot, &reg).unwrap();
+        let recovered = deserialize_snapshot(&data, &reg).unwrap();
+
+        // Only "users" should be in the recovered snapshot
+        assert_eq!(recovered.tables.len(), 1);
+        assert!(recovered.tables.contains_key("users"));
+    }
+
+    #[test]
+    fn write_checkpoint_creates_tmp_then_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let (snapshot, reg) = make_snapshot_with_users();
+
+        write_checkpoint(dir.path(), &snapshot, &reg).unwrap();
+
+        // Final file should exist, tmp should not
+        let final_path = dir.path().join("checkpoint_42.bin");
+        let tmp_path = dir.path().join("checkpoint_42.bin.tmp");
+        assert!(final_path.exists());
+        assert!(!tmp_path.exists());
     }
 }

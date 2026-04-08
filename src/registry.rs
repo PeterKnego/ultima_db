@@ -284,4 +284,217 @@ mod tests {
         let reg = TableRegistry::default();
         reg.validate_type::<TestUser>("unknown").unwrap(); // no error
     }
+
+    #[test]
+    fn contains_registered_table() {
+        let mut reg = TableRegistry::default();
+        assert!(!reg.contains("users"));
+        reg.register::<TestUser>("users").unwrap();
+        assert!(reg.contains("users"));
+        assert!(!reg.contains("orders"));
+    }
+
+    #[test]
+    fn table_names_returns_all_registered() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        reg.register::<String>("logs").unwrap();
+        let mut names = reg.table_names();
+        names.sort();
+        assert_eq!(names, vec!["logs", "users"]);
+    }
+
+    #[test]
+    fn table_names_empty_registry() {
+        let reg = TableRegistry::default();
+        assert!(reg.table_names().is_empty());
+    }
+
+    #[test]
+    fn new_empty_table_creates_empty() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+        let table_any = (info.new_empty_table)();
+        let table = table_any.downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn replay_insert_update_delete() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        // Start with an empty table
+        let mut table_box: Box<dyn Any> = (info.new_empty_table)();
+
+        // Replay insert
+        let user = TestUser { name: "Alice".into(), age: 30 };
+        let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
+        (info.replay_insert)(table_box.as_mut(), 1, &data).unwrap();
+
+        let table = table_box.downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(1).unwrap().name, "Alice");
+
+        // Replay update
+        let updated = TestUser { name: "Alice Updated".into(), age: 31 };
+        let data = bincode::serde::encode_to_vec(&updated, bincode::config::standard()).unwrap();
+        (info.replay_update)(table_box.as_mut(), 1, &data).unwrap();
+
+        let table = table_box.downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(table.get(1).unwrap().name, "Alice Updated");
+
+        // Replay delete
+        (info.replay_delete)(table_box.as_mut(), 1).unwrap();
+
+        let table = table_box.downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn replay_insert_duplicate_id_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut table_box: Box<dyn Any> = (info.new_empty_table)();
+        let user = TestUser { name: "Alice".into(), age: 30 };
+        let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
+        (info.replay_insert)(table_box.as_mut(), 1, &data).unwrap();
+        // Insert same ID again
+        let result = (info.replay_insert)(table_box.as_mut(), 1, &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn replay_update_missing_id_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut table_box: Box<dyn Any> = (info.new_empty_table)();
+        let user = TestUser { name: "Alice".into(), age: 30 };
+        let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
+        let result = (info.replay_update)(table_box.as_mut(), 99, &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn replay_delete_missing_id_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut table_box: Box<dyn Any> = (info.new_empty_table)();
+        let result = (info.replay_delete)(table_box.as_mut(), 99);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_record_wrong_type_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+        // Pass a String instead of TestUser
+        let wrong: String = "not a user".into();
+        let result = (info.serialize_record)(&wrong);
+        assert!(matches!(result, Err(Error::TypeMismatch(_))));
+    }
+
+    #[test]
+    fn serialize_table_wrong_type_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+        // Pass a Table<String> instead of Table<TestUser>
+        let wrong_table = Table::<String>::new();
+        let result = (info.serialize_table)(&wrong_table);
+        assert!(matches!(result, Err(Error::TypeMismatch(_))));
+    }
+
+    #[test]
+    fn replay_insert_wrong_table_type_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut wrong_table: Box<dyn Any> = Box::new(Table::<String>::new());
+        let user = TestUser { name: "Alice".into(), age: 30 };
+        let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
+        let result = (info.replay_insert)(wrong_table.as_mut(), 1, &data);
+        assert!(matches!(result, Err(Error::TypeMismatch(_))));
+    }
+
+    #[test]
+    fn replay_update_wrong_table_type_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut wrong_table: Box<dyn Any> = Box::new(Table::<String>::new());
+        let user = TestUser { name: "Alice".into(), age: 30 };
+        let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
+        let result = (info.replay_update)(wrong_table.as_mut(), 1, &data);
+        assert!(matches!(result, Err(Error::TypeMismatch(_))));
+    }
+
+    #[test]
+    fn replay_delete_wrong_table_type_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut wrong_table: Box<dyn Any> = Box::new(Table::<String>::new());
+        let result = (info.replay_delete)(wrong_table.as_mut(), 1);
+        assert!(matches!(result, Err(Error::TypeMismatch(_))));
+    }
+
+    #[test]
+    fn serialize_deserialize_empty_table() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+
+        let table = Table::<TestUser>::new();
+        let info = reg.get("users").unwrap();
+        let bytes = (info.serialize_table)(&table).unwrap();
+        let any = (info.deserialize_table)(&bytes).unwrap();
+        let recovered = any.downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(recovered.len(), 0);
+        assert_eq!(recovered.next_id(), 1);
+    }
+
+    #[test]
+    fn table_roundtrip_preserves_next_id() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+
+        let mut table = Table::<TestUser>::new();
+        table.insert(TestUser { name: "A".into(), age: 1 }).unwrap();
+        table.insert(TestUser { name: "B".into(), age: 2 }).unwrap();
+        table.delete(2).unwrap(); // next_id stays at 3
+
+        let info = reg.get("users").unwrap();
+        let bytes = (info.serialize_table)(&table).unwrap();
+        let any = (info.deserialize_table)(&bytes).unwrap();
+        let recovered = any.downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered.next_id(), 3);
+    }
+
+    #[test]
+    fn get_nonexistent_returns_none() {
+        let reg = TableRegistry::default();
+        assert!(reg.get("nope").is_none());
+    }
+
+    #[test]
+    fn deserialize_record_bad_bytes_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser>("users").unwrap();
+        let info = reg.get("users").unwrap();
+        let result = (info.deserialize_record)(&[0xFF, 0xFF, 0xFF]);
+        assert!(matches!(result, Err(Error::Persistence(_))));
+    }
 }

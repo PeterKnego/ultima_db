@@ -30,7 +30,7 @@ fn smr_config(dir: &Path) -> StoreConfig {
 
 /// Helper: create store, register User table, recover from disk.
 fn open_store(config: StoreConfig) -> Store {
-    let store = Store::new(config);
+    let store = Store::new(config).unwrap();
     store.register_table::<User>("users").unwrap();
     store.recover().unwrap();
     store
@@ -403,5 +403,39 @@ fn consistent_checkpoint_plus_wal_recovery() {
     assert_eq!(table.len(), 10);
     for i in 1..=10u64 {
         assert_eq!(table.get(i).unwrap().name, format!("User_{i}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery returns error (not panic) on unregistered table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recover_unregistered_table_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    // Write data with a registered User table.
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users").unwrap()
+            .insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.commit().unwrap();
+        store.checkpoint().unwrap();
+    }
+
+    // Recover WITHOUT registering the User table — should return an error,
+    // not panic.
+    {
+        let store = Store::new(config).unwrap();
+        // Deliberately do NOT call store.register_table::<User>("users")
+        let result = store.recover();
+        assert!(result.is_err(), "recover() should return Err for unregistered table, not panic");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ultima_db::Error::TableNotRegistered(ref name) if name == "users"),
+            "expected TableNotRegistered('users'), got: {err:?}"
+        );
     }
 }

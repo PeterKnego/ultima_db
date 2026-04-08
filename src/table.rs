@@ -222,21 +222,34 @@ impl<R: Record> Table<R> {
             return Ok(());
         }
 
-        // Phase 0: Validate all IDs exist and collect old records.
-        let mut old_records: Vec<(u64, Arc<R>)> = Vec::with_capacity(updates.len());
-        for &(id, _) in &updates {
+        // Deduplicate: keep only the last value for each ID.
+        let mut seen = BTreeMap::new();
+        for (i, (id, _)) in updates.iter().enumerate() {
+            seen.insert(*id, i);
+        }
+        let deduped_indices: Vec<usize> = {
+            let mut indices: Vec<usize> = seen.values().copied().collect();
+            indices.sort_unstable();
+            indices
+        };
+
+        // Phase 0: Validate all unique IDs exist and collect old records.
+        let mut old_records: Vec<(u64, Arc<R>)> = Vec::with_capacity(deduped_indices.len());
+        for &i in &deduped_indices {
+            let id = updates[i].0;
             let old = self.data.get_arc(&id).ok_or(Error::KeyNotFound)?;
             old_records.push((id, old));
         }
 
         let snap = self.snapshot();
 
-        // Phase 1: Mutate data BTree for all updates.
+        // Phase 1: Mutate data BTree for all updates (in original order so
+        // last-value-wins semantics are preserved).
         for (id, record) in updates {
             self.data = self.data.insert(id, record);
         }
 
-        // Phase 2: Update each index for all updated records.
+        // Phase 2: Update each index for all deduplicated records.
         // SAFETY: Same invariants as single-record `insert` — see comment there.
         let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
@@ -1451,5 +1464,27 @@ mod tests {
     fn table_def_const_new() {
         const DEF: TableDef<String> = TableDef::new("my_table");
         assert_eq!(DEF.name(), "my_table");
+    }
+
+    /// update_batch with duplicate IDs and a unique index should succeed
+    /// (last value wins), not false-fail with DuplicateKey.
+    #[test]
+    fn update_batch_duplicate_ids_with_unique_index() {
+        let mut table: Table<User> = Table::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        let id = table.insert(User { email: "a@x.com".into(), age: 30, name: "A".into() }).unwrap();
+
+        // Same ID appears twice — last value should win.
+        table.update_batch(vec![
+            (id, User { email: "b@x.com".into(), age: 31, name: "A".into() }),
+            (id, User { email: "c@x.com".into(), age: 32, name: "A".into() }),
+        ]).unwrap();
+
+        assert_eq!(table.get(id).unwrap().email, "c@x.com");
+        assert_eq!(table.get(id).unwrap().age, 32);
+        // Index should reflect the final value only.
+        assert!(table.get_unique::<String>("by_email", &"a@x.com".to_string()).unwrap().is_none());
+        assert!(table.get_unique::<String>("by_email", &"b@x.com".to_string()).unwrap().is_none());
+        assert!(table.get_unique::<String>("by_email", &"c@x.com".to_string()).unwrap().is_some());
     }
 }

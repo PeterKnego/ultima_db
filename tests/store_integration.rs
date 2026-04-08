@@ -263,7 +263,7 @@ fn two_overlapping_write_txs_to_different_tables() {
     let store = Store::new(StoreConfig {
         writer_mode: WriterMode::MultiWriter,
         ..StoreConfig::default()
-    });
+    }).unwrap();
 
     // Open both write transactions before either commits — different tables.
     let mut wtx_a = store.begin_write(None).unwrap(); // will be v1
@@ -1398,7 +1398,7 @@ fn readable_trait_generic_access() {
         table.iter().count()
     }
 
-    let store = Store::new(StoreConfig::default());
+    let store = Store::new(StoreConfig::default()).unwrap();
     let mut wtx = store.begin_write(None).unwrap();
     {
         let mut table = wtx.open_table::<TestRecord>("widgets").unwrap();
@@ -1416,13 +1416,28 @@ fn readable_trait_generic_access() {
 // Multi-writer OCC tests
 // ===========================================================================
 
+/// Store::new returns Err when WAL directory is unwritable.
+#[cfg(feature = "persistence")]
+#[test]
+fn store_new_returns_error_on_bad_wal_path() {
+    use ultima_db::{Durability, Persistence, StoreConfig};
+    let result = Store::new(StoreConfig {
+        persistence: Persistence::Standalone {
+            dir: std::path::PathBuf::from("/nonexistent/deeply/nested/path/that/cannot/exist"),
+            durability: Durability::Consistent,
+        },
+        ..StoreConfig::default()
+    });
+    assert!(result.is_err(), "Store::new should return Err for unwritable WAL directory");
+}
+
 /// Helper: create a store in `MultiWriter` mode with default config.
 fn multi_writer_store() -> Store {
     use ultima_db::{StoreConfig, WriterMode};
     Store::new(StoreConfig {
         writer_mode: WriterMode::MultiWriter,
         ..StoreConfig::default()
-    })
+    }).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,6 +1739,48 @@ fn multi_writer_conflict_cleans_up_active_writer() {
 // MultiWriter: read-only writer — a WriteTx that opens a table but only reads
 // has an empty write set, so it never conflicts.
 // ---------------------------------------------------------------------------
+
+/// update_batch that fails should NOT poison the write set with phantom IDs.
+/// If it does, a subsequent commit may produce spurious WriteConflict.
+#[test]
+fn multi_writer_update_batch_failure_does_not_poison_write_set() {
+    let store = multi_writer_store();
+
+    // Seed with one record.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t").unwrap().insert("hello".to_string()).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // Writer A: attempt an update_batch on a nonexistent ID (should fail).
+    let mut wtx_a = store.begin_write(None).unwrap();
+    {
+        let mut table = wtx_a.open_table::<String>("t").unwrap();
+        let res = table.update_batch(vec![
+            (1, "updated".to_string()),
+            (999, "missing".to_string()), // KeyNotFound
+        ]);
+        assert!(res.is_err());
+    }
+
+    // Writer B: modify key 1 and commit.
+    {
+        let mut wtx_b = store.begin_write(None).unwrap();
+        wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
+        wtx_b.commit().unwrap();
+    }
+
+    // Writer A now does a valid write on a DIFFERENT key and commits.
+    // Since the failed update_batch should not have recorded key 1 in the write set,
+    // there should be no conflict.
+    {
+        let mut table = wtx_a.open_table::<String>("t").unwrap();
+        table.insert("new_record".to_string()).unwrap();
+    }
+    // This commit should succeed — A only wrote key 2, B wrote key 1.
+    wtx_a.commit().unwrap();
+}
 
 /// Writer B opens a table and reads but writes nothing → empty write set → no conflict.
 #[test]

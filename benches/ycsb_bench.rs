@@ -21,7 +21,7 @@ impl UltimaEngine {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();

@@ -152,13 +152,16 @@ pub struct Store {
 
 impl Store {
     /// Creates a new, empty store. The initial version is 0.
-    pub fn new(config: StoreConfig) -> Self {
+    ///
+    /// Returns an error if persistence is configured and the WAL cannot be
+    /// initialized (e.g., directory does not exist and cannot be created,
+    /// or permission denied).
+    pub fn new(config: StoreConfig) -> Result<Self> {
         #[cfg(feature = "persistence")]
         let wal_handle = match &config.persistence {
             crate::persistence::Persistence::Standalone { dir, durability } => {
                 let consistent = matches!(durability, crate::persistence::Durability::Consistent);
-                Some(crate::wal::WalHandle::new(dir, consistent)
-                    .expect("failed to initialize WAL"))
+                Some(crate::wal::WalHandle::new(dir, consistent)?)
             }
             _ => None,
         };
@@ -166,7 +169,7 @@ impl Store {
         let empty = Arc::new(Snapshot { version: 0, tables: BTreeMap::new() });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
-        Self {
+        Ok(Self {
             inner: Arc::new(RwLock::new(StoreInner {
                 snapshots,
                 latest_version: 0,
@@ -182,7 +185,7 @@ impl Store {
                 #[cfg(all(test, feature = "persistence"))]
                 mock_wal: None,
             })),
-        }
+        })
     }
 
     /// The version number of the most recently committed snapshot.
@@ -391,14 +394,14 @@ impl Store {
                     // Build a new table map with sole ownership of each Arc.
                     // We re-wrap each table in a fresh Arc so Arc::get_mut succeeds during replay.
                     let base_snap = &inner.snapshots[&inner.latest_version];
-                    let mut tables: BTreeMap<String, Arc<dyn Any>> = base_snap.tables.iter()
-                        .map(|(name, arc)| {
-                            let info = inner.registry.get(name).unwrap();
-                            let bytes = (info.serialize_table)(arc.as_ref()).unwrap();
-                            let new_table = (info.deserialize_table)(&bytes).unwrap();
-                            (name.clone(), Arc::from(new_table))
-                        })
-                        .collect();
+                    let mut tables: BTreeMap<String, Arc<dyn Any>> = BTreeMap::new();
+                    for (name, arc) in &base_snap.tables {
+                        let info = inner.registry.get(name)
+                            .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+                        let bytes = (info.serialize_table)(arc.as_ref())?;
+                        let new_table = (info.deserialize_table)(&bytes)?;
+                        tables.insert(name.clone(), Arc::from(new_table));
+                    }
                     let mut latest_version = inner.latest_version;
 
                     for entry in &to_replay {
@@ -524,7 +527,7 @@ fn gc_inner(inner: &mut StoreInner) {
 
 impl Default for Store {
     fn default() -> Self {
-        Self::new(StoreConfig::default())
+        Self::new(StoreConfig::default()).expect("default StoreConfig cannot fail")
     }
 }
 
@@ -730,23 +733,24 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Update multiple records atomically.
     pub fn update_batch(&mut self, updates: Vec<(u64, R)>) -> Result<()> {
-        if let Some(ws) = &mut self.write_set {
-            for &(id, _) in &updates {
-                ws.insert(id);
-            }
-        }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             let ops_data: Vec<(u64, Vec<u8>)> = updates.iter()
                 .map(|(id, r)| Self::serialize_record(r).map(|d| (*id, d)))
                 .collect::<Result<_>>()?;
+            let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
             self.table.update_batch(updates)?;
+            if let Some(ws) = &mut self.write_set { ws.extend(ids.iter()); }
             for (id, data) in ops_data {
                 w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
             }
             return Ok(());
         }
+        let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
         self.table.update_batch(updates)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.extend(ids.iter());
+        }
         Ok(())
     }
 
@@ -1341,7 +1345,7 @@ mod tests {
             num_snapshots_retained: 1,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         // Commit v1
         store.begin_write(None).unwrap().commit().unwrap();
         // Commit v2
@@ -1374,7 +1378,7 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         // Commit v1, v2, v3
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
@@ -1395,7 +1399,7 @@ mod tests {
             num_snapshots_retained: 1,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         // Commit v1, v2
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
@@ -1416,7 +1420,7 @@ mod tests {
             num_snapshots_retained: 0,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
         // Snapshots: 0, 1, 2
@@ -1434,7 +1438,7 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         // Commit 5 versions
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
@@ -1451,7 +1455,7 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
         }
@@ -1487,7 +1491,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         let wtx = store.begin_write(Some(10)).unwrap();
         assert_eq!(wtx.version(), 10);
         wtx.commit().unwrap();
@@ -1502,7 +1506,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("t").unwrap().insert("hello".into()).unwrap();
@@ -1524,7 +1528,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -1549,7 +1553,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -1624,7 +1628,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         // v1
         {
             let mut wtx = store.begin_write(None).unwrap();
@@ -1659,7 +1663,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         // Push next_version to 11 with explicit version 10
         store.begin_write(Some(10)).unwrap().commit().unwrap();
         // Now latest=10, next_version=11. Request version 10+1=11 (auto) or explicit < 11 but > 10... impossible.
@@ -1675,7 +1679,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -1700,7 +1704,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("t1").unwrap().insert("x".into()).unwrap();
@@ -1724,7 +1728,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
@@ -1748,7 +1752,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
@@ -1771,7 +1775,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             require_explicit_version: true,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         let result = store.begin_write(None);
         assert!(matches!(result, Err(Error::ExplicitVersionRequired)));
     }
@@ -1781,7 +1785,7 @@ mod tests {
         let store = Store::new(StoreConfig {
             require_explicit_version: true,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         let wtx = store.begin_write(Some(1)).unwrap();
         assert_eq!(wtx.version(), 1);
         wtx.commit().unwrap();
@@ -1816,7 +1820,7 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        });
+        }).unwrap();
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
         }
@@ -1843,7 +1847,7 @@ mod tests {
     #[cfg(feature = "persistence")]
     fn store_with_mock_wal() -> (Store, std::sync::Arc<crate::wal::MockWal>) {
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(StoreConfig::default());
+        let store = Store::new(StoreConfig::default()).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
         (store, mock)
     }
@@ -1902,7 +1906,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(store_config);
+        let store = Store::new(store_config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Two concurrent writers on different tables (avoids auto-increment ID collision).
@@ -1947,7 +1951,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(config);
+        let store = Store::new(config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Preload so both writers modify the same key.
@@ -2040,7 +2044,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(config);
+        let store = Store::new(config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer A on table_a, writer B on table_b (no key conflict).
@@ -2091,7 +2095,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(config);
+        let store = Store::new(config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         let flag_1 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2153,7 +2157,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(config);
+        let store = Store::new(config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer 1 blocks in phase 2.
@@ -2244,7 +2248,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(config);
+        let store = Store::new(config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer 1 will panic during phase 2 wait.
@@ -2300,7 +2304,7 @@ mod tests {
             ..StoreConfig::default()
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
-        let store = Store::new(config);
+        let store = Store::new(config).unwrap();
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer A and B on different tables.

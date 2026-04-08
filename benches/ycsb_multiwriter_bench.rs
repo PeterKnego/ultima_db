@@ -32,7 +32,7 @@ fn make_store(mode: WriterMode) -> Store {
         auto_snapshot_gc: true,
         writer_mode: mode,
         require_explicit_version: false,
-    });
+    }).unwrap();
     // Preload table with NUM_RECORDS rows
     let mut wtx = store.begin_write(None).unwrap();
     {
@@ -155,7 +155,7 @@ fn bench_no_contention(c: &mut Criterion) {
         auto_snapshot_gc: true,
         writer_mode: WriterMode::MultiWriter,
         require_explicit_version: false,
-    });
+    }).unwrap();
     // Preload each writer's table
     for w in 0..MW_WRITERS {
         let mut wtx = store.begin_write(None).unwrap();

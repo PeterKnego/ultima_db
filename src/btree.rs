@@ -38,11 +38,12 @@ pub struct BTree<K, V> {
 // ---------------------------------------------------------------------------
 
 enum InsertResult<K, V> {
-    Fit(Arc<BTreeNode<K, V>>),
+    Fit(Arc<BTreeNode<K, V>>, bool),
     Split {
         left: Arc<BTreeNode<K, V>>,
         median: (K, Arc<V>),
         right: Arc<BTreeNode<K, V>>,
+        replaced: bool,
     },
 }
 
@@ -87,13 +88,15 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Insert or replace a key-value pair. Returns a new tree; `self` is
     /// unchanged.
     pub fn insert(&self, key: K, val: V) -> BTree<K, V> {
-        let replacing = self.get(&key).is_some();
         let val_arc = Arc::new(val);
-        let new_len = if replacing { self.len } else { self.len + 1 };
 
         match insert_into_node(&self.root, key, val_arc) {
-            InsertResult::Fit(new_root) => BTree { root: new_root, len: new_len },
-            InsertResult::Split { left, median, right } => {
+            InsertResult::Fit(new_root, replaced) => {
+                let new_len = if replaced { self.len } else { self.len + 1 };
+                BTree { root: new_root, len: new_len }
+            }
+            InsertResult::Split { left, median, right, replaced } => {
+                let new_len = if replaced { self.len } else { self.len + 1 };
                 let new_root = Arc::new(BTreeNode {
                     entries: vec![median],
                     children: vec![left, right],
@@ -399,26 +402,26 @@ fn insert_into_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: K, val:
             // Replace existing value.
             entries[pos] = (key, val);
             let children = node.children.clone();
-            InsertResult::Fit(Arc::new(BTreeNode { entries, children }))
+            InsertResult::Fit(Arc::new(BTreeNode { entries, children }), true)
         }
         Err(pos) => {
             if node.children.is_empty() {
                 // Leaf: insert and possibly split.
                 entries.insert(pos, (key, val));
-                maybe_split(entries, vec![])
+                maybe_split(entries, vec![], false)
             } else {
                 // Internal: recurse into child[pos], then merge the result.
                 let mut children = node.children.clone();
                 match insert_into_node(&children[pos], key, val) {
-                    InsertResult::Fit(new_child) => {
+                    InsertResult::Fit(new_child, replaced) => {
                         children[pos] = new_child;
-                        InsertResult::Fit(Arc::new(BTreeNode { entries, children }))
+                        InsertResult::Fit(Arc::new(BTreeNode { entries, children }), replaced)
                     }
-                    InsertResult::Split { left, median, right } => {
+                    InsertResult::Split { left, median, right, replaced } => {
                         entries.insert(pos, median);
                         children[pos] = left;
                         children.insert(pos + 1, right);
-                        maybe_split(entries, children)
+                        maybe_split(entries, children, replaced)
                     }
                 }
             }
@@ -430,11 +433,12 @@ fn insert_into_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: K, val:
 fn maybe_split<K: Clone, V>(
     entries: Vec<(K, Arc<V>)>,
     children: Vec<Arc<BTreeNode<K, V>>>,
+    replaced: bool,
 ) -> InsertResult<K, V> {
     if entries.len() <= MAX_KEYS {
-        InsertResult::Fit(Arc::new(BTreeNode { entries, children }))
+        InsertResult::Fit(Arc::new(BTreeNode { entries, children }), replaced)
     } else {
-        // entries.len() == MAX_KEYS + 1 == 6; split at mid == 3.
+        // entries.len() == MAX_KEYS + 1 == 64; split at mid == 32.
         let mid = entries.len() / 2;
         let median = entries[mid].clone();
         let right_entries = entries[mid + 1..].to_vec();
@@ -450,6 +454,7 @@ fn maybe_split<K: Clone, V>(
             left: Arc::new(BTreeNode { entries: left_entries, children: left_children }),
             median,
             right: Arc::new(BTreeNode { entries: right_entries, children: right_children }),
+            replaced,
         }
     }
 }

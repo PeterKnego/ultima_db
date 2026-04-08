@@ -253,6 +253,16 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
 }
 
 /// Truncate the WAL file, removing all entries with version <= `up_to_version`.
+///
+/// This truncates and rewrites the file in place rather than using atomic
+/// rename, because the WalHandle background thread may have the file open in
+/// append mode. An atomic rename would cause the bg thread to write to the
+/// old (unlinked) inode, losing subsequent entries.
+///
+/// Crash safety: if the process crashes mid-rewrite, the WAL may be truncated
+/// or partially rewritten. Recovery handles this by stopping at the first
+/// corrupt/truncated entry and falling back to the checkpoint. Since prune_wal
+/// is only called after a successful checkpoint, no committed data is lost.
 pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
     let entries = read_wal(path)?;
     let remaining: Vec<&WalEntry> = entries.iter()
@@ -263,11 +273,22 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
         return Ok(()); // nothing to prune
     }
 
+    // Serialize all remaining entries into a buffer first, then do a
+    // single truncate + write + sync to minimize the window of corruption.
+    let mut buf = Vec::new();
+    for entry in &remaining {
+        let data = serialize_entry(entry)?;
+        let len = data.len() as u32;
+        let checksum = crc32(&data);
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&data);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+    }
+
     let mut file = File::create(path)
         .map_err(|e| Error::Persistence(e.to_string()))?;
-    for entry in remaining {
-        write_entry_to_file(&mut file, entry)?;
-    }
+    file.write_all(&buf)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
     file.sync_all()
         .map_err(|e| Error::Persistence(e.to_string()))?;
     Ok(())
@@ -375,9 +396,13 @@ impl WalHandle {
                 let _ = file.sync_all();
                 bg_in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
                 // Notify Consistent waiters that this batch is durable.
+                // The epoch update MUST happen inside the mutex to prevent
+                // lost wakeups: without it, a waiter could check fsynced_epoch
+                // (seeing the old value), then we update + notify before the
+                // waiter enters condvar.wait(), causing it to block forever.
                 if let Some(state) = &bg_sync_state {
-                    state.fsynced_epoch.fetch_add(count, std::sync::atomic::Ordering::Release);
                     let _guard = state.mu.lock().unwrap();
+                    state.fsynced_epoch.fetch_add(count, std::sync::atomic::Ordering::Release);
                     state.condvar.notify_all();
                 }
             }
@@ -520,7 +545,7 @@ mod tests {
                 durability: crate::Durability::Consistent,
             },
             ..crate::StoreConfig::default()
-        });
+        }).unwrap();
         (store, dir)
     }
 
