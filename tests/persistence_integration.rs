@@ -323,3 +323,85 @@ fn eventual_drop_flushes_all_pending_wal_writes() {
         assert_eq!(user.age, i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Consistent: WAL recovery via three-phase commit
+// ---------------------------------------------------------------------------
+// With three-phase commit, WAL entries are written by a background thread.
+// If the store is dropped between WAL fsync (phase 2) and snapshot promotion
+// (phase 3), the WAL has the entry but the in-memory snapshot doesn't.
+// Recovery must replay the WAL and reconstruct the missing snapshot.
+
+#[test]
+fn consistent_wal_recovery_after_multiple_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    // Write several transactions, then drop without checkpointing.
+    {
+        let store = open_store(config.clone());
+        for i in 1..=10u32 {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User {
+                    name: format!("User_{i}"),
+                    age: 20 + i,
+                })
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        // Drop store — WAL background thread flushes pending entries.
+    }
+
+    // Recover from WAL only (no checkpoint).
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(rtx.version(), 10);
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 10);
+    for i in 1..=10u64 {
+        let user = table.get(i).unwrap();
+        assert_eq!(user.name, format!("User_{i}"));
+    }
+}
+
+#[test]
+fn consistent_checkpoint_plus_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    {
+        let store = open_store(config.clone());
+        // 5 commits, then checkpoint at v5.
+        for i in 1..=5u32 {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User { name: format!("User_{i}"), age: i })
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        store.checkpoint().unwrap();
+
+        // 5 more commits (WAL only).
+        for i in 6..=10u32 {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User { name: format!("User_{i}"), age: i })
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+    }
+
+    // Recover: checkpoint (v5) + WAL replay (v6..v10).
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(rtx.version(), 10);
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 10);
+    for i in 1..=10u64 {
+        assert_eq!(table.get(i).unwrap().name, format!("User_{i}"));
+    }
+}

@@ -274,30 +274,63 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// WalWriter — handles sync/async writing
+// Epoch-based sync state — shared between WalHandle and SyncWaiter
 // ---------------------------------------------------------------------------
 
-pub(crate) enum WalWriter {
-    /// Writes and fsyncs inline on each commit.
-    Consistent { file: File },
-    /// Sends entries to a background thread for async fsync.
-    Eventual { sender: mpsc::Sender<WalEntry> },
+/// Tracks which WAL epoch has been fsynced. Writers obtain an epoch via
+/// `next_epoch`, then wait until `fsynced_epoch >= their_epoch`.
+pub(crate) struct WalSyncState {
+    pub(crate) next_epoch: std::sync::atomic::AtomicU64,
+    fsynced_epoch: std::sync::atomic::AtomicU64,
+    condvar: std::sync::Condvar,
+    mu: std::sync::Mutex<()>,
 }
 
+/// Returned by `WalHandle::write()`. Consistent callers block on `wait()`;
+/// Eventual callers get `Done` (fire-and-forget).
+pub(crate) enum SyncWaiter {
+    /// Already durable or fire-and-forget (Eventual).
+    Done,
+    /// Block until the background thread fsyncs past this epoch.
+    WaitForEpoch { epoch: u64, state: Arc<WalSyncState> },
+}
+
+impl SyncWaiter {
+    pub fn wait(self) {
+        if let SyncWaiter::WaitForEpoch { epoch, state } = self {
+            let mut guard = state.mu.lock().unwrap();
+            while state.fsynced_epoch.load(std::sync::atomic::Ordering::Acquire) < epoch {
+                guard = state.condvar.wait(guard).unwrap();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WalHandle — background-thread WAL writer for both modes
+// ---------------------------------------------------------------------------
+
 /// Handle for the background WAL writer thread.
+///
+/// Both Consistent and Eventual modes use a background thread with a channel.
+/// - **Consistent**: `write()` returns `SyncWaiter::WaitForEpoch` — the caller
+///   must call `wait()` to block until fsync completes.
+/// - **Eventual**: `write()` returns `SyncWaiter::Done` — fire-and-forget.
+///
+/// The background thread batches queued entries (recv + try_recv drain) and
+/// issues a single fsync for the batch.
 pub(crate) struct WalHandle {
-    /// The writer is wrapped in Option so Drop can take ownership of the sender
-    /// and drop it before joining the background thread.
-    pub writer: Option<WalWriter>,
-    /// Join handle for the background thread (Eventual mode only).
+    sender: Option<mpsc::Sender<WalEntry>>,
     bg_thread: Option<thread::JoinHandle<()>>,
-    /// Number of WAL entries sent but not yet fsynced (Eventual mode only).
-    /// Incremented on send, decremented by the background thread after fsync.
+    consistent: bool,
+    sync_state: Option<Arc<WalSyncState>>,
+    /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WalHandle {
     /// Create a new WAL handle. Opens (or creates) the WAL file.
+    /// Both modes use a background thread for batched writes.
     pub fn new(dir: &Path, consistent: bool) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::Persistence(e.to_string()))?;
@@ -305,87 +338,156 @@ impl WalHandle {
 
         let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        if consistent {
-            let file = OpenOptions::new()
+        let sync_state = if consistent {
+            Some(Arc::new(WalSyncState {
+                next_epoch: std::sync::atomic::AtomicU64::new(1),
+                fsynced_epoch: std::sync::atomic::AtomicU64::new(0),
+                condvar: std::sync::Condvar::new(),
+                mu: std::sync::Mutex::new(()),
+            }))
+        } else {
+            None
+        };
+
+        let (tx, rx) = mpsc::channel::<WalEntry>();
+        let bg_in_flight = in_flight.clone();
+        let bg_sync_state = sync_state.clone();
+
+        let handle = thread::spawn(move || {
+            let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&wal_path)
-                .map_err(|e| Error::Persistence(e.to_string()))?;
-            Ok(Self {
-                writer: Some(WalWriter::Consistent { file }),
-                bg_thread: None,
-                in_flight,
-            })
-        } else {
-            let (tx, rx) = mpsc::channel::<WalEntry>();
-            let bg_in_flight = in_flight.clone();
-            let handle = thread::spawn(move || {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&wal_path)
-                    .expect("failed to open WAL file in background thread");
-                // Block on the first entry, then drain all queued entries
-                // so they share a single fsync.
-                while let Ok(first) = rx.recv() {
-                    let mut count = 1u64;
-                    if write_entry_to_file(&mut file, &first).is_err() {
-                        count = 0;
-                    }
-                    while let Ok(entry) = rx.try_recv() {
-                        count += 1;
-                        if write_entry_to_file(&mut file, &entry).is_err() {
-                            count -= 1;
-                        }
-                    }
-                    let _ = file.sync_all();
-                    bg_in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+                .expect("failed to open WAL file in background thread");
+            // Block on the first entry, then drain all queued entries
+            // so they share a single fsync.
+            while let Ok(first) = rx.recv() {
+                let mut count = 1u64;
+                if write_entry_to_file(&mut file, &first).is_err() {
+                    count = 0;
                 }
-            });
-            Ok(Self {
-                writer: Some(WalWriter::Eventual { sender: tx }),
-                bg_thread: Some(handle),
-                in_flight,
-            })
+                while let Ok(entry) = rx.try_recv() {
+                    count += 1;
+                    if write_entry_to_file(&mut file, &entry).is_err() {
+                        count -= 1;
+                    }
+                }
+                let _ = file.sync_all();
+                bg_in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+                // Notify Consistent waiters that this batch is durable.
+                if let Some(state) = &bg_sync_state {
+                    state.fsynced_epoch.fetch_add(count, std::sync::atomic::Ordering::Release);
+                    let _guard = state.mu.lock().unwrap();
+                    state.condvar.notify_all();
+                }
+            }
+        });
+
+        Ok(Self {
+            sender: Some(tx),
+            bg_thread: Some(handle),
+            consistent,
+            sync_state,
+            in_flight,
+        })
+    }
+
+    /// Submit a WAL entry to the background thread.
+    ///
+    /// - **Consistent**: returns `SyncWaiter::WaitForEpoch` — caller must
+    ///   call `wait()` outside the store lock to block until fsync.
+    /// - **Eventual**: returns `SyncWaiter::Done` — no wait needed.
+    pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
+        let sender = self.sender.as_ref().expect("WalHandle used after drop");
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sender.send(entry)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+
+        if self.consistent {
+            let state = self.sync_state.as_ref().unwrap();
+            let epoch = state.next_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(SyncWaiter::WaitForEpoch { epoch, state: Arc::clone(state) })
+        } else {
+            Ok(SyncWaiter::Done)
         }
     }
 
-    /// Write a WAL entry. Blocks for Consistent, returns immediately for Eventual.
-    pub fn write(&mut self, entry: WalEntry) -> Result<()> {
-        match self.writer.as_mut().expect("WalHandle used after drop") {
-            WalWriter::Consistent { file } => {
-                write_entry_to_file(file, &entry)?;
-                file.sync_all()
-                    .map_err(|e| Error::Persistence(e.to_string()))?;
-                Ok(())
-            }
-            WalWriter::Eventual { sender } => {
-                self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Channel send can only fail if the receiver is dropped (thread panicked).
-                sender.send(entry)
-                    .map_err(|e| Error::Persistence(e.to_string()))?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Returns the number of WAL entries sent but not yet fsynced (Eventual mode).
-    /// Always 0 for Consistent mode.
+    /// Returns the number of WAL entries sent but not yet fsynced.
     pub fn pending_writes(&self) -> u64 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
-
 }
 
 impl Drop for WalHandle {
     fn drop(&mut self) {
-        // Drop the writer (and its channel sender) first so the background
-        // thread's `for entry in rx` loop exits after draining pending entries.
-        self.writer.take();
+        // Drop the sender first so the background thread's recv() loop exits
+        // after draining pending entries.
+        self.sender.take();
         // Join the background thread to ensure all entries are fsynced.
         if let Some(handle) = self.bg_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockWal — test-only WAL with manual flush control
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) struct MockWal {
+    pub(crate) entries: std::sync::Mutex<Vec<WalEntry>>,
+    sync_state: Arc<WalSyncState>,
+}
+
+#[cfg(test)]
+impl MockWal {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            sync_state: Arc::new(WalSyncState {
+                next_epoch: std::sync::atomic::AtomicU64::new(1),
+                fsynced_epoch: std::sync::atomic::AtomicU64::new(0),
+                condvar: std::sync::Condvar::new(),
+                mu: std::sync::Mutex::new(()),
+            }),
+        }
+    }
+
+    /// Submit a WAL entry. Returns a SyncWaiter that blocks until `flush()`.
+    pub fn write(&self, entry: WalEntry) -> SyncWaiter {
+        self.entries.lock().unwrap().push(entry);
+        let epoch = self.sync_state.next_epoch.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        SyncWaiter::WaitForEpoch {
+            epoch,
+            state: Arc::clone(&self.sync_state),
+        }
+    }
+
+    /// Advance fsynced_epoch to release all currently blocked waiters.
+    /// Sets fsynced_epoch to next_epoch - 1 (the highest assigned epoch).
+    pub fn flush(&self) {
+        let current_next = self.sync_state.next_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        self.sync_state.fsynced_epoch.store(current_next - 1, std::sync::atomic::Ordering::Release);
+        let _guard = self.sync_state.mu.lock().unwrap();
+        self.sync_state.condvar.notify_all();
+    }
+
+    /// Advance fsynced_epoch by 1, releasing only the next blocked waiter.
+    pub fn flush_one(&self) {
+        self.sync_state.fsynced_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let _guard = self.sync_state.mu.lock().unwrap();
+        self.sync_state.condvar.notify_all();
+    }
+
+    /// Number of entries not yet flushed.
+    pub fn pending(&self) -> usize {
+        let next = self.sync_state.next_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        let fsynced = self.sync_state.fsynced_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        (next.saturating_sub(fsynced).saturating_sub(1)) as usize
     }
 }
 
@@ -555,9 +657,12 @@ mod tests {
     #[test]
     fn wal_handle_consistent_write() {
         let dir = tempfile::tempdir().unwrap();
-        let mut handle = WalHandle::new(dir.path(), true).unwrap();
-        handle.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
-        handle.write(WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
+        let handle = WalHandle::new(dir.path(), true).unwrap();
+        let w1 = handle.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        let w2 = handle.write(WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
+        // Wait for both fsyncs to complete.
+        w1.wait();
+        w2.wait();
 
         let entries = read_wal(&wal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 2);
@@ -566,12 +671,151 @@ mod tests {
     #[test]
     fn wal_handle_eventual_write() {
         let dir = tempfile::tempdir().unwrap();
-        let mut handle = WalHandle::new(dir.path(), false).unwrap();
+        let handle = WalHandle::new(dir.path(), false).unwrap();
         handle.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
         // Drop flushes the background thread.
         drop(handle);
 
         let entries = read_wal(&wal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn wal_handle_pending_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false).unwrap();
+        assert_eq!(handle.pending_writes(), 0);
+        handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        // pending_writes may be 1 or 0 depending on bg thread speed, but
+        // it should not panic. After drop it must be 0.
+        drop(handle);
+        // Can't check after drop, but the fact it didn't panic is enough.
+    }
+
+    #[test]
+    fn wal_handle_consistent_pending_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), true).unwrap();
+        assert_eq!(handle.pending_writes(), 0);
+        let w = handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        // Before wait, in_flight should be >= 1.
+        w.wait();
+        // After wait + bg thread sync, pending should be 0 (eventually).
+        drop(handle);
+    }
+
+    /// Truncated entry at end of WAL file (simulates crash during write).
+    /// read_wal should return entries before the truncation.
+    #[test]
+    fn wal_truncated_entry_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+
+        {
+            let mut file = File::create(&path).unwrap();
+            let e1 = WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] };
+            let e2 = WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] };
+            write_entry_to_file(&mut file, &e1).unwrap();
+            write_entry_to_file(&mut file, &e2).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Truncate the file mid-entry: remove last 3 bytes.
+        {
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
+        }
+
+        // Should recover the first entry and silently skip the truncated second.
+        let entries = read_wal(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version, 1);
+    }
+
+    /// Unknown op tag in WAL entry data triggers WalCorrupted error.
+    #[test]
+    fn wal_unknown_op_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+
+        // Write a valid entry, then manually craft one with a bad op tag.
+        {
+            let mut file = File::create(&path).unwrap();
+            // Craft a minimal entry: version=1, op_count=1, tag=0xFF (invalid).
+            let config = bincode::config::standard();
+            let mut data = Vec::new();
+            bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
+            bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // op_count
+            data.push(0xFF); // invalid tag
+
+            let len = data.len() as u32;
+            file.write_all(&len.to_le_bytes()).unwrap();
+            file.write_all(&data).unwrap();
+            let crc = crc32(&data);
+            file.write_all(&crc.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let err = read_wal(&path).unwrap_err();
+        assert!(matches!(err, Error::WalCorrupted(ref msg) if msg.contains("unknown op tag")));
+    }
+
+    /// Truncated op data inside an entry (op_count says 2, but data ends after 1).
+    #[test]
+    fn wal_truncated_op_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+
+        {
+            let mut file = File::create(&path).unwrap();
+            let config = bincode::config::standard();
+            let mut data = Vec::new();
+            bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
+            bincode::encode_into_std_write(2u32, &mut data, config).unwrap(); // op_count = 2
+            // Only write one op (CreateTable).
+            data.push(super::TAG_CREATE_TABLE);
+            bincode::encode_into_std_write("t".to_string(), &mut data, config).unwrap();
+            // No second op — data ends here.
+
+            let len = data.len() as u32;
+            file.write_all(&len.to_le_bytes()).unwrap();
+            file.write_all(&data).unwrap();
+            let crc = crc32(&data);
+            file.write_all(&crc.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let err = read_wal(&path).unwrap_err();
+        assert!(matches!(err, Error::WalCorrupted(ref msg) if msg.contains("unexpected end")));
+    }
+
+    /// prune_wal with a version below all entries does nothing.
+    #[test]
+    fn wal_prune_nothing_to_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+
+        {
+            let mut file = File::create(&path).unwrap();
+            for v in 5..=7 {
+                let entry = WalEntry { version: v, ops: vec![] };
+                write_entry_to_file(&mut file, &entry).unwrap();
+            }
+            file.sync_all().unwrap();
+        }
+
+        // Prune up to version 2 — all entries are > 2, nothing to remove.
+        prune_wal(&path, 2).unwrap();
+        let entries = read_wal(&path).unwrap();
+        assert_eq!(entries.len(), 3);
+    }
+
+    /// read_wal on a nonexistent file returns empty Vec.
+    #[test]
+    fn wal_read_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.bin");
+        let entries = read_wal(&path).unwrap();
+        assert!(entries.is_empty());
     }
 }

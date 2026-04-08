@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "smallbank_bench"
 harness = false
+
+[[bench]]
+name = "multiwriter_persistence_bench"
+harness = false

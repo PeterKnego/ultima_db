@@ -15,7 +15,7 @@ lint:
 	cargo clippy -- -D warnings
 
 coverage:
-	cargo llvm-cov --html
+	cargo llvm-cov --features persistence --html
 	@echo "Report: target/llvm-cov/html/index.html"
 
 clean:
@@ -84,6 +84,11 @@ bench/smallbank/persistent:
 	$(call check_cmd,critcmp)
 	cargo bench --bench smallbank_bench --features persistence -- --save-baseline smallbank
 	critcmp smallbank -g '([^/]+)/[^/]+' -f smallbank
+
+# Multi-writer persistence benchmark (threaded commits with WAL)
+
+bench/multiwriter/persistent:
+	cargo bench --bench multiwriter_persistence_bench --features persistence
 
 # Save a named baseline (usage: make bench/save NAME=main)
 bench/save:

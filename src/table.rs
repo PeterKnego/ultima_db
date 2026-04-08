@@ -1380,4 +1380,76 @@ mod tests {
             "expected DuplicateKey(aaa_idx), got: {err:?}"
         );
     }
+
+    #[test]
+    fn default_creates_empty_table() {
+        let table: Table<String> = Table::default();
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.next_id(), 1);
+    }
+
+    #[test]
+    fn insert_with_id_duplicate_returns_error() {
+        let mut table = Table::<String>::new();
+        table.insert_with_id(1, "first".into()).unwrap();
+        let err = table.insert_with_id(1, "duplicate".into()).unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey(_)));
+        // Original record is preserved.
+        assert_eq!(table.get(1).unwrap(), "first");
+    }
+
+    #[test]
+    fn insert_with_id_unique_index_violation_rolls_back() {
+        let mut table = Table::<(String, u32)>::new();
+        table
+            .define_index("name", IndexKind::Unique, |r: &(String, u32)| r.0.clone())
+            .unwrap();
+
+        table.insert_with_id(1, ("alice".into(), 30)).unwrap();
+
+        // Insert with a different ID but duplicate index key.
+        let err = table.insert_with_id(2, ("alice".into(), 25)).unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey(_)));
+
+        // ID 2 should not exist; original record preserved.
+        assert_eq!(table.len(), 1);
+        assert!(table.get(2).is_none());
+        assert_eq!(table.get(1).unwrap().0, "alice");
+
+        // A new unique key should still insert successfully (index wasn't corrupted).
+        table.insert_with_id(3, ("bob".into(), 40)).unwrap();
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn insert_with_id_multi_index_partial_rollback() {
+        // Two unique indexes. The second one fails, so the first must be rolled back.
+        let mut table = Table::<(String, String)>::new();
+        // BTreeMap iterates alphabetically, so "idx_a" is checked before "idx_b".
+        table
+            .define_index("idx_a", IndexKind::Unique, |r: &(String, String)| r.0.clone())
+            .unwrap();
+        table
+            .define_index("idx_b", IndexKind::Unique, |r: &(String, String)| r.1.clone())
+            .unwrap();
+
+        table.insert_with_id(1, ("alice".into(), "x".into())).unwrap();
+
+        // Second insert: unique key for idx_a ("bob") but duplicate for idx_b ("x").
+        // idx_a succeeds first, then idx_b fails → idx_a must be rolled back.
+        let err = table.insert_with_id(2, ("bob".into(), "x".into())).unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey(_)));
+        assert_eq!(table.len(), 1);
+        assert!(table.get(2).is_none());
+
+        // "bob" should NOT be in idx_a after rollback.
+        table.insert_with_id(3, ("bob".into(), "y".into())).unwrap();
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn table_def_const_new() {
+        const DEF: TableDef<String> = TableDef::new("my_table");
+        assert_eq!(DEF.name(), "my_table");
+    }
 }
