@@ -33,6 +33,9 @@ pub enum Error {
     /// Index queried with a different key type than its definition.
     #[error("index '{0}' queried with wrong key type")]
     IndexTypeMismatch(String),
+    /// Custom index with this name already exists.
+    #[error("index '{0}' already exists")]
+    IndexAlreadyExists(String),
     /// Returned when `begin_write(None)` is called but
     /// [`StoreConfig::require_explicit_version`] is `true`.
     #[error("explicit version required (require_explicit_version is enabled)")]
@@ -107,6 +110,12 @@ mod tests {
     fn error_version_not_found_displays() {
         let e = Error::VersionNotFound(42);
         assert_eq!(e.to_string(), "snapshot version 42 not found");
+    }
+
+    #[test]
+    fn error_index_already_exists_displays() {
+        let e = Error::IndexAlreadyExists("my_index".to_string());
+        assert_eq!(e.to_string(), "index 'my_index' already exists");
     }
 
     #[test]

@@ -51,8 +51,9 @@ Each Snapshot contains:
 
 | Module | Purpose |
 |---|---|
-| `btree` | Persistent copy-on-write B-tree. Internal to the crate; not re-exported. |
+| `btree` | Persistent copy-on-write B-tree. `BTree<K, V>` is re-exported from the crate root as a building block for custom indexes. |
 | `table` | `Table<R>` — typed collection backed by `BTree<R>` with auto-incrementing IDs. |
+| `index` | Secondary index infrastructure: built-in `ManagedIndex` with `KeyExtractor` pattern, and the public `CustomIndex<R>` trait for user-defined indexes. |
 | `store` | `Store`, `Snapshot`, `ReadTx`, `WriteTx` — version history and transactions. |
 | `transaction` | Re-exports `ReadTx` and `WriteTx` from `store` (see [circular dependency note](#circular-dependency-resolution)). |
 | `error` | `Error` enum and `Result` alias. |
@@ -135,6 +136,30 @@ A still exists, unmodified, for any ReadTx holding it.
 ### Clone preserves next_id
 
 `Table::clone()` copies `next_id` along with the O(1) `BTree` clone. This ensures that when `WriteTx` forks a table from the base snapshot, subsequent inserts continue from the correct ID and never collide with existing entries.
+
+---
+
+## Custom indexes
+
+**File:** `src/index.rs`
+
+UltimaDB supports user-defined custom indexes via the `CustomIndex<R>` trait. Unlike built-in indexes (which use `KeyExtractor` + `UniqueStorage`/`NonUniqueStorage`), custom indexes have full control over their internal data structure and expose their own query API.
+
+### How it works
+
+1. The user implements `CustomIndex<R>` on their type, providing `on_insert`, `on_update`, and `on_delete` hooks.
+2. They register it via `table.define_custom_index("name", my_index)`.
+3. Internally, a `CustomIndexAdapter` wraps the custom index and implements `IndexMaintainer<R>`, so it's stored alongside built-in indexes in the same map.
+4. Queries go through a typed handle: `table.custom_index::<MyIndex>("name")` returns `&MyIndex`, giving access to the index's own query methods.
+5. Record resolution is separate: `table.resolve(&ids)` maps IDs to records.
+
+### Clone and CoW
+
+Custom indexes must implement `Clone`. For O(1) clone (critical for snapshot performance), index authors should use `BTree<K, V>` — the same persistent CoW B-tree that backs the rest of UltimaDB. `BTree` is re-exported from the crate root for this purpose.
+
+### Persistence
+
+Custom indexes are rebuilt from table data on recovery. The `rebuild` method (with a default implementation that iterates `on_insert`) handles both backfill-on-define and recovery-from-persistence.
 
 ---
 

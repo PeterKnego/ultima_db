@@ -4,7 +4,7 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::btree::BTree;
-use crate::index::{IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage, UniqueStorage};
+use crate::index::{CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage, UniqueStorage};
 use crate::persistence::Record;
 use crate::{Error, Result};
 
@@ -412,7 +412,7 @@ impl<R: Record> Table<R> {
         extractor: impl Fn(&R) -> K + Send + Sync + 'static,
     ) -> Result<()> {
         if let Some(existing) = self.indexes.get(name) {
-            if existing.kind() != kind {
+            if existing.kind() == IndexKind::Custom || existing.kind() != kind {
                 return Err(Error::IndexTypeMismatch(name.to_string()));
             }
             // Same name and kind — idempotent. (We can't verify the extractor
@@ -433,6 +433,9 @@ impl<R: Record> Table<R> {
                 extractor,
                 NonUniqueStorage::new(),
             )),
+            IndexKind::Custom => {
+                return Err(Error::IndexTypeMismatch(name.to_string()));
+            }
         };
         // Backfill from existing data.
         for (&id, record) in self.data.range(..) {
@@ -545,6 +548,50 @@ impl<R: Record> Table<R> {
             .filter_map(|(_, id)| self.data.get(&id).map(|r| (id, r)))
             .collect())
     }
+
+    // -----------------------------------------------------------------------
+    // Custom index management
+    // -----------------------------------------------------------------------
+
+    /// Define a custom index. If the table already contains data, the index
+    /// is backfilled via [`CustomIndex::rebuild`]. Returns an error if any
+    /// index (built-in or custom) with the same name already exists.
+    pub fn define_custom_index<I: CustomIndex<R>>(
+        &mut self,
+        name: &str,
+        mut index: I,
+    ) -> Result<()> {
+        if self.indexes.contains_key(name) {
+            return Err(Error::IndexAlreadyExists(name.to_string()));
+        }
+        index.rebuild(self.data.range(..).map(|(&id, r)| (id, r)))?;
+        let adapter = CustomIndexAdapter::new(name.to_string(), index);
+        self.indexes.insert(name.to_string(), Box::new(adapter));
+        Ok(())
+    }
+
+    /// Retrieve a reference to a custom index by name, downcast to the
+    /// concrete index type. Returns `IndexNotFound` if the name doesn't
+    /// exist, or `IndexTypeMismatch` if the type doesn't match.
+    pub fn custom_index<I: CustomIndex<R>>(&self, name: &str) -> Result<&I> {
+        let idx = self
+            .indexes
+            .get(name)
+            .ok_or_else(|| Error::IndexNotFound(name.to_string()))?;
+        let adapter = idx
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<R, I>>()
+            .ok_or_else(|| Error::IndexTypeMismatch(name.to_string()))?;
+        Ok(adapter.inner())
+    }
+
+    /// Resolve a slice of record IDs to `(id, &record)` pairs.
+    /// IDs that don't exist in the table are silently skipped.
+    pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
+        ids.iter()
+            .filter_map(|&id| self.get(id).map(|r| (id, r)))
+            .collect()
+    }
 }
 
 impl<R> Clone for Table<R> {
@@ -568,6 +615,7 @@ impl<R: Record> Default for Table<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::CustomIndex;
 
     #[test]
     fn insert_returns_id_starting_at_one() {
@@ -722,6 +770,22 @@ mod tests {
         table.define_index("idx", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
         // Redefining with same name but different kind should fail
         let res = table.define_index("idx", IndexKind::NonUnique, |u: &User| u.age);
+        assert!(matches!(res, Err(crate::Error::IndexTypeMismatch(_))));
+    }
+
+    #[test]
+    fn define_index_rejects_custom_kind() {
+        let mut table: Table<User> = Table::new();
+        let res = table.define_index("idx", IndexKind::Custom, |u: &User| u.email.clone());
+        assert!(matches!(res, Err(crate::Error::IndexTypeMismatch(_))));
+    }
+
+    #[test]
+    fn define_index_rejects_collision_with_custom_index() {
+        let mut table: Table<User> = Table::new();
+        table.define_custom_index("idx", SumIndex::new(|u| u.age as u64)).unwrap();
+        // Trying to define a built-in index with the same name as a custom index
+        let res = table.define_index("idx", IndexKind::Unique, |u: &User| u.email.clone());
         assert!(matches!(res, Err(crate::Error::IndexTypeMismatch(_))));
     }
 
@@ -1486,5 +1550,245 @@ mod tests {
         assert!(table.get_unique::<String>("by_email", &"a@x.com".to_string()).unwrap().is_none());
         assert!(table.get_unique::<String>("by_email", &"b@x.com".to_string()).unwrap().is_none());
         assert!(table.get_unique::<String>("by_email", &"c@x.com".to_string()).unwrap().is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Custom index tests
+    // -------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct SumIndex {
+        total: u64,
+        field_extractor: Arc<dyn Fn(&User) -> u64 + Send + Sync>,
+    }
+
+    impl SumIndex {
+        fn new(extractor: impl Fn(&User) -> u64 + Send + Sync + 'static) -> Self {
+            Self { total: 0, field_extractor: Arc::new(extractor) }
+        }
+
+        fn total(&self) -> u64 {
+            self.total
+        }
+    }
+
+    impl CustomIndex<User> for SumIndex {
+        fn on_insert(&mut self, _id: u64, record: &User) -> Result<()> {
+            self.total += (self.field_extractor)(record);
+            Ok(())
+        }
+
+        fn on_update(&mut self, _id: u64, old: &User, new: &User) -> Result<()> {
+            self.total -= (self.field_extractor)(old);
+            self.total += (self.field_extractor)(new);
+            Ok(())
+        }
+
+        fn on_delete(&mut self, _id: u64, record: &User) {
+            self.total -= (self.field_extractor)(record);
+        }
+    }
+
+    #[test]
+    fn define_custom_index_and_query() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("age_sum", SumIndex::new(|u| u.age as u64)).unwrap();
+
+        table.insert(User { email: "a@x.com".to_string(), age: 30, name: "Alice".to_string() }).unwrap();
+        table.insert(User { email: "b@x.com".to_string(), age: 20, name: "Bob".to_string() }).unwrap();
+
+        let idx = table.custom_index::<SumIndex>("age_sum").unwrap();
+        assert_eq!(idx.total(), 50);
+    }
+
+    #[test]
+    fn define_custom_index_backfills_existing_data() {
+        let mut table = Table::<User>::new();
+        table.insert(User { email: "a@x.com".to_string(), age: 10, name: "A".to_string() }).unwrap();
+        table.insert(User { email: "b@x.com".to_string(), age: 20, name: "B".to_string() }).unwrap();
+
+        table.define_custom_index("age_sum", SumIndex::new(|u| u.age as u64)).unwrap();
+
+        let idx = table.custom_index::<SumIndex>("age_sum").unwrap();
+        assert_eq!(idx.total(), 30);
+    }
+
+    #[test]
+    fn define_custom_index_rejects_duplicate_name() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("idx", SumIndex::new(|u| u.age as u64)).unwrap();
+        let res = table.define_custom_index("idx", SumIndex::new(|u| u.age as u64));
+        assert!(matches!(res, Err(Error::IndexAlreadyExists(_))));
+    }
+
+    #[test]
+    fn define_custom_index_rejects_name_collision_with_builtin() {
+        let mut table = Table::<User>::new();
+        table.define_index("idx", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        let res = table.define_custom_index("idx", SumIndex::new(|u| u.age as u64));
+        assert!(matches!(res, Err(Error::IndexAlreadyExists(_))));
+    }
+
+    #[test]
+    fn custom_index_not_found() {
+        let table = Table::<User>::new();
+        let res = table.custom_index::<SumIndex>("nope");
+        assert!(matches!(res, Err(Error::IndexNotFound(_))));
+    }
+
+    #[test]
+    fn custom_index_type_mismatch() {
+        let mut table = Table::<User>::new();
+        table.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone()).unwrap();
+        let res = table.custom_index::<SumIndex>("by_email");
+        assert!(matches!(res, Err(Error::IndexTypeMismatch(_))));
+    }
+
+    #[test]
+    fn resolve_returns_matching_records() {
+        let mut table = Table::<User>::new();
+        let id1 = table.insert(User { email: "a@x.com".to_string(), age: 30, name: "A".to_string() }).unwrap();
+        let id2 = table.insert(User { email: "b@x.com".to_string(), age: 20, name: "B".to_string() }).unwrap();
+
+        let results = table.resolve(&[id1, id2, 999]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, id1);
+        assert_eq!(results[1].0, id2);
+    }
+
+    #[test]
+    fn resolve_empty_ids() {
+        let table = Table::<User>::new();
+        let results = table.resolve(&[]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn custom_index_tracks_updates() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("age_sum", SumIndex::new(|u| u.age as u64)).unwrap();
+
+        let id = table.insert(User { email: "a@x.com".to_string(), age: 30, name: "A".to_string() }).unwrap();
+        assert_eq!(table.custom_index::<SumIndex>("age_sum").unwrap().total(), 30);
+
+        table.update(id, User { email: "a@x.com".to_string(), age: 40, name: "A".to_string() }).unwrap();
+        assert_eq!(table.custom_index::<SumIndex>("age_sum").unwrap().total(), 40);
+
+        table.delete(id).unwrap();
+        assert_eq!(table.custom_index::<SumIndex>("age_sum").unwrap().total(), 0);
+    }
+
+    #[test]
+    fn custom_index_works_with_batch_insert() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("age_sum", SumIndex::new(|u| u.age as u64)).unwrap();
+
+        let records = vec![
+            User { email: "a@x.com".to_string(), age: 10, name: "A".to_string() },
+            User { email: "b@x.com".to_string(), age: 20, name: "B".to_string() },
+            User { email: "c@x.com".to_string(), age: 30, name: "C".to_string() },
+        ];
+        table.insert_batch(records).unwrap();
+
+        assert_eq!(table.custom_index::<SumIndex>("age_sum").unwrap().total(), 60);
+    }
+
+    #[test]
+    fn custom_index_works_with_batch_delete() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("age_sum", SumIndex::new(|u| u.age as u64)).unwrap();
+
+        let ids = table.insert_batch(vec![
+            User { email: "a@x.com".to_string(), age: 10, name: "A".to_string() },
+            User { email: "b@x.com".to_string(), age: 20, name: "B".to_string() },
+            User { email: "c@x.com".to_string(), age: 30, name: "C".to_string() },
+        ]).unwrap();
+
+        table.delete_batch(&[ids[0], ids[2]]).unwrap();
+        assert_eq!(table.custom_index::<SumIndex>("age_sum").unwrap().total(), 20);
+    }
+
+    #[test]
+    fn custom_index_clone_is_independent() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("age_sum", SumIndex::new(|u| u.age as u64)).unwrap();
+        table.insert(User { email: "a@x.com".to_string(), age: 30, name: "A".to_string() }).unwrap();
+
+        let clone = table.clone();
+
+        table.insert(User { email: "b@x.com".to_string(), age: 20, name: "B".to_string() }).unwrap();
+
+        assert_eq!(clone.custom_index::<SumIndex>("age_sum").unwrap().total(), 30);
+        assert_eq!(table.custom_index::<SumIndex>("age_sum").unwrap().total(), 50);
+    }
+
+    /// A custom index that rejects inserts when total would exceed a limit.
+    #[derive(Clone)]
+    struct CappedSumIndex {
+        total: u64,
+        cap: u64,
+    }
+
+    impl CappedSumIndex {
+        fn new(cap: u64) -> Self {
+            Self { total: 0, cap }
+        }
+    }
+
+    impl CustomIndex<User> for CappedSumIndex {
+        fn on_insert(&mut self, _id: u64, record: &User) -> Result<()> {
+            let new_total = self.total + record.age as u64;
+            if new_total > self.cap {
+                return Err(Error::DuplicateKey("cap exceeded".to_string()));
+            }
+            self.total = new_total;
+            Ok(())
+        }
+
+        fn on_update(&mut self, _id: u64, old: &User, new: &User) -> Result<()> {
+            let new_total = self.total - old.age as u64 + new.age as u64;
+            if new_total > self.cap {
+                return Err(Error::DuplicateKey("cap exceeded".to_string()));
+            }
+            self.total = new_total;
+            Ok(())
+        }
+
+        fn on_delete(&mut self, _id: u64, record: &User) {
+            self.total -= record.age as u64;
+        }
+    }
+
+    #[test]
+    fn custom_index_veto_rejects_insert() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("capped", CappedSumIndex::new(50)).unwrap();
+
+        table.insert(User { email: "a@x.com".to_string(), age: 30, name: "A".to_string() }).unwrap();
+        table.insert(User { email: "b@x.com".to_string(), age: 15, name: "B".to_string() }).unwrap();
+
+        // This would push total to 55, exceeding cap of 50
+        let res = table.insert(User { email: "c@x.com".to_string(), age: 10, name: "C".to_string() });
+        assert!(res.is_err());
+
+        // Total should still be 45 (rollback)
+        assert_eq!(table.custom_index::<CappedSumIndex>("capped").unwrap().total, 45);
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn custom_index_veto_rejects_update() {
+        let mut table = Table::<User>::new();
+        table.define_custom_index("capped", CappedSumIndex::new(50)).unwrap();
+
+        let id = table.insert(User { email: "a@x.com".to_string(), age: 30, name: "A".to_string() }).unwrap();
+        table.insert(User { email: "b@x.com".to_string(), age: 15, name: "B".to_string() }).unwrap();
+
+        // Update age 30 -> 40 would push total to 55
+        let res = table.update(id, User { email: "a@x.com".to_string(), age: 40, name: "A".to_string() });
+        assert!(res.is_err());
+
+        // Total should still be 45
+        assert_eq!(table.custom_index::<CappedSumIndex>("capped").unwrap().total, 45);
     }
 }
