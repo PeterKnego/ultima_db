@@ -10,6 +10,7 @@ use crate::{Error, Result};
 pub enum IndexKind {
     Unique,
     NonUnique,
+    Custom,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +214,95 @@ impl<K: Ord + Clone + Send + Sync + 'static> IndexStorage<K> for NonUniqueStorag
 }
 
 // ---------------------------------------------------------------------------
+// CustomIndex — public trait for user-defined index structures
+// ---------------------------------------------------------------------------
+
+/// Trait for user-defined custom indexes.
+///
+/// Implementors have full control over their internal data structure and query
+/// API. The `Clone` bound is required for CoW snapshot cloning — use
+/// [`BTree<K, V>`](crate::btree::BTree) internally for O(1) clone.
+pub trait CustomIndex<R: Record>: Send + Sync + Clone + 'static {
+    /// Called when a record is inserted. Return `Err` to veto the mutation.
+    fn on_insert(&mut self, id: u64, record: &R) -> Result<()>;
+
+    /// Called when a record is updated. Return `Err` to veto the mutation.
+    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()>;
+
+    /// Called when a record is deleted.
+    fn on_delete(&mut self, id: u64, record: &R);
+
+    /// Rebuild the entire index from an iterator of `(id, record)` pairs.
+    ///
+    /// Used for backfilling when the index is defined on a non-empty table,
+    /// and for recovery from persistence. The default implementation iterates
+    /// and calls [`on_insert`](Self::on_insert) for each entry.
+    fn rebuild<'a>(&mut self, data: impl Iterator<Item = (u64, &'a R)>) -> Result<()>
+    where
+        R: 'a,
+    {
+        for (id, record) in data {
+            self.on_insert(id, record)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CustomIndexAdapter — bridges CustomIndex into IndexMaintainer
+// ---------------------------------------------------------------------------
+
+pub(crate) struct CustomIndexAdapter<R: Record, I: CustomIndex<R>> {
+    inner: I,
+    name: String,
+    _phantom: std::marker::PhantomData<R>,
+}
+
+impl<R: Record, I: CustomIndex<R>> CustomIndexAdapter<R, I> {
+    pub fn new(name: String, index: I) -> Self {
+        Self {
+            inner: index,
+            name,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn inner(&self) -> &I {
+        &self.inner
+    }
+}
+
+impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R> for CustomIndexAdapter<R, I> {
+    fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
+        self.inner.on_insert(id, record)
+    }
+
+    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()> {
+        self.inner.on_update(id, old, new)
+    }
+
+    fn on_delete(&mut self, id: u64, record: &R) {
+        self.inner.on_delete(id, record)
+    }
+
+    fn kind(&self) -> IndexKind {
+        IndexKind::Custom
+    }
+
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
+        Box::new(CustomIndexAdapter {
+            inner: self.inner.clone(),
+            name: self.name.clone(),
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -344,6 +434,122 @@ mod tests {
         let cloned = cloned.as_any().downcast_ref::<ManagedIndex<User, String, UniqueStorage<String>>>().unwrap();
         assert_eq!(cloned.storage().get(&"bob@example.com".to_string()), None);
         assert_eq!(cloned.storage().get(&"alice@example.com".to_string()), Some(1));
+    }
+
+    #[test]
+    fn index_kind_custom_variant() {
+        let kind = IndexKind::Custom;
+        assert_eq!(kind, IndexKind::Custom);
+        assert_ne!(kind, IndexKind::Unique);
+        assert_ne!(kind, IndexKind::NonUnique);
+    }
+
+    /// A minimal custom index that tracks the sum of a numeric field.
+    #[derive(Clone)]
+    struct SumIndex {
+        total: u64,
+    }
+
+    impl SumIndex {
+        fn new() -> Self {
+            Self { total: 0 }
+        }
+
+        fn total(&self) -> u64 {
+            self.total
+        }
+    }
+
+    impl CustomIndex<User> for SumIndex {
+        fn on_insert(&mut self, _id: u64, record: &User) -> Result<()> {
+            self.total += record.age as u64;
+            Ok(())
+        }
+
+        fn on_update(&mut self, _id: u64, old: &User, new: &User) -> Result<()> {
+            self.total -= old.age as u64;
+            self.total += new.age as u64;
+            Ok(())
+        }
+
+        fn on_delete(&mut self, _id: u64, record: &User) {
+            self.total -= record.age as u64;
+        }
+    }
+
+    #[test]
+    fn custom_index_adapter_lifecycle() {
+        let sum = SumIndex::new();
+        let mut adapter = CustomIndexAdapter::new("sum".to_string(), sum);
+
+        let u1 = User { email: "a@x.com".to_string(), age: 30 };
+        adapter.on_insert(1, &u1).unwrap();
+
+        let inner = adapter
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .unwrap()
+            .inner();
+        assert_eq!(inner.total(), 30);
+
+        let u2 = User { email: "b@x.com".to_string(), age: 20 };
+        adapter.on_insert(2, &u2).unwrap();
+
+        let inner = adapter
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .unwrap()
+            .inner();
+        assert_eq!(inner.total(), 50);
+
+        let u1_new = User { email: "a@x.com".to_string(), age: 35 };
+        adapter.on_update(1, &u1, &u1_new).unwrap();
+
+        let inner = adapter
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .unwrap()
+            .inner();
+        assert_eq!(inner.total(), 55);
+
+        adapter.on_delete(2, &u2);
+
+        let inner = adapter
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .unwrap()
+            .inner();
+        assert_eq!(inner.total(), 35);
+
+        assert_eq!(adapter.kind(), IndexKind::Custom);
+    }
+
+    #[test]
+    fn custom_index_adapter_clone_box_independent() {
+        let sum = SumIndex::new();
+        let mut adapter = CustomIndexAdapter::new("sum".to_string(), sum);
+
+        let u1 = User { email: "a@x.com".to_string(), age: 30 };
+        adapter.on_insert(1, &u1).unwrap();
+
+        let cloned = adapter.clone_box();
+
+        let u2 = User { email: "b@x.com".to_string(), age: 20 };
+        adapter.on_insert(2, &u2).unwrap();
+
+        let cloned_inner = cloned
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .unwrap()
+            .inner();
+        assert_eq!(cloned_inner.total(), 30);
+
+        let orig_inner = adapter
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .unwrap()
+            .inner();
+        assert_eq!(orig_inner.total(), 50);
     }
 
     #[test]

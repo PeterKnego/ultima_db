@@ -871,6 +871,26 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     ) -> Result<Vec<(u64, &R)>> {
         self.table.index_range(index_name, range)
     }
+
+    /// Define a custom index on the underlying table.
+    pub fn define_custom_index<I: crate::CustomIndex<R>>(
+        &mut self,
+        name: &str,
+        index: I,
+    ) -> Result<()> {
+        self.table.define_custom_index(name, index)
+    }
+
+    /// Retrieve a reference to a custom index by name, downcast to the concrete type.
+    pub fn custom_index<I: crate::CustomIndex<R>>(&self, name: &str) -> Result<&I> {
+        self.table.custom_index(name)
+    }
+
+    /// Resolve a slice of record IDs to `(id, &record)` pairs.
+    /// IDs that don't exist in the table are silently skipped.
+    pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
+        self.table.resolve(ids)
+    }
 }
 
 // ---------------------------------------------------------------------------
