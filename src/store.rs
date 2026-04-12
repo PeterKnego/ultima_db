@@ -578,7 +578,7 @@ pub struct ReadTx {
 /// accept `impl Readable` instead of a concrete transaction type.
 pub trait Readable {
     /// Borrow a table from this snapshot.
-    fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>>;
+    fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<TableReader<'_, R>>;
     /// Returns the names of all tables in this snapshot, sorted alphabetically.
     fn table_names(&self) -> Vec<String>;
     /// The version number this snapshot reads from.
@@ -603,19 +603,25 @@ impl ReadTx {
     /// Returns [`Error::KeyNotFound`] if the table does not exist in this
     /// snapshot, or [`Error::TypeMismatch`] if it was created with a different
     /// record type.
-    pub fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>> {
+    pub fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<TableReader<'_, R>> {
         let name = opener.table_name();
-        self.snapshot
+        let table = self.snapshot
             .tables
             .get(name)
             .ok_or(Error::KeyNotFound)?
             .downcast_ref::<Table<R>>()
-            .ok_or_else(|| Error::TypeMismatch(name.to_string()))
+            .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
+        self.metrics.register_table(name);
+        Ok(TableReader {
+            table,
+            metrics: &self.metrics,
+            table_name: name.to_string(),
+        })
     }
 }
 
 impl Readable for ReadTx {
-    fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<&Table<R>> {
+    fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<TableReader<'_, R>> {
         ReadTx::open_table(self, opener)
     }
 
@@ -919,6 +925,120 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Resolve a slice of record IDs to `(id, &record)` pairs.
     /// IDs that don't exist in the table are silently skipped.
     pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
+        self.table.resolve(ids)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TableReader — read-only instrumented wrapper around &Table<R>
+// ---------------------------------------------------------------------------
+
+/// A read-only instrumented wrapper around [`Table<R>`].
+///
+/// Returned by [`ReadTx::open_table`]. Provides the same read methods as
+/// [`TableWriter`] while tracking read metrics.
+pub struct TableReader<'tx, R: Record> {
+    table: &'tx Table<R>,
+    metrics: &'tx StoreMetrics,
+    table_name: String,
+}
+
+impl<'tx, R: Record> TableReader<'tx, R> {
+    /// Look up a record by its ID.
+    pub fn get(&self, id: u64) -> Option<&R> {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table.get(id)
+    }
+
+    /// Returns an iterator over records within the specified ID range.
+    pub fn range<'a>(&'a self, range: impl std::ops::RangeBounds<u64> + 'a) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+        self.metrics.inc_primary_key_scans(&self.table_name);
+        self.table.range(range)
+    }
+
+    /// Returns the number of records in the table.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Returns true if the table contains no records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Returns true if the table contains a record with the given ID.
+    pub fn contains(&self, id: u64) -> bool {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table.contains(id)
+    }
+
+    /// Returns the first (lowest ID) record, or `None` if empty.
+    pub fn first(&self) -> Option<(u64, &R)> {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table.first()
+    }
+
+    /// Returns the last (highest ID) record, or `None` if empty.
+    pub fn last(&self) -> Option<(u64, &R)> {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table.last()
+    }
+
+    /// Iterate over all records in ID order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+        self.metrics.inc_primary_key_scans(&self.table_name);
+        self.table.iter()
+    }
+
+    /// Look up multiple records by ID.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
+        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.table.get_many(ids)
+    }
+
+    /// Look up a single record by a unique index.
+    pub fn get_unique<K: Ord + Clone + Send + Sync + 'static>(
+        &self, index_name: &str, key: &K,
+    ) -> Result<Option<(u64, &R)>> {
+        self.metrics.inc_index_reads(&self.table_name, index_name);
+        self.table.get_unique(index_name, key)
+    }
+
+    /// Look up records by a non-unique index key.
+    pub fn get_by_index<K: Ord + Clone + Send + Sync + 'static>(
+        &self, index_name: &str, key: &K,
+    ) -> Result<Vec<(u64, &R)>> {
+        self.metrics.inc_index_reads(&self.table_name, index_name);
+        self.table.get_by_index(index_name, key)
+    }
+
+    /// Look up records by index key (works for both unique and non-unique).
+    pub fn get_by_key<K: Ord + Clone + Send + Sync + 'static>(
+        &self, index_name: &str, key: &K,
+    ) -> Result<Vec<(u64, &R)>> {
+        self.metrics.inc_index_reads(&self.table_name, index_name);
+        self.table.get_by_key(index_name, key)
+    }
+
+    /// Range scan on an index (works for both unique and non-unique).
+    pub fn index_range<K: Ord + Clone + Send + Sync + 'static>(
+        &self, index_name: &str, range: impl std::ops::RangeBounds<K>,
+    ) -> Result<Vec<(u64, &R)>> {
+        self.metrics.inc_index_range_scans(&self.table_name, index_name);
+        self.table.index_range(index_name, range)
+    }
+
+    /// Retrieve a reference to a custom index by name, downcast to the concrete type.
+    pub fn custom_index<I: crate::CustomIndex<R>>(&self, name: &str) -> Result<&I> {
+        self.table.custom_index(name)
+    }
+
+    /// Resolve a slice of record IDs to `(id, &record)` pairs.
+    /// IDs that don't exist in the table are silently skipped.
+    pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
+        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.resolve(ids)
     }
 }
@@ -2399,6 +2519,30 @@ mod tests {
         // initial empty v0 snapshot). The key invariant: no panic or deadlock.
         let rtx = store.begin_read(None).unwrap();
         assert_eq!(rtx.version(), 2);
+    }
+
+    #[test]
+    fn table_reader_delegates_reads() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("items").unwrap();
+            t.insert("hello".to_string()).unwrap();
+            t.insert("world".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let rtx = store.begin_read(None).unwrap();
+        let reader = rtx.open_table::<String>("items").unwrap();
+        assert_eq!(reader.len(), 2);
+        assert!(!reader.is_empty());
+        assert!(reader.contains(1));
+        assert_eq!(reader.get(1), Some(&"hello".to_string()));
+        assert_eq!(reader.first().unwrap().0, 1);
+        assert_eq!(reader.last().unwrap().0, 2);
+        assert_eq!(reader.get_many(&[1, 2]).len(), 2);
+        assert_eq!(reader.resolve(&[1, 99]).len(), 1);
+        assert_eq!(reader.iter().count(), 2);
+        assert_eq!(reader.range(1..=2).count(), 2);
     }
 
     #[test]
