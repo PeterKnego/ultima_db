@@ -15,7 +15,7 @@ lint:
 	cargo clippy -- -D warnings
 
 coverage:
-	cargo llvm-cov --features persistence --html
+	cargo llvm-cov --features persistence,fulltext --html
 	@echo "Report: target/llvm-cov/html/index.html"
 
 clean:

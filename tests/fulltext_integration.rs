@@ -3,6 +3,7 @@
 use ultima_db::{FullTextIndex, Store, Table};
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 struct Article {
     title: String,
     body: String,
