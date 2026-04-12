@@ -685,6 +685,8 @@ pub struct WriteTx {
 pub struct TableWriter<'tx, R: Record> {
     table: &'tx mut Table<R>,
     write_set: Option<&'tx mut BTreeSet<u64>>,
+    metrics: Arc<StoreMetrics>,
+    table_name: String,
     #[cfg(feature = "persistence")]
     wal_ops: Option<WalOpsWriter<'tx>>,
 }
@@ -707,12 +709,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             let id = self.table.insert(record)?;
             if let Some(ws) = &mut self.write_set { ws.insert(id); }
             w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data });
+            self.metrics.inc_inserts(&self.table_name, 1);
             return Ok(id);
         }
         let id = self.table.insert(record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
+        self.metrics.inc_inserts(&self.table_name, 1);
         Ok(id)
     }
 
@@ -724,12 +728,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             self.table.update(id, record)?;
             if let Some(ws) = &mut self.write_set { ws.insert(id); }
             w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
+            self.metrics.inc_updates(&self.table_name, 1);
             return Ok(());
         }
         self.table.update(id, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
+        self.metrics.inc_updates(&self.table_name, 1);
         Ok(())
     }
 
@@ -743,6 +749,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(w) = &mut self.wal_ops {
             w.ops.push(crate::wal::WalOp::Delete { table: w.table_name.clone(), id });
         }
+        self.metrics.inc_deletes(&self.table_name, 1);
         Ok(old)
     }
 
@@ -758,12 +765,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             for (id, data) in ids.iter().zip(data_list) {
                 w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id: *id, data });
             }
+            self.metrics.inc_inserts(&self.table_name, ids.len() as u64);
             return Ok(ids);
         }
         let ids = self.table.insert_batch(records)?;
         if let Some(ws) = &mut self.write_set {
             ws.extend(ids.iter().copied());
         }
+        self.metrics.inc_inserts(&self.table_name, ids.len() as u64);
         Ok(ids)
     }
 
@@ -780,6 +789,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             for (id, data) in ops_data {
                 w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
             }
+            self.metrics.inc_updates(&self.table_name, ids.len() as u64);
             return Ok(());
         }
         let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
@@ -787,6 +797,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(ws) = &mut self.write_set {
             ws.extend(ids.iter());
         }
+        self.metrics.inc_updates(&self.table_name, ids.len() as u64);
         Ok(())
     }
 
@@ -802,6 +813,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 w.ops.push(crate::wal::WalOp::Delete { table: w.table_name.clone(), id });
             }
         }
+        self.metrics.inc_deletes(&self.table_name, ids.len() as u64);
         Ok(())
     }
 
@@ -815,11 +827,13 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Look up a record by its ID.
     pub fn get(&self, id: u64) -> Option<&R> {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.get(id)
     }
 
     /// Returns an iterator over records within the specified ID range.
     pub fn range<'a>(&'a self, range: impl std::ops::RangeBounds<u64> + 'a) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+        self.metrics.inc_primary_key_scans(&self.table_name);
         self.table.range(range)
     }
 
@@ -837,26 +851,31 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Returns true if the table contains a record with the given ID.
     pub fn contains(&self, id: u64) -> bool {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.contains(id)
     }
 
     /// Returns the first (lowest ID) record, or `None` if empty.
     pub fn first(&self) -> Option<(u64, &R)> {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.first()
     }
 
     /// Returns the last (highest ID) record, or `None` if empty.
     pub fn last(&self) -> Option<(u64, &R)> {
+        self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.last()
     }
 
     /// Iterate over all records in ID order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+        self.metrics.inc_primary_key_scans(&self.table_name);
         self.table.iter()
     }
 
     /// Look up multiple records by ID.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
+        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.get_many(ids)
     }
 
@@ -869,6 +888,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         kind: IndexKind,
         extractor: impl Fn(&R) -> K + Send + Sync + 'static,
     ) -> Result<()> {
+        self.metrics.register_index(&self.table_name, name);
         self.table.define_index(name, kind, extractor)
     }
 
@@ -878,6 +898,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         key: &K,
     ) -> Result<Option<(u64, &R)>> {
+        self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_unique(index_name, key)
     }
 
@@ -887,6 +908,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         key: &K,
     ) -> Result<Vec<(u64, &R)>> {
+        self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_index(index_name, key)
     }
 
@@ -896,6 +918,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         key: &K,
     ) -> Result<Vec<(u64, &R)>> {
+        self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_key(index_name, key)
     }
 
@@ -905,6 +928,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         range: impl std::ops::RangeBounds<K>,
     ) -> Result<Vec<(u64, &R)>> {
+        self.metrics.inc_index_range_scans(&self.table_name, index_name);
         self.table.index_range(index_name, range)
     }
 
@@ -914,6 +938,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         name: &str,
         index: I,
     ) -> Result<()> {
+        self.metrics.register_index(&self.table_name, name);
         self.table.define_custom_index(name, index)
     }
 
@@ -925,6 +950,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Resolve a slice of record IDs to `(id, &record)` pairs.
     /// IDs that don't exist in the table are silently skipped.
     pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
+        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.resolve(ids)
     }
 }
@@ -1090,10 +1116,11 @@ impl WriteTx {
             WriterMode::MultiWriter => Some(self.write_set.entry(name_str.clone()).or_default()),
             WriterMode::SingleWriter => None,
         };
+        self.metrics.register_table(&name_str);
         #[cfg(feature = "persistence")]
         let wal_ops = if self.wal_enabled {
             Some(WalOpsWriter {
-                table_name: name_str,
+                table_name: name_str.clone(),
                 ops: &mut self.wal_ops,
             })
         } else {
@@ -1102,6 +1129,8 @@ impl WriteTx {
         Ok(TableWriter {
             table,
             write_set,
+            metrics: Arc::clone(&self.metrics),
+            table_name: name_str,
             #[cfg(feature = "persistence")]
             wal_ops,
         })
@@ -2581,5 +2610,90 @@ mod tests {
         let m = store.metrics();
         assert_eq!(m.gc_runs, 1);
         assert_eq!(m.snapshots_collected, 3);
+    }
+
+    #[test]
+    fn metrics_tracks_table_writes() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("items").unwrap();
+            t.insert("a".to_string()).unwrap();
+            t.insert("b".to_string()).unwrap();
+            t.update(1, "aa".to_string()).unwrap();
+            t.delete(2).unwrap();
+            wtx.commit().unwrap();
+        }
+        let m = store.metrics();
+        let t = &m.tables["items"];
+        assert_eq!(t.inserts, 2);
+        assert_eq!(t.updates, 1);
+        assert_eq!(t.deletes, 1);
+    }
+
+    #[test]
+    fn metrics_tracks_batch_writes() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("items").unwrap();
+            t.insert_batch(vec!["a".into(), "b".into(), "c".into()]).unwrap();
+            t.update_batch(vec![(1, "aa".into()), (2, "bb".into())]).unwrap();
+            t.delete_batch(&[1, 2]).unwrap();
+            wtx.commit().unwrap();
+        }
+        let m = store.metrics();
+        let t = &m.tables["items"];
+        assert_eq!(t.inserts, 3);
+        assert_eq!(t.updates, 2);
+        assert_eq!(t.deletes, 2);
+    }
+
+    #[test]
+    fn metrics_tracks_table_writer_reads() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("items").unwrap();
+            t.insert("hello".to_string()).unwrap();
+            t.insert("world".to_string()).unwrap();
+            t.get(1);
+            t.contains(1);
+            t.first();
+            t.last();
+            t.get_many(&[1, 2]);
+            t.resolve(&[1, 2]);
+            let _ = t.range(1..=2).count();
+            let _ = t.iter().count();
+            wtx.commit().unwrap();
+        }
+        let m = store.metrics();
+        let t = &m.tables["items"];
+        // get(1) + contains(1) + first() + last() + get_many(2) + resolve(2) = 1+1+1+1+2+2 = 8
+        assert_eq!(t.primary_key_reads, 8);
+        // range() + iter() = 2
+        assert_eq!(t.primary_key_scans, 2);
+    }
+
+    #[test]
+    fn metrics_tracks_index_operations() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("items").unwrap();
+            t.define_index("len", IndexKind::NonUnique, |s: &String| s.len()).unwrap();
+            t.insert("hi".to_string()).unwrap();
+            t.insert("hello".to_string()).unwrap();
+            let _ = t.get_by_index::<usize>("len", &2);
+            let _ = t.index_range::<usize>("len", 0..=10);
+            wtx.commit().unwrap();
+        }
+        let rtx = store.begin_read(None).unwrap();
+        let reader = rtx.open_table::<String>("items").unwrap();
+        let _ = reader.get_by_index::<usize>("len", &5);
+        let m = store.metrics();
+        let idx = &m.tables["items"].indexes["len"];
+        assert_eq!(idx.reads, 2);       // 1 writer (get_by_index) + 1 reader (get_by_index)
+        assert_eq!(idx.range_scans, 1); // 1 writer (index_range)
     }
 }
