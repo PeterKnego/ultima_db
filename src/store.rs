@@ -127,7 +127,7 @@ pub(crate) struct StoreInner {
     pub(crate) wal_handle: Option<crate::wal::WalHandle>,
     /// Type registry for serialization (persistence feature only).
     #[cfg(feature = "persistence")]
-    pub(crate) registry: crate::registry::TableRegistry,
+    pub(crate) registry: Arc<crate::registry::TableRegistry>,
     /// Test-only mock WAL for controlled fsync testing.
     #[cfg(all(test, feature = "persistence"))]
     pub(crate) mock_wal: Option<std::sync::Arc<crate::wal::MockWal>>,
@@ -181,7 +181,7 @@ impl Store {
                 #[cfg(feature = "persistence")]
                 wal_handle,
                 #[cfg(feature = "persistence")]
-                registry: crate::registry::TableRegistry::default(),
+                registry: Arc::new(crate::registry::TableRegistry::default()),
                 #[cfg(all(test, feature = "persistence"))]
                 mock_wal: None,
             })),
@@ -300,32 +300,38 @@ impl Store {
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
-        inner.registry.register::<R>(name)
+        Arc::get_mut(&mut inner.registry)
+            .ok_or_else(|| Error::Persistence(
+                "cannot register table: registry is in use (checkpoint in progress?)".into(),
+            ))?
+            .register::<R>(name)
     }
 
     /// Write a checkpoint of the latest snapshot to disk.
     ///
-    /// Blocks the caller until the checkpoint is fully written and fsynced.
-    /// The store continues serving reads and writes during serialization
-    /// (only the caller thread blocks).
+    /// Blocks the caller until the checkpoint is fully written and fsynced,
+    /// but does not hold any store lock during I/O — reads and writes
+    /// proceed without contention.
     ///
     /// In `Standalone` mode, the WAL is pruned after the checkpoint is written.
     /// Returns the version of the checkpointed snapshot.
     #[cfg(feature = "persistence")]
     pub fn checkpoint(&self) -> Result<u64> {
-        let inner = self.inner.read().unwrap();
-        let dir = match &inner.config.persistence {
-            crate::persistence::Persistence::Standalone { dir, .. }
-            | crate::persistence::Persistence::Smr { dir } => dir.clone(),
-            crate::persistence::Persistence::None => {
-                return Err(Error::Persistence("checkpoint requires persistence to be configured".into()));
-            }
-        };
-        let snap = inner.snapshots[&inner.latest_version].clone();
-        let registry = &inner.registry;
+        let (dir, snap, registry) = {
+            let inner = self.inner.read().unwrap();
+            let dir = match &inner.config.persistence {
+                crate::persistence::Persistence::Standalone { dir, .. }
+                | crate::persistence::Persistence::Smr { dir } => dir.clone(),
+                crate::persistence::Persistence::None => {
+                    return Err(Error::Persistence("checkpoint requires persistence to be configured".into()));
+                }
+            };
+            let snap = inner.snapshots[&inner.latest_version].clone();
+            let registry = Arc::clone(&inner.registry);
+            (dir, snap, registry)
+        }; // read lock released here
 
-        let version = crate::checkpoint::write_checkpoint(&dir, &snap, registry)?;
-        drop(inner); // release read lock
+        let version = crate::checkpoint::write_checkpoint(&dir, &snap, &registry)?;
 
         // Prune WAL in Standalone mode
         let inner = self.inner.read().unwrap();
@@ -363,9 +369,11 @@ impl Store {
 
         // Load latest checkpoint if present.
         if let Some(cp_path) = crate::checkpoint::find_latest_checkpoint(&dir)? {
-            let inner = self.inner.read().unwrap();
-            let snapshot = crate::checkpoint::load_checkpoint(&cp_path, &inner.registry)?;
-            drop(inner);
+            let registry = {
+                let inner = self.inner.read().unwrap();
+                Arc::clone(&inner.registry)
+            };
+            let snapshot = crate::checkpoint::load_checkpoint(&cp_path, &registry)?;
 
             let mut inner = self.inner.write().unwrap();
             let v = snapshot.version;

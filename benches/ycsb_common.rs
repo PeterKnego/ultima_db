@@ -246,8 +246,6 @@ pub trait YcsbEngine {
 /// Benchmark IDs use the format `ycsb_{workload}/{engine}` so that
 /// `critcmp` groups workloads together across engines.
 pub fn bench_all_workloads(c: &mut Criterion, engine: &mut impl YcsbEngine) {
-    let name = engine.name().to_owned();
-
     // Workload A: Update Heavy
     {
         let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
