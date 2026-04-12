@@ -7,6 +7,7 @@ description = "Embedded in-memory B-tree store with MVCC"
 [features]
 default = []
 fulltext = []
+metrics = []
 persistence = ["dep:serde", "dep:bincode"]
 
 [dependencies]
