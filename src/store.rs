@@ -568,7 +568,6 @@ impl Default for Store {
 /// newer versions.
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
-    #[allow(dead_code)]
     metrics: Arc<StoreMetrics>,
 }
 
@@ -2695,5 +2694,52 @@ mod tests {
         let idx = &m.tables["items"].indexes["len"];
         assert_eq!(idx.reads, 2);       // 1 writer (get_by_index) + 1 reader (get_by_index)
         assert_eq!(idx.range_scans, 1); // 1 writer (index_range)
+    }
+
+    #[test]
+    fn metrics_end_to_end() {
+        let store = Store::default();
+
+        // Write some data
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("users").unwrap();
+            t.define_index("value", IndexKind::Unique, |s: &String| s.clone()).unwrap();
+            t.insert("alice".to_string()).unwrap();
+            t.insert("bob".to_string()).unwrap();
+            t.update(1, "ALICE".to_string()).unwrap();
+            t.delete(2).unwrap();
+            // Read via writer
+            let _ = t.get(1);
+            let _ = t.get_unique::<String>("value", &"ALICE".to_string());
+            wtx.commit().unwrap();
+        }
+
+        // Read via reader
+        {
+            let rtx = store.begin_read(None).unwrap();
+            let reader = rtx.open_table::<String>("users").unwrap();
+            reader.get(1);
+            reader.iter().count();
+        }
+
+        // Rollback
+        {
+            let wtx = store.begin_write(None).unwrap();
+            wtx.rollback();
+        }
+
+        let m = store.metrics();
+        assert_eq!(m.commits, 1);
+        assert_eq!(m.rollbacks, 1);
+        assert_eq!(m.tables["users"].inserts, 2);
+        assert_eq!(m.tables["users"].updates, 1);
+        assert_eq!(m.tables["users"].deletes, 1);
+        // Writer reads: get(1) = 1. Reader reads: get(1) = 1. Total = 2.
+        assert_eq!(m.tables["users"].primary_key_reads, 2);
+        // Reader scans: iter() = 1
+        assert_eq!(m.tables["users"].primary_key_scans, 1);
+        // Index reads: get_unique = 1
+        assert_eq!(m.tables["users"].indexes["value"].reads, 1);
     }
 }

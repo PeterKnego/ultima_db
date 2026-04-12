@@ -7,13 +7,14 @@ description = "Embedded in-memory B-tree store with MVCC"
 [features]
 default = []
 fulltext = []
-metrics = []
+metrics = ["dep:metrics"]
 persistence = ["dep:serde", "dep:bincode"]
 
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
+metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

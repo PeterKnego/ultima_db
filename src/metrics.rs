@@ -45,13 +45,11 @@ pub struct IndexMetricsSnapshot {
 // ---------------------------------------------------------------------------
 
 /// Per-index atomic counters.
-#[allow(dead_code)]
 struct IndexMetrics {
     reads: AtomicU64,
     range_scans: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl IndexMetrics {
     fn new() -> Self {
         Self {
@@ -69,7 +67,6 @@ impl IndexMetrics {
 }
 
 /// Per-table atomic counters plus per-index metrics.
-#[allow(dead_code)]
 struct TableMetrics {
     inserts: AtomicU64,
     updates: AtomicU64,
@@ -79,7 +76,6 @@ struct TableMetrics {
     indexes: RwLock<HashMap<String, IndexMetrics>>,
 }
 
-#[allow(dead_code)]
 impl TableMetrics {
     fn new() -> Self {
         Self {
@@ -112,7 +108,6 @@ impl TableMetrics {
 }
 
 /// Store-level atomic counters plus per-table metrics.
-#[allow(dead_code)]
 pub(crate) struct StoreMetrics {
     commits: AtomicU64,
     rollbacks: AtomicU64,
@@ -135,7 +130,6 @@ fn emit(name: &'static str, labels: &[(&'static str, String)], val: u64) {
 // StoreMetrics implementation
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 impl StoreMetrics {
     pub(crate) fn new() -> Self {
         Self {
@@ -244,7 +238,7 @@ impl StoreMetrics {
             t.primary_key_reads.fetch_add(n, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
             emit(
-                "ultima.table.primary_key_reads",
+                "ultima.table.primary_reads",
                 &[("table", table.to_string())],
                 n,
             );
@@ -257,7 +251,7 @@ impl StoreMetrics {
             t.primary_key_scans.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
             emit(
-                "ultima.table.primary_key_scans",
+                "ultima.table.primary_scans",
                 &[("table", table.to_string())],
                 1,
             );
