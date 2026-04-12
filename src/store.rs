@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::index::IndexKind;
+use crate::metrics::StoreMetrics;
 use crate::persistence::Record;
 use crate::table::{Table, TableOpener};
 use crate::{Error, Result};
@@ -131,6 +132,7 @@ pub(crate) struct StoreInner {
     /// Test-only mock WAL for controlled fsync testing.
     #[cfg(all(test, feature = "persistence"))]
     pub(crate) mock_wal: Option<std::sync::Arc<crate::wal::MockWal>>,
+    pub(crate) metrics: Arc<StoreMetrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +168,7 @@ impl Store {
             _ => None,
         };
 
+        let metrics = Arc::new(StoreMetrics::new());
         let empty = Arc::new(Snapshot { version: 0, tables: BTreeMap::new() });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
@@ -184,6 +187,7 @@ impl Store {
                 registry: Arc::new(crate::registry::TableRegistry::default()),
                 #[cfg(all(test, feature = "persistence"))]
                 mock_wal: None,
+                metrics,
             })),
         })
     }
@@ -204,7 +208,8 @@ impl Store {
             .get(&v)
             .ok_or(Error::VersionNotFound(v))?
             .clone();
-        Ok(ReadTx { snapshot })
+        let metrics = Arc::clone(&inner.metrics);
+        Ok(ReadTx { snapshot, metrics })
     }
 
     /// Open a write transaction.
@@ -251,6 +256,7 @@ impl Store {
         let base = inner.snapshots[&inner.latest_version].clone();
         let base_version = base.version;
         let writer_mode = inner.config.writer_mode;
+        let metrics = Arc::clone(&inner.metrics);
 
         // Track active writer.
         inner.active_writer_count += 1;
@@ -268,6 +274,7 @@ impl Store {
             ever_deleted_tables: BTreeSet::new(),
             writer_mode,
             needs_cleanup: true,
+            metrics,
             #[cfg(feature = "persistence")]
             wal_ops: Vec::new(),
             #[cfg(feature = "persistence")]
@@ -282,6 +289,11 @@ impl Store {
     pub fn gc(&self) {
         let mut inner = self.inner.write().unwrap();
         gc_inner(&mut inner);
+    }
+
+    /// Returns a point-in-time snapshot of all store and table metrics.
+    pub fn metrics(&self) -> crate::metrics::MetricsSnapshot {
+        self.inner.read().unwrap().metrics.snapshot()
     }
 
     // --- Persistence methods (feature-gated) ---
@@ -528,9 +540,15 @@ fn gc_inner(inner: &mut StoreInner) {
     let cutoff_idx = versions.len().saturating_sub(retain_count);
     let protected: BTreeSet<u64> = versions[cutoff_idx..].iter().copied().collect();
 
+    let before = inner.snapshots.len();
     inner.snapshots.retain(|&v, snapshot| {
         protected.contains(&v) || Arc::strong_count(snapshot) > 1
     });
+    let removed = (before - inner.snapshots.len()) as u64;
+    inner.metrics.inc_gc_run();
+    if removed > 0 {
+        inner.metrics.inc_snapshots_collected(removed);
+    }
 }
 
 impl Default for Store {
@@ -550,6 +568,8 @@ impl Default for Store {
 /// newer versions.
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
+    #[allow(dead_code)]
+    metrics: Arc<StoreMetrics>,
 }
 
 /// Read-only access to a snapshot.
@@ -634,6 +654,8 @@ pub struct WriteTx {
     writer_mode: WriterMode,
     /// Set to `true` on successful commit so `Drop` skips cleanup.
     needs_cleanup: bool,
+    /// Shared metrics for the store this transaction belongs to.
+    metrics: Arc<StoreMetrics>,
     /// WAL operations accumulated during this transaction (persistence only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_ops: Vec<crate::wal::WalOp>,
@@ -978,6 +1000,7 @@ impl WriteTx {
         if matches!(self.writer_mode, WriterMode::MultiWriter)
             && let Some(conflict) = self.validate_write_set(&inner)
         {
+            self.metrics.inc_write_conflict();
             drop(inner); // release lock before Drop runs
             return Err(conflict);
         }
@@ -1090,6 +1113,7 @@ impl WriteTx {
             }
         }
 
+        self.metrics.inc_commit();
         Ok(v)
     }
 
@@ -1197,6 +1221,7 @@ impl WriteTx {
 impl Drop for WriteTx {
     fn drop(&mut self) {
         if self.needs_cleanup {
+            self.metrics.inc_rollback();
             let mut inner = self.store_inner.write().unwrap();
             inner.active_writer_count -= 1;
             if matches!(self.writer_mode, WriterMode::MultiWriter) {
@@ -2374,5 +2399,43 @@ mod tests {
         // initial empty v0 snapshot). The key invariant: no panic or deadlock.
         let rtx = store.begin_read(None).unwrap();
         assert_eq!(rtx.version(), 2);
+    }
+
+    #[test]
+    fn metrics_tracks_commits_and_rollbacks() {
+        let store = Store::default();
+        {
+            let wtx = store.begin_write(None).unwrap();
+            wtx.commit().unwrap();
+        }
+        {
+            let wtx = store.begin_write(None).unwrap();
+            wtx.rollback();
+        }
+        {
+            let wtx = store.begin_write(None).unwrap();
+            drop(wtx); // implicit rollback
+        }
+        let m = store.metrics();
+        assert_eq!(m.commits, 1);
+        assert_eq!(m.rollbacks, 2);
+    }
+
+    #[test]
+    fn metrics_tracks_gc_runs_and_snapshots_collected() {
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        }).unwrap();
+        store.begin_write(None).unwrap().commit().unwrap();
+        store.begin_write(None).unwrap().commit().unwrap();
+        store.begin_write(None).unwrap().commit().unwrap();
+        // Versions: 0,1,2,3. retain_count = max(1,1) = 1. protected = {3}.
+        // v0, v1, v2 removed.
+        store.gc();
+        let m = store.metrics();
+        assert_eq!(m.gc_runs, 1);
+        assert_eq!(m.snapshots_collected, 3);
     }
 }

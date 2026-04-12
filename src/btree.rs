@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn remove_absent_key_returns_key_not_found() {
         let t = insert_range(1, 5);
-        assert!(matches!(t.remove(&99), Err(crate::Error::KeyNotFound)));
+        assert!(matches!(t.remove(&99), Err(Error::KeyNotFound)));
     }
 
     #[test]
