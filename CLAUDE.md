@@ -42,3 +42,12 @@ UltimaDB is an in-memory MVCC store built on a persistent copy-on-write B-tree. 
 - Batch operations (`insert_batch`, `update_batch`, `delete_batch`) use snapshot-and-restore for atomic rollback: capture table state before the operation, restore on failure.
 - Index mutation during insert/update uses raw pointers to avoid borrowing `self.indexes` mutably while iterating. This is safe because the HashMap is not structurally modified during the loop.
 - New features are documented in `docs/tasks/taskXX_feature_name.md` with architectural decisions and implementation details.
+
+## Feature Development Workflow
+
+Using superpowers (brainstorming, writing-plans, executing-plans) during feature development is fine — the generated plans/notes under `docs/superpowers/` are working artifacts, not deliverables. Before finishing and committing the feature:
+
+1. Consolidate the architectural decisions and implementation details into `docs/tasks/taskXX_feature_name.md` (the canonical per-feature doc).
+2. Delete the corresponding superpowers artifacts (`docs/superpowers/plans/*.md`, etc.) for that feature. They must not be committed alongside the `taskXX_feature_name.md`.
+
+Superpowers artifacts are ephemeral scaffolding; `docs/tasks/` is the permanent record.
