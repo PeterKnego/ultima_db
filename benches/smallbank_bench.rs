@@ -414,6 +414,21 @@ impl SmallBankEngine for UltimaEngine {
         &self.name
     }
 
+    fn verify(&self) -> StateHash {
+        let rtx = self.store.begin_read(None).unwrap();
+        let savings = rtx.open_table::<Savings>("savings").unwrap();
+        let checking = rtx.open_table::<Checking>("checking").unwrap();
+        let mut accounts: std::collections::BTreeMap<u64, AccountState> =
+            std::collections::BTreeMap::new();
+        for (_, s) in savings.iter() {
+            accounts.entry(s.customer_id).or_default().savings = s.balance;
+        }
+        for (_, c) in checking.iter() {
+            accounts.entry(c.customer_id).or_default().checking = c.balance;
+        }
+        hash_accounts(accounts)
+    }
+
     fn execute(&mut self, ops: &[SmallBankOp]) {
         for op in ops {
             Self::execute_single_op(&self.store, op);
@@ -463,6 +478,15 @@ impl SmallBankEngine for UltimaEngine {
 // ---------------------------------------------------------------------------
 
 fn bench_smallbank(c: &mut Criterion) {
+    // Correctness gate — every `cargo bench` run confirms the engine matches
+    // the reference implementation before burning cycles on timings.
+    {
+        let config = SmallBankConfig::inmemory();
+        let mut engine = UltimaEngine::new(&config, WriterMode::SingleWriter);
+        assert_matches_reference(&mut engine);
+    }
+
+    let fixture = generate_fixture(FIXTURE_POOL_SIZE);
     let configs = vec![
         SmallBankConfig::inmemory(),
         #[cfg(feature = "persistence")]
@@ -474,11 +498,11 @@ fn bench_smallbank(c: &mut Criterion) {
     for config in &configs {
         {
             let mut engine = UltimaEngine::new(config, WriterMode::SingleWriter);
-            bench_workloads(c, &mut engine);
+            bench_workloads(c, &mut engine, &fixture);
         }
         {
             let mut engine = UltimaEngine::new(config, WriterMode::MultiWriter);
-            bench_contention(c, &mut engine);
+            bench_contention(c, &mut engine, &fixture);
         }
     }
 }

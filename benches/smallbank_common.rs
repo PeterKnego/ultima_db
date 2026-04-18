@@ -1,11 +1,17 @@
 //! Shared smallbank workload: record types, op types, Zipfian generator,
-//! workload generators, and the `SmallBankEngine` trait that backends implement.
+//! workload generators, the `SmallBankEngine` trait that backends implement,
+//! and the pre-generated `WorkloadFixture` + reference implementation that
+//! lets cross-DB parity tests verify identical final state.
 //!
 //! Included via `#[path = "smallbank_common.rs"]` in each bench binary.
 
 #![allow(dead_code, unused_imports)]
 
+use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::hint::black_box;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput};
@@ -247,6 +253,225 @@ pub trait SmallBankEngine {
     /// Execute `op_sets.len()` writers concurrently on separate OS threads.
     /// Each writer retries on conflict. Returns totals across all writers.
     fn execute_burst(&mut self, op_sets: &[Vec<SmallBankOp>]) -> BurstResult;
+
+    /// Compute a deterministic hash of the current durable state (sum of
+    /// balances per table, rounded). Used by parity tests to confirm that
+    /// every backend that applied the same sequential op stream landed in
+    /// the same final state.
+    fn verify(&self) -> StateHash;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-generated workload fixture
+//
+// Why pre-generate? Each backend's criterion run decides its own iteration
+// count (fast engines run more iters in the same wall-clock budget). If each
+// iteration re-generates ops via a shared-seed `StdRng`, the RNG state
+// diverges between backends after the first mismatched iter count. A fixed
+// fixture means iteration N on every backend runs the byte-for-byte same op
+// slice — which is what we need for cross-DB comparison and correctness
+// verification.
+// ---------------------------------------------------------------------------
+
+pub const FIXTURE_POOL_SIZE: usize = 256;
+pub const FIXTURE_SEED: u64 = 0x5B_5B_5B_5B;
+pub const CORRECTNESS_ITERS: usize = 32;
+
+pub struct WorkloadFixture {
+    pub mixed: Vec<Vec<SmallBankOp>>,
+    pub read_heavy: Vec<Vec<SmallBankOp>>,
+    pub write_heavy: Vec<Vec<SmallBankOp>>,
+    pub contention_low: Vec<Vec<Vec<SmallBankOp>>>,
+    pub contention_high: Vec<Vec<Vec<SmallBankOp>>>,
+}
+
+pub fn generate_fixture(pool_size: usize) -> Arc<WorkloadFixture> {
+    let zipf = ZipfianGenerator::new(NUM_ACCOUNTS, ZIPFIAN_CONSTANT);
+    let mut rng_mixed = StdRng::seed_from_u64(100);
+    let mut rng_read = StdRng::seed_from_u64(200);
+    let mut rng_write = StdRng::seed_from_u64(300);
+    let mut rng_cont_low = StdRng::seed_from_u64(400);
+    let mut rng_cont_high = StdRng::seed_from_u64(500);
+
+    Arc::new(WorkloadFixture {
+        mixed: (0..pool_size)
+            .map(|_| gen_mixed_workload(&mut rng_mixed, &zipf))
+            .collect(),
+        read_heavy: (0..pool_size)
+            .map(|_| gen_read_heavy_workload(&mut rng_read, &zipf))
+            .collect(),
+        write_heavy: (0..pool_size)
+            .map(|_| gen_write_heavy_workload(&mut rng_write, &zipf))
+            .collect(),
+        contention_low: (0..pool_size)
+            .map(|_| gen_contention_ops(&mut rng_cont_low, &zipf))
+            .collect(),
+        contention_high: (0..pool_size)
+            .map(|_| gen_high_contention_ops(&mut rng_cont_high))
+            .collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Reference implementation — the oracle for correctness checks
+//
+// `ReferenceState` tracks per-customer savings and checking as plain f64.
+// `apply_op` mutates it exactly the way a correctly-implemented smallbank
+// backend should. Running the same op sequence through the reference and
+// through each backend must produce the same `StateHash`.
+//
+// Correctness tests only use this in sequential mode — multi-threaded bursts
+// have non-deterministic commit interleavings, so parity against a linear
+// reference would be meaningless.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccountState {
+    pub savings: f64,
+    pub checking: f64,
+}
+
+pub struct ReferenceState {
+    pub accounts: BTreeMap<u64, AccountState>,
+}
+
+impl ReferenceState {
+    pub fn seeded(num_accounts: u64) -> Self {
+        let accounts = (1..=num_accounts)
+            .map(|i| {
+                (
+                    i,
+                    AccountState {
+                        savings: INITIAL_SAVINGS,
+                        checking: INITIAL_CHECKING,
+                    },
+                )
+            })
+            .collect();
+        Self { accounts }
+    }
+
+    pub fn apply(&mut self, op: &SmallBankOp) {
+        match op {
+            SmallBankOp::Balance(_) => {}
+            SmallBankOp::DepositChecking(cid, amount) => {
+                if let Some(a) = self.accounts.get_mut(cid) {
+                    a.checking += amount;
+                }
+            }
+            SmallBankOp::TransactSavings(cid, amount) => {
+                if let Some(a) = self.accounts.get_mut(cid) {
+                    a.savings += amount;
+                }
+            }
+            SmallBankOp::Amalgamate { source, dest } => {
+                let src_amt = self
+                    .accounts
+                    .get_mut(source)
+                    .map(|a| {
+                        let amt = a.savings;
+                        a.savings = 0.0;
+                        amt
+                    })
+                    .unwrap_or(0.0);
+                if let Some(a) = self.accounts.get_mut(dest) {
+                    a.checking += src_amt;
+                }
+            }
+            SmallBankOp::WriteCheck(cid, amount) => {
+                if let Some(a) = self.accounts.get_mut(cid) {
+                    let total = a.savings + a.checking;
+                    let penalty = if total < *amount { 1.0 } else { 0.0 };
+                    a.checking -= amount + penalty;
+                }
+            }
+            SmallBankOp::SendPayment { source, dest, amount } => {
+                let allow = self
+                    .accounts
+                    .get(source)
+                    .map(|a| a.checking >= *amount)
+                    .unwrap_or(false);
+                let dest_exists = self.accounts.contains_key(dest);
+                if allow && dest_exists {
+                    self.accounts.get_mut(source).unwrap().checking -= amount;
+                    self.accounts.get_mut(dest).unwrap().checking += amount;
+                }
+            }
+        }
+    }
+
+    pub fn apply_all(&mut self, ops: &[SmallBankOp]) {
+        for op in ops {
+            self.apply(op);
+        }
+    }
+
+    pub fn hash(&self) -> StateHash {
+        hash_accounts(self.accounts.iter().map(|(id, a)| (*id, *a)))
+    }
+}
+
+/// Deterministic representation of the final state used for cross-DB equality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateHash {
+    pub account_count: u64,
+    pub savings_bits: u64,
+    pub checking_bits: u64,
+    pub mix: u64,
+}
+
+pub fn hash_accounts<I>(accounts: I) -> StateHash
+where
+    I: IntoIterator<Item = (u64, AccountState)>,
+{
+    let mut total_savings = 0.0_f64;
+    let mut total_checking = 0.0_f64;
+    let mut h = DefaultHasher::new();
+    let mut count = 0u64;
+    let mut rows: Vec<(u64, AccountState)> = accounts.into_iter().collect();
+    rows.sort_by_key(|(id, _)| *id);
+    for (id, a) in &rows {
+        count += 1;
+        total_savings += a.savings;
+        total_checking += a.checking;
+        id.hash(&mut h);
+        a.savings.to_bits().hash(&mut h);
+        a.checking.to_bits().hash(&mut h);
+    }
+    StateHash {
+        account_count: count,
+        savings_bits: total_savings.to_bits(),
+        checking_bits: total_checking.to_bits(),
+        mix: h.finish(),
+    }
+}
+
+/// Run the first `CORRECTNESS_ITERS` batches of the mixed workload sequentially
+/// through `engine`, run the same through the reference, and return
+/// `(engine_hash, reference_hash)`. Callers assert they match.
+pub fn run_correctness_check(engine: &mut impl SmallBankEngine) -> (StateHash, StateHash) {
+    let fixture = generate_fixture(CORRECTNESS_ITERS);
+    let mut reference = ReferenceState::seeded(NUM_ACCOUNTS);
+    for ops in &fixture.mixed {
+        engine.execute(ops);
+        reference.apply_all(ops);
+    }
+    (engine.verify(), reference.hash())
+}
+
+/// Asserts `engine`'s final state matches the reference after a fixed
+/// sequential workload. Panics with a detailed diff on mismatch. Intended to
+/// be called from the criterion entry point so every `cargo bench` run
+/// exercises correctness before perf measurement.
+pub fn assert_matches_reference(engine: &mut impl SmallBankEngine) {
+    let name = engine.name().to_owned();
+    let (engine_hash, reference_hash) = run_correctness_check(engine);
+    if engine_hash != reference_hash {
+        panic!(
+            "[{name}] final state diverged from reference\n  engine   : {engine_hash:?}\n  reference: {reference_hash:?}"
+        );
+    }
+    eprintln!("[{name}] correctness check passed: {engine_hash:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -263,69 +488,60 @@ pub fn smallbank_criterion() -> Criterion {
 // Shared bench harness
 // ---------------------------------------------------------------------------
 
-pub fn bench_workloads(c: &mut Criterion, engine: &mut impl SmallBankEngine) {
-    let cfg_name = engine.name().to_owned();
-    let zipf = ZipfianGenerator::new(NUM_ACCOUNTS, ZIPFIAN_CONSTANT);
+/// Per-bench counter: lets each `iter_batched_ref` advance deterministically
+/// through the shared fixture pool.
+struct Cursor(AtomicUsize);
 
-    // Mixed workload (paper ratios)
-    {
-        let mut rng = StdRng::seed_from_u64(100);
-        let mut group = c.benchmark_group(format!("smallbank_mixed/{cfg_name}"));
-        group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function("ops", |b| {
-            b.iter_batched_ref(
-                || gen_mixed_workload(&mut rng, &zipf),
-                |ops| engine.execute(ops),
-                BatchSize::SmallInput,
-            );
-        });
-        group.finish();
+impl Cursor {
+    fn new() -> Self {
+        Self(AtomicUsize::new(0))
     }
-
-    // Read-heavy workload
-    {
-        let mut rng = StdRng::seed_from_u64(200);
-        let mut group = c.benchmark_group(format!("smallbank_read_heavy/{cfg_name}"));
-        group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function("ops", |b| {
-            b.iter_batched_ref(
-                || gen_read_heavy_workload(&mut rng, &zipf),
-                |ops| engine.execute(ops),
-                BatchSize::SmallInput,
-            );
-        });
-        group.finish();
-    }
-
-    // Write-heavy workload
-    {
-        let mut rng = StdRng::seed_from_u64(300);
-        let mut group = c.benchmark_group(format!("smallbank_write_heavy/{cfg_name}"));
-        group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
-        group.bench_function("ops", |b| {
-            b.iter_batched_ref(
-                || gen_write_heavy_workload(&mut rng, &zipf),
-                |ops| engine.execute(ops),
-                BatchSize::SmallInput,
-            );
-        });
-        group.finish();
+    fn next(&self, len: usize) -> usize {
+        self.0.fetch_add(1, Ordering::Relaxed) % len
     }
 }
 
-pub fn bench_contention(c: &mut Criterion, engine: &mut impl SmallBankEngine) {
+pub fn bench_workloads(
+    c: &mut Criterion,
+    engine: &mut impl SmallBankEngine,
+    fixture: &Arc<WorkloadFixture>,
+) {
     let cfg_name = engine.name().to_owned();
-    let zipf = ZipfianGenerator::new(NUM_ACCOUNTS, ZIPFIAN_CONSTANT);
+
+    let mut run = |c: &mut Criterion, label: &str, pool: &[Vec<SmallBankOp>]| {
+        let cursor = Cursor::new();
+        let mut group = c.benchmark_group(format!("smallbank_{label}/{cfg_name}"));
+        group.throughput(Throughput::Elements(OPS_PER_ITER as u64));
+        group.bench_function("ops", |b| {
+            b.iter_batched_ref(
+                || pool[cursor.next(pool.len())].clone(),
+                |ops| engine.execute(ops),
+                BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    };
+
+    run(c, "mixed", &fixture.mixed);
+    run(c, "read_heavy", &fixture.read_heavy);
+    run(c, "write_heavy", &fixture.write_heavy);
+}
+
+pub fn bench_contention(
+    c: &mut Criterion,
+    engine: &mut impl SmallBankEngine,
+    fixture: &Arc<WorkloadFixture>,
+) {
+    let cfg_name = engine.name().to_owned();
     let total_ops = (NUM_WRITERS * OPS_PER_WRITER) as u64;
 
-    // Low contention: Zipfian across full keyspace
-    {
-        let mut rng = StdRng::seed_from_u64(400);
-        let mut group = c.benchmark_group(format!("smallbank_contention_low/{cfg_name}"));
+    let mut run = |c: &mut Criterion, label: &str, pool: &[Vec<Vec<SmallBankOp>>]| {
+        let cursor = Cursor::new();
+        let mut group = c.benchmark_group(format!("smallbank_contention_{label}/{cfg_name}"));
         group.throughput(Throughput::Elements(total_ops));
         group.bench_function("burst", |b| {
             b.iter_batched_ref(
-                || gen_contention_ops(&mut rng, &zipf),
+                || pool[cursor.next(pool.len())].clone(),
                 |op_sets| {
                     black_box(engine.execute_burst(op_sets));
                 },
@@ -333,22 +549,8 @@ pub fn bench_contention(c: &mut Criterion, engine: &mut impl SmallBankEngine) {
             );
         });
         group.finish();
-    }
+    };
 
-    // High contention: hot accounts 1..=10
-    {
-        let mut rng = StdRng::seed_from_u64(500);
-        let mut group = c.benchmark_group(format!("smallbank_contention_high/{cfg_name}"));
-        group.throughput(Throughput::Elements(total_ops));
-        group.bench_function("burst", |b| {
-            b.iter_batched_ref(
-                || gen_high_contention_ops(&mut rng),
-                |op_sets| {
-                    black_box(engine.execute_burst(op_sets));
-                },
-                BatchSize::SmallInput,
-            );
-        });
-        group.finish();
-    }
+    run(c, "low", &fixture.contention_low);
+    run(c, "high", &fixture.contention_high);
 }

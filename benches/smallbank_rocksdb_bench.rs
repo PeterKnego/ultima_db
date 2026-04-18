@@ -233,6 +233,24 @@ impl SmallBankEngine for RocksDbEngine {
         "rocksdb"
     }
 
+    fn verify(&self) -> StateHash {
+        let cf_sav = self.db.cf_handle(CF_SAVINGS).unwrap();
+        let cf_chk = self.db.cf_handle(CF_CHECKING).unwrap();
+        let mut accounts: std::collections::BTreeMap<u64, AccountState> =
+            std::collections::BTreeMap::new();
+        for item in self.db.iterator_cf(&cf_sav, rocksdb::IteratorMode::Start) {
+            let (_k, v) = item.unwrap();
+            let s: Savings = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            accounts.entry(s.customer_id).or_default().savings = s.balance;
+        }
+        for item in self.db.iterator_cf(&cf_chk, rocksdb::IteratorMode::Start) {
+            let (_k, v) = item.unwrap();
+            let c: Checking = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            accounts.entry(c.customer_id).or_default().checking = c.balance;
+        }
+        hash_accounts(accounts)
+    }
+
     fn execute(&mut self, ops: &[SmallBankOp]) {
         for op in ops {
             Self::execute_single_op(&self.db, op);
@@ -283,9 +301,15 @@ impl SmallBankEngine for RocksDbEngine {
 // ---------------------------------------------------------------------------
 
 fn bench_smallbank(c: &mut Criterion) {
+    {
+        let mut engine = RocksDbEngine::preload();
+        assert_matches_reference(&mut engine);
+    }
+
+    let fixture = generate_fixture(FIXTURE_POOL_SIZE);
     let mut engine = RocksDbEngine::preload();
-    bench_workloads(c, &mut engine);
-    bench_contention(c, &mut engine);
+    bench_workloads(c, &mut engine, &fixture);
+    bench_contention(c, &mut engine, &fixture);
 }
 
 criterion_group! {

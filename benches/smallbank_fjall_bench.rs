@@ -207,6 +207,22 @@ impl SmallBankEngine for FjallEngine {
         "fjall"
     }
 
+    fn verify(&self) -> StateHash {
+        let mut accounts: std::collections::BTreeMap<u64, AccountState> =
+            std::collections::BTreeMap::new();
+        for guard in self.ks_savings.inner().iter() {
+            let v = guard.value().unwrap();
+            let s: Savings = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            accounts.entry(s.customer_id).or_default().savings = s.balance;
+        }
+        for guard in self.ks_checking.inner().iter() {
+            let v = guard.value().unwrap();
+            let c: Checking = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            accounts.entry(c.customer_id).or_default().checking = c.balance;
+        }
+        hash_accounts(accounts)
+    }
+
     fn execute(&mut self, ops: &[SmallBankOp]) {
         for op in ops {
             match op {
@@ -278,9 +294,15 @@ impl SmallBankEngine for FjallEngine {
 // ---------------------------------------------------------------------------
 
 fn bench_smallbank(c: &mut Criterion) {
+    {
+        let mut engine = FjallEngine::preload();
+        assert_matches_reference(&mut engine);
+    }
+
+    let fixture = generate_fixture(FIXTURE_POOL_SIZE);
     let mut engine = FjallEngine::preload();
-    bench_workloads(c, &mut engine);
-    bench_contention(c, &mut engine);
+    bench_workloads(c, &mut engine, &fixture);
+    bench_contention(c, &mut engine, &fixture);
 }
 
 criterion_group! {
