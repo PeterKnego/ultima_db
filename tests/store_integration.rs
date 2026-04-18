@@ -278,14 +278,17 @@ fn two_overlapping_write_txs_to_different_tables() {
     assert_eq!(v_a, 1);
     assert_eq!(v_b, 2);
 
-    // v1 has table_a only
+    // v1 has table_a only — wtx_a committed first, before wtx_b.
     let r1 = store.begin_read(Some(1)).unwrap();
     assert_eq!(r1.open_table::<u32>("table_a").unwrap().get(1), Some(&100u32));
     assert!(matches!(r1.open_table::<u32>("table_b"), Err(Error::KeyNotFound)));
 
-    // v2 has only table_b — wtx_b's base was v0 (empty), so table_a isn't present
+    // v2 has BOTH tables. wtx_b rebased onto the current latest snapshot at
+    // commit time — v1 (which contains wtx_a's table_a). OCC confirmed no
+    // concurrent commit touched table_b, so wtx_b's table_b is safely merged
+    // on top.
     let r2 = store.begin_read(Some(2)).unwrap();
-    assert!(matches!(r2.open_table::<u32>("table_a"), Err(Error::KeyNotFound)));
+    assert_eq!(r2.open_table::<u32>("table_a").unwrap().get(1), Some(&100u32));
     assert_eq!(r2.open_table::<u32>("table_b").unwrap().get(1), Some(&200u32));
 }
 
@@ -1485,7 +1488,9 @@ fn single_writer_allows_after_drop() {
 // MultiWriter: disjoint tables — no overlap, both commit successfully.
 // ---------------------------------------------------------------------------
 
-/// Two writers to different tables have no key overlap → both commit.
+/// Two writers to different tables have no overlap → both commit, and the
+/// later commit rebases onto the earlier so the final snapshot contains
+/// BOTH tables.
 #[test]
 fn multi_writer_disjoint_tables_both_commit() {
     let store = multi_writer_store();
@@ -1502,18 +1507,21 @@ fn multi_writer_disjoint_tables_both_commit() {
     assert!(v_a < v_b);
 
     let rtx = store.begin_read(Some(v_b)).unwrap();
-    // v_b's base was v0, so only t2 exists
+    assert_eq!(rtx.open_table::<String>("t1").unwrap().get(1), Some(&"a".to_string()));
     assert_eq!(rtx.open_table::<String>("t2").unwrap().get(1), Some(&"b".to_string()));
 }
 
 // ---------------------------------------------------------------------------
-// MultiWriter: disjoint keys, same table — key-level detection allows both.
+// MultiWriter: two writers to the same table always conflict (table-level OCC).
+// The retry pattern is the supported way to land non-conflicting edits to the
+// same table from concurrent writers.
 // ---------------------------------------------------------------------------
 
-/// Two writers to the same table but different keys → both commit.
-/// Writer A inserts (new key), writer B updates (existing key).
+/// Two writers to the same table — even on different keys — conflict. The
+/// second writer must retry, which rebases onto the first's commit and lands
+/// cleanly.
 #[test]
-fn multi_writer_disjoint_keys_same_table_both_commit() {
+fn multi_writer_same_table_conflicts_and_retry_succeeds() {
     let store = multi_writer_store();
 
     // Seed table with record id=1
@@ -1526,12 +1534,27 @@ fn multi_writer_disjoint_keys_same_table_both_commit() {
     let mut wtx_a = store.begin_write(None).unwrap();
     let mut wtx_b = store.begin_write(None).unwrap();
 
-    // Both share same base (v1). Writer A inserts id=2, writer B updates id=1.
+    // Both share the same base (v1). Writer A inserts id=2, writer B updates id=1.
     wtx_a.open_table::<String>("t").unwrap().insert("from_a".to_string()).unwrap();
     wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
 
     wtx_a.commit().unwrap();
-    wtx_b.commit().unwrap(); // should succeed — different keys
+    // Table-level OCC: any concurrent commit to the same table conflicts,
+    // even if keys are disjoint.
+    let err = wtx_b.commit().unwrap_err();
+    assert!(matches!(err, Error::WriteConflict { table, .. } if table == "t"));
+
+    // Retry B with a fresh transaction. It now bases on the snapshot that
+    // already contains A's insert, applies its update, and commits cleanly.
+    let mut wtx_b = store.begin_write(None).unwrap();
+    wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
+    wtx_b.commit().unwrap();
+
+    // Final state has both A's insert (id=2) and B's update (id=1).
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<String>("t").unwrap();
+    assert_eq!(t.get(1), Some(&"from_b".to_string()));
+    assert_eq!(t.get(2), Some(&"from_a".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,7 +1764,10 @@ fn multi_writer_conflict_cleans_up_active_writer() {
 // ---------------------------------------------------------------------------
 
 /// update_batch that fails should NOT poison the write set with phantom IDs.
-/// If it does, a subsequent commit may produce spurious WriteConflict.
+/// If it does, an intervening rollback and reopen may produce spurious
+/// WriteConflict later. (With table-level OCC, we exercise poisoning via a
+/// rollback-and-retry pattern rather than two concurrent writers on the
+/// same table, which would conflict regardless.)
 #[test]
 fn multi_writer_update_batch_failure_does_not_poison_write_set() {
     let store = multi_writer_store();
@@ -1764,21 +1790,20 @@ fn multi_writer_update_batch_failure_does_not_poison_write_set() {
         assert!(res.is_err());
     }
 
-    // Writer B: modify key 1 and commit.
+    // Writer B: modify key 1 on "t" and commit.
     {
         let mut wtx_b = store.begin_write(None).unwrap();
         wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
         wtx_b.commit().unwrap();
     }
 
-    // Writer A now does a valid write on a DIFFERENT key and commits.
-    // Since the failed update_batch should not have recorded key 1 in the write set,
-    // there should be no conflict.
+    // Writer A writes to a DIFFERENT table "u". If the failed batch had
+    // poisoned write_set["t"] with phantom IDs, table-level OCC would flag
+    // a conflict with B's commit to "t". Clean write_set["t"] → no conflict.
     {
-        let mut table = wtx_a.open_table::<String>("t").unwrap();
-        table.insert("new_record".to_string()).unwrap();
+        let mut table_u = wtx_a.open_table::<String>("u").unwrap();
+        table_u.insert("new_record".to_string()).unwrap();
     }
-    // This commit should succeed — A only wrote key 2, B wrote key 1.
     wtx_a.commit().unwrap();
 }
 
@@ -1805,4 +1830,291 @@ fn multi_writer_read_only_tx_no_conflict() {
 
     wtx_a.commit().unwrap();
     wtx_b.commit().unwrap(); // should succeed — B had no writes
+}
+
+// ---------------------------------------------------------------------------
+// Real-thread concurrent writes
+//
+// These tests drive WriterMode::MultiWriter from multiple OS threads. They
+// verify that Store is Send + Sync and that the OCC machinery behaves
+// correctly when transactions genuinely overlap in wall-clock time rather
+// than being interleaved on a single thread.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashSet;
+use std::sync::{Arc, Barrier};
+use std::thread;
+
+/// Store is the handle that crosses thread boundaries. Verify by inspection
+/// that a Store clone compiles inside a thread::spawn move closure.
+#[test]
+fn concurrent_store_is_send_and_sync() {
+    let store = multi_writer_store();
+    let h = {
+        let store = store.clone();
+        thread::spawn(move || {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<u64>("t").unwrap().insert(42).unwrap();
+            wtx.commit().unwrap()
+        })
+    };
+    let v = h.join().unwrap();
+    assert!(v >= 1);
+}
+
+/// Two threads, each writing to its own disjoint table — both commits succeed.
+#[test]
+fn concurrent_disjoint_tables_both_commit() {
+    let store = multi_writer_store();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let store_a = store.clone();
+    let b_a = barrier.clone();
+    let ta = thread::spawn(move || {
+        b_a.wait();
+        let mut wtx = store_a.begin_write(None).unwrap();
+        wtx.open_table::<String>("t_a").unwrap().insert("a".into()).unwrap();
+        wtx.commit().unwrap()
+    });
+
+    let store_b = store.clone();
+    let b_b = barrier.clone();
+    let tb = thread::spawn(move || {
+        b_b.wait();
+        let mut wtx = store_b.begin_write(None).unwrap();
+        wtx.open_table::<String>("t_b").unwrap().insert("b".into()).unwrap();
+        wtx.commit().unwrap()
+    });
+
+    let va = ta.join().unwrap();
+    let vb = tb.join().unwrap();
+    assert_ne!(va, vb);
+
+    let final_v = store.latest_version();
+    let rtx = store.begin_read(Some(final_v)).unwrap();
+    assert_eq!(rtx.open_table::<String>("t_a").unwrap().get(1), Some(&"a".to_string()));
+    assert_eq!(rtx.open_table::<String>("t_b").unwrap().get(1), Some(&"b".to_string()));
+}
+
+/// N threads, same table, disjoint keys — all commits eventually succeed.
+/// No conflicts expected because each thread writes a unique, pre-seeded key.
+#[test]
+fn concurrent_same_table_disjoint_keys_all_commit() {
+    const THREADS: u64 = 8;
+    let store = multi_writer_store();
+
+    // Preload ids 1..=THREADS so each thread owns exactly one key.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<u64>("t").unwrap();
+        for i in 1..=THREADS {
+            t.insert(i).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+
+    let barrier = Arc::new(Barrier::new(THREADS as usize));
+    let handles: Vec<_> = (1..=THREADS)
+        .map(|i| {
+            let store = store.clone();
+            let b = barrier.clone();
+            thread::spawn(move || {
+                b.wait();
+                // Retry on conflict — can still happen if other threads' commits race.
+                loop {
+                    let mut wtx = store.begin_write(None).unwrap();
+                    wtx.open_table::<u64>("t").unwrap().update(i, i * 100).unwrap();
+                    match wtx.commit() {
+                        Ok(_) => return,
+                        Err(Error::WriteConflict { .. }) => continue,
+                        Err(e) => panic!("unexpected error: {e}"),
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<u64>("t").unwrap();
+    for i in 1..=THREADS {
+        assert_eq!(t.get(i), Some(&(i * 100)));
+    }
+}
+
+/// N threads, same table, *overlapping* keys — some commits conflict and
+/// retry. Once all retries drain, final state reflects every logical write.
+#[test]
+fn concurrent_same_table_overlapping_keys_with_retry() {
+    const THREADS: usize = 8;
+    const WRITES_PER_THREAD: u64 = 20;
+    let store = multi_writer_store();
+
+    // Seed a single key that every thread will contend on, plus per-thread keys.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<u64>("t").unwrap();
+        t.insert(0).unwrap(); // hot key id=1
+        for _ in 0..THREADS as u64 {
+            t.insert(0).unwrap(); // ids 2..=THREADS+1
+        }
+        wtx.commit().unwrap();
+    }
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS as u64)
+        .map(|tid| {
+            let store = store.clone();
+            let b = barrier.clone();
+            thread::spawn(move || {
+                b.wait();
+                let mut conflicts = 0u64;
+                for n in 0..WRITES_PER_THREAD {
+                    loop {
+                        let mut wtx = store.begin_write(None).unwrap();
+                        {
+                            let mut t = wtx.open_table::<u64>("t").unwrap();
+                            // Always touch the hot key id=1.
+                            t.update(1, tid * 1000 + n).unwrap();
+                            // And the per-thread key (id = 2 + tid).
+                            t.update(2 + tid, tid * 1000 + n).unwrap();
+                        }
+                        match wtx.commit() {
+                            Ok(_) => break,
+                            Err(Error::WriteConflict { .. }) => {
+                                conflicts += 1;
+                                continue;
+                            }
+                            Err(e) => panic!("unexpected error: {e}"),
+                        }
+                    }
+                }
+                conflicts
+            })
+        })
+        .collect();
+
+    let total_conflicts: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    // Real contention on the hot key should produce *some* conflicts. If this
+    // ever fires 0, OCC is not detecting cross-thread overlap.
+    assert!(
+        total_conflicts > 0,
+        "expected at least one WriteConflict across {THREADS} threads hitting hot key; got {total_conflicts}",
+    );
+
+    // Final state: each per-thread key shows its last logical write
+    // (tid * 1000 + WRITES_PER_THREAD - 1).
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<u64>("t").unwrap();
+    for tid in 0..THREADS as u64 {
+        let expected = tid * 1000 + WRITES_PER_THREAD - 1;
+        assert_eq!(t.get(2 + tid), Some(&expected), "thread {tid} final value");
+    }
+}
+
+/// Readers opened on older versions continue to see their snapshot while
+/// writers promote new snapshots concurrently.
+#[test]
+fn concurrent_readers_unaffected_by_writers() {
+    let store = multi_writer_store();
+
+    // Commit v1 so we have a snapshot to pin.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<u64>("t").unwrap().insert(100).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let rtx_v1 = store.begin_read(Some(1)).unwrap();
+    assert_eq!(rtx_v1.version(), 1);
+
+    // Spawn writers that push many new versions.
+    let barrier = Arc::new(Barrier::new(4));
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let store = store.clone();
+            let b = barrier.clone();
+            thread::spawn(move || {
+                b.wait();
+                for _ in 0..10 {
+                    loop {
+                        let mut wtx = store.begin_write(None).unwrap();
+                        wtx.open_table::<u64>("t").unwrap().insert(999).unwrap();
+                        if wtx.commit().is_ok() {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // v1 reader still reads exactly what was there at v1.
+    let t = rtx_v1.open_table::<u64>("t").unwrap();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.get(1), Some(&100));
+}
+
+/// Stress test: many threads, many commits, validate that the set of
+/// successfully-committed primary keys exactly matches what we asked for.
+#[test]
+fn concurrent_stress_insert_batch_no_lost_writes() {
+    const THREADS: usize = 8;
+    const INSERTS_PER_THREAD: u64 = 25;
+    let store = multi_writer_store();
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS as u64)
+        .map(|tid| {
+            let store = store.clone();
+            let b = barrier.clone();
+            thread::spawn(move || {
+                b.wait();
+                let mut inserted = Vec::with_capacity(INSERTS_PER_THREAD as usize);
+                for n in 0..INSERTS_PER_THREAD {
+                    let marker = tid * 10_000 + n;
+                    loop {
+                        let mut wtx = store.begin_write(None).unwrap();
+                        let id = wtx
+                            .open_table::<u64>("data")
+                            .unwrap()
+                            .insert(marker)
+                            .unwrap();
+                        match wtx.commit() {
+                            Ok(_) => {
+                                inserted.push((id, marker));
+                                break;
+                            }
+                            Err(Error::WriteConflict { .. }) => continue,
+                            Err(e) => panic!("unexpected: {e}"),
+                        }
+                    }
+                }
+                inserted
+            })
+        })
+        .collect();
+
+    let mut all_inserted: Vec<(u64, u64)> = Vec::new();
+    for h in handles {
+        all_inserted.extend(h.join().unwrap());
+    }
+
+    // Final table should contain exactly the markers we inserted, and their
+    // ids should be unique (no two threads got the same assigned id).
+    let ids: HashSet<u64> = all_inserted.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids.len(), all_inserted.len(), "auto-assigned ids collided");
+
+    let expected_markers: HashSet<u64> = all_inserted.iter().map(|(_, m)| *m).collect();
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<u64>("data").unwrap();
+    let actual_markers: HashSet<u64> = t.iter().map(|(_, v)| *v).collect();
+    assert_eq!(actual_markers, expected_markers);
+    assert_eq!(t.len(), (THREADS as u64 * INSERTS_PER_THREAD) as usize);
 }

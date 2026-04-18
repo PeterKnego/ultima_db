@@ -45,7 +45,7 @@ fn serialize_snapshot(
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     // Only serialize tables that are registered in the registry.
-    let registered_tables: Vec<(&String, &std::sync::Arc<dyn std::any::Any>)> = snapshot
+    let registered_tables: Vec<(&String, &std::sync::Arc<dyn std::any::Any + Send + Sync>)> = snapshot
         .tables
         .iter()
         .filter(|(name, _)| registry.contains(name))
@@ -276,7 +276,7 @@ mod tests {
         table.insert(User { name: "Bob".into(), age: 25 }).unwrap();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(table) as std::sync::Arc<dyn std::any::Any>);
+        tables.insert("users".to_string(), std::sync::Arc::new(table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
 
         let snapshot = Snapshot { version: 42, tables };
         (snapshot, reg)
@@ -487,8 +487,8 @@ mod tests {
         order_table.insert(Order { item: "Gadget".into(), qty: 3 }).unwrap();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any>);
-        tables.insert("orders".to_string(), std::sync::Arc::new(order_table) as std::sync::Arc<dyn std::any::Any>);
+        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        tables.insert("orders".to_string(), std::sync::Arc::new(order_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
 
         let snapshot = Snapshot { version: 7, tables };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();
@@ -520,8 +520,8 @@ mod tests {
         let log_table = Table::<String>::new();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any>);
-        tables.insert("logs".to_string(), std::sync::Arc::new(log_table) as std::sync::Arc<dyn std::any::Any>);
+        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        tables.insert("logs".to_string(), std::sync::Arc::new(log_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
 
         let snapshot = Snapshot { version: 1, tables };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();

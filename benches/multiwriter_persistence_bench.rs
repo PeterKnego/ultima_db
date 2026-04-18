@@ -25,20 +25,6 @@ struct Record {
 }
 
 // ---------------------------------------------------------------------------
-// SendStore — Store is not Send+Sync (Arc<dyn Any> issue, tracked separately)
-// ---------------------------------------------------------------------------
-
-struct SendStore(Store);
-unsafe impl Send for SendStore {}
-unsafe impl Sync for SendStore {}
-impl std::ops::Deref for SendStore {
-    type Target = Store;
-    fn deref(&self) -> &Store {
-        &self.0
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -84,18 +70,17 @@ fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Sto
 /// Run N threads, each committing COMMITS_PER_THREAD transactions.
 /// Each transaction updates a single key in the thread's private range.
 fn run_threaded_commits(store: &Store) {
-    let ss = Arc::new(SendStore(store.clone()));
     let barrier = Arc::new(Barrier::new(NUM_THREADS));
 
     let handles: Vec<_> = (0..NUM_THREADS)
         .map(|t| {
-            let ss = Arc::clone(&ss);
+            let store = store.clone();
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
                 for i in 0..COMMITS_PER_THREAD {
                     let key = (t * 1000 + i + 1) as u64;
-                    let mut wtx = ss.begin_write(None).unwrap();
+                    let mut wtx = store.begin_write(None).unwrap();
                     wtx.open_table::<Record>("data")
                         .unwrap()
                         .update(key, Record { value: key * 100 })
@@ -104,7 +89,7 @@ fn run_threaded_commits(store: &Store) {
                         Ok(_) => {}
                         Err(ultima_db::Error::WriteConflict { .. }) => {
                             // Retry once on conflict (rare with disjoint keys).
-                            let mut wtx = ss.begin_write(None).unwrap();
+                            let mut wtx = store.begin_write(None).unwrap();
                             wtx.open_table::<Record>("data")
                                 .unwrap()
                                 .update(key, Record { value: key * 100 })

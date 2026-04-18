@@ -1,8 +1,5 @@
-// Arc<Snapshot> is intentionally non-Send+Sync for now. Task 4 will add
-// Send + Sync bounds when multi-threaded access is required.
-#![allow(clippy::arc_with_non_send_sync)]
-
 use std::any::Any;
+use std::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
@@ -18,16 +15,13 @@ use crate::{Error, Result};
 
 /// An immutable snapshot of all tables at a specific version.
 ///
-/// Tables are stored as `Arc<dyn Any>` so that building a new snapshot from an
-/// existing one (at commit time) is O(number-of-tables) with O(1) per table.
-///
-/// `Snapshot` is not `Send + Sync` because `dyn Any` does not require those
-/// bounds. Task 4 will add `Send + Sync` bounds when multi-threaded access is
-/// required.
+/// Tables are stored as `Arc<dyn Any + Send + Sync>` so that building a new
+/// snapshot from an existing one (at commit time) is O(number-of-tables) with
+/// O(1) per table, and so snapshots can be shared across threads.
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub(crate) version: u64,
-    pub(crate) tables: BTreeMap<String, Arc<dyn Any>>,
+    pub(crate) tables: BTreeMap<String, Arc<dyn Any + Send + Sync>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +203,7 @@ impl Store {
             .ok_or(Error::VersionNotFound(v))?
             .clone();
         let metrics = Arc::clone(&inner.metrics);
-        Ok(ReadTx { snapshot, metrics })
+        Ok(ReadTx { snapshot, metrics, _not_send: PhantomData })
     }
 
     /// Open a write transaction.
@@ -279,6 +273,7 @@ impl Store {
             wal_ops: Vec::new(),
             #[cfg(feature = "persistence")]
             wal_enabled: inner.wal_handle.is_some(),
+            _not_send: PhantomData,
         })
     }
 
@@ -414,7 +409,7 @@ impl Store {
                     // Build a new table map with sole ownership of each Arc.
                     // We re-wrap each table in a fresh Arc so Arc::get_mut succeeds during replay.
                     let base_snap = &inner.snapshots[&inner.latest_version];
-                    let mut tables: BTreeMap<String, Arc<dyn Any>> = BTreeMap::new();
+                    let mut tables: BTreeMap<String, Arc<dyn Any + Send + Sync>> = BTreeMap::new();
                     for (name, arc) in &base_snap.tables {
                         let info = inner.registry.get(name)
                             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
@@ -569,6 +564,9 @@ impl Default for Store {
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
     metrics: Arc<StoreMetrics>,
+    /// Pins `ReadTx` to its creating thread. Users who need a read view on
+    /// another thread should call `store.begin_read(Some(version))` there.
+    _not_send: PhantomData<*const ()>,
 }
 
 /// Read-only access to a snapshot.
@@ -643,7 +641,7 @@ impl Readable for ReadTx {
 pub struct WriteTx {
     base: Arc<Snapshot>,
     /// Mutable working copies of tables opened for writing.
-    dirty: BTreeMap<String, Box<dyn Any>>,
+    dirty: BTreeMap<String, Box<dyn Any + Send + Sync>>,
     /// The version number that will be assigned to the new snapshot on commit.
     version: u64,
     /// Reference back to the store's interior state, used during commit.
@@ -667,6 +665,11 @@ pub struct WriteTx {
     /// Whether WAL tracking is active (true only when a WAL handle exists).
     #[cfg(feature = "persistence")]
     wal_enabled: bool,
+    /// Pins `WriteTx` to its creating thread. A transaction must complete on
+    /// the thread that opened it — the write-set tracking is not designed to
+    /// be split across threads. Users who want concurrent writers should
+    /// `store.clone()` and call `begin_write` on each thread.
+    _not_send: PhantomData<*const ()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,10 +1178,14 @@ impl WriteTx {
             mock.write(crate::wal::WalEntry { version: self.version, ops: vec![] })
         });
 
-        // Build the new table map.
-        let mut new_tables: BTreeMap<String, Arc<dyn Any>> = self
-            .base
-            .tables
+        // Build the new table map by rebasing onto the CURRENT latest
+        // snapshot (not self.base). Two concurrent writers touching different
+        // tables must each see the other's committed tables in the final
+        // snapshot. OCC (validate_write_set) has already ruled out any
+        // concurrent commit writing to a table we wrote to, so overwriting
+        // `new_tables[name]` with our dirty copy is safe.
+        let latest_tables = &inner.snapshots[&inner.latest_version].tables;
+        let mut new_tables: BTreeMap<String, Arc<dyn Any + Send + Sync>> = latest_tables
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
@@ -1336,13 +1343,24 @@ impl WriteTx {
                     });
                 }
             }
-            // Key-level overlap in write sets.
+            // Table-level OCC: any concurrent commit that wrote to a table
+            // we also wrote to is a conflict. Table-level (rather than
+            // key-level) is required because commit rebases the new snapshot
+            // onto the current latest version; a per-writer dirty table holds
+            // only its author's edits on its own base, so merging two dirty
+            // versions of the same table would silently drop the other
+            // writer's edits. Users who want non-conflicting updates to
+            // different keys in the same table should retry on conflict —
+            // retry rebases and applies their edit on top of the latest.
             for (table_name, my_keys) in &self.write_set {
-                if let Some(their_keys) = cws.tables.get(table_name)
-                    && !my_keys.is_disjoint(their_keys)
-                {
-                    let conflicting: Vec<u64> =
-                        my_keys.intersection(their_keys).copied().collect();
+                // `open_table` in MultiWriter mode inserts an empty write-set
+                // entry eagerly. Treat "opened but nothing written" as no
+                // write for OCC purposes.
+                if my_keys.is_empty() {
+                    continue;
+                }
+                if let Some(their_keys) = cws.tables.get(table_name) {
+                    let conflicting: Vec<u64> = their_keys.iter().copied().collect();
                     return Some(Error::WriteConflict {
                         table: table_name.clone(),
                         keys: conflicting,
@@ -1383,6 +1401,17 @@ impl Drop for WriteTx {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+// Compile-time assertion: `Store` is thread-safe. `WriteTx` and `ReadTx` are
+// deliberately `!Send` via `PhantomData<*const ()>` so a transaction stays on
+// its creating thread; that's verified by a trybuild-style negative test in
+// `tests/store_integration.rs`.
+#[cfg(test)]
+#[allow(dead_code)]
+const fn _assert_store_is_thread_safe() {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<Store>();
+}
 
 #[cfg(test)]
 mod tests {
@@ -2035,10 +2064,6 @@ mod tests {
     // Mock WAL tests — three-phase commit verification
     // -----------------------------------------------------------------------
 
-    #[cfg(not(feature = "persistence"))]
-    #[derive(Clone, Debug, PartialEq)]
-    struct Item { name: String }
-
     #[cfg(feature = "persistence")]
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Item { name: String }
@@ -2053,28 +2078,13 @@ mod tests {
         (store, mock)
     }
 
-    // Store is not Send+Sync because Snapshot uses Arc<dyn Any> instead of
-    // Arc<dyn Any + Send + Sync>. In tests all record types are Send+Sync,
-    // so this is safe. The proper fix is tracked as a future task.
-    #[cfg(feature = "persistence")]
-    struct SendStore(Store);
-    #[cfg(feature = "persistence")]
-    unsafe impl Send for SendStore {}
-    #[cfg(feature = "persistence")]
-    unsafe impl Sync for SendStore {}
-    #[cfg(feature = "persistence")]
-    impl std::ops::Deref for SendStore {
-        type Target = Store;
-        fn deref(&self) -> &Store { &self.0 }
-    }
-
     #[test]
     #[cfg(feature = "persistence")]
     fn mock_wal_snapshot_not_visible_before_flush() {
         let (store, mock) = store_with_mock_wal();
 
         // Commit in a background thread — it will block waiting for flush.
-        let ss = SendStore(store.clone());
+        let ss = store.clone();
         let t = std::thread::spawn(move || {
             let mut wtx = ss.begin_write(None).unwrap();
             wtx.open_table::<Item>("items").unwrap()
@@ -2111,7 +2121,7 @@ mod tests {
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Two concurrent writers on different tables (avoids auto-increment ID collision).
-        let ss1 = SendStore(store.clone());
+        let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
             wtx.open_table::<Item>("items_a").unwrap()
@@ -2119,7 +2129,7 @@ mod tests {
             wtx.commit().unwrap()
         });
 
-        let ss2 = SendStore(store.clone());
+        let ss2 = store.clone();
         let t2 = std::thread::spawn(move || {
             let mut wtx = ss2.begin_write(None).unwrap();
             wtx.open_table::<Item>("items_b").unwrap()
@@ -2171,7 +2181,7 @@ mod tests {
         let mut wtx2 = store.begin_write(None).unwrap();
 
         // T1: modify key 1, commit (blocks waiting for flush).
-        let ss1 = SendStore(store.clone());
+        let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
             wtx.open_table::<Item>("items").unwrap()
@@ -2214,7 +2224,7 @@ mod tests {
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Start a write that blocks on WAL flush.
-        let ss = SendStore(store.clone());
+        let ss = store.clone();
         let t = std::thread::spawn(move || {
             let mut wtx = ss.begin_write(None).unwrap();
             wtx.open_table::<Item>("items").unwrap()
@@ -2249,7 +2259,7 @@ mod tests {
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer A on table_a, writer B on table_b (no key conflict).
-        let ss_a = SendStore(store.clone());
+        let ss_a = store.clone();
         let t_a = std::thread::spawn(move || {
             let mut wtx = ss_a.begin_write(None).unwrap();
             wtx.open_table::<Item>("table_a").unwrap()
@@ -2257,7 +2267,7 @@ mod tests {
             wtx.commit().unwrap()
         });
 
-        let ss_b = SendStore(store.clone());
+        let ss_b = store.clone();
         let t_b = std::thread::spawn(move || {
             let mut wtx = ss_b.begin_write(None).unwrap();
             wtx.open_table::<Item>("table_b").unwrap()
@@ -2302,7 +2312,7 @@ mod tests {
         let flag_1 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag_2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let ss1 = SendStore(store.clone());
+        let ss1 = store.clone();
         let f1 = flag_1.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
@@ -2313,7 +2323,7 @@ mod tests {
             v
         });
 
-        let ss2 = SendStore(store.clone());
+        let ss2 = store.clone();
         let f2 = flag_2.clone();
         let t2 = std::thread::spawn(move || {
             let mut wtx = ss2.begin_write(None).unwrap();
@@ -2362,7 +2372,7 @@ mod tests {
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer 1 blocks in phase 2.
-        let ss1 = SendStore(store.clone());
+        let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
             wtx.open_table::<Item>("items").unwrap()
@@ -2381,7 +2391,7 @@ mod tests {
         drop(wtx2); // drop without committing — just proving begin_write works
 
         // Writer 2 via thread can also commit (will block in phase 2).
-        let ss2 = SendStore(store.clone());
+        let ss2 = store.clone();
         let t2 = std::thread::spawn(move || {
             let mut wtx = ss2.begin_write(None).unwrap();
             wtx.open_table::<Item>("other").unwrap()
@@ -2408,7 +2418,7 @@ mod tests {
         let (store, mock) = store_with_mock_wal();
 
         // Each commit must block, so run in a thread.
-        let ss = SendStore(store.clone());
+        let ss = store.clone();
         let mock2 = mock.clone();
         let t = std::thread::spawn(move || {
             for i in 0..3u64 {
@@ -2453,7 +2463,7 @@ mod tests {
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer 1 will panic during phase 2 wait.
-        let ss1 = SendStore(store.clone());
+        let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
             wtx.open_table::<Item>("items").unwrap()
@@ -2509,7 +2519,7 @@ mod tests {
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
 
         // Writer A and B on different tables.
-        let ss_a = SendStore(store.clone());
+        let ss_a = store.clone();
         let t_a = std::thread::spawn(move || {
             let mut wtx = ss_a.begin_write(None).unwrap();
             wtx.open_table::<Item>("table_a").unwrap()
@@ -2517,7 +2527,7 @@ mod tests {
             wtx.commit().unwrap()
         });
 
-        let ss_b = SendStore(store.clone());
+        let ss_b = store.clone();
         let t_b = std::thread::spawn(move || {
             let mut wtx = ss_b.begin_write(None).unwrap();
             wtx.open_table::<Item>("table_b").unwrap()
