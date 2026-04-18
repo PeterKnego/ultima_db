@@ -64,6 +64,7 @@ required-features = ["persistence"]
 [[bench]]
 name = "multiwriter_persistence_bench"
 harness = false
+required-features = ["persistence"]
 
 [[bench]]
 name = "smallbank_rocksdb_bench"
