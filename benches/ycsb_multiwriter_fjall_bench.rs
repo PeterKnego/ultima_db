@@ -1,4 +1,11 @@
+#![allow(clippy::redundant_iter_cloned)]
+
 //! Multi-writer contention benchmarks for Fjall using OptimisticTxDatabase.
+//!
+//! Each writer runs on its own OS thread, sharing Arc-wrapped db+keyspace.
+
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace};
@@ -22,8 +29,8 @@ fn encode_key(id: u64) -> [u8; 8] {
 // ---------------------------------------------------------------------------
 
 struct FjallMultiWriterEngine {
-    db: OptimisticTxDatabase,
-    keyspace: OptimisticTxKeyspace,
+    db: Arc<OptimisticTxDatabase>,
+    keyspace: Arc<OptimisticTxKeyspace>,
     _tmpdir: TempDir,
 }
 
@@ -45,8 +52,8 @@ impl FjallMultiWriterEngine {
         }
 
         FjallMultiWriterEngine {
-            db,
-            keyspace,
+            db: Arc::new(db),
+            keyspace: Arc::new(keyspace),
             _tmpdir: tmpdir,
         }
     }
@@ -58,50 +65,46 @@ impl MultiWriterEngine for FjallMultiWriterEngine {
     }
 
     fn execute_burst(&mut self, key_sets: &[Vec<u64>]) -> BurstResult {
-        let mut committed = 0u64;
-        let mut conflicts = 0u64;
-
-        // Open all transactions simultaneously
-        let mut txns: Vec<_> = (0..key_sets.len())
-            .map(|_| Some(self.db.write_tx().expect("write_tx failed")))
+        let barrier = Arc::new(Barrier::new(key_sets.len()));
+        let handles: Vec<_> = key_sets
+            .iter()
+            .cloned()
+            .map(|keys| {
+                let db = Arc::clone(&self.db);
+                let keyspace = Arc::clone(&self.keyspace);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut conflicts = 0u64;
+                    loop {
+                        let mut txn = db.write_tx().expect("write_tx failed");
+                        for &key in &keys {
+                            let k = encode_key(key);
+                            let value = bincode::serde::encode_to_vec(
+                                YcsbRecord::new(key.wrapping_add(1)),
+                                BINCODE_CFG,
+                            )
+                            .expect("serialize failed");
+                            txn.insert(keyspace.as_ref(), k, value);
+                        }
+                        match txn.commit().expect("io error on commit") {
+                            Ok(()) => return (1u64, conflicts),
+                            Err(_conflict) => {
+                                conflicts += 1;
+                                continue;
+                            }
+                        }
+                    }
+                })
+            })
             .collect();
 
-        // Each transaction updates its keys
-        for (w, txn_opt) in txns.iter_mut().enumerate() {
-            let txn = txn_opt.as_mut().unwrap();
-            for &key in &key_sets[w] {
-                let k = encode_key(key);
-                let value =
-                    bincode::serde::encode_to_vec(YcsbRecord::new(key.wrapping_add(1)), BINCODE_CFG)
-                        .expect("serialize failed");
-                txn.insert(&self.keyspace, k, value);
-            }
-        }
-
-        // Commit in sequence — retry on conflict
-        for w in 0..key_sets.len() {
-            let txn = txns[w].take().unwrap();
-            match txn.commit().expect("io error on commit") {
-                Ok(()) => committed += 1,
-                Err(_conflict) => {
-                    conflicts += 1;
-                    // Retry with fresh transaction
-                    let mut txn = self.db.write_tx().expect("write_tx failed");
-                    for &key in &key_sets[w] {
-                        let k = encode_key(key);
-                        let value = bincode::serde::encode_to_vec(
-                            YcsbRecord::new(key.wrapping_add(1)),
-                            BINCODE_CFG,
-                        )
-                        .expect("serialize failed");
-                        txn.insert(&self.keyspace, k, value);
-                    }
-                    txn.commit()
-                        .expect("io error on retry")
-                        .expect("retry conflicted");
-                    committed += 1;
-                }
-            }
+        let mut committed = 0u64;
+        let mut conflicts = 0u64;
+        for h in handles {
+            let (c, x) = h.join().unwrap();
+            committed += c;
+            conflicts += x;
         }
         BurstResult { committed, conflicts }
     }

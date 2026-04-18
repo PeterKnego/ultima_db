@@ -63,3 +63,11 @@ harness = false
 [[bench]]
 name = "multiwriter_persistence_bench"
 harness = false
+
+[[bench]]
+name = "smallbank_rocksdb_bench"
+harness = false
+
+[[bench]]
+name = "smallbank_fjall_bench"
+harness = false

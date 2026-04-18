@@ -1,14 +1,15 @@
-//! YCSB-style benchmarks for multi-writer OCC.
+#![allow(clippy::redundant_iter_cloned)]
+
+//! YCSB-style benchmarks for multi-writer OCC, using real OS threads.
 //!
-//! Since `WriteTx` is not `Send` (see `dyn Any` type-erasure limitation),
-//! these benchmarks simulate concurrent writers on a single thread using a
-//! burst pattern: open W writers, execute operations, commit in sequence,
-//! retry on conflict.
-//!
+//! `Store: Send + Sync`, so each thread holds a clone and opens its own
+//! `WriteTx` locally. `WriteTx` itself is `!Send` and never crosses a thread.
 //! Includes Ultima-specific scenarios (baseline, no-contention) plus the
 //! shared multi-writer suite via `MultiWriterEngine`.
 
 use std::hint::black_box;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::rngs::StdRng;
@@ -31,7 +32,7 @@ fn make_store(mode: WriterMode) -> Store {
         num_snapshots_retained: 2,
         auto_snapshot_gc: true,
         writer_mode: mode,
-        require_explicit_version: false,
+        ..StoreConfig::default()
     }).unwrap();
     // Preload table with NUM_RECORDS rows
     let mut wtx = store.begin_write(None).unwrap();
@@ -67,43 +68,43 @@ impl MultiWriterEngine for UltimaMultiWriterEngine {
     }
 
     fn execute_burst(&mut self, key_sets: &[Vec<u64>]) -> BurstResult {
-        let mut committed = 0u64;
-        let mut conflicts = 0u64;
-
-        // Open all writers simultaneously (burst pattern)
-        let mut writers: Vec<_> = (0..key_sets.len())
-            .map(|_| Some(self.store.begin_write(None).unwrap()))
-            .collect();
-
-        // Each writer updates its keys
-        for (w, wtx_opt) in writers.iter_mut().enumerate() {
-            let wtx = wtx_opt.as_mut().unwrap();
-            let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
-            for &key in &key_sets[w] {
-                let _ = table.update(key, YcsbRecord::new(key.wrapping_add(1)));
-            }
-        }
-
-        // Commit in sequence — conflicts trigger retry with fresh tx
-        for w in 0..key_sets.len() {
-            let wtx = writers[w].take().unwrap();
-            match wtx.commit() {
-                Ok(_) => committed += 1,
-                Err(ultima_db::Error::WriteConflict { .. }) => {
-                    conflicts += 1;
-                    // Retry with fresh transaction
-                    let mut wtx = self.store.begin_write(None).unwrap();
-                    {
-                        let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
-                        for &key in &key_sets[w] {
-                            let _ = table.update(key, YcsbRecord::new(key.wrapping_add(1)));
+        let barrier = Arc::new(Barrier::new(key_sets.len()));
+        let handles: Vec<_> = key_sets
+            .iter()
+            .cloned()
+            .map(|keys| {
+                let store = self.store.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut conflicts = 0u64;
+                    loop {
+                        let mut wtx = store.begin_write(None).unwrap();
+                        {
+                            let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
+                            for &key in &keys {
+                                let _ = table.update(key, YcsbRecord::new(key.wrapping_add(1)));
+                            }
+                        }
+                        match wtx.commit() {
+                            Ok(_) => return (1u64, conflicts),
+                            Err(ultima_db::Error::WriteConflict { .. }) => {
+                                conflicts += 1;
+                                continue;
+                            }
+                            Err(e) => panic!("unexpected error: {e}"),
                         }
                     }
-                    wtx.commit().unwrap();
-                    committed += 1;
-                }
-                Err(e) => panic!("unexpected error: {e}"),
-            }
+                })
+            })
+            .collect();
+
+        let mut committed = 0u64;
+        let mut conflicts = 0u64;
+        for h in handles {
+            let (c, x) = h.join().unwrap();
+            committed += c;
+            conflicts += x;
         }
         BurstResult { committed, conflicts }
     }
@@ -154,7 +155,7 @@ fn bench_no_contention(c: &mut Criterion) {
         num_snapshots_retained: 2,
         auto_snapshot_gc: true,
         writer_mode: WriterMode::MultiWriter,
-        require_explicit_version: false,
+        ..StoreConfig::default()
     }).unwrap();
     // Preload each writer's table
     for w in 0..MW_WRITERS {
@@ -178,28 +179,44 @@ fn bench_no_contention(c: &mut Criterion) {
     group.throughput(Throughput::Elements(total_ops));
 
     group.bench_function("no_contention_diff_tables", |b| {
-        b.iter(|| {
-            let table_names: Vec<String> =
-                (0..MW_WRITERS).map(|w| format!("ycsb_{w}")).collect();
-            let mut writers: Vec<_> = (0..MW_WRITERS)
-                .map(|_| store.begin_write(None).unwrap())
-                .collect();
-
-            for (w, wtx) in writers.iter_mut().enumerate() {
-                let mut table = wtx
-                    .open_table::<YcsbRecord>(table_names[w].as_str())
-                    .unwrap();
-                for _ in 0..MW_OPS_PER_WRITER {
-                    let key = zipf.next(&mut rng);
-                    let _ = table.update(key, YcsbRecord::new(key.wrapping_add(1)));
+        b.iter_batched(
+            || {
+                // Generate per-thread key sequences deterministically in the setup
+                // phase so RNG state stays off the hot path.
+                (0..MW_WRITERS)
+                    .map(|_| (0..MW_OPS_PER_WRITER).map(|_| zipf.next(&mut rng)).collect::<Vec<u64>>())
+                    .collect::<Vec<_>>()
+            },
+            |key_sets| {
+                let barrier = Arc::new(Barrier::new(MW_WRITERS));
+                let handles: Vec<_> = key_sets
+                    .into_iter()
+                    .enumerate()
+                    .map(|(w, keys)| {
+                        let store = store.clone();
+                        let barrier = Arc::clone(&barrier);
+                        let table_name = format!("ycsb_{w}");
+                        thread::spawn(move || {
+                            barrier.wait();
+                            let mut wtx = store.begin_write(None).unwrap();
+                            {
+                                let mut table =
+                                    wtx.open_table::<YcsbRecord>(table_name.as_str()).unwrap();
+                                for key in keys {
+                                    let _ = table.update(key, YcsbRecord::new(key.wrapping_add(1)));
+                                }
+                            }
+                            wtx.commit().unwrap();
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join().unwrap();
                 }
-            }
-
-            for wtx in writers {
-                wtx.commit().unwrap();
-            }
-            black_box(());
-        });
+                black_box(());
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
     group.finish();
 }

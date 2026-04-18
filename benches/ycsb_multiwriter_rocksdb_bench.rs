@@ -1,4 +1,11 @@
+#![allow(clippy::redundant_iter_cloned)]
+
 //! Multi-writer contention benchmarks for RocksDB using OptimisticTransactionDB.
+//!
+//! Each writer runs on its own OS thread, sharing an `Arc<OptimisticTransactionDB>`.
+
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use rocksdb::{OptimisticTransactionDB, Options};
@@ -22,7 +29,7 @@ fn encode_key(id: u64) -> [u8; 8] {
 // ---------------------------------------------------------------------------
 
 struct RocksDbMultiWriterEngine {
-    db: OptimisticTransactionDB,
+    db: Arc<OptimisticTransactionDB>,
     _tmpdir: TempDir,
 }
 
@@ -47,7 +54,7 @@ impl RocksDbMultiWriterEngine {
             }
         }
 
-        RocksDbMultiWriterEngine { db, _tmpdir: tmpdir }
+        RocksDbMultiWriterEngine { db: Arc::new(db), _tmpdir: tmpdir }
     }
 }
 
@@ -57,46 +64,45 @@ impl MultiWriterEngine for RocksDbMultiWriterEngine {
     }
 
     fn execute_burst(&mut self, key_sets: &[Vec<u64>]) -> BurstResult {
-        let mut committed = 0u64;
-        let mut conflicts = 0u64;
-
-        // Open all transactions simultaneously
-        let txns: Vec<_> = (0..key_sets.len())
-            .map(|_| self.db.transaction())
+        let barrier = Arc::new(Barrier::new(key_sets.len()));
+        let handles: Vec<_> = key_sets
+            .iter()
+            .cloned()
+            .map(|keys| {
+                let db = Arc::clone(&self.db);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut conflicts = 0u64;
+                    loop {
+                        let txn = db.transaction();
+                        for &key in &keys {
+                            let k = encode_key(key);
+                            let value = bincode::serde::encode_to_vec(
+                                YcsbRecord::new(key.wrapping_add(1)),
+                                BINCODE_CFG,
+                            )
+                            .expect("serialize failed");
+                            txn.put(k, value).expect("put failed");
+                        }
+                        match txn.commit() {
+                            Ok(_) => return (1u64, conflicts),
+                            Err(_) => {
+                                conflicts += 1;
+                                continue;
+                            }
+                        }
+                    }
+                })
+            })
             .collect();
 
-        // Each transaction updates its keys
-        for (w, txn) in txns.iter().enumerate() {
-            for &key in &key_sets[w] {
-                let k = encode_key(key);
-                let value =
-                    bincode::serde::encode_to_vec(YcsbRecord::new(key.wrapping_add(1)), BINCODE_CFG)
-                        .expect("serialize failed");
-                txn.put(k, value).expect("put failed");
-            }
-        }
-
-        // Commit in sequence — retry on conflict
-        for (w, txn) in txns.into_iter().enumerate() {
-            match txn.commit() {
-                Ok(_) => committed += 1,
-                Err(_) => {
-                    conflicts += 1;
-                    // Retry with fresh transaction
-                    let txn = self.db.transaction();
-                    for &key in &key_sets[w] {
-                        let k = encode_key(key);
-                        let value = bincode::serde::encode_to_vec(
-                            YcsbRecord::new(key.wrapping_add(1)),
-                            BINCODE_CFG,
-                        )
-                        .expect("serialize failed");
-                        txn.put(k, value).expect("put failed");
-                    }
-                    txn.commit().expect("retry commit failed");
-                    committed += 1;
-                }
-            }
+        let mut committed = 0u64;
+        let mut conflicts = 0u64;
+        for h in handles {
+            let (c, x) = h.join().unwrap();
+            committed += c;
+            conflicts += x;
         }
         BurstResult { committed, conflicts }
     }
