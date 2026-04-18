@@ -1,5 +1,11 @@
 # Task: Full Multithreaded Concurrent Writes
 
+> **Follow-up:** the table-level OCC described below was superseded by
+> per-key OCC in [task19_key_level_occ.md](task19_key_level_occ.md). The
+> Send+Sync infrastructure, `WriteTx: !Send`, and the rebase-on-latest
+> commit path from this task are still current — only the conflict
+> granularity changed.
+
 ## Motivation
 
 `WriterMode::MultiWriter` already existed with OCC, write-set tracking, three-phase commit for WAL, and pruning — but `Store` could not actually cross thread boundaries. Tests that drove real threads wrapped `Store` in an `unsafe impl Send/Sync for SendStore(Store)` shim because `Snapshot.tables: BTreeMap<String, Arc<dyn Any>>` and `WriteTx.dirty: BTreeMap<String, Box<dyn Any>>` lacked `Send + Sync` on their trait objects. "Concurrent writes" was only exercised in single-threaded simulation or via the unsafe wrapper.

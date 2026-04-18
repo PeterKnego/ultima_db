@@ -274,7 +274,7 @@ See [isolation-levels.md](isolation-levels.md) for a detailed treatment of:
 `StoreConfig::writer_mode` controls concurrency:
 
 - **`SingleWriter`** (default): at most one active `WriteTx` at a time. `begin_write` returns `Error::WriterBusy` if another is already active. No OCC tracking overhead.
-- **`MultiWriter`**: multiple concurrent `WriteTx` allowed. Table-level OCC: any two writers that touch the same table conflict, even if modified keys are disjoint. The loser retries; the retry rebases onto the current latest snapshot.
+- **`MultiWriter`**: multiple concurrent `WriteTx` allowed. Key-level OCC: two writers conflict only if their modified rows overlap on the same table. Disjoint rows in the same table both commit; the second commit's per-key merge pulls only its edited keys onto the current latest snapshot via the `MergeableTable` trait. Fast path: if no concurrent writer touched a given dirty table, install it wholesale (single Arc swap). See [task19_key_level_occ.md](tasks/task19_key_level_occ.md).
 
 `Store`, `ReadTx`, and `Snapshot` are all `Send + Sync`, so the `Store` handle can be cloned across threads. `WriteTx` and `ReadTx` are deliberately `!Send` (via `PhantomData<*const ()>`) — a transaction must be opened and committed on the same thread. The intended pattern is: clone the `Store` into each thread, and call `begin_write`/`begin_read` locally.
 
@@ -301,11 +301,12 @@ This gives users a semantically clear import path (`use ultima_db::WriteTx` or `
 | Persistent CoW B-tree | `std::BTreeMap` with deep copy or mutex | O(log n) per mutation instead of O(n); no locking; multiple versions coexist for free |
 | `Arc<R>` for values | Store `R` directly, require `R: Clone` | Avoids cloning potentially large values on every node reconstruction; removes `Clone` bound from the public API |
 | `Arc<BTreeNode<R>>` for children | `Box<BTreeNode<R>>` | Structural sharing — unchanged subtrees are shared across versions |
-| `Arc<dyn Any + Send + Sync>` in Snapshot | `Box<dyn Any + Send + Sync>` | Must be cloneable (O(1) per table at commit time); `Box` is not `Clone` |
-| `Box<dyn Any + Send + Sync>` in WriteTx dirty | `Arc<dyn Any + Send + Sync>` | Need `&mut` access for table mutations; `Box` provides `downcast_mut` |
+| `Arc<dyn MergeableTable>` in Snapshot | `Box<dyn MergeableTable>` | Must be cloneable (O(1) per table at commit time); `Box` is not `Clone`. `MergeableTable: Any + Send + Sync` so existing downcasts still work via `.as_any()` |
+| `Box<dyn MergeableTable>` in WriteTx dirty | `Arc<dyn MergeableTable>` | Need `&mut` access for table mutations; `Box` provides `downcast_mut` through `.as_any_mut()` |
 | `WriteTx` / `ReadTx` are `!Send` via `PhantomData<*const ()>` | Make them `Send` | A transaction is not designed to split work across threads; pinning to the creating thread prevents a footgun. Clone `Store` across threads instead |
-| Table-level OCC in MultiWriter mode | Key-level OCC | Per-row replay across type-erased tables would require an `R: Clone` bound and a new merge trait; table-level is a small diff that preserves correctness. Retry cost is acceptable when writers rarely touch the same table |
-| `WriteTx::commit` rebases onto latest | Commit from `self.base` (old design) | Preserves non-conflicting concurrent commits in the final snapshot; required for real multi-threaded correctness |
+| Key-level OCC in MultiWriter mode | Table-level OCC | Fewer spurious conflicts on same-table disjoint-key writes. Cost: commit clones latest table + replays writer's keys via `upsert_arc` (index-preserving). Fast-path wholesale install when no concurrent writer touched the table keeps single-writer commits cheap |
+| `WriteTx::commit` rebases onto latest + per-key merge | Whole-table swap from dirty | Preserves non-conflicting concurrent commits in the final snapshot. Merge uses Arc-level record sharing (no `R: Clone` bound) via `BTree::insert_arc` |
+| Auto-assigned commit version bumped to `latest + 1` | Keep pre-assigned version | Pre-assigned versions can land out of commit order under MultiWriter; rebase chain would lose updates. SMR explicit versions are left alone |
 | Bottom-up splitting | Pre-emptive (top-down) splitting | Simpler with immutable nodes — no need to prepare nodes on the way down |
 | Check-before-delete | Always enter deletion path | Avoids O(log n) CoW cost when the key doesn't exist |
 | All core types in `store.rs` | Separate `transaction.rs` module | Avoids circular module dependency |
@@ -318,5 +319,5 @@ This gives users a semantically clear import path (`use ultima_db::WriteTx` or `
 ## What is not yet implemented
 
 - **Serializable Snapshot Isolation (SSI).** The store does not track read sets, so write skew is possible. See [isolation-levels.md](isolation-levels.md) for what SSI would require.
-- **Key-level MultiWriter OCC.** Table-level OCC serializes all writers that share a table, even on disjoint keys. A key-level design would require record-level merge at commit time (a per-table trait object implementing "apply my modified keys onto the latest snapshot's table"), which in turn needs either `R: Clone` or `Arc<R>`-level record sharing exposed through a new `MergeableTable` trait.
 - **Lock-free commit path.** Commit still takes `inner.write()` for phases 1 and 3. Under heavy contention, N threads committing serialize on this lock. A lock-free design would need epoch-based reclamation for the snapshot map and a lock-free committed-write-set log.
+- **Serializable Snapshot Isolation (SSI).** Would require tracking per-key reads in `ReadTx` / `TableWriter.get*` and aborting writers whose read set overlaps a concurrent committer's write set. See how fjall implements this in its `ConflictManager`.

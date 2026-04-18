@@ -45,7 +45,10 @@ fn serialize_snapshot(
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     // Only serialize tables that are registered in the registry.
-    let registered_tables: Vec<(&String, &std::sync::Arc<dyn std::any::Any + Send + Sync>)> = snapshot
+    let registered_tables: Vec<(
+        &String,
+        &std::sync::Arc<dyn crate::table::MergeableTable>,
+    )> = snapshot
         .tables
         .iter()
         .filter(|(name, _)| registry.contains(name))
@@ -62,8 +65,9 @@ fn serialize_snapshot(
         bincode::encode_into_std_write(name.as_str(), &mut buf, config)
             .map_err(|e| Error::Persistence(e.to_string()))?;
 
-        // Serialize table data
-        let table_bytes = (info.serialize_table)(table_any.as_ref())?;
+        // Serialize table data — serialize_table takes &dyn Any, so upcast
+        // from &dyn MergeableTable via as_any().
+        let table_bytes = (info.serialize_table)(table_any.as_ref().as_any())?;
         bincode::encode_into_std_write(table_bytes.len() as u64, &mut buf, config)
             .map_err(|e| Error::Persistence(e.to_string()))?;
         buf.extend_from_slice(&table_bytes);
@@ -276,7 +280,7 @@ mod tests {
         table.insert(User { name: "Bob".into(), age: 25 }).unwrap();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        tables.insert("users".to_string(), std::sync::Arc::new(table) as std::sync::Arc<dyn crate::table::MergeableTable>);
 
         let snapshot = Snapshot { version: 42, tables };
         (snapshot, reg)
@@ -289,7 +293,7 @@ mod tests {
         let recovered = deserialize_snapshot(&data, &reg).unwrap();
         assert_eq!(recovered.version, 42);
         let table = recovered.tables.get("users").unwrap()
-            .downcast_ref::<Table<User>>().unwrap();
+            .as_any().downcast_ref::<Table<User>>().unwrap();
         assert_eq!(table.len(), 2);
         assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
         assert_eq!(table.get(2).unwrap(), &User { name: "Bob".into(), age: 25 });
@@ -487,8 +491,8 @@ mod tests {
         order_table.insert(Order { item: "Gadget".into(), qty: 3 }).unwrap();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
-        tables.insert("orders".to_string(), std::sync::Arc::new(order_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
+        tables.insert("orders".to_string(), std::sync::Arc::new(order_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
 
         let snapshot = Snapshot { version: 7, tables };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();
@@ -498,11 +502,11 @@ mod tests {
         assert_eq!(recovered.tables.len(), 2);
 
         let users = recovered.tables.get("users").unwrap()
-            .downcast_ref::<Table<User>>().unwrap();
+            .as_any().downcast_ref::<Table<User>>().unwrap();
         assert_eq!(users.len(), 1);
 
         let orders = recovered.tables.get("orders").unwrap()
-            .downcast_ref::<Table<Order>>().unwrap();
+            .as_any().downcast_ref::<Table<Order>>().unwrap();
         assert_eq!(orders.len(), 2);
         assert_eq!(orders.get(1).unwrap().item, "Widget");
         assert_eq!(orders.get(2).unwrap().qty, 3);
@@ -520,8 +524,8 @@ mod tests {
         let log_table = Table::<String>::new();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
-        tables.insert("logs".to_string(), std::sync::Arc::new(log_table) as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
+        tables.insert("logs".to_string(), std::sync::Arc::new(log_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
 
         let snapshot = Snapshot { version: 1, tables };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();

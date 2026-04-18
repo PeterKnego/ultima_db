@@ -11,18 +11,23 @@ use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 
 use crate::persistence::Record;
-use crate::table::Table;
+use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
 
+// Deserialize and new-empty closures return `Box<dyn MergeableTable>`
+// because their output flows directly into `Snapshot.tables`. Replay
+// closures take `&mut dyn Any` because callers pass through
+// `MergeableTable::as_any_mut()` — keeping `dyn Any` here avoids pulling
+// MergeableTable into every closure's body.
 type SerializeAnyFn = Box<dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync>;
-type DeserializeAnyFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>;
-type ReplayInsertFn =
-    Box<dyn Fn(&mut (dyn Any + Send + Sync), u64, &[u8]) -> Result<()> + Send + Sync>;
-type ReplayUpdateFn =
-    Box<dyn Fn(&mut (dyn Any + Send + Sync), u64, &[u8]) -> Result<()> + Send + Sync>;
-type ReplayDeleteFn =
-    Box<dyn Fn(&mut (dyn Any + Send + Sync), u64) -> Result<()> + Send + Sync>;
-type NewEmptyTableFn = Box<dyn Fn() -> Box<dyn Any + Send + Sync> + Send + Sync>;
+type DeserializeRecordFn =
+    Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>;
+type DeserializeTableFn =
+    Box<dyn Fn(&[u8]) -> Result<Box<dyn MergeableTable>> + Send + Sync>;
+type ReplayInsertFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
+type ReplayUpdateFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
+type ReplayDeleteFn = Box<dyn Fn(&mut dyn Any, u64) -> Result<()> + Send + Sync>;
+type NewEmptyTableFn = Box<dyn Fn() -> Box<dyn MergeableTable> + Send + Sync>;
 
 /// Type-erased serialization functions for a single table type.
 pub(crate) struct TableTypeInfo {
@@ -32,11 +37,11 @@ pub(crate) struct TableTypeInfo {
     /// Serialize a single record (`&R` as `&dyn Any`) to bytes.
     pub serialize_record: SerializeAnyFn,
     /// Deserialize bytes to a single record (`Box<dyn Any + Send + Sync>` wrapping `R`).
-    pub deserialize_record: DeserializeAnyFn,
+    pub deserialize_record: DeserializeRecordFn,
     /// Serialize an entire `Table<R>` (as `&dyn Any`) to bytes.
     pub serialize_table: SerializeAnyFn,
-    /// Deserialize bytes to a `Table<R>` (as `Box<dyn Any + Send + Sync>`).
-    pub deserialize_table: DeserializeAnyFn,
+    /// Deserialize bytes to a `Table<R>` (as `Box<dyn MergeableTable>`).
+    pub deserialize_table: DeserializeTableFn,
     /// Create a new empty `Table<R>` as `Box<dyn Any + Send + Sync>`.
     pub new_empty_table: NewEmptyTableFn,
     /// Insert a serialized record into a `Table<R>` (as `&mut dyn Any`) at a specific ID.
@@ -248,7 +253,7 @@ mod tests {
         let info = reg.get("users").unwrap();
         let bytes = (info.serialize_table)(&table).unwrap();
         let any = (info.deserialize_table)(&bytes).unwrap();
-        let recovered = any.downcast_ref::<Table<TestUser>>().unwrap();
+        let recovered = any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered.get(1).unwrap(), &TestUser { name: "Alice".into(), age: 30 });
         assert_eq!(recovered.get(2).unwrap(), &TestUser { name: "Bob".into(), age: 25 });
@@ -319,7 +324,7 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
         let info = reg.get("users").unwrap();
         let table_any = (info.new_empty_table)();
-        let table = table_any.downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(table.len(), 0);
     }
 
@@ -330,29 +335,29 @@ mod tests {
         let info = reg.get("users").unwrap();
 
         // Start with an empty table
-        let mut table_box: Box<dyn Any + Send + Sync> = (info.new_empty_table)();
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
 
         // Replay insert
         let user = TestUser { name: "Alice".into(), age: 30 };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        (info.replay_insert)(table_box.as_mut(), 1, &data).unwrap();
+        (info.replay_insert)(table_box.as_any_mut(), 1, &data).unwrap();
 
-        let table = table_box.downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_box.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(table.len(), 1);
         assert_eq!(table.get(1).unwrap().name, "Alice");
 
         // Replay update
         let updated = TestUser { name: "Alice Updated".into(), age: 31 };
         let data = bincode::serde::encode_to_vec(&updated, bincode::config::standard()).unwrap();
-        (info.replay_update)(table_box.as_mut(), 1, &data).unwrap();
+        (info.replay_update)(table_box.as_any_mut(), 1, &data).unwrap();
 
-        let table = table_box.downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_box.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(table.get(1).unwrap().name, "Alice Updated");
 
         // Replay delete
-        (info.replay_delete)(table_box.as_mut(), 1).unwrap();
+        (info.replay_delete)(table_box.as_any_mut(), 1).unwrap();
 
-        let table = table_box.downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_box.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(table.len(), 0);
     }
 
@@ -362,10 +367,10 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
         let info = reg.get("users").unwrap();
 
-        let mut table_box: Box<dyn Any + Send + Sync> = (info.new_empty_table)();
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
         let user = TestUser { name: "Alice".into(), age: 30 };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        (info.replay_insert)(table_box.as_mut(), 1, &data).unwrap();
+        (info.replay_insert)(table_box.as_any_mut(), 1, &data).unwrap();
         // Insert same ID again
         let result = (info.replay_insert)(table_box.as_mut(), 1, &data);
         assert!(result.is_err());
@@ -377,7 +382,7 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
         let info = reg.get("users").unwrap();
 
-        let mut table_box: Box<dyn Any + Send + Sync> = (info.new_empty_table)();
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
         let user = TestUser { name: "Alice".into(), age: 30 };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
         let result = (info.replay_update)(table_box.as_mut(), 99, &data);
@@ -390,7 +395,7 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
         let info = reg.get("users").unwrap();
 
-        let mut table_box: Box<dyn Any + Send + Sync> = (info.new_empty_table)();
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
         let result = (info.replay_delete)(table_box.as_mut(), 99);
         assert!(result.is_err());
     }
@@ -463,7 +468,7 @@ mod tests {
         let info = reg.get("users").unwrap();
         let bytes = (info.serialize_table)(&table).unwrap();
         let any = (info.deserialize_table)(&bytes).unwrap();
-        let recovered = any.downcast_ref::<Table<TestUser>>().unwrap();
+        let recovered = any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(recovered.len(), 0);
         assert_eq!(recovered.next_id(), 1);
     }
@@ -481,7 +486,7 @@ mod tests {
         let info = reg.get("users").unwrap();
         let bytes = (info.serialize_table)(&table).unwrap();
         let any = (info.deserialize_table)(&bytes).unwrap();
-        let recovered = any.downcast_ref::<Table<TestUser>>().unwrap();
+        let recovered = any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered.next_id(), 3);
     }

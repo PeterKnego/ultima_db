@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -7,6 +8,85 @@ use crate::btree::BTree;
 use crate::index::{CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage, UniqueStorage};
 use crate::persistence::Record;
 use crate::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// MergeableTable — the trait object carried in Snapshot.tables and WriteTx.dirty
+// ---------------------------------------------------------------------------
+//
+// Supertrait `Any + Send + Sync` keeps existing downcast machinery working
+// via the explicit `as_any()` accessor. `boxed_clone` is an O(1) CoW clone
+// used at commit to take the latest snapshot's table and layer the writer's
+// edits on top. `merge_keys_from` walks the writer's write_set and upserts
+// each modified record from `source` into `self`.
+
+pub(crate) trait MergeableTable: Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// O(1)-CoW clone (Arc bumps on the BTree root and index internals).
+    fn boxed_clone(&self) -> Box<dyn MergeableTable>;
+
+    /// For each key in `keys`, take the writer's record at that key from
+    /// `source` and apply it to `self`:
+    /// - `source` has a record → upsert into self (maintains indexes)
+    /// - `source` does not have a record → delete from self (if present)
+    ///
+    /// OCC guarantees no concurrent committed writer touched any key in
+    /// `keys`, so self's state at those keys matches source's base state
+    /// and the writes never fight another committer. A unique-index
+    /// violation is still possible (two writers assigning the same indexed
+    /// value to different rows); that bubbles up as `Error::DuplicateKey`.
+    fn merge_keys_from(
+        &mut self,
+        source: &dyn MergeableTable,
+        keys: &BTreeSet<u64>,
+    ) -> Result<()>;
+}
+
+impl<R: Record> MergeableTable for Table<R> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn boxed_clone(&self) -> Box<dyn MergeableTable> {
+        Box::new(self.clone())
+    }
+
+    fn merge_keys_from(
+        &mut self,
+        source: &dyn MergeableTable,
+        keys: &BTreeSet<u64>,
+    ) -> Result<()> {
+        let source = source
+            .as_any()
+            .downcast_ref::<Table<R>>()
+            .ok_or_else(|| Error::TypeMismatch("merge source".to_string()))?;
+        for &k in keys {
+            match (source.data.get_arc(&k), self.data.get_arc(&k)) {
+                (Some(new_arc), _) => self.upsert_arc(k, new_arc)?,
+                (None, Some(_)) => {
+                    // Writer deleted this key. `self` still has the prior
+                    // value (OCC rules out concurrent deletion at this key).
+                    let _ = self.delete(k)?;
+                }
+                (None, None) => {
+                    // Writer inserted-then-deleted in the same tx — no-op.
+                }
+            }
+        }
+        // Ensure the merged table's next_id is at least as large as the
+        // writer's, so future auto-assigned inserts don't collide with any
+        // id the writer already used.
+        if source.next_id > self.next_id {
+            self.next_id = source.next_id;
+        }
+        Ok(())
+    }
+}
 
 /// A compile-time table definition binding a name to a record type.
 #[derive(Copy, Clone)]
@@ -129,6 +209,52 @@ impl<R: Record> Table<R> {
         }
 
         self.data = self.data.insert(id, record);
+        Ok(())
+    }
+
+    /// Insert-or-replace at an explicit id, reusing an existing `Arc<R>`.
+    /// Maintains secondary indexes (routing to `on_insert` or `on_update`
+    /// depending on whether a prior record exists at the id). Does NOT
+    /// bump `next_id`. Used at commit by the per-key merge path.
+    pub(crate) fn upsert_arc(&mut self, id: u64, arc: Arc<R>) -> Result<()> {
+        let prior = self.data.get_arc(&id);
+        let new_ref: &R = &arc;
+        // SAFETY: same invariants as `insert` — see comment there.
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+            self.indexes.values_mut().map(|v| v as *mut _).collect();
+
+        match &prior {
+            Some(old_arc) => {
+                let old_ref: &R = old_arc;
+                for (applied, ptr) in ptrs.iter().enumerate() {
+                    let idx = unsafe { &mut **ptr };
+                    if let Err(e) = idx.on_update(id, old_ref, new_ref) {
+                        // Roll back previously applied index updates by
+                        // reversing them (new → old). Should not fail
+                        // because we are restoring valid state.
+                        for prev_ptr in &ptrs[..applied] {
+                            let prev_idx = unsafe { &mut **prev_ptr };
+                            let _ = prev_idx.on_update(id, new_ref, old_ref);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            None => {
+                for (applied, ptr) in ptrs.iter().enumerate() {
+                    let idx = unsafe { &mut **ptr };
+                    if let Err(e) = idx.on_insert(id, new_ref) {
+                        for prev_ptr in &ptrs[..applied] {
+                            let prev_idx = unsafe { &mut **prev_ptr };
+                            prev_idx.on_delete(id, new_ref);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        self.data = self.data.insert_arc(id, arc);
         Ok(())
     }
 

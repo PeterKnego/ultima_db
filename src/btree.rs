@@ -88,8 +88,14 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Insert or replace a key-value pair. Returns a new tree; `self` is
     /// unchanged.
     pub fn insert(&self, key: K, val: V) -> BTree<K, V> {
-        let val_arc = Arc::new(val);
+        self.insert_arc(key, Arc::new(val))
+    }
 
+    /// Insert or replace a key-value pair, reusing an existing `Arc<V>`
+    /// (no clone of the payload). Used at commit time for per-key merge
+    /// to carry records from one snapshot into another without forcing
+    /// `V: Clone`.
+    pub fn insert_arc(&self, key: K, val_arc: Arc<V>) -> BTree<K, V> {
         match insert_into_node(&self.root, key, val_arc) {
             InsertResult::Fit(new_root, replaced) => {
                 let new_len = if replaced { self.len } else { self.len + 1 };

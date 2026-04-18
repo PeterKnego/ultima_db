@@ -1512,16 +1512,15 @@ fn multi_writer_disjoint_tables_both_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// MultiWriter: two writers to the same table always conflict (table-level OCC).
-// The retry pattern is the supported way to land non-conflicting edits to the
-// same table from concurrent writers.
+// MultiWriter: disjoint keys, same table — key-level OCC allows both, and the
+// per-key merge at commit preserves each writer's edits in the final snapshot.
 // ---------------------------------------------------------------------------
 
-/// Two writers to the same table — even on different keys — conflict. The
-/// second writer must retry, which rebases onto the first's commit and lands
-/// cleanly.
+/// Two writers to the same table but different keys → both commit.
+/// Writer A inserts a new row, writer B updates an existing row. The final
+/// snapshot contains BOTH edits.
 #[test]
-fn multi_writer_same_table_conflicts_and_retry_succeeds() {
+fn multi_writer_disjoint_keys_same_table_both_commit() {
     let store = multi_writer_store();
 
     // Seed table with record id=1
@@ -1539,15 +1538,8 @@ fn multi_writer_same_table_conflicts_and_retry_succeeds() {
     wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
 
     wtx_a.commit().unwrap();
-    // Table-level OCC: any concurrent commit to the same table conflicts,
-    // even if keys are disjoint.
-    let err = wtx_b.commit().unwrap_err();
-    assert!(matches!(err, Error::WriteConflict { table, .. } if table == "t"));
-
-    // Retry B with a fresh transaction. It now bases on the snapshot that
-    // already contains A's insert, applies its update, and commits cleanly.
-    let mut wtx_b = store.begin_write(None).unwrap();
-    wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
+    // Key-level OCC: A wrote {2}, B wrote {1} — disjoint, no conflict.
+    // B's commit rebases onto A's snapshot and merges its edit at id=1.
     wtx_b.commit().unwrap();
 
     // Final state has both A's insert (id=2) and B's update (id=1).

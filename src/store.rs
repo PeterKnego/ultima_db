@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
@@ -6,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use crate::index::IndexKind;
 use crate::metrics::StoreMetrics;
 use crate::persistence::Record;
-use crate::table::{Table, TableOpener};
+use crate::table::{MergeableTable, Table, TableOpener};
 use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -15,13 +14,16 @@ use crate::{Error, Result};
 
 /// An immutable snapshot of all tables at a specific version.
 ///
-/// Tables are stored as `Arc<dyn Any + Send + Sync>` so that building a new
-/// snapshot from an existing one (at commit time) is O(number-of-tables) with
-/// O(1) per table, and so snapshots can be shared across threads.
+/// Tables are stored as `Arc<dyn MergeableTable>` so that building a new
+/// snapshot from an existing one (at commit time) is O(number-of-tables)
+/// with O(1) per table, and so `WriteTx::commit` can do per-key merges
+/// against the latest snapshot's tables without touching the concrete
+/// `Table<R>` type. `MergeableTable: Any + Send + Sync`, so downcasts to
+/// `Table<R>` still work via the explicit `as_any()` accessor.
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub(crate) version: u64,
-    pub(crate) tables: BTreeMap<String, Arc<dyn Any + Send + Sync>>,
+    pub(crate) tables: BTreeMap<String, Arc<dyn MergeableTable>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +234,7 @@ impl Store {
             WriterMode::MultiWriter => {}
         }
 
+        let explicit_version = version.is_some();
         let commit_version = match version {
             None => inner.next_version,
             Some(v) if v > inner.latest_version => v,
@@ -262,6 +265,7 @@ impl Store {
             base,
             dirty: BTreeMap::new(),
             version: commit_version,
+            explicit_version,
             store_inner: Arc::clone(&self.inner),
             deleted_tables: BTreeSet::new(),
             write_set: BTreeMap::new(),
@@ -409,11 +413,11 @@ impl Store {
                     // Build a new table map with sole ownership of each Arc.
                     // We re-wrap each table in a fresh Arc so Arc::get_mut succeeds during replay.
                     let base_snap = &inner.snapshots[&inner.latest_version];
-                    let mut tables: BTreeMap<String, Arc<dyn Any + Send + Sync>> = BTreeMap::new();
+                    let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
                     for (name, arc) in &base_snap.tables {
                         let info = inner.registry.get(name)
                             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
-                        let bytes = (info.serialize_table)(arc.as_ref())?;
+                        let bytes = (info.serialize_table)(arc.as_ref().as_any())?;
                         let new_table = (info.deserialize_table)(&bytes)?;
                         tables.insert(name.clone(), Arc::from(new_table));
                     }
@@ -435,7 +439,8 @@ impl Store {
                                     let table_mut = Arc::get_mut(table_arc)
                                         .ok_or_else(|| Error::Persistence(
                                             "table Arc has multiple references during replay".into()
-                                        ))?;
+                                        ))?
+                                        .as_any_mut();
 
                                     if matches!(op, crate::wal::WalOp::Insert { .. }) {
                                         (info.replay_insert)(table_mut, *id, data)?;
@@ -450,7 +455,8 @@ impl Store {
                                         let table_mut = Arc::get_mut(table_arc)
                                             .ok_or_else(|| Error::Persistence(
                                                 "table Arc has multiple references during replay".into()
-                                            ))?;
+                                            ))?
+                                            .as_any_mut();
                                         (info.replay_delete)(table_mut, *id)?;
                                     }
                                 }
@@ -606,6 +612,7 @@ impl ReadTx {
             .tables
             .get(name)
             .ok_or(Error::KeyNotFound)?
+            .as_any()
             .downcast_ref::<Table<R>>()
             .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
         self.metrics.register_table(name);
@@ -641,9 +648,14 @@ impl Readable for ReadTx {
 pub struct WriteTx {
     base: Arc<Snapshot>,
     /// Mutable working copies of tables opened for writing.
-    dirty: BTreeMap<String, Box<dyn Any + Send + Sync>>,
+    dirty: BTreeMap<String, Box<dyn MergeableTable>>,
     /// The version number that will be assigned to the new snapshot on commit.
     version: u64,
+    /// True when the caller passed an explicit version to `begin_write`
+    /// (SMR mode). Auto-assigned versions (the None path) are bumped at
+    /// commit time if a concurrent MultiWriter commit landed at a higher
+    /// version in the meantime — see the commit code for the rationale.
+    explicit_version: bool,
     /// Reference back to the store's interior state, used during commit.
     store_inner: Arc<RwLock<StoreInner>>,
     /// Tables explicitly deleted in this transaction (cleared on re-open).
@@ -1098,7 +1110,8 @@ impl WriteTx {
                 Table::new()
             } else {
                 match self.base.tables.get(name) {
-                    Some(arc_any) => arc_any
+                    Some(arc_mt) => arc_mt
+                        .as_any()
                         .downcast_ref::<Table<R>>()
                         .ok_or_else(|| Error::TypeMismatch(name.to_string()))?
                         .clone(), // O(1) BTree root Arc clone
@@ -1112,6 +1125,7 @@ impl WriteTx {
         let table = self.dirty
             .get_mut(&name_str)
             .unwrap()
+            .as_any_mut()
             .downcast_mut::<Table<R>>()
             .ok_or_else(|| Error::TypeMismatch(name_str.clone()))?;
         let write_set = match self.writer_mode {
@@ -1156,6 +1170,29 @@ impl WriteTx {
             return Err(conflict);
         }
 
+        // --- Commit-time version bump (MultiWriter + auto-version only) ---
+        //
+        // Versions pre-assigned at `begin_write` may not match the order in
+        // which concurrent writers actually acquire the commit lock. Without
+        // this bump, a writer with a lower pre-assigned version that commits
+        // AFTER one with a higher version would install its snapshot at a
+        // lower version, leaving `latest_version` pointing at the earlier
+        // (chronologically older) snapshot. The per-key merge then rebases
+        // future commits onto that stale snapshot and silently drops the
+        // intervening writer's edits. Forcing auto-assigned versions up to
+        // `latest_version + 1` keeps commit order identical to version order.
+        // Explicit-version writers (SMR mode) are left alone — the caller
+        // controls the version there.
+        if matches!(self.writer_mode, WriterMode::MultiWriter)
+            && !self.explicit_version
+            && self.version <= inner.latest_version
+        {
+            self.version = inner.latest_version + 1;
+            if self.version >= inner.next_version {
+                inner.next_version = self.version + 1;
+            }
+        }
+
         // --- Phase 1: WAL submit + snapshot build + write set recording (under lock) ---
 
         // Submit WAL entry to background thread (no fsync yet).
@@ -1179,19 +1216,71 @@ impl WriteTx {
         });
 
         // Build the new table map by rebasing onto the CURRENT latest
-        // snapshot (not self.base). Two concurrent writers touching different
-        // tables must each see the other's committed tables in the final
-        // snapshot. OCC (validate_write_set) has already ruled out any
-        // concurrent commit writing to a table we wrote to, so overwriting
-        // `new_tables[name]` with our dirty copy is safe.
+        // snapshot and merging each dirty table's modifications in per-key.
+        //
+        // For each dirty table:
+        //   - If the latest snapshot already has a version of it, clone it
+        //     (O(1), CoW) and apply our writes at exactly the keys we
+        //     modified (`merge_keys_from`). Concurrent non-conflicting
+        //     writers to other keys in the same table survive into our
+        //     snapshot.
+        //   - If the latest doesn't have it (fresh table we created), just
+        //     install our dirty copy wholesale.
+        //
+        // OCC (validate_write_set above) has already guaranteed that no
+        // concurrent committed writer overlapped on any key we wrote, so
+        // the merge is always a clean key-level upsert.
         let latest_tables = &inner.snapshots[&inner.latest_version].tables;
-        let mut new_tables: BTreeMap<String, Arc<dyn Any + Send + Sync>> = latest_tables
+        let mut new_tables: BTreeMap<String, Arc<dyn MergeableTable>> = latest_tables
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
 
-        for (name, boxed) in std::mem::take(&mut self.dirty) {
-            new_tables.insert(name, Arc::from(boxed));
+        let dirty = std::mem::take(&mut self.dirty);
+        for (name, my_dirty) in dirty {
+            // Did any concurrent committed writer touch this table?
+            let has_concurrent_write = inner
+                .committed_write_sets
+                .iter()
+                .any(|cws| cws.version > self.base.version && cws.tables.contains_key(&name));
+
+            if !has_concurrent_write {
+                // Fast path: no concurrent commit wrote to this table, so
+                // my dirty == (my base + my edits) == (latest + my edits).
+                // Install wholesale with a single Arc swap — no merge cost.
+                new_tables.insert(name, Arc::from(my_dirty));
+                continue;
+            }
+
+            let keys = self.write_set.get(&name);
+            match (new_tables.get(&name), keys) {
+                // Concurrent writer wrote this table AND I wrote specific
+                // keys: merge my keys onto latest. OCC guarantees my keys
+                // don't overlap theirs.
+                (Some(latest_arc), Some(keys)) if !keys.is_empty() => {
+                    let mut merged = latest_arc.boxed_clone();
+                    if let Err(e) = merged.merge_keys_from(&*my_dirty, keys) {
+                        // Release the lock via early return; Drop handles
+                        // active-writer cleanup because `needs_cleanup` is
+                        // still true at this point.
+                        drop(inner);
+                        return Err(e);
+                    }
+                    new_tables.insert(name, Arc::from(merged));
+                }
+                // Concurrent writer wrote this table and I didn't write
+                // any keys (read-only open, or failed batch that rolled
+                // back its write set). Keep latest's version untouched.
+                (Some(_), _) => {
+                    // new_tables already has latest's Arc for `name`; do
+                    // nothing.
+                }
+                // Table doesn't exist in latest but some concurrent writer
+                // wrote to `name` (must have deleted it). Install my dirty.
+                (None, _) => {
+                    new_tables.insert(name, Arc::from(my_dirty));
+                }
+            }
         }
 
         for name in &self.deleted_tables {
@@ -1343,15 +1432,11 @@ impl WriteTx {
                     });
                 }
             }
-            // Table-level OCC: any concurrent commit that wrote to a table
-            // we also wrote to is a conflict. Table-level (rather than
-            // key-level) is required because commit rebases the new snapshot
-            // onto the current latest version; a per-writer dirty table holds
-            // only its author's edits on its own base, so merging two dirty
-            // versions of the same table would silently drop the other
-            // writer's edits. Users who want non-conflicting updates to
-            // different keys in the same table should retry on conflict —
-            // retry rebases and applies their edit on top of the latest.
+            // Key-level OCC: I conflict only with concurrent commits that
+            // wrote to at least one of the same rows in the same table.
+            // The per-key merge at commit time (see the `merge_keys_from`
+            // call below) guarantees that disjoint-key writers to the same
+            // table both land cleanly without losing each other's edits.
             for (table_name, my_keys) in &self.write_set {
                 // `open_table` in MultiWriter mode inserts an empty write-set
                 // entry eagerly. Treat "opened but nothing written" as no
@@ -1359,8 +1444,11 @@ impl WriteTx {
                 if my_keys.is_empty() {
                     continue;
                 }
-                if let Some(their_keys) = cws.tables.get(table_name) {
-                    let conflicting: Vec<u64> = their_keys.iter().copied().collect();
+                if let Some(their_keys) = cws.tables.get(table_name)
+                    && !my_keys.is_disjoint(their_keys)
+                {
+                    let conflicting: Vec<u64> =
+                        my_keys.intersection(their_keys).copied().collect();
                     return Some(Error::WriteConflict {
                         table: table_name.clone(),
                         keys: conflicting,
