@@ -9,8 +9,11 @@
 //! Read-only reference: Alomari et al., "The Cost of Serializability on
 //! Platforms That Use Snapshot Isolation" (ICDE 2008).
 //!
-//! Uses `WriterMode::MultiWriter` for contention runs — each writer runs on
-//! its own OS thread and retries on `WriteConflict`.
+//! Runs under `Persistence::Standalone { durability: Durability::Eventual }`
+//! to match the default durability of the rocksdb and fjall comparison
+//! engines (WAL written, no fsync per commit). Requires `--features
+//! persistence`. Uses `WriterMode::MultiWriter` for contention runs — each
+//! writer runs on its own OS thread and retries on `WriteConflict`.
 
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -31,44 +34,17 @@ use smallbank_common::*;
 struct SmallBankConfig {
     name: String,
     store_config: StoreConfig,
-    #[cfg(feature = "persistence")]
     persistence: ultima_db::Persistence,
 }
 
 impl SmallBankConfig {
-    fn inmemory() -> Self {
-        Self {
-            name: "inmemory".into(),
-            store_config: StoreConfig {
-                num_snapshots_retained: 2,
-                auto_snapshot_gc: true,
-                ..StoreConfig::default()
-            },
-            #[cfg(feature = "persistence")]
-            persistence: ultima_db::Persistence::None,
-        }
-    }
-
-    #[cfg(feature = "persistence")]
-    fn standalone_consistent() -> Self {
-        Self {
-            name: "standalone_consistent".into(),
-            store_config: StoreConfig {
-                num_snapshots_retained: 2,
-                auto_snapshot_gc: true,
-                ..StoreConfig::default()
-            },
-            persistence: ultima_db::Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Consistent,
-            },
-        }
-    }
-
-    #[cfg(feature = "persistence")]
+    /// WAL-backed with eventual durability — the default for this bench.
+    /// Matches rocksdb's `WriteOptions { sync: false, disable_wal: false }`
+    /// and fjall's default `PersistMode::Buffer`: WAL is written, but no
+    /// fsync is forced per commit.
     fn standalone_eventual() -> Self {
         Self {
-            name: "standalone_eventual".into(),
+            name: "ultima".into(),
             store_config: StoreConfig {
                 num_snapshots_retained: 2,
                 auto_snapshot_gc: true,
@@ -94,39 +70,25 @@ struct UltimaEngine {
 
 impl UltimaEngine {
     fn new(config: &SmallBankConfig, writer_mode: WriterMode) -> Self {
-        #[allow(unused_mut)]
         let mut store_config = config.store_config.clone();
         store_config.writer_mode = writer_mode;
-        let tmpdir;
-
-        #[cfg(feature = "persistence")]
-        {
-            tmpdir = match &config.persistence {
-                ultima_db::Persistence::None => None,
-                ultima_db::Persistence::Standalone { durability, .. } => {
-                    let dir = tempfile::tempdir().unwrap();
-                    store_config.persistence = ultima_db::Persistence::Standalone {
-                        dir: dir.path().to_path_buf(),
-                        durability: *durability,
-                    };
-                    Some(dir)
-                }
-                ultima_db::Persistence::Smr { .. } => None,
-            };
-        }
-        #[cfg(not(feature = "persistence"))]
-        {
-            tmpdir = None;
-        }
+        let tmpdir = match &config.persistence {
+            ultima_db::Persistence::None => None,
+            ultima_db::Persistence::Standalone { durability, .. } => {
+                let dir = tempfile::tempdir().unwrap();
+                store_config.persistence = ultima_db::Persistence::Standalone {
+                    dir: dir.path().to_path_buf(),
+                    durability: *durability,
+                };
+                Some(dir)
+            }
+            ultima_db::Persistence::Smr { .. } => None,
+        };
 
         let store = Store::new(store_config).unwrap();
-
-        #[cfg(feature = "persistence")]
-        {
-            store.register_table::<Account>("accounts").unwrap();
-            store.register_table::<Savings>("savings").unwrap();
-            store.register_table::<Checking>("checking").unwrap();
-        }
+        store.register_table::<Account>("accounts").unwrap();
+        store.register_table::<Savings>("savings").unwrap();
+        store.register_table::<Checking>("checking").unwrap();
 
         let mut wtx = store.begin_write(None).unwrap();
         {
@@ -478,32 +440,29 @@ impl SmallBankEngine for UltimaEngine {
 // ---------------------------------------------------------------------------
 
 fn bench_smallbank(c: &mut Criterion) {
-    // Correctness gate — every `cargo bench` run confirms the engine matches
+    let config = SmallBankConfig::standalone_eventual();
+
+    // Correctness gates — every `cargo bench` run confirms the engine matches
     // the reference implementation before burning cycles on timings.
+    // First: sequential mixed workload. Second: commutative-only concurrent
+    // burst (verifies real multi-threaded OCC behavior).
     {
-        let config = SmallBankConfig::inmemory();
         let mut engine = UltimaEngine::new(&config, WriterMode::SingleWriter);
         assert_matches_reference(&mut engine);
     }
+    {
+        let mut engine = UltimaEngine::new(&config, WriterMode::MultiWriter);
+        assert_matches_reference_concurrent(&mut engine);
+    }
 
     let fixture = generate_fixture(FIXTURE_POOL_SIZE);
-    let configs = vec![
-        SmallBankConfig::inmemory(),
-        #[cfg(feature = "persistence")]
-        SmallBankConfig::standalone_consistent(),
-        #[cfg(feature = "persistence")]
-        SmallBankConfig::standalone_eventual(),
-    ];
-
-    for config in &configs {
-        {
-            let mut engine = UltimaEngine::new(config, WriterMode::SingleWriter);
-            bench_workloads(c, &mut engine, &fixture);
-        }
-        {
-            let mut engine = UltimaEngine::new(config, WriterMode::MultiWriter);
-            bench_contention(c, &mut engine, &fixture);
-        }
+    {
+        let mut engine = UltimaEngine::new(&config, WriterMode::SingleWriter);
+        bench_workloads(c, &mut engine, &fixture);
+    }
+    {
+        let mut engine = UltimaEngine::new(&config, WriterMode::MultiWriter);
+        bench_contention(c, &mut engine, &fixture);
     }
 }
 

@@ -471,7 +471,87 @@ pub fn assert_matches_reference(engine: &mut impl SmallBankEngine) {
             "[{name}] final state diverged from reference\n  engine   : {engine_hash:?}\n  reference: {reference_hash:?}"
         );
     }
-    eprintln!("[{name}] correctness check passed: {engine_hash:?}");
+    eprintln!("[{name}] sequential correctness check passed: {engine_hash:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent correctness — commutative-only burst workload
+//
+// A real smallbank mix (WriteCheck, Amalgamate, SendPayment) is
+// order-sensitive: final state depends on which writer commits first, so
+// replaying through a linear reference is meaningless. But if we restrict
+// the burst to *commutative* ops — DepositChecking and TransactSavings,
+// both of which do `balance += amount` — then any serialization of the
+// successful commits yields the same final state. That lets us verify real
+// multi-threaded commit correctness: the engine's post-burst state must
+// match the reference state computed by applying every op once, regardless
+// of the commit interleaving.
+//
+// This exercises the thing we actually care about: that OCC retries neither
+// duplicate writes nor drop them.
+// ---------------------------------------------------------------------------
+
+pub fn gen_commutative_burst(
+    rng: &mut impl Rng,
+    zipf: &ZipfianGenerator,
+) -> Vec<Vec<SmallBankOp>> {
+    // INTEGER amounts only. f64 addition is non-associative for general
+    // values, so with commit-order-dependent sum order, per-account balances
+    // would differ bit-for-bit across engines even when the ops are
+    // mathematically commutative. Integers up to 2^53 are represented
+    // exactly in f64 and their sums are bit-exact regardless of order.
+    (0..NUM_WRITERS)
+        .map(|_| {
+            (0..OPS_PER_WRITER)
+                .map(|_| {
+                    let cid = zipf.next(rng);
+                    let amount = rng.random_range(1u32..500u32) as f64;
+                    if rng.random_bool(0.5) {
+                        SmallBankOp::DepositChecking(cid, amount)
+                    } else {
+                        SmallBankOp::TransactSavings(cid, amount)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub const CONCURRENT_CORRECTNESS_BURSTS: usize = 16;
+
+/// Runs a series of commutative-only bursts through the engine and through
+/// the reference (applying each writer's ops once, in any order, since the
+/// ops are commutative). Final state must match bit-for-bit.
+pub fn assert_matches_reference_concurrent(engine: &mut impl SmallBankEngine) {
+    let name = engine.name().to_owned();
+    let zipf = ZipfianGenerator::new(NUM_ACCOUNTS, ZIPFIAN_CONSTANT);
+    let mut rng = StdRng::seed_from_u64(777);
+
+    let mut reference = ReferenceState::seeded(NUM_ACCOUNTS);
+    let mut total_committed = 0u64;
+    let mut total_aborted = 0u64;
+    for _ in 0..CONCURRENT_CORRECTNESS_BURSTS {
+        let burst = gen_commutative_burst(&mut rng, &zipf);
+        let result = engine.execute_burst(&burst);
+        total_committed += result.committed;
+        total_aborted += result.aborted;
+        for writer_ops in &burst {
+            reference.apply_all(writer_ops);
+        }
+    }
+
+    let engine_hash = engine.verify();
+    let reference_hash = reference.hash();
+    if engine_hash != reference_hash {
+        panic!(
+            "[{name}] burst state diverged from reference (commutative ops)\n\
+             committed={total_committed}, aborted={total_aborted}\n\
+             engine   : {engine_hash:?}\n  reference: {reference_hash:?}"
+        );
+    }
+    eprintln!(
+        "[{name}] concurrent correctness check passed: committed={total_committed}, aborted={total_aborted}, hash={engine_hash:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

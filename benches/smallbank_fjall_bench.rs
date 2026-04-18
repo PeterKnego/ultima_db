@@ -298,6 +298,10 @@ fn bench_smallbank(c: &mut Criterion) {
         let mut engine = FjallEngine::preload();
         assert_matches_reference(&mut engine);
     }
+    {
+        let mut engine = FjallEngine::preload();
+        assert_matches_reference_concurrent(&mut engine);
+    }
 
     let fixture = generate_fixture(FIXTURE_POOL_SIZE);
     let mut engine = FjallEngine::preload();
