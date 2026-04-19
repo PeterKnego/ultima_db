@@ -68,6 +68,11 @@ harness = false
 required-features = ["persistence"]
 
 [[bench]]
+name = "disjoint_tables_bench"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
 name = "multiwriter_persistence_bench"
 harness = false
 required-features = ["persistence"]

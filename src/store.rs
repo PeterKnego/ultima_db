@@ -1,7 +1,9 @@
 use std::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use dashmap::DashMap;
 
 use crate::index::IndexKind;
 use crate::intents::{CommitWaiter, IntentMap, IntentWaiter};
@@ -155,6 +157,13 @@ pub struct Store {
     /// Monotonic ID source; every `WriteTx` gets a unique id used as the
     /// holder token in the intent map.
     pub(crate) next_writer_id: Arc<AtomicU64>,
+    /// Per-table commit mutexes. Writers acquire locks for tables in
+    /// their dirty set (canonical order by name, deadlock-free) and hold
+    /// them across the merge + install phases. Writers with disjoint
+    /// dirty sets don't serialize — they proceed through merge in
+    /// parallel and only briefly share the global `inner` write lock at
+    /// install time.
+    pub(crate) table_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Store {
@@ -196,6 +205,7 @@ impl Store {
             })),
             intents: Arc::new(IntentMap::default()),
             next_writer_id: Arc::new(AtomicU64::new(1)),
+            table_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -273,13 +283,14 @@ impl Store {
             inner.active_writer_base_versions.push(base_version);
         }
 
-        let (intents, waiter, writer_id) = match writer_mode {
+        let (intents, waiter, writer_id, table_locks) = match writer_mode {
             WriterMode::MultiWriter => (
                 Some(Arc::clone(&self.intents)),
                 Some(IntentWaiter::new()),
                 self.next_writer_id.fetch_add(1, Ordering::Relaxed),
+                Some(Arc::clone(&self.table_locks)),
             ),
-            WriterMode::SingleWriter => (None, None, 0),
+            WriterMode::SingleWriter => (None, None, 0, None),
         };
         Ok(WriteTx {
             base,
@@ -296,6 +307,7 @@ impl Store {
             intents,
             writer_id,
             waiter,
+            table_locks,
             #[cfg(feature = "persistence")]
             wal_ops: Vec::new(),
             #[cfg(feature = "persistence")]
@@ -528,6 +540,65 @@ impl Store {
     }
 }
 
+/// RAII owner of a set of per-table commit locks acquired in canonical
+/// order. Stores each `Arc<Mutex<()>>` alongside a `MutexGuard` borrowed
+/// from it; the guard is dropped before the Arc (via explicit
+/// `ManuallyDrop`), so the borrow never outlives its source.
+///
+/// The `'static` lifetime on the stored guards is a pure bookkeeping
+/// trick — the actual lifetime is tied to the paired `Arc<Mutex<()>>` in
+/// the same entry. Safety relies on dropping guards before Arcs, which
+/// `Drop::drop` enforces explicitly below.
+struct TableLockGuards {
+    slots: Vec<LockSlot>,
+}
+
+struct LockSlot {
+    // `arc` keeps the Mutex alive for the lifetime of the stored guard;
+    // it is "read" only via the borrow carried inside the guard.
+    #[allow(dead_code)]
+    arc: Arc<Mutex<()>>,
+    guard: std::mem::ManuallyDrop<MutexGuard<'static, ()>>,
+}
+
+impl TableLockGuards {
+    fn empty() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    fn acquire(arcs: Vec<Arc<Mutex<()>>>) -> Self {
+        let mut slots = Vec::with_capacity(arcs.len());
+        for arc in arcs {
+            // SAFETY: the MutexGuard borrows from the Mutex inside this
+            // Arc. We store both in the same `LockSlot`, and `Drop for
+            // TableLockGuards` drops the guard before dropping the Arc
+            // (via `ManuallyDrop::drop` followed by struct-field drop).
+            // The Arc keeps the Mutex alive for at least as long as the
+            // guard, so the extended `'static` lifetime is sound.
+            let guard: MutexGuard<'_, ()> = arc.lock().unwrap();
+            let guard: MutexGuard<'static, ()> = unsafe { std::mem::transmute(guard) };
+            slots.push(LockSlot {
+                arc,
+                guard: std::mem::ManuallyDrop::new(guard),
+            });
+        }
+        Self { slots }
+    }
+}
+
+impl Drop for TableLockGuards {
+    fn drop(&mut self) {
+        // Drop guards first (reverse acquisition order), then the Arcs
+        // fall out of scope when `slots` is dropped.
+        while let Some(mut slot) = self.slots.pop() {
+            // SAFETY: the guard is only dropped here, and the paired Arc
+            // is still alive in `slot.arc` until this method returns.
+            unsafe { std::mem::ManuallyDrop::drop(&mut slot.guard) };
+            // `slot.arc` drops normally when `slot` goes out of scope.
+        }
+    }
+}
+
 /// Remove a base version from the active writer tracking list.
 ///
 /// Called on commit and drop to unregister a `WriteTx` so that
@@ -703,6 +774,10 @@ pub struct WriteTx {
     writer_id: u64,
     /// Per-writer "done" signal. `Some` only in MultiWriter mode.
     waiter: Option<Arc<IntentWaiter>>,
+    /// Per-table commit mutex registry (MultiWriter only). `commit`
+    /// acquires an `Arc<Mutex<()>>` from this map for each dirty table in
+    /// canonical order before doing merge + install.
+    table_locks: Option<Arc<DashMap<String, Arc<Mutex<()>>>>>,
     /// WAL operations accumulated during this transaction (persistence only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_ops: Vec<crate::wal::WalOp>,
@@ -1251,42 +1326,193 @@ impl WriteTx {
     /// modified overlapping keys. Returns [`Error::WriteConflict`] on conflict.
     ///
     /// Returns the version number of the new snapshot.
-    pub fn commit(mut self) -> Result<u64> {
+    pub fn commit(self) -> Result<u64> {
+        // SingleWriter: no concurrent commits possible, so skip the
+        // per-table lock acquisition + read-lock handshake and use the
+        // original "one write lock through the whole commit" flow. This
+        // keeps the sequential path a single lock acquire/release per
+        // commit (no read→drop→write hop).
+        match self.writer_mode {
+            WriterMode::SingleWriter => self.commit_single_writer(),
+            WriterMode::MultiWriter => self.commit_multi_writer(),
+        }
+    }
+
+    /// SingleWriter commit: acquires one `inner.write()` lock and does
+    /// validation, merge, install all under it. No per-table locks
+    /// because there's no other writer to exclude.
+    fn commit_single_writer(mut self) -> Result<u64> {
         let mut inner = self.store_inner.write().unwrap();
 
-        // --- OCC validation (MultiWriter only) ---
-        if matches!(self.writer_mode, WriterMode::MultiWriter)
-            && let Some(conflict) = self.validate_write_set(&inner)
-        {
-            self.metrics.inc_write_conflict();
-            drop(inner); // release lock before Drop runs
-            return Err(conflict);
+        // WAL submit under lock (preserves ordering with snapshot promote).
+        #[cfg(feature = "persistence")]
+        let waiter = if let Some(wal) = &inner.wal_handle {
+            let ops = std::mem::take(&mut self.wal_ops);
+            if !ops.is_empty() {
+                let entry = crate::wal::WalEntry { version: self.version, ops };
+                Some(wal.write(entry)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        #[cfg(all(test, feature = "persistence"))]
+        let mock_waiter = inner.mock_wal.as_ref().map(|mock| {
+            mock.write(crate::wal::WalEntry { version: self.version, ops: vec![] })
+        });
+
+        // SingleWriter: nobody else commits concurrently, so the fast
+        // path always fires — install every dirty table wholesale.
+        let latest_tables = &inner.snapshots[&inner.latest_version].tables;
+        let mut new_tables: BTreeMap<String, Arc<dyn MergeableTable>> = latest_tables
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        let dirty = std::mem::take(&mut self.dirty);
+        for (name, my_dirty) in dirty {
+            new_tables.insert(name, Arc::from(my_dirty));
+        }
+        for name in &self.deleted_tables {
+            new_tables.remove(name);
         }
 
-        // --- Commit-time version bump (MultiWriter + auto-version only) ---
+        let snapshot = Arc::new(Snapshot { version: self.version, tables: new_tables });
+        let v = snapshot.version;
+        inner.active_writer_count -= 1;
+        self.needs_cleanup = false;
+
+        #[cfg(feature = "persistence")]
+        let needs_wal_wait = {
+            #[allow(unused_mut)]
+            let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
+            #[cfg(test)]
+            { w = w || mock_waiter.is_some(); }
+            w
+        };
+        #[cfg(not(feature = "persistence"))]
+        let needs_wal_wait = false;
+
+        if needs_wal_wait {
+            drop(inner);
+            #[cfg(feature = "persistence")]
+            {
+                if let Some(w) = waiter { w.wait(); }
+                #[cfg(test)]
+                if let Some(w) = mock_waiter { w.wait(); }
+            }
+            let mut inner = self.store_inner.write().unwrap();
+            inner.snapshots.insert(v, snapshot);
+            if v > inner.latest_version { inner.latest_version = v; }
+            if inner.config.auto_snapshot_gc { gc_inner(&mut inner); }
+        } else {
+            inner.snapshots.insert(v, snapshot);
+            if v > inner.latest_version { inner.latest_version = v; }
+            if inner.config.auto_snapshot_gc { gc_inner(&mut inner); }
+        }
+
+        self.metrics.inc_commit();
+        Ok(v)
+    }
+
+    /// MultiWriter commit: the sharded path. Acquires per-table locks,
+    /// does OCC + merge outside the global write lock, then takes the
+    /// global write lock briefly for install.
+    fn commit_multi_writer(mut self) -> Result<u64> {
+        // Phase 0: acquire per-table commit locks for every dirty table
+        // and every table deleted during this tx. Holding these across
+        // the merge + install phases is what lets disjoint-table writers
+        // run in parallel; writers on overlapping tables still serialize.
         //
-        // Versions pre-assigned at `begin_write` may not match the order in
-        // which concurrent writers actually acquire the commit lock. Without
-        // this bump, a writer with a lower pre-assigned version that commits
-        // AFTER one with a higher version would install its snapshot at a
-        // lower version, leaving `latest_version` pointing at the earlier
-        // (chronologically older) snapshot. The per-key merge then rebases
-        // future commits onto that stale snapshot and silently drops the
-        // intervening writer's edits. Forcing auto-assigned versions up to
-        // `latest_version + 1` keeps commit order identical to version order.
-        // Explicit-version writers (SMR mode) are left alone — the caller
-        // controls the version there.
-        if matches!(self.writer_mode, WriterMode::MultiWriter)
-            && !self.explicit_version
-            && self.version <= inner.latest_version
-        {
+        // Canonical order: dirty is already a BTreeMap (sorted), and
+        // ever_deleted_tables is a BTreeSet — we take the sorted union, so
+        // all writers acquire locks in the same order (deadlock-free).
+        let _table_guards = self.acquire_table_locks();
+
+        // Phase 1: OCC validation + merge-base snapshot (brief read lock).
+        //
+        // With per-table locks held, no concurrent writer can install
+        // changes to OUR tables during the rest of commit. Any CWS for a
+        // table we hold must have been recorded before we acquired its
+        // lock, so a single OCC pass under the read lock is sufficient.
+        let (latest_tables_ref, concurrent_flags) = {
+            let inner = self.store_inner.read().unwrap();
+
+            if let Some(conflict) = self.validate_write_set(&inner) {
+                self.metrics.inc_write_conflict();
+                drop(inner);
+                return Err(conflict);
+            }
+
+            // Pre-compute fast/slow-path flag for each dirty table under
+            // the same read lock; avoids a second scan later.
+            let flags: BTreeMap<String, bool> = self
+                .dirty
+                .keys()
+                .map(|n| {
+                    let has = inner.committed_write_sets.iter().any(|cws| {
+                        cws.version > self.base.version && cws.tables.contains_key(n)
+                    });
+                    (n.clone(), has)
+                })
+                .collect();
+            (inner.snapshots[&inner.latest_version].tables.clone(), flags)
+        };
+
+        // --- Phase 2: merge dirty tables (no store-wide locks held) ---
+        //
+        // This is the work we moved out of the global write lock. Each
+        // dirty table's merge is O(modified_keys × log N), potentially µs
+        // to ms; previously all writers serialized through it, now only
+        // writers on the same table do (via their shared per-table lock).
+        let dirty = std::mem::take(&mut self.dirty);
+        let mut merged_tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
+        for (name, my_dirty) in dirty {
+            let has_concurrent = concurrent_flags.get(&name).copied().unwrap_or(false);
+
+            if !has_concurrent {
+                // Fast path: no concurrent commit touched this table since
+                // my base, so my dirty is already a valid new version.
+                merged_tables.insert(name, Arc::from(my_dirty));
+                continue;
+            }
+
+            let keys = self.write_set.get(&name);
+            match (latest_tables_ref.get(&name), keys) {
+                (Some(latest_arc), Some(keys)) if !keys.is_empty() => {
+                    let mut merged = latest_arc.boxed_clone();
+                    // Drop handles active-writer cleanup on error
+                    // (needs_cleanup still true). Table locks drop at
+                    // end of scope.
+                    merged.merge_keys_from(&*my_dirty, keys)?;
+                    merged_tables.insert(name, Arc::from(merged));
+                }
+                (Some(_), _) => {
+                    // Read-only open or failed batch rolled back write set.
+                    // Don't substitute at install — keep latest as-is.
+                }
+                (None, _) => {
+                    // Table doesn't exist in the base but I wrote to it
+                    // (concurrent writer deleted it). Install wholesale.
+                    merged_tables.insert(name, Arc::from(my_dirty));
+                }
+            }
+        }
+
+        // --- Phase 3: install under brief write lock ---
+        let mut inner = self.store_inner.write().unwrap();
+
+        // Commit-time version bump (auto-version only). Pre-assigned
+        // versions may be out of order by the time we reach install;
+        // bumping keeps commit order == version order. Explicit-version
+        // writers (SMR mode) are left alone.
+        if !self.explicit_version && self.version <= inner.latest_version {
             self.version = inner.latest_version + 1;
             if self.version >= inner.next_version {
                 inner.next_version = self.version + 1;
             }
         }
-
-        // --- Phase 1: WAL submit + snapshot build + write set recording (under lock) ---
 
         // Submit WAL entry to background thread (no fsync yet).
         #[cfg(feature = "persistence")]
@@ -1308,74 +1534,17 @@ impl WriteTx {
             mock.write(crate::wal::WalEntry { version: self.version, ops: vec![] })
         });
 
-        // Build the new table map by rebasing onto the CURRENT latest
-        // snapshot and merging each dirty table's modifications in per-key.
-        //
-        // For each dirty table:
-        //   - If the latest snapshot already has a version of it, clone it
-        //     (O(1), CoW) and apply our writes at exactly the keys we
-        //     modified (`merge_keys_from`). Concurrent non-conflicting
-        //     writers to other keys in the same table survive into our
-        //     snapshot.
-        //   - If the latest doesn't have it (fresh table we created), just
-        //     install our dirty copy wholesale.
-        //
-        // OCC (validate_write_set above) has already guaranteed that no
-        // concurrent committed writer overlapped on any key we wrote, so
-        // the merge is always a clean key-level upsert.
-        let latest_tables = &inner.snapshots[&inner.latest_version].tables;
-        let mut new_tables: BTreeMap<String, Arc<dyn MergeableTable>> = latest_tables
+        // Fork from the *current* latest (may have advanced since phase 1
+        // due to concurrent writers on other tables), then substitute in my
+        // merged tables. Tables I don't touch come through unchanged.
+        let fresh_latest_tables = &inner.snapshots[&inner.latest_version].tables;
+        let mut new_tables: BTreeMap<String, Arc<dyn MergeableTable>> = fresh_latest_tables
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
-
-        let dirty = std::mem::take(&mut self.dirty);
-        for (name, my_dirty) in dirty {
-            // Did any concurrent committed writer touch this table?
-            let has_concurrent_write = inner
-                .committed_write_sets
-                .iter()
-                .any(|cws| cws.version > self.base.version && cws.tables.contains_key(&name));
-
-            if !has_concurrent_write {
-                // Fast path: no concurrent commit wrote to this table, so
-                // my dirty == (my base + my edits) == (latest + my edits).
-                // Install wholesale with a single Arc swap — no merge cost.
-                new_tables.insert(name, Arc::from(my_dirty));
-                continue;
-            }
-
-            let keys = self.write_set.get(&name);
-            match (new_tables.get(&name), keys) {
-                // Concurrent writer wrote this table AND I wrote specific
-                // keys: merge my keys onto latest. OCC guarantees my keys
-                // don't overlap theirs.
-                (Some(latest_arc), Some(keys)) if !keys.is_empty() => {
-                    let mut merged = latest_arc.boxed_clone();
-                    if let Err(e) = merged.merge_keys_from(&*my_dirty, keys) {
-                        // Release the lock via early return; Drop handles
-                        // active-writer cleanup because `needs_cleanup` is
-                        // still true at this point.
-                        drop(inner);
-                        return Err(e);
-                    }
-                    new_tables.insert(name, Arc::from(merged));
-                }
-                // Concurrent writer wrote this table and I didn't write
-                // any keys (read-only open, or failed batch that rolled
-                // back its write set). Keep latest's version untouched.
-                (Some(_), _) => {
-                    // new_tables already has latest's Arc for `name`; do
-                    // nothing.
-                }
-                // Table doesn't exist in latest but some concurrent writer
-                // wrote to `name` (must have deleted it). Install my dirty.
-                (None, _) => {
-                    new_tables.insert(name, Arc::from(my_dirty));
-                }
-            }
+        for (name, merged) in merged_tables {
+            new_tables.insert(name, merged);
         }
-
         for name in &self.deleted_tables {
             new_tables.remove(name);
         }
@@ -1383,23 +1552,15 @@ impl WriteTx {
         let snapshot = Arc::new(Snapshot { version: self.version, tables: new_tables });
         let v = snapshot.version;
 
-        // Record write set (must happen before releasing lock so concurrent
-        // writers performing OCC in phase 1 see our write set).
-        match self.writer_mode {
-            WriterMode::MultiWriter => {
-                inner.committed_write_sets.push(CommittedWriteSet {
-                    version: v,
-                    tables: std::mem::take(&mut self.write_set),
-                    deleted_tables: std::mem::take(&mut self.ever_deleted_tables),
-                });
-                remove_active_writer(&mut inner, self.base.version);
-                prune_write_sets(&mut inner);
-            }
-            WriterMode::SingleWriter => {}
-        }
+        // Record write set (under write lock so concurrent OCC sees it).
+        inner.committed_write_sets.push(CommittedWriteSet {
+            version: v,
+            tables: std::mem::take(&mut self.write_set),
+            deleted_tables: std::mem::take(&mut self.ever_deleted_tables),
+        });
+        remove_active_writer(&mut inner, self.base.version);
+        prune_write_sets(&mut inner);
         inner.active_writer_count -= 1;
-        // Phase 1 has decremented active_writer_count. Mark cleanup done so
-        // Drop won't double-decrement if a panic occurs during phase 2.
         self.needs_cleanup = false;
 
         // Determine if we need to wait for WAL fsync before promoting.
@@ -1415,10 +1576,8 @@ impl WriteTx {
         let needs_wal_wait = false;
 
         if needs_wal_wait {
-            // --- Release lock, wait for fsync, then re-acquire and promote ---
             drop(inner);
 
-            // Phase 2: wait for WAL fsync (no lock held).
             #[cfg(feature = "persistence")]
             {
                 if let Some(w) = waiter {
@@ -1430,7 +1589,6 @@ impl WriteTx {
                 }
             }
 
-            // Phase 3: promote snapshot (brief lock).
             let mut inner = self.store_inner.write().unwrap();
             inner.snapshots.insert(v, snapshot);
             if v > inner.latest_version {
@@ -1440,7 +1598,6 @@ impl WriteTx {
                 gc_inner(&mut inner);
             }
         } else {
-            // Eventual or no WAL: promote immediately.
             inner.snapshots.insert(v, snapshot);
             if v > inner.latest_version {
                 inner.latest_version = v;
@@ -1494,6 +1651,43 @@ impl WriteTx {
             names.remove(name);
         }
         names.into_iter().collect()
+    }
+
+    /// Acquire per-table commit locks for every dirty or ever-deleted
+    /// table, in canonical (sorted) order. Returned guard owns both the
+    /// `Arc<Mutex<()>>`s and their locked `MutexGuard`s; dropping it
+    /// releases all locks in reverse order.
+    ///
+    /// No-op in `SingleWriter` mode (no concurrent commits possible).
+    fn acquire_table_locks(&self) -> TableLockGuards {
+        let Some(locks) = self.table_locks.as_ref() else {
+            return TableLockGuards::empty();
+        };
+
+        // Collect sorted set of (dirty names ∪ ever_deleted_tables).
+        let mut names: Vec<String> = self.dirty.keys().cloned().collect();
+        for d in &self.ever_deleted_tables {
+            if !names.contains(d) {
+                names.push(d.clone());
+            }
+        }
+        names.sort();
+        if names.is_empty() {
+            return TableLockGuards::empty();
+        }
+
+        // Snapshot the `Arc<Mutex<()>>` for each name (creating lazily).
+        let arcs: Vec<Arc<Mutex<()>>> = names
+            .iter()
+            .map(|n| {
+                locks
+                    .entry(n.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            })
+            .collect();
+
+        TableLockGuards::acquire(arcs)
     }
 
     /// Check for write-write conflicts against committed transactions.
