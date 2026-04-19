@@ -281,7 +281,13 @@ impl UltimaEngine {
     /// path — each thread wraps its whole op slice in one transaction, so the
     /// thread's writes are atomic end-to-end and the retry loop retries the
     /// full slice on conflict.
-    fn execute_ops_on_tx(wtx: &mut ultima_db::WriteTx, ops: &[SmallBankOp]) {
+    ///
+    /// Returns `Err(WriteConflict)` on the first conflicting write so the
+    /// outer retry loop can block on the holder's `CommitWaiter` and retry.
+    fn execute_ops_on_tx(
+        wtx: &mut ultima_db::WriteTx,
+        ops: &[SmallBankOp],
+    ) -> Result<(), ultima_db::Error> {
         for op in ops {
             match op {
                 SmallBankOp::Balance(_) => {}
@@ -291,7 +297,7 @@ impl UltimaEngine {
                         checking.get_unique::<u64>("customer_id", cid).unwrap()
                     {
                         let new = Checking { balance: rec.balance + amount, ..*rec };
-                        let _ = checking.update(id, new);
+                        checking.update(id, new)?;
                     }
                 }
                 SmallBankOp::TransactSavings(cid, amount) => {
@@ -300,7 +306,7 @@ impl UltimaEngine {
                         savings.get_unique::<u64>("customer_id", cid).unwrap()
                     {
                         let new = Savings { balance: rec.balance + amount, ..*rec };
-                        let _ = savings.update(id, new);
+                        savings.update(id, new)?;
                     }
                 }
                 SmallBankOp::Amalgamate { source, dest } => {
@@ -309,7 +315,7 @@ impl UltimaEngine {
                         savings.get_unique::<u64>("customer_id", source).unwrap()
                     {
                         let amt = rec.balance;
-                        let _ = savings.update(id, Savings { balance: 0.0, ..*rec });
+                        savings.update(id, Savings { balance: 0.0, ..*rec })?;
                         amt
                     } else {
                         0.0
@@ -320,10 +326,10 @@ impl UltimaEngine {
                     if let Some((id, rec)) =
                         checking.get_unique::<u64>("customer_id", dest).unwrap()
                     {
-                        let _ = checking.update(
+                        checking.update(
                             id,
                             Checking { balance: rec.balance + source_amount, ..*rec },
-                        );
+                        )?;
                     }
                 }
                 SmallBankOp::WriteCheck(cid, amount) => {
@@ -341,13 +347,13 @@ impl UltimaEngine {
                     {
                         let total = sbal + rec.balance;
                         let penalty = if total < *amount { 1.0 } else { 0.0 };
-                        let _ = checking.update(
+                        checking.update(
                             id,
                             Checking {
                                 balance: rec.balance - amount - penalty,
                                 ..*rec
                             },
-                        );
+                        )?;
                     }
                 }
                 SmallBankOp::SendPayment { source, dest, amount } => {
@@ -361,13 +367,14 @@ impl UltimaEngine {
                             checking.get_unique::<u64>("customer_id", dest).unwrap()
                         {
                             let dst_new = Checking { balance: dst_rec.balance + amount, ..*dst_rec };
-                            let _ = checking.update(src_id, src_new);
-                            let _ = checking.update(dst_id, dst_new);
+                            checking.update(src_id, src_new)?;
+                            checking.update(dst_id, dst_new)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -410,11 +417,21 @@ impl SmallBankEngine for UltimaEngine {
                     let mut retries = 0u64;
                     loop {
                         let mut wtx = store.begin_write(None).unwrap();
-                        Self::execute_ops_on_tx(&mut wtx, &ops);
+                        match Self::execute_ops_on_tx(&mut wtx, &ops) {
+                            Ok(()) => {}
+                            Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
+                                drop(wtx);
+                                retries += 1;
+                                if let Some(w) = wait_for { w.wait(); }
+                                continue;
+                            }
+                            Err(e) => panic!("unexpected error during ops: {e}"),
+                        }
                         match wtx.commit() {
                             Ok(_) => return (1u64, retries),
-                            Err(ultima_db::Error::WriteConflict { .. }) => {
+                            Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
                                 retries += 1;
+                                if let Some(w) = wait_for { w.wait(); }
                                 continue;
                             }
                             Err(e) => panic!("unexpected error: {e}"),

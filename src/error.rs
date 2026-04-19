@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::intents::CommitWaiter;
+
 #[derive(Debug, Error)]
 pub enum Error {
     /// Requested key or version does not exist.
@@ -8,14 +10,21 @@ pub enum Error {
     /// Requested snapshot version does not exist.
     #[error("snapshot version {0} not found")]
     VersionNotFound(u64),
-    /// Returned when a write transaction conflicts with a concurrent commit
-    /// (overlapping keys or table deletion), or when `begin_write` is called
-    /// with an explicit version ≤ the latest committed version.
+    /// Returned when a write transaction conflicts with a concurrent writer.
+    ///
+    /// Two detection sites produce this error:
+    /// 1. *Early-fail* inside `TableWriter::update`/`delete` — another active
+    ///    writer already holds an intent on the same key. `wait_for` is
+    ///    `Some(waiter)`; callers can block on it until the holder commits or
+    ///    aborts, then retry.
+    /// 2. *Commit-time* OCC — a writer that already committed overlapped on
+    ///    a key or deleted a table. `wait_for` is `None`; the winner is gone.
     #[error("write conflict on table '{table}', keys {keys:?} (conflicting version {version})")]
     WriteConflict {
         table: String,
         keys: Vec<u64>,
         version: u64,
+        wait_for: Option<CommitWaiter>,
     },
     /// Returned when `begin_write` is called while another write transaction
     /// is active in [`WriterMode::SingleWriter`] mode.
@@ -72,6 +81,7 @@ mod tests {
             table: "users".to_string(),
             keys: vec![1, 2],
             version: 3,
+            wait_for: None,
         };
         assert_eq!(e.to_string(), "write conflict on table 'users', keys [1, 2] (conflicting version 3)");
     }

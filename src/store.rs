@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::index::IndexKind;
+use crate::intents::{CommitWaiter, IntentMap, IntentWaiter};
 use crate::metrics::StoreMetrics;
 use crate::persistence::Record;
 use crate::table::{MergeableTable, Table, TableOpener};
@@ -146,6 +148,13 @@ pub(crate) struct StoreInner {
 #[derive(Clone)]
 pub struct Store {
     pub(crate) inner: Arc<RwLock<StoreInner>>,
+    /// Write-intent table for early-fail conflict detection (MultiWriter).
+    /// Lives outside the commit lock so per-write intent checks don't
+    /// serialize through `inner`.
+    pub(crate) intents: Arc<IntentMap>,
+    /// Monotonic ID source; every `WriteTx` gets a unique id used as the
+    /// holder token in the intent map.
+    pub(crate) next_writer_id: Arc<AtomicU64>,
 }
 
 impl Store {
@@ -185,6 +194,8 @@ impl Store {
                 mock_wal: None,
                 metrics,
             })),
+            intents: Arc::new(IntentMap::default()),
+            next_writer_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -243,6 +254,7 @@ impl Store {
                     table: String::new(),
                     keys: vec![],
                     version: inner.latest_version,
+                    wait_for: None,
                 })
             }
         };
@@ -261,6 +273,14 @@ impl Store {
             inner.active_writer_base_versions.push(base_version);
         }
 
+        let (intents, waiter, writer_id) = match writer_mode {
+            WriterMode::MultiWriter => (
+                Some(Arc::clone(&self.intents)),
+                Some(IntentWaiter::new()),
+                self.next_writer_id.fetch_add(1, Ordering::Relaxed),
+            ),
+            WriterMode::SingleWriter => (None, None, 0),
+        };
         Ok(WriteTx {
             base,
             dirty: BTreeMap::new(),
@@ -273,6 +293,9 @@ impl Store {
             writer_mode,
             needs_cleanup: true,
             metrics,
+            intents,
+            writer_id,
+            waiter,
             #[cfg(feature = "persistence")]
             wal_ops: Vec::new(),
             #[cfg(feature = "persistence")]
@@ -671,6 +694,15 @@ pub struct WriteTx {
     needs_cleanup: bool,
     /// Shared metrics for the store this transaction belongs to.
     metrics: Arc<StoreMetrics>,
+    /// Shared intent table. `Some` only in MultiWriter mode — SingleWriter
+    /// has no concurrent writers, so intent bookkeeping is elided entirely
+    /// (no Arc clone, no per-tx waiter allocation).
+    intents: Option<Arc<IntentMap>>,
+    /// Unique token identifying this writer in the intent table. Unused
+    /// when `intents` is `None`.
+    writer_id: u64,
+    /// Per-writer "done" signal. `Some` only in MultiWriter mode.
+    waiter: Option<Arc<IntentWaiter>>,
     /// WAL operations accumulated during this transaction (persistence only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_ops: Vec<crate::wal::WalOp>,
@@ -701,8 +733,21 @@ pub struct TableWriter<'tx, R: Record> {
     write_set: Option<&'tx mut BTreeSet<u64>>,
     metrics: Arc<StoreMetrics>,
     table_name: String,
+    /// `Some` in MultiWriter mode: bundles the shared intent map with the
+    /// caller-writer's id and waiter, so `update`/`delete` can perform
+    /// early-fail conflict detection without re-plumbing three separate
+    /// fields through every call site.
+    intent_ctx: Option<IntentCtx<'tx>>,
     #[cfg(feature = "persistence")]
     wal_ops: Option<WalOpsWriter<'tx>>,
+}
+
+/// Shared intent-table context held by `TableWriter` in MultiWriter mode.
+/// Borrowed from the parent `WriteTx` for the lifetime of the writer.
+struct IntentCtx<'tx> {
+    intents: &'tx IntentMap,
+    writer_id: u64,
+    waiter: &'tx Arc<IntentWaiter>,
 }
 
 /// Bundles the table name and ops list for WAL tracking in TableWriter.
@@ -713,6 +758,36 @@ struct WalOpsWriter<'tx> {
 }
 
 impl<'tx, R: Record> TableWriter<'tx, R> {
+    /// Claim a write intent on `(table, id)` for this writer. Returns
+    /// `Err(WriteConflict { wait_for: Some(..) })` immediately if another
+    /// active writer already holds the intent — the caller's retry loop
+    /// can block on that waiter until the holder commits or aborts.
+    ///
+    /// Only runs in `MultiWriter` mode; in `SingleWriter` there can be no
+    /// conflicting writer by construction.
+    fn claim_intent(&self, id: u64) -> Result<()> {
+        let Some(ctx) = self.intent_ctx.as_ref() else {
+            return Ok(());
+        };
+        match ctx
+            .intents
+            .try_acquire(&self.table_name, id, ctx.writer_id, ctx.waiter)
+        {
+            Ok(()) => Ok(()),
+            Err(holder_waiter) => {
+                self.metrics.inc_write_conflict();
+                Err(Error::WriteConflict {
+                    table: self.table_name.clone(),
+                    keys: vec![id],
+                    // Early-fail has no "conflicting committed version"; the
+                    // holder is still in flight. Use 0 as a sentinel.
+                    version: 0,
+                    wait_for: Some(CommitWaiter(Arc::clone(&holder_waiter))),
+                })
+            }
+        }
+    }
+
     // --- Write methods (tracked) ---
 
     /// Insert a record. Returns the auto-assigned ID.
@@ -736,6 +811,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Update a record by its ID.
     pub fn update(&mut self, id: u64, record: R) -> Result<()> {
+        self.claim_intent(id)?;
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             let data = Self::serialize_record(&record)?;
@@ -755,6 +831,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Delete a record by its ID. Returns the deleted record.
     pub fn delete(&mut self, id: u64) -> Result<Arc<R>> {
+        self.claim_intent(id)?;
         let old = self.table.delete(id)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
@@ -791,6 +868,12 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     }
 
     /// Update multiple records atomically.
+    ///
+    /// Batch ops rely on commit-time OCC rather than early-fail intents:
+    /// the underlying `Table::update_batch` uses snapshot-and-restore for
+    /// atomic rollback, and pre-claiming intents would leave dangling
+    /// claims on failure (breaking the poison-free guarantee of the
+    /// write set). Conflict on any id still surfaces — just at commit.
     pub fn update_batch(&mut self, updates: Vec<(u64, R)>) -> Result<()> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
@@ -815,7 +898,8 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         Ok(())
     }
 
-    /// Delete multiple records atomically.
+    /// Delete multiple records atomically. See `update_batch` for why
+    /// batch ops skip early-fail intent claiming.
     pub fn delete_batch(&mut self, ids: &[u64]) -> Result<()> {
         self.table.delete_batch(ids)?;
         if let Some(ws) = &mut self.write_set {
@@ -1132,6 +1216,14 @@ impl WriteTx {
             WriterMode::MultiWriter => Some(self.write_set.entry(name_str.clone()).or_default()),
             WriterMode::SingleWriter => None,
         };
+        let intent_ctx = match (self.intents.as_deref(), self.waiter.as_ref()) {
+            (Some(intents), Some(waiter)) => Some(IntentCtx {
+                intents,
+                writer_id: self.writer_id,
+                waiter,
+            }),
+            _ => None,
+        };
         self.metrics.register_table(&name_str);
         #[cfg(feature = "persistence")]
         let wal_ops = if self.wal_enabled {
@@ -1147,6 +1239,7 @@ impl WriteTx {
             write_set,
             metrics: Arc::clone(&self.metrics),
             table_name: name_str,
+            intent_ctx,
             #[cfg(feature = "persistence")]
             wal_ops,
         })
@@ -1357,6 +1450,13 @@ impl WriteTx {
             }
         }
 
+        // Release write intents and signal waiters. Happens *after* the
+        // snapshot is promoted so any writer that was parked on our waiter
+        // retries against a base that already includes our commit.
+        if let (Some(intents), Some(waiter)) = (&self.intents, &self.waiter) {
+            intents.release_all_for(self.writer_id, waiter);
+        }
+
         self.metrics.inc_commit();
         Ok(v)
     }
@@ -1419,6 +1519,7 @@ impl WriteTx {
                         table: deleted.clone(),
                         keys: vec![],
                         version: cws.version,
+                        wait_for: None,
                     });
                 }
             }
@@ -1429,6 +1530,7 @@ impl WriteTx {
                         table: deleted.clone(),
                         keys: vec![],
                         version: cws.version,
+                        wait_for: None,
                     });
                 }
             }
@@ -1453,6 +1555,7 @@ impl WriteTx {
                         table: table_name.clone(),
                         keys: conflicting,
                         version: cws.version,
+                        wait_for: None,
                     });
                 }
             }
@@ -1482,6 +1585,13 @@ impl Drop for WriteTx {
                 remove_active_writer(&mut inner, self.base.version);
                 prune_write_sets(&mut inner);
             }
+        }
+        // Always release intents and signal waiters — the `needs_cleanup`
+        // flag only gates the StoreInner bookkeeping (which commit already
+        // did). Any writer parked on this tx's waiter must wake whether
+        // this tx committed or aborted.
+        if let (Some(intents), Some(waiter)) = (&self.intents, &self.waiter) {
+            intents.release_all_for(self.writer_id, waiter);
         }
     }
 }
@@ -1818,7 +1928,8 @@ mod tests {
         assert_eq!(wtx2.version(), 11);
     }
 
-    /// Delete via `TableWriter` conflicts with update on the same key.
+    /// Delete via `TableWriter` conflicts with update on the same key —
+    /// surfaced at the conflicting write call (early-fail intents).
     #[test]
     fn multi_writer_delete_via_table_writer() {
         let store = Store::new(StoreConfig {
@@ -1834,13 +1945,13 @@ mod tests {
         let mut wtx_b = store.begin_write(None).unwrap();
 
         wtx_a.open_table::<String>("t").unwrap().delete(1).unwrap();
-        wtx_b.open_table::<String>("t").unwrap().update(1, "b".into()).unwrap();
-
+        let err = wtx_b.open_table::<String>("t").unwrap().update(1, "b".into());
+        assert!(matches!(err, Err(Error::WriteConflict { wait_for: Some(_), .. })));
         wtx_a.commit().unwrap();
-        assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
     }
 
-    /// `update_batch` records all keys in the write set for conflict detection.
+    /// `update_batch` records all keys in the write set — conflict
+    /// surfaces at commit time (batch ops skip early-fail, see TableWriter).
     #[test]
     fn multi_writer_update_batch_tracks_keys() {
         let store = Store::new(StoreConfig {
@@ -1857,7 +1968,10 @@ mod tests {
         let mut wtx_a = store.begin_write(None).unwrap();
         let mut wtx_b = store.begin_write(None).unwrap();
 
-        wtx_a.open_table::<String>("t").unwrap().update(1, "a2".into()).unwrap();
+        // wtx_a must use update_batch too — single update would hold an
+        // intent that would early-fail B's batch via A's other writes.
+        wtx_a.open_table::<String>("t").unwrap()
+            .update_batch(vec![(1, "a2".into())]).unwrap();
         wtx_b.open_table::<String>("t").unwrap()
             .update_batch(vec![(1, "b2".into())]).unwrap();
 
@@ -1865,7 +1979,8 @@ mod tests {
         assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
     }
 
-    /// `delete_batch` records all keys in the write set for conflict detection.
+    /// `delete_batch` records all keys in the write set — conflict
+    /// surfaces at commit time (batch ops skip early-fail, see TableWriter).
     #[test]
     fn multi_writer_delete_batch_tracks_keys() {
         let store = Store::new(StoreConfig {
@@ -1882,7 +1997,8 @@ mod tests {
         let mut wtx_a = store.begin_write(None).unwrap();
         let mut wtx_b = store.begin_write(None).unwrap();
 
-        wtx_a.open_table::<String>("t").unwrap().update(2, "a2".into()).unwrap();
+        wtx_a.open_table::<String>("t").unwrap()
+            .update_batch(vec![(2, "a2".into())]).unwrap();
         wtx_b.open_table::<String>("t").unwrap().delete_batch(&[2]).unwrap();
 
         wtx_a.commit().unwrap();
@@ -2010,7 +2126,7 @@ mod tests {
 
         // Use delete_batch through TableWriter — tests write_set tracking for delete_batch
         wtx_a.open_table::<String>("t").unwrap().delete_batch(&[1]).unwrap();
-        wtx_b.open_table::<String>("t").unwrap().delete(1).unwrap();
+        wtx_b.open_table::<String>("t").unwrap().delete_batch(&[1]).unwrap();
 
         wtx_a.commit().unwrap();
         assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
@@ -2280,16 +2396,17 @@ mod tests {
         // Give T1 time to reach WAL wait (write set recorded, lock released).
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // T2: modify same key 1. OCC should detect conflict with T1's
-        // pending write set even though T1's snapshot isn't promoted yet.
-        wtx2.open_table::<Item>("items").unwrap()
-            .update(1, Item { name: "from_t2".into() }).unwrap();
-        let result = wtx2.commit();
+        // T2: modify same key 1. With early-fail intents, T2's update()
+        // surfaces the conflict immediately — T1 still holds the intent
+        // even while it's blocked on the mock WAL fsync.
+        let result = wtx2.open_table::<Item>("items").unwrap()
+            .update(1, Item { name: "from_t2".into() });
 
         assert!(
-            matches!(result, Err(Error::WriteConflict { .. })),
-            "T2 should conflict with T1's pending write set, got: {result:?}"
+            matches!(result, Err(Error::WriteConflict { wait_for: Some(_), .. })),
+            "T2 should early-fail against T1's intent, got: {result:?}"
         );
+        drop(wtx2);
 
         // Release T1.
         mock.flush();

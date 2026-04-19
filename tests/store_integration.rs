@@ -1553,8 +1553,9 @@ fn multi_writer_disjoint_keys_same_table_both_commit() {
 // MultiWriter: overlapping keys → WriteConflict with table name, keys, version.
 // ---------------------------------------------------------------------------
 
-/// Both writers update key 1 → second commit returns `WriteConflict`
-/// with the conflicting table, keys, and the version that caused the conflict.
+/// Both writers try to update key 1 → the second writer early-fails on
+/// its `update` call with a `WriteConflict` carrying the first writer's
+/// `CommitWaiter`.
 #[test]
 fn multi_writer_overlapping_keys_conflict() {
     let store = multi_writer_store();
@@ -1569,21 +1570,24 @@ fn multi_writer_overlapping_keys_conflict() {
     let mut wtx_a = store.begin_write(None).unwrap();
     let mut wtx_b = store.begin_write(None).unwrap();
 
-    // Both update key 1
+    // A claims intent on key 1 first.
     wtx_a.open_table::<String>("t").unwrap().update(1, "from_a".to_string()).unwrap();
-    wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".to_string()).unwrap();
-
-    wtx_a.commit().unwrap();
-    let err = wtx_b.commit().unwrap_err();
+    // B's update trips the early-fail path — conflict surfaces now.
+    let err = wtx_b
+        .open_table::<String>("t").unwrap()
+        .update(1, "from_b".to_string())
+        .unwrap_err();
 
     match err {
-        Error::WriteConflict { table, keys, version } => {
+        Error::WriteConflict { table, keys, wait_for, .. } => {
             assert_eq!(table, "t");
             assert!(keys.contains(&1));
-            assert_eq!(version, 2); // wtx_a committed as v2
+            assert!(wait_for.is_some(), "early-fail should carry a CommitWaiter");
         }
         other => panic!("expected WriteConflict, got {other:?}"),
     }
+
+    wtx_a.commit().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,8 +1727,8 @@ fn multi_writer_insert_batch_tracks_keys() {
 // decrement active_writer_count so subsequent writers aren't blocked.
 // ---------------------------------------------------------------------------
 
-/// After a `WriteConflict`, the failed writer's tracking state is cleaned up
-/// and a new writer can proceed normally.
+/// After an early-fail `WriteConflict`, the failed writer's tracking
+/// state is cleaned up on drop and a new writer can proceed normally.
 #[test]
 fn multi_writer_conflict_cleans_up_active_writer() {
     let store = multi_writer_store();
@@ -1740,10 +1744,11 @@ fn multi_writer_conflict_cleans_up_active_writer() {
     let mut wtx_b = store.begin_write(None).unwrap();
 
     wtx_a.open_table::<String>("t").unwrap().update(1, "a".to_string()).unwrap();
-    wtx_b.open_table::<String>("t").unwrap().update(1, "b".to_string()).unwrap();
+    // B early-fails, then is dropped.
+    let _ = wtx_b.open_table::<String>("t").unwrap().update(1, "b".to_string());
+    drop(wtx_b);
 
     wtx_a.commit().unwrap();
-    let _ = wtx_b.commit(); // fails with WriteConflict, but should clean up
 
     // Should be able to start a new writer
     let wtx_c = store.begin_write(None).unwrap();
@@ -1967,17 +1972,28 @@ fn concurrent_same_table_overlapping_keys_with_retry() {
                 for n in 0..WRITES_PER_THREAD {
                     loop {
                         let mut wtx = store.begin_write(None).unwrap();
-                        {
+                        let write_res: Result<(), ultima_db::Error> = {
                             let mut t = wtx.open_table::<u64>("t").unwrap();
                             // Always touch the hot key id=1.
-                            t.update(1, tid * 1000 + n).unwrap();
-                            // And the per-thread key (id = 2 + tid).
-                            t.update(2 + tid, tid * 1000 + n).unwrap();
+                            t.update(1, tid * 1000 + n)
+                                // And the per-thread key (id = 2 + tid).
+                                .and_then(|_| t.update(2 + tid, tid * 1000 + n))
+                        };
+                        match write_res {
+                            Ok(()) => {}
+                            Err(Error::WriteConflict { wait_for, .. }) => {
+                                drop(wtx);
+                                conflicts += 1;
+                                if let Some(w) = wait_for { w.wait(); }
+                                continue;
+                            }
+                            Err(e) => panic!("unexpected error: {e}"),
                         }
                         match wtx.commit() {
                             Ok(_) => break,
-                            Err(Error::WriteConflict { .. }) => {
+                            Err(Error::WriteConflict { wait_for, .. }) => {
                                 conflicts += 1;
+                                if let Some(w) = wait_for { w.wait(); }
                                 continue;
                             }
                             Err(e) => panic!("unexpected error: {e}"),
@@ -2109,4 +2125,80 @@ fn concurrent_stress_insert_batch_no_lost_writes() {
     let actual_markers: HashSet<u64> = t.iter().map(|(_, v)| *v).collect();
     assert_eq!(actual_markers, expected_markers);
     assert_eq!(t.len(), (THREADS as u64 * INSERTS_PER_THREAD) as usize);
+}
+
+/// Second writer gets a `CommitWaiter` on early-fail and blocks on it.
+/// After the first writer commits, the waiter unblocks. The second
+/// writer retries against the new base and commits successfully.
+#[test]
+fn commit_waiter_unblocks_on_first_writer_commit() {
+    use ultima_db::{StoreConfig, WriterMode};
+    use std::time::{Duration, Instant};
+
+    let store = Store::new(StoreConfig {
+        writer_mode: WriterMode::MultiWriter,
+        ..StoreConfig::default()
+    })
+    .unwrap();
+
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t").unwrap().insert("seed".into()).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // Writer A claims intent on key 1 and then blocks on the barrier,
+    // holding the intent while writer B tries to update the same key.
+    let start = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let store_a = store.clone();
+    let start_a = Arc::clone(&start);
+    let release_a = Arc::clone(&release);
+    let a = thread::spawn(move || {
+        let mut wtx = store_a.begin_write(None).unwrap();
+        wtx.open_table::<String>("t").unwrap()
+            .update(1, "from_a".into())
+            .unwrap();
+        start_a.wait();   // tell B to proceed
+        release_a.wait(); // wait until B has blocked on the waiter
+        thread::sleep(Duration::from_millis(50));
+        wtx.commit().unwrap();
+    });
+
+    start.wait();
+    // B's update trips the early-fail path.
+    let mut wtx_b = store.begin_write(None).unwrap();
+    let err = wtx_b.open_table::<String>("t").unwrap().update(1, "from_b".into())
+        .unwrap_err();
+    let waiter = match err {
+        Error::WriteConflict { wait_for: Some(w), .. } => w,
+        other => panic!("expected early-fail WriteConflict, got {other:?}"),
+    };
+    drop(wtx_b);
+
+    // Signal A to commit, then block on the waiter. Expect wait() to return
+    // quickly once A commits (~50ms sleep).
+    release.wait();
+    let t0 = Instant::now();
+    waiter.wait();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "waiter should unblock promptly after commit, took {elapsed:?}"
+    );
+
+    a.join().unwrap();
+
+    // Retry B against the new base — key 1 is free, no conflict.
+    let mut wtx_b2 = store.begin_write(None).unwrap();
+    wtx_b2
+        .open_table::<String>("t").unwrap()
+        .update(1, "from_b_retry".into())
+        .unwrap();
+    wtx_b2.commit().unwrap();
+
+    // Verify B's retry landed.
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<String>("t").unwrap();
+    assert_eq!(t.get(1), Some(&"from_b_retry".to_string()));
 }

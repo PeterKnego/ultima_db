@@ -3,6 +3,7 @@ pub mod error;
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
 pub mod index;
+pub(crate) mod intents;
 pub mod persistence;
 #[cfg(feature = "persistence")]
 pub(crate) mod checkpoint;
@@ -17,6 +18,7 @@ pub mod transaction;
 
 pub use btree::BTree;
 pub use error::{Error, Result};
+pub use intents::CommitWaiter;
 #[cfg(feature = "fulltext")]
 pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
