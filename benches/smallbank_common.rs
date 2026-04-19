@@ -634,3 +634,58 @@ pub fn bench_contention(
     run(c, "low", &fixture.contention_low);
     run(c, "high", &fixture.contention_high);
 }
+
+/// Extended contention bench that runs at a parameterized writer count,
+/// generating its own pool on the fly. Used to compare engines at N=16
+/// alongside the standard N=4 runs.
+pub fn bench_contention_at_n(
+    c: &mut Criterion,
+    engine: &mut impl SmallBankEngine,
+    n_writers: usize,
+    pool_size: usize,
+) {
+    let cfg_name = engine.name().to_owned();
+    let total_ops = (n_writers * OPS_PER_WRITER) as u64;
+
+    let zipf_full = ZipfianGenerator::new(NUM_ACCOUNTS, ZIPFIAN_CONSTANT);
+    let hot_zipf = ZipfianGenerator::new(10, ZIPFIAN_CONSTANT);
+
+    let mut rng_low = StdRng::seed_from_u64(400 + n_writers as u64);
+    let low_pool: Vec<Vec<Vec<SmallBankOp>>> = (0..pool_size)
+        .map(|_| {
+            (0..n_writers)
+                .map(|_| gen_mixed_workload_n(&mut rng_low, &zipf_full, OPS_PER_WRITER))
+                .collect()
+        })
+        .collect();
+
+    let mut rng_high = StdRng::seed_from_u64(500 + n_writers as u64);
+    let high_pool: Vec<Vec<Vec<SmallBankOp>>> = (0..pool_size)
+        .map(|_| {
+            (0..n_writers)
+                .map(|_| gen_mixed_workload_n(&mut rng_high, &hot_zipf, OPS_PER_WRITER))
+                .collect()
+        })
+        .collect();
+
+    let mut run = |c: &mut Criterion, label: &str, pool: &[Vec<Vec<SmallBankOp>>]| {
+        let cursor = Cursor::new();
+        let mut group = c.benchmark_group(format!(
+            "smallbank_contention_{label}_n{n_writers}/{cfg_name}"
+        ));
+        group.throughput(Throughput::Elements(total_ops));
+        group.bench_function("burst", |b| {
+            b.iter_batched_ref(
+                || pool[cursor.next(pool.len())].clone(),
+                |op_sets| {
+                    black_box(engine.execute_burst(op_sets));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    };
+
+    run(c, "low", &low_pool);
+    run(c, "high", &high_pool);
+}

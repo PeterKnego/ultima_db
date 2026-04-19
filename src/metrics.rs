@@ -19,6 +19,13 @@ pub struct MetricsSnapshot {
     pub gc_runs: u64,
     pub snapshots_collected: u64,
     pub write_conflicts: u64,
+    /// MultiWriter commit-phase cumulative wall time, in nanoseconds.
+    /// Useful for profiling where commit-path time is actually spent.
+    /// All four sum to approximately the total time inside `commit()`.
+    pub commit_ns_phase0_acquire_locks: u64,
+    pub commit_ns_phase1_read_validate: u64,
+    pub commit_ns_phase2_merge: u64,
+    pub commit_ns_phase3_install: u64,
     pub tables: HashMap<String, TableMetricsSnapshot>,
 }
 
@@ -114,6 +121,10 @@ pub(crate) struct StoreMetrics {
     gc_runs: AtomicU64,
     snapshots_collected: AtomicU64,
     write_conflicts: AtomicU64,
+    commit_ns_phase0: AtomicU64,
+    commit_ns_phase1: AtomicU64,
+    commit_ns_phase2: AtomicU64,
+    commit_ns_phase3: AtomicU64,
     tables: RwLock<HashMap<String, TableMetrics>>,
 }
 
@@ -138,8 +149,25 @@ impl StoreMetrics {
             gc_runs: AtomicU64::new(0),
             snapshots_collected: AtomicU64::new(0),
             write_conflicts: AtomicU64::new(0),
+            commit_ns_phase0: AtomicU64::new(0),
+            commit_ns_phase1: AtomicU64::new(0),
+            commit_ns_phase2: AtomicU64::new(0),
+            commit_ns_phase3: AtomicU64::new(0),
             tables: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn add_phase0(&self, ns: u64) {
+        self.commit_ns_phase0.fetch_add(ns, Ordering::Relaxed);
+    }
+    pub(crate) fn add_phase1(&self, ns: u64) {
+        self.commit_ns_phase1.fetch_add(ns, Ordering::Relaxed);
+    }
+    pub(crate) fn add_phase2(&self, ns: u64) {
+        self.commit_ns_phase2.fetch_add(ns, Ordering::Relaxed);
+    }
+    pub(crate) fn add_phase3(&self, ns: u64) {
+        self.commit_ns_phase3.fetch_add(ns, Ordering::Relaxed);
     }
 
     // --- Registration -------------------------------------------------------
@@ -314,6 +342,10 @@ impl StoreMetrics {
             gc_runs: self.gc_runs.load(Ordering::Relaxed),
             snapshots_collected: self.snapshots_collected.load(Ordering::Relaxed),
             write_conflicts: self.write_conflicts.load(Ordering::Relaxed),
+            commit_ns_phase0_acquire_locks: self.commit_ns_phase0.load(Ordering::Relaxed),
+            commit_ns_phase1_read_validate: self.commit_ns_phase1.load(Ordering::Relaxed),
+            commit_ns_phase2_merge: self.commit_ns_phase2.load(Ordering::Relaxed),
+            commit_ns_phase3_install: self.commit_ns_phase3.load(Ordering::Relaxed),
             tables,
         }
     }

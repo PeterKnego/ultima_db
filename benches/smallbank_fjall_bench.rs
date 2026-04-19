@@ -307,6 +307,7 @@ fn bench_smallbank(c: &mut Criterion) {
     let mut engine = FjallEngine::preload();
     bench_workloads(c, &mut engine, &fixture);
     bench_contention(c, &mut engine, &fixture);
+    bench_contention_at_n(c, &mut engine, 16, FIXTURE_POOL_SIZE);
 }
 
 criterion_group! {

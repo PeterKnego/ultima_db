@@ -1420,6 +1420,8 @@ impl WriteTx {
     /// does OCC + merge outside the global write lock, then takes the
     /// global write lock briefly for install.
     fn commit_multi_writer(mut self) -> Result<u64> {
+        use std::time::Instant;
+
         // Phase 0: acquire per-table commit locks for every dirty table
         // and every table deleted during this tx. Holding these across
         // the merge + install phases is what lets disjoint-table writers
@@ -1428,7 +1430,9 @@ impl WriteTx {
         // Canonical order: dirty is already a BTreeMap (sorted), and
         // ever_deleted_tables is a BTreeSet — we take the sorted union, so
         // all writers acquire locks in the same order (deadlock-free).
+        let t0 = Instant::now();
         let _table_guards = self.acquire_table_locks();
+        self.metrics.add_phase0(t0.elapsed().as_nanos() as u64);
 
         // Phase 1: OCC validation + merge-base snapshot (brief read lock).
         //
@@ -1436,12 +1440,14 @@ impl WriteTx {
         // changes to OUR tables during the rest of commit. Any CWS for a
         // table we hold must have been recorded before we acquired its
         // lock, so a single OCC pass under the read lock is sufficient.
+        let t1 = Instant::now();
         let (latest_tables_ref, concurrent_flags) = {
             let inner = self.store_inner.read().unwrap();
 
             if let Some(conflict) = self.validate_write_set(&inner) {
                 self.metrics.inc_write_conflict();
                 drop(inner);
+                self.metrics.add_phase1(t1.elapsed().as_nanos() as u64);
                 return Err(conflict);
             }
 
@@ -1459,6 +1465,7 @@ impl WriteTx {
                 .collect();
             (inner.snapshots[&inner.latest_version].tables.clone(), flags)
         };
+        self.metrics.add_phase1(t1.elapsed().as_nanos() as u64);
 
         // --- Phase 2: merge dirty tables (no store-wide locks held) ---
         //
@@ -1466,6 +1473,7 @@ impl WriteTx {
         // dirty table's merge is O(modified_keys × log N), potentially µs
         // to ms; previously all writers serialized through it, now only
         // writers on the same table do (via their shared per-table lock).
+        let t2 = Instant::now();
         let dirty = std::mem::take(&mut self.dirty);
         let mut merged_tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
         for (name, my_dirty) in dirty {
@@ -1500,7 +1508,10 @@ impl WriteTx {
             }
         }
 
+        self.metrics.add_phase2(t2.elapsed().as_nanos() as u64);
+
         // --- Phase 3: install under brief write lock ---
+        let t3 = Instant::now();
         let mut inner = self.store_inner.write().unwrap();
 
         // Commit-time version bump (auto-version only). Pre-assigned
@@ -1614,6 +1625,7 @@ impl WriteTx {
             intents.release_all_for(self.writer_id, waiter);
         }
 
+        self.metrics.add_phase3(t3.elapsed().as_nanos() as u64);
         self.metrics.inc_commit();
         Ok(v)
     }

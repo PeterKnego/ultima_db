@@ -480,6 +480,8 @@ fn bench_smallbank(c: &mut Criterion) {
     {
         let mut engine = UltimaEngine::new(&config, WriterMode::MultiWriter);
         bench_contention(c, &mut engine, &fixture);
+        // Same workload at N=16 for scaling comparison against Fjall.
+        bench_contention_at_n(c, &mut engine, 16, FIXTURE_POOL_SIZE);
     }
 }
 
