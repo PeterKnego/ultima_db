@@ -27,25 +27,39 @@ SQL defines four isolation levels by which anomalies each one prevents:
 
 ## What UltimaDB currently implements
 
-UltimaDB implements **Snapshot Isolation (SI)**, which is equivalent to PostgreSQL's *Repeatable Read* level.
+UltimaDB supports **two isolation levels**, selected via `StoreConfig::isolation_level`:
 
-### How it works
+- **`IsolationLevel::SnapshotIsolation`** (default) — equivalent to PostgreSQL's *Repeatable Read*. Zero overhead. Prevents dirty/nonrepeatable/phantom reads but **allows write skew**.
+- **`IsolationLevel::Serializable`** (opt-in) — Snapshot Isolation plus read-set tracking and commit-time validation. Additionally prevents write skew. Only takes effect under `WriterMode::MultiWriter`; in `SingleWriter` mode there are no concurrent writers and SSI degenerates to SI semantically (and pays no validation cost).
 
-- `Store::new()` seeds a version-0 empty snapshot.
+Both modes share the same SI guarantees for `ReadTx` (read-only transactions cannot write-skew, so SSI tracking is not applied to them).
+
+### How Snapshot Isolation works
+
+- `Store::new(StoreConfig::default())` seeds a version-0 empty snapshot.
 - Every `WriteTx::commit` atomically publishes a new `Arc<Snapshot>` containing an immutable copy of all tables.
 - `ReadTx` holds an `Arc<Snapshot>` pinned to a specific version. Because the Arc keeps that snapshot alive regardless of subsequent commits, all reads within the transaction see a consistent, unchanging point-in-time view.
 - `WriteTx` lazily copies (O(1) BTree root `Arc` clone) only the tables it touches. Changes are invisible to any concurrent `ReadTx` until `commit` returns.
 
-### Anomalies prevented
+### Anomalies prevented under SI
 
 | Anomaly            | Prevented? | Reason |
 |--------------------|:----------:|--------|
 | Dirty read         | Yes | Uncommitted `WriteTx` changes live only in its private `dirty` map; no `ReadTx` can observe them. |
 | Nonrepeatable read | Yes | `ReadTx` is pinned to a fixed `Arc<Snapshot>`. Later commits do not mutate it. |
 | Phantom read       | Yes | Range queries on a `ReadTx` iterate over the same immutable BTree root regardless of concurrent inserts. |
-| Serialization anomaly | **No** | Write skew is possible (see below). |
+| Serialization anomaly | **No** | Write skew is possible (see the example below). |
 
-### Write skew — the remaining anomaly
+### Anomalies prevented under Serializable (opt-in)
+
+| Anomaly            | Prevented? | Reason |
+|--------------------|:----------:|--------|
+| Dirty read         | Yes | Same as SI — uncommitted writes live only in dirty map. |
+| Nonrepeatable read | Yes | Same as SI — fixed snapshot view. |
+| Phantom read       | Yes | Same as SI — immutable BTree root for the duration. |
+| Serialization anomaly | **Yes** | `WriteTx` records its read set; commit aborts with `Error::SerializationFailure` if any read was invalidated by a concurrent commit since the tx's base version. |
+
+### Write skew — the anomaly SI permits but SSI prevents
 
 ```
 T1: r = rtx.open_table("doctors").len()  // sees 2
@@ -53,47 +67,76 @@ T2: r = rtx.open_table("doctors").len()  // sees 2
 T1: wtx.open_table("doctors").update(1, "off_call")  // T1 goes off call
 T2: wtx.open_table("doctors").update(2, "off_call")  // T2 goes off call
 T1: commit → v2
-T2: commit → v3   // succeeds! no conflict detected
+T2: commit → v3   // succeeds under SI! disjoint key writes, no conflict detected
 // result: 0 doctors on call — impossible in any serial execution
 ```
 
-UltimaDB does not detect this because `WriteTx` does not track which keys were *read*, only which tables were *written*.
+Under SI, UltimaDB does not detect this because `WriteTx` does not track which keys were *read*, only which keys were *written*. Under SSI, `T2`'s `len()` call records a coarse `table_scan` flag for `doctors`; when `T1` commits a write to that table, `T2`'s commit sees the conflict via the `committed_write_sets` walk and returns `Error::SerializationFailure`.
 
 ---
 
-## Achieving Serializable (SSI)
+## How Serializable works in UltimaDB
 
-Serializable Snapshot Isolation adds a read-set tracking phase on top of SI. The canonical algorithm is described in the paper *Serializable Snapshot Isolation in PostgreSQL* (Ports & Grittner, VLDB 2012).
+The implementation lives in `src/store.rs` and reuses the same `committed_write_sets` data structure that key-level OCC (task 19) and the sharded commit path (task 20) already maintain. The full per-feature record is in `docs/tasks/task21_serializable_isolation.md`.
 
-### What would need to change in UltimaDB
+### Read-set tracking
 
-1. **Track read sets in `WriteTx`**: Record every `(table, key)` pair accessed via `get`, and every `(table, range)` accessed via `range`, during the transaction's lifetime.
-
-2. **Track write sets**: Already implicit — every table in `dirty` with the keys inserted/updated/deleted.
-
-3. **Conflict detection at commit time**: Before publishing the new snapshot, scan all `WriteTx` instances that committed *after* this transaction's base version. For each such committer:
-   - If the committer wrote a key that this transaction *read* → potential rw-anti-dependency.
-   - If this transaction wrote a key that the committer *read* → another rw-anti-dependency in the other direction.
-   - If both directions exist in a cycle → abort with `Err(Error::WriteConflict)`.
-
-4. **Concurrent `WriteTx` registry**: The `Store` would need a list of in-flight and recently-committed write transactions (with their read/write sets) that can be checked at commit time. Entries can be GC'd once all snapshots older than the entry's base version are released.
-
-### Approximate API change
+Each `WriteTx` carries:
 
 ```rust
-// WriteTx gains read-set tracking (transparent to callers):
-pub fn open_table<R: 'static>(&mut self, name: &str) -> Result<&mut Table<R>>
-// Table gets read-set hooks — get/range record accessed keys into WriteTx.read_set
-
-// Store gains an in-flight registry:
-struct Store {
-    // ... existing fields ...
-    in_flight: Vec<TxRecord>,  // read/write sets of active and recently committed txs
-}
-
-// commit() returns WriteConflict if an rw-antidependency cycle is detected
-pub fn commit(self, store: &mut Store) -> Result<u64>
+read_set: Option<RefCell<BTreeMap<String, ReadSetEntry>>>
 ```
+
+`None` in `IsolationLevel::SnapshotIsolation` (zero overhead — branch elided). `Some(_)` in `IsolationLevel::Serializable`. Keyed by table name, with:
+
+```rust
+struct ReadSetEntry {
+    keys: BTreeSet<u64>,   // precise per-key reads
+    table_scan: bool,      // coarse "any non-key read happened" flag
+}
+```
+
+The `RefCell` is required because `WriteTx`'s read methods on `TableWriter` take `&self`, but tracking mutates the read set. `WriteTx` is `!Send + !Sync`, so no `Mutex` is needed.
+
+### Two granularities of tracking
+
+`TableWriter` read methods route through one of two helpers, `record_point_read` and `record_table_scan`:
+
+- **Precise per-key** — `get`, `contains`, `get_many`, `resolve` (each individual id is recorded).
+- **Coarse table-scan flag** — `iter`, `range`, `len`, `is_empty`, `first`, `last`, `get_unique`, `get_by_index`, `get_by_key`, `index_range`, `custom_index`.
+
+`TableReader` (used by `ReadTx`) does not record reads — read-only transactions cannot produce write skew, so SSI tracking is not applied.
+
+### Validation at commit
+
+`validate_read_set` runs in `commit_multi_writer`'s Phase 1, after `validate_write_set`. It walks the same `committed_write_sets` vector that OCC already maintains, skipping entries with `cws.version <= base_version`. For each later-than-base committed write set, and each `(table, entry)` in the read set, three conflict criteria apply:
+
+1. The committer **deleted** a table we read → conflict.
+2. `entry.table_scan == true` and the committer modified **any key** in that table → conflict.
+3. `entry.table_scan == false` and the committer modified a key that intersects `entry.keys` → conflict.
+
+First-match wins. The failure mode is:
+
+```rust
+Error::SerializationFailure { table: String, version: u64 }
+```
+
+There is no `wait_for` (unlike `WriteConflict`) because the conflicting committer has **already finished** — there is nothing left to wait on. Retry must rebase against a fresh base (re-`begin_write` and replay).
+
+`commit_single_writer` does not call `validate_read_set`. SingleWriter has no concurrent writers, so SSI is correctly a no-op there (and pays no read-tracking cost beyond the `Option::Some` allocation per `WriteTx`).
+
+### Cost
+
+- `IsolationLevel::SnapshotIsolation` (default): zero overhead. The `Option` is `None`, every `record_*` call short-circuits, the `validate_read_set` branch is elided.
+- `IsolationLevel::Serializable` + `WriterMode::SingleWriter`: zero validation overhead (SingleWriter commit path skips it). One `BTreeSet::insert` per point read and one `bool` set per scan are still paid, but they don't matter without concurrent writers.
+- `IsolationLevel::Serializable` + `WriterMode::MultiWriter`: one `BTreeSet::insert` per point read, one `bool` set per scan, plus one `committed_write_sets` walk at commit. Estimated <5% on write-heavy workloads (smallbank), 10–20% on read-heavy mixes (YCSB-B).
+- `ReadTx` (always, regardless of mode): zero overhead.
+
+### v1 caveats
+
+- **Range/scan reads use coarse table-scan tracking.** `iter`, `range`, `index_range`, `len`, `is_empty`, `first`, `last`, `get_unique`, `get_by_index`, `get_by_key`, `custom_index` flip the `table_scan` flag for the table; any concurrent commit on that table is then treated as a conflict at validation time. This produces **false positives** (a concurrent commit on a key outside the read range will still fail the SSI commit) but no **false negatives**. Range-key tracking is a v2 follow-up.
+- **No SSI for `update_batch` / `delete_batch` early-fail.** Those still rely on commit-time OCC (same as task 20's batch limitation).
+- **First-match validation** by `committed_write_sets` vector position. In MultiWriter the vector is naturally version-ordered; in SMR mode (explicit versions) ordering is the caller's responsibility.
 
 ---
 
@@ -105,9 +148,9 @@ The patterns below use the UltimaDB transaction API. Each test intentionally con
 
 ```rust
 // Setup: T1 writes but does not commit; T2 must not see T1's value.
-let mut store = Store::new();
+let store = Store::new(StoreConfig::default()).unwrap();
 let mut wtx = store.begin_write(None).unwrap();
-wtx.open_table::<u32>("t").unwrap().insert(42);
+wtx.open_table::<u32>("t").unwrap().insert(42).unwrap();
 // Do NOT commit yet.
 
 let rtx = store.begin_read(None).unwrap();  // pinned to v0
@@ -119,11 +162,11 @@ wtx.rollback();
 
 ```rust
 // T_read opens a snapshot; T_write commits a change; T_read re-reads and must see the old value.
-let mut store = Store::new();
+let store = Store::new(StoreConfig::default()).unwrap();
 {
     let mut w = store.begin_write(None).unwrap();
-    w.open_table::<u32>("t").unwrap().insert(1);
-    w.commit(&mut store).unwrap();
+    w.open_table::<u32>("t").unwrap().insert(1).unwrap();
+    w.commit().unwrap();
 }
 
 let rtx = store.begin_read(None).unwrap();  // pinned to v1
@@ -132,7 +175,7 @@ let first_read = *rtx.open_table::<u32>("t").unwrap().get(1).unwrap();
 {
     let mut w = store.begin_write(None).unwrap();
     w.open_table::<u32>("t").unwrap().update(1, 999).unwrap();
-    w.commit(&mut store).unwrap();
+    w.commit().unwrap();
 }
 
 // rtx still reads from v1 — value must not have changed.
@@ -144,11 +187,11 @@ assert_eq!(first_read, second_read);  // both 1, not 999
 
 ```rust
 // T_read counts rows; T_write inserts a row; T_read re-counts and must see the old count.
-let mut store = Store::new();
+let store = Store::new(StoreConfig::default()).unwrap();
 {
     let mut w = store.begin_write(None).unwrap();
-    w.open_table::<u32>("t").unwrap().insert(10);
-    w.commit(&mut store).unwrap();
+    w.open_table::<u32>("t").unwrap().insert(10).unwrap();
+    w.commit().unwrap();
 }
 
 let rtx = store.begin_read(None).unwrap();
@@ -156,52 +199,112 @@ let count_before = rtx.open_table::<u32>("t").unwrap().len();
 
 {
     let mut w = store.begin_write(None).unwrap();
-    w.open_table::<u32>("t").unwrap().insert(20);
-    w.commit(&mut store).unwrap();
+    w.open_table::<u32>("t").unwrap().insert(20).unwrap();
+    w.commit().unwrap();
 }
 
 let count_after = rtx.open_table::<u32>("t").unwrap().len();
 assert_eq!(count_before, count_after);  // both 1, phantom row not visible
 ```
 
-### Write skew (currently possible — would be prevented by SSI)
+### Write skew under SI (anomaly is permitted)
+
+The default `IsolationLevel::SnapshotIsolation` does **not** detect write skew. Two
+writers, each scanning the table to verify "at least one other doctor is on call",
+each updating themselves off-call, will both commit — the disjoint-key writes look
+like normal MultiWriter OCC traffic.
 
 ```rust
-// Two transactions each see "enough" of a shared resource, each consume one unit,
-// leaving the invariant violated after both commit.
-let mut store = Store::new();
+// SI permits write skew: both commits succeed.
+let store = Store::new(StoreConfig {
+    writer_mode: WriterMode::MultiWriter,
+    isolation_level: IsolationLevel::SnapshotIsolation,
+    ..StoreConfig::default()
+}).unwrap();
+
+// Seed two doctors on call.
 {
-    // Seed: two doctors on call (value 1 = on_call).
-    let mut w = store.begin_write(None).unwrap();
-    let t = w.open_table::<u32>("doctors").unwrap();
-    t.insert(1); // doctor 1 on call
-    t.insert(1); // doctor 2 on call
-    w.commit(&mut store).unwrap();
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table::<String>("doctors").unwrap();
+    t.insert("on".to_string()).unwrap();
+    t.insert("on".to_string()).unwrap();
+    wtx.commit().unwrap();
 }
 
-// Both transactions start from the same base (v1).
+// Two concurrent writers from the same base.
 let mut wtx_a = store.begin_write(None).unwrap();
-let mut wtx_b = store.begin_write(Some(3)).unwrap();
+let mut wtx_b = store.begin_write(None).unwrap();
 
-// Both read: 2 doctors on call — safe to go off call.
-let count_a = wtx_a.open_table::<u32>("doctors").unwrap().len();
-let count_b = wtx_b.open_table::<u32>("doctors").unwrap().len();
-assert_eq!(count_a, 2);
-assert_eq!(count_b, 2);
+// A scans + writes id=1.
+{ let _: Vec<_> = wtx_a.open_table::<String>("doctors").unwrap().iter().collect(); }
+wtx_a.open_table::<String>("doctors").unwrap().update(1, "off".to_string()).unwrap();
 
-// Each goes off call (sets their own row to 0).
-wtx_a.open_table::<u32>("doctors").unwrap().update(1, 0).unwrap();
-wtx_b.open_table::<u32>("doctors").unwrap().update(2, 0).unwrap();
+// B scans + writes id=2.
+{ let _: Vec<_> = wtx_b.open_table::<String>("doctors").unwrap().iter().collect(); }
+wtx_b.open_table::<String>("doctors").unwrap().update(2, "off".to_string()).unwrap();
 
-wtx_a.commit(&mut store).unwrap();
-wtx_b.commit(&mut store).unwrap(); // succeeds under SI — would abort under SSI
+wtx_a.commit().expect("A commits");
+wtx_b.commit().expect("B commits — write skew permitted under SI");
 
 // Invariant violated: 0 doctors on call.
-let rtx = store.begin_read(None).unwrap();
-let t = rtx.open_table::<u32>("doctors").unwrap();
-let on_call: u32 = t.range(..).map(|(_, v)| v).sum();
-assert_eq!(on_call, 0); // demonstrates the anomaly SI allows
-// Under SSI, wtx_b.commit() would return Err(Error::WriteConflict).
 ```
 
-The write-skew test is structured to **demonstrate the anomaly** rather than assert it is prevented. When SSI is implemented, the final `assert_eq!(on_call, 0)` line would be replaced by an assertion that one of the commits returned `Err(Error::WriteConflict)`.
+### Write skew under Serializable (prevented)
+
+The same scenario with `IsolationLevel::Serializable` records each writer's `iter()`
+as a coarse `table_scan` on `doctors`. When A commits a key in that table, B's
+commit-time validation walks `committed_write_sets`, sees `cws.tables.contains_key("doctors")`,
+and aborts with `Error::SerializationFailure`. The retry path must rebase
+(re-`begin_write` and replay against the fresh base).
+
+```rust
+// SSI prevents write skew: A commits; B aborts with SerializationFailure.
+let store = Store::new(StoreConfig {
+    writer_mode: WriterMode::MultiWriter,
+    isolation_level: IsolationLevel::Serializable,
+    ..StoreConfig::default()
+}).unwrap();
+
+// Same seed as the SI version.
+{
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table::<String>("doctors").unwrap();
+    t.insert("on".to_string()).unwrap();
+    t.insert("on".to_string()).unwrap();
+    wtx.commit().unwrap();
+}
+
+let mut wtx_a = store.begin_write(None).unwrap();
+let mut wtx_b = store.begin_write(None).unwrap();
+
+// A scans (records table_scan flag) + writes id=1.
+{
+    let t = wtx_a.open_table::<String>("doctors").unwrap();
+    assert!(t.iter().filter(|(_, s)| *s == "on").count() >= 2);
+}
+wtx_a.open_table::<String>("doctors").unwrap().update(1, "off".to_string()).unwrap();
+
+// B scans (records table_scan flag) + writes id=2.
+{
+    let t = wtx_b.open_table::<String>("doctors").unwrap();
+    assert!(t.iter().filter(|(_, s)| *s == "on").count() >= 2);
+}
+wtx_b.open_table::<String>("doctors").unwrap().update(2, "off".to_string()).unwrap();
+
+wtx_a.commit().expect("A commits");
+
+// B's iter() recorded table_scan=true on "doctors". A's commit modified a key in
+// "doctors" after B's base version → SSI flags the conflict.
+let res = wtx_b.commit();
+assert!(matches!(
+    res,
+    Err(Error::SerializationFailure { ref table, .. }) if table == "doctors"
+));
+```
+
+These two tests live inlined in `tests/store_integration.rs` as
+`si_allows_write_skew_table_scan` and `ssi_prevents_write_skew_via_table_scan`.
+Two further integration tests cover the precise (point-key) path:
+`ssi_read_then_write_conflicts_on_concurrent_modify` (point read invalidated by
+concurrent write) and `ssi_disjoint_point_reads_dont_conflict` (disjoint
+point reads/writes do not produce false positives).
