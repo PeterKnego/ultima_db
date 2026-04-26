@@ -136,6 +136,25 @@ struct CommittedWriteSet {
 }
 
 // ---------------------------------------------------------------------------
+// ReadSetEntry — per-table reads recorded by a Serializable WriteTx
+// ---------------------------------------------------------------------------
+
+/// The reads a `Serializable` WriteTx has issued against one table.
+///
+/// `keys` records primary-key point reads (precise). `table_scan` is set to
+/// `true` whenever a non-key read is issued — `iter`, `range`, `len`,
+/// `is_empty`, `first`, `last`, `get_unique`, `get_by_index`, `get_by_key`,
+/// `index_range`, `custom_index`, `resolve`. v1 conservatively treats any
+/// concurrent commit on a `table_scan == true` table as a serialization
+/// conflict; v2 may track index-range bounds for finer granularity.
+#[allow(dead_code)] // fields used in Task 6
+#[derive(Default)]
+struct ReadSetEntry {
+    keys: BTreeSet<u64>,
+    table_scan: bool,
+}
+
+// ---------------------------------------------------------------------------
 // StoreInner — the interior-mutable state behind Store
 // ---------------------------------------------------------------------------
 
@@ -305,6 +324,7 @@ impl Store {
         let base = inner.snapshots[&inner.latest_version].clone();
         let base_version = base.version;
         let writer_mode = inner.config.writer_mode;
+        let isolation_level = inner.config.isolation_level;
         let metrics = Arc::clone(&inner.metrics);
 
         // Track active writer.
@@ -342,6 +362,11 @@ impl Store {
             wal_ops: Vec::new(),
             #[cfg(feature = "persistence")]
             wal_enabled: inner.wal_handle.is_some(),
+            read_set: match isolation_level {
+                IsolationLevel::Serializable => Some(std::cell::RefCell::new(BTreeMap::new())),
+                IsolationLevel::SnapshotIsolation => None,
+            },
+            isolation_level,
             _not_send: PhantomData,
         })
     }
@@ -814,6 +839,15 @@ pub struct WriteTx {
     /// Whether WAL tracking is active (true only when a WAL handle exists).
     #[cfg(feature = "persistence")]
     wal_enabled: bool,
+    /// Per-table read set tracked when `isolation == Serializable`. `None` in
+    /// `SnapshotIsolation` mode (zero overhead). `RefCell` because reads are
+    /// recorded through shared `&TableReader`/`&TableWriter` references.
+    #[allow(dead_code)] // used in Task 5+
+    read_set: Option<std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
+    /// Cached isolation level — copied from the store config at `begin_write`
+    /// so the commit path doesn't re-read the config under a lock.
+    #[allow(dead_code)] // used in Task 5+
+    isolation_level: IsolationLevel,
     /// Pins `WriteTx` to its creating thread. A transaction must complete on
     /// the thread that opened it — the write-set tracking is not designed to
     /// be split across threads. Users who want concurrent writers should
