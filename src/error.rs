@@ -26,6 +26,15 @@ pub enum Error {
         version: u64,
         wait_for: Option<CommitWaiter>,
     },
+    /// Returned when a `Serializable` WriteTx's read set was invalidated by a
+    /// concurrent committed transaction. The reading tx must abort and retry
+    /// against a fresh base; there is no `wait_for` because the conflicting
+    /// writer has already finished.
+    #[error("serialization failure on table '{table}' (conflicting version {version})")]
+    SerializationFailure {
+        table: String,
+        version: u64,
+    },
     /// Returned when `begin_write` is called while another write transaction
     /// is active in [`WriterMode::SingleWriter`] mode.
     #[error("another write transaction is active (SingleWriter mode)")]
@@ -134,6 +143,18 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "explicit version required (require_explicit_version is enabled)"
+        );
+    }
+
+    #[test]
+    fn error_serialization_failure_displays() {
+        let e = Error::SerializationFailure {
+            table: "accounts".to_string(),
+            version: 5,
+        };
+        assert_eq!(
+            e.to_string(),
+            "serialization failure on table 'accounts' (conflicting version 5)"
         );
     }
 }
