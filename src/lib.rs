@@ -24,6 +24,6 @@ pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
 pub use persistence::{Durability, Persistence, Record};
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
-pub use store::{Readable, Store, StoreConfig, WriterMode};
+pub use store::{IsolationLevel, Readable, Store, StoreConfig, WriterMode};
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};

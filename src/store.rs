@@ -47,6 +47,29 @@ pub enum WriterMode {
 }
 
 // ---------------------------------------------------------------------------
+// IsolationLevel
+// ---------------------------------------------------------------------------
+
+/// Transaction isolation level.
+///
+/// Controls whether [`WriteTx`] tracks read sets and validates them at commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// Snapshot Isolation. Reads are not tracked. Prevents dirty/nonrepeatable
+    /// reads and phantoms but does *not* prevent write skew. Zero overhead.
+    /// Default.
+    SnapshotIsolation,
+    /// Serializable. WriteTx records every read; commit fails with
+    /// [`Error::SerializationFailure`] if any read was invalidated by a
+    /// concurrent commit since the tx's base version. Equivalent to
+    /// [`SnapshotIsolation`] in [`WriterMode::SingleWriter`] (no concurrent
+    /// writers, no validation needed). v1 tracks point reads precisely;
+    /// any range/scan/index read is recorded as a coarse "table touched"
+    /// flag (false positives possible on read-heavy scan workloads).
+    Serializable,
+}
+
+// ---------------------------------------------------------------------------
 // StoreConfig
 // ---------------------------------------------------------------------------
 
@@ -60,6 +83,12 @@ pub struct StoreConfig {
     pub auto_snapshot_gc: bool,
     /// Writer concurrency mode. Default: [`WriterMode::SingleWriter`].
     pub writer_mode: WriterMode,
+    /// Transaction isolation level. Default: [`IsolationLevel::SnapshotIsolation`].
+    ///
+    /// Set to [`IsolationLevel::Serializable`] to prevent write skew at the
+    /// cost of read-set tracking on every `WriteTx` read. Has no effect in
+    /// [`WriterMode::SingleWriter`] mode (always equivalent to SI there).
+    pub isolation_level: IsolationLevel,
     /// When `true`, [`Store::begin_write`] requires an explicit version
     /// (`Some(v)`). Calling `begin_write(None)` returns
     /// [`Error::ExplicitVersionRequired`]. Default: `false`.
@@ -78,6 +107,7 @@ impl Default for StoreConfig {
             num_snapshots_retained: 10,
             auto_snapshot_gc: true,
             writer_mode: WriterMode::SingleWriter,
+            isolation_level: IsolationLevel::SnapshotIsolation,
             require_explicit_version: false,
             #[cfg(feature = "persistence")]
             persistence: crate::persistence::Persistence::None,
@@ -1971,6 +2001,22 @@ mod tests {
         let wtx = store.begin_write(None).unwrap();
         wtx.rollback();
         assert_eq!(store.latest_version(), 0);
+    }
+
+    #[test]
+    fn store_config_default_isolation_is_snapshot() {
+        let c = StoreConfig::default();
+        assert_eq!(c.isolation_level, IsolationLevel::SnapshotIsolation);
+    }
+
+    #[test]
+    fn store_config_can_request_serializable() {
+        let c = StoreConfig {
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        };
+        assert_eq!(c.isolation_level, IsolationLevel::Serializable);
+        let _store = Store::new(c).unwrap();
     }
 
     #[test]
