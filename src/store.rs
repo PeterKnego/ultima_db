@@ -769,6 +769,7 @@ impl ReadTx {
             table,
             metrics: &self.metrics,
             table_name: name.to_string(),
+            read_set: None,
         })
     }
 }
@@ -842,11 +843,10 @@ pub struct WriteTx {
     /// Per-table read set tracked when `isolation == Serializable`. `None` in
     /// `SnapshotIsolation` mode (zero overhead). `RefCell` because reads are
     /// recorded through shared `&TableReader`/`&TableWriter` references.
-    #[allow(dead_code)] // used in Task 5+
     read_set: Option<std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
     /// Cached isolation level — copied from the store config at `begin_write`
     /// so the commit path doesn't re-read the config under a lock.
-    #[allow(dead_code)] // used in Task 5+
+    #[allow(dead_code)] // used in Task 7
     isolation_level: IsolationLevel,
     /// Pins `WriteTx` to its creating thread. A transaction must complete on
     /// the thread that opened it — the write-set tracking is not designed to
@@ -879,6 +879,11 @@ pub struct TableWriter<'tx, R: Record> {
     intent_ctx: Option<IntentCtx<'tx>>,
     #[cfg(feature = "persistence")]
     wal_ops: Option<WalOpsWriter<'tx>>,
+    /// Mirrors `TableReader::read_set` — used by `TableWriter`'s read methods
+    /// (`get`, `iter`, ...) so reads done through a write-mode handle still
+    /// participate in SSI tracking.
+    #[allow(dead_code)] // used in Task 6
+    read_set: Option<&'tx std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
 }
 
 /// Shared intent-table context held by `TableWriter` in MultiWriter mode.
@@ -1204,6 +1209,37 @@ pub struct TableReader<'tx, R: Record> {
     table: &'tx Table<R>,
     metrics: &'tx StoreMetrics,
     table_name: String,
+    /// `Some` only when the parent `WriteTx` is in `Serializable` mode and
+    /// this reader was created via `WriteTx::open_table`. `ReadTx` always
+    /// passes `None`.
+    #[allow(dead_code)] // used in Task 6
+    read_set: Option<&'tx std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
+}
+
+/// Record a point-read against `table` for the given `id`. No-op when `rs`
+/// is `None` (SnapshotIsolation or read-only tx).
+#[allow(dead_code)] // used in Task 6
+#[inline]
+fn record_point_read(
+    rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
+    table: &str,
+    id: u64,
+) {
+    if let Some(cell) = rs {
+        cell.borrow_mut().entry(table.to_string()).or_default().keys.insert(id);
+    }
+}
+
+/// Record a range/scan/index read against `table`. No-op when `rs` is `None`.
+#[allow(dead_code)] // used in Task 6
+#[inline]
+fn record_table_scan(
+    rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
+    table: &str,
+) {
+    if let Some(cell) = rs {
+        cell.borrow_mut().entry(table.to_string()).or_default().table_scan = true;
+    }
 }
 
 impl<'tx, R: Record> TableReader<'tx, R> {
@@ -1381,6 +1417,7 @@ impl WriteTx {
             intent_ctx,
             #[cfg(feature = "persistence")]
             wal_ops,
+            read_set: self.read_set.as_ref(),
         })
     }
 
