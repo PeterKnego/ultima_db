@@ -2423,3 +2423,45 @@ fn ssi_disjoint_point_reads_dont_conflict() {
     // No SSI failures recorded.
     assert_eq!(store.metrics().serialization_failures, 0);
 }
+
+#[test]
+fn ssi_in_single_writer_mode_is_noop() {
+    use ultima_db::{IsolationLevel, StoreConfig, WriterMode};
+
+    // SingleWriter has no concurrent writers, so Serializable degenerates to
+    // SI semantically. Verify a sequential read+write workload completes
+    // without any serialization failures and the metric counter stays 0.
+    let store = Store::new(StoreConfig {
+        writer_mode: WriterMode::SingleWriter,
+        isolation_level: IsolationLevel::Serializable,
+        ..StoreConfig::default()
+    }).unwrap();
+
+    // Seed.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // Read + write in a separate, sequential WriteTx.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            assert_eq!(t.get(1), Some(&"seed".to_string()));
+            let _: Vec<_> = t.iter().collect();
+        }
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.update(1, "updated".to_string()).unwrap();
+        }
+        wtx.commit().expect("sequential SSI commits cleanly");
+    }
+
+    assert_eq!(
+        store.metrics().serialization_failures,
+        0,
+        "SingleWriter+Serializable should never produce a serialization failure"
+    );
+}
