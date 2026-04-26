@@ -2163,6 +2163,80 @@ mod tests {
     }
 
     #[test]
+    fn ssi_read_set_records_get_many_per_id() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+            t.insert("b".to_string()).unwrap();
+            t.insert("c".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.get_many(&[1, 2, 3]);
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        let entry = rs.get("t").expect("table 't' must be in read_set");
+        assert!(entry.keys.contains(&1));
+        assert!(entry.keys.contains(&2));
+        assert!(entry.keys.contains(&3));
+        assert!(!entry.table_scan, "get_many is point-precise, should not promote to scan");
+    }
+
+    #[test]
+    fn ssi_read_set_records_missing_key_get() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            assert!(t.get(999).is_none(), "key 999 should not exist");
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        let entry = rs.get("t").expect("table 't' must be in read_set");
+        assert!(entry.keys.contains(&999), "missing-key reads must still record (phantom-write-skew defense)");
+    }
+
+    #[test]
+    fn ssi_read_set_mixed_point_and_scan() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.get(1);
+            let _: Vec<_> = t.iter().collect();
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        let entry = rs.get("t").expect("table 't' must be in read_set");
+        assert!(entry.keys.contains(&1), "point read of id=1 must be retained");
+        assert!(entry.table_scan, "subsequent iter() must promote table_scan to true");
+    }
+
+    #[test]
     fn gc_removes_old_snapshots_except_latest_and_active_rtx() {
         let store = Store::new(StoreConfig {
             num_snapshots_retained: 1,
