@@ -147,7 +147,6 @@ struct CommittedWriteSet {
 /// `index_range`, `custom_index`, `resolve`. v1 conservatively treats any
 /// concurrent commit on a `table_scan == true` table as a serialization
 /// conflict; v2 may track index-range bounds for finer granularity.
-#[allow(dead_code)] // fields used in Task 6
 #[derive(Default)]
 struct ReadSetEntry {
     keys: BTreeSet<u64>,
@@ -881,7 +880,6 @@ pub struct TableWriter<'tx, R: Record> {
     /// Mirrors `TableReader::read_set` — used by `TableWriter`'s read methods
     /// (`get`, `iter`, ...) so reads done through a write-mode handle still
     /// participate in SSI tracking.
-    #[allow(dead_code)] // used in Task 6
     read_set: Option<&'tx std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
 }
 
@@ -1068,12 +1066,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Look up a record by its ID.
     pub fn get(&self, id: u64) -> Option<&R> {
+        record_point_read(self.read_set, &self.table_name, id);
         self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.get(id)
     }
 
     /// Returns an iterator over records within the specified ID range.
     pub fn range<'a>(&'a self, range: impl std::ops::RangeBounds<u64> + 'a) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_primary_key_scans(&self.table_name);
         self.table.range(range)
     }
@@ -1081,41 +1081,48 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Returns the number of records in the table.
     #[must_use]
     pub fn len(&self) -> usize {
+        record_table_scan(self.read_set, &self.table_name);
         self.table.len()
     }
 
     /// Returns true if the table contains no records.
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        record_table_scan(self.read_set, &self.table_name);
         self.table.is_empty()
     }
 
     /// Returns true if the table contains a record with the given ID.
     pub fn contains(&self, id: u64) -> bool {
+        record_point_read(self.read_set, &self.table_name, id);
         self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.contains(id)
     }
 
     /// Returns the first (lowest ID) record, or `None` if empty.
     pub fn first(&self) -> Option<(u64, &R)> {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.first()
     }
 
     /// Returns the last (highest ID) record, or `None` if empty.
     pub fn last(&self) -> Option<(u64, &R)> {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_primary_key_reads(&self.table_name, 1);
         self.table.last()
     }
 
     /// Iterate over all records in ID order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_primary_key_scans(&self.table_name);
         self.table.iter()
     }
 
     /// Look up multiple records by ID.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
+        for id in ids { record_point_read(self.read_set, &self.table_name, *id); }
         self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.get_many(ids)
     }
@@ -1139,6 +1146,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         key: &K,
     ) -> Result<Option<(u64, &R)>> {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_unique(index_name, key)
     }
@@ -1149,6 +1157,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         key: &K,
     ) -> Result<Vec<(u64, &R)>> {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_index(index_name, key)
     }
@@ -1159,6 +1168,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         key: &K,
     ) -> Result<Vec<(u64, &R)>> {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_key(index_name, key)
     }
@@ -1169,6 +1179,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index_name: &str,
         range: impl std::ops::RangeBounds<K>,
     ) -> Result<Vec<(u64, &R)>> {
+        record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_range_scans(&self.table_name, index_name);
         self.table.index_range(index_name, range)
     }
@@ -1185,12 +1196,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Retrieve a reference to a custom index by name, downcast to the concrete type.
     pub fn custom_index<I: crate::CustomIndex<R>>(&self, name: &str) -> Result<&I> {
+        record_table_scan(self.read_set, &self.table_name);
         self.table.custom_index(name)
     }
 
     /// Resolve a slice of record IDs to `(id, &record)` pairs.
     /// IDs that don't exist in the table are silently skipped.
     pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
+        for id in ids { record_point_read(self.read_set, &self.table_name, *id); }
         self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.resolve(ids)
     }
@@ -1212,7 +1225,6 @@ pub struct TableReader<'tx, R: Record> {
 
 /// Record a point-read against `table` for the given `id`. No-op when `rs`
 /// is `None` (SnapshotIsolation or read-only tx).
-#[allow(dead_code)] // used in Task 6
 #[inline]
 fn record_point_read(
     rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
@@ -1225,7 +1237,6 @@ fn record_point_read(
 }
 
 /// Record a range/scan/index read against `table`. No-op when `rs` is `None`.
-#[allow(dead_code)] // used in Task 6
 #[inline]
 fn record_table_scan(
     rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
@@ -2082,6 +2093,73 @@ mod tests {
         };
         assert_eq!(c.isolation_level, IsolationLevel::Serializable);
         let _store = Store::new(c).unwrap();
+    }
+
+    #[test]
+    fn ssi_read_set_records_point_reads() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+
+        // Seed: insert a row id=1.
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("a".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        // Now open Serializable wtx, do a point read, inspect read_set.
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.get(1);
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        assert!(rs.get("t").map(|e| e.keys.contains(&1)).unwrap_or(false));
+        assert!(!rs.get("t").map(|e| e.table_scan).unwrap_or(true));
+    }
+
+    #[test]
+    fn ssi_read_set_records_iter_as_table_scan() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _: Vec<_> = t.iter().collect();
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false));
+    }
+
+    #[test]
+    fn ssi_read_set_empty_in_si_mode() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::SnapshotIsolation,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.get(1);
+        }
+        assert!(wtx.read_set.is_none());
     }
 
     #[test]
