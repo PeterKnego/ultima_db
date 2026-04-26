@@ -2202,3 +2202,120 @@ fn commit_waiter_unblocks_on_first_writer_commit() {
     let t = rtx.open_table::<String>("t").unwrap();
     assert_eq!(t.get(1), Some(&"from_b_retry".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// SSI: Serializable mode prevents write skew that SnapshotIsolation allows.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssi_prevents_write_skew_via_table_scan() {
+    use ultima_db::{IsolationLevel, StoreConfig, WriterMode};
+
+    // Classic write-skew: two doctors on call. Each tx scans the table to
+    // confirm at least one OTHER doctor remains on call, then sets ITSELF
+    // off-call. Under SI both commit (disjoint key writes); under
+    // Serializable, the second commit fails because the first's commit
+    // invalidated the second's iter() read.
+    let store = Store::new(StoreConfig {
+        writer_mode: WriterMode::MultiWriter,
+        isolation_level: IsolationLevel::Serializable,
+        ..StoreConfig::default()
+    }).unwrap();
+
+    // Seed two doctors (id=1, id=2). Use a String "on" / "off" payload.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("doctors").unwrap();
+        t.insert("on".to_string()).unwrap();
+        t.insert("on".to_string()).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // Two concurrent writers, both at the same base.
+    let mut wtx_a = store.begin_write(None).unwrap();
+    let mut wtx_b = store.begin_write(None).unwrap();
+
+    // A scans + writes id=1.
+    {
+        let t = wtx_a.open_table::<String>("doctors").unwrap();
+        let on_count = t.iter().filter(|(_, s)| *s == "on").count();
+        assert!(on_count >= 2);
+    }
+    {
+        let mut t = wtx_a.open_table::<String>("doctors").unwrap();
+        t.update(1, "off".to_string()).unwrap();
+    }
+
+    // B (same base) scans + writes id=2.
+    {
+        let t = wtx_b.open_table::<String>("doctors").unwrap();
+        let on_count = t.iter().filter(|(_, s)| *s == "on").count();
+        assert!(on_count >= 2);
+    }
+    {
+        let mut t = wtx_b.open_table::<String>("doctors").unwrap();
+        t.update(2, "off".to_string()).unwrap();
+    }
+
+    // A commits cleanly.
+    wtx_a.commit().expect("A commits");
+
+    // B's table_scan read of "doctors" was invalidated by A's commit
+    // (A modified id=1 in "doctors", and B scanned the table).
+    let res = wtx_b.commit();
+    assert!(
+        matches!(res, Err(Error::SerializationFailure { ref table, .. }) if table == "doctors"),
+        "expected SerializationFailure on 'doctors', got {:?}", res
+    );
+
+    // Metric counter incremented.
+    assert!(store.metrics().serialization_failures >= 1);
+}
+
+#[test]
+fn si_allows_write_skew_table_scan() {
+    use ultima_db::{IsolationLevel, StoreConfig, WriterMode};
+
+    // Same scenario but isolation_level: SnapshotIsolation. Both writers'
+    // disjoint-key updates commit; SI does not validate read sets.
+    let store = Store::new(StoreConfig {
+        writer_mode: WriterMode::MultiWriter,
+        isolation_level: IsolationLevel::SnapshotIsolation,
+        ..StoreConfig::default()
+    }).unwrap();
+
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("doctors").unwrap();
+        t.insert("on".to_string()).unwrap();
+        t.insert("on".to_string()).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let mut wtx_a = store.begin_write(None).unwrap();
+    let mut wtx_b = store.begin_write(None).unwrap();
+
+    {
+        let t = wtx_a.open_table::<String>("doctors").unwrap();
+        let _: Vec<_> = t.iter().collect();
+    }
+    {
+        let mut t = wtx_a.open_table::<String>("doctors").unwrap();
+        t.update(1, "off".to_string()).unwrap();
+    }
+
+    {
+        let t = wtx_b.open_table::<String>("doctors").unwrap();
+        let _: Vec<_> = t.iter().collect();
+    }
+    {
+        let mut t = wtx_b.open_table::<String>("doctors").unwrap();
+        t.update(2, "off".to_string()).unwrap();
+    }
+
+    wtx_a.commit().expect("A commits in SI");
+    wtx_b.commit().expect("B commits in SI (write skew permitted)");
+
+    // SI must not have incremented the SSI counter.
+    assert_eq!(store.metrics().serialization_failures, 0);
+}

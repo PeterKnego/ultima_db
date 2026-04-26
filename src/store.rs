@@ -844,7 +844,6 @@ pub struct WriteTx {
     read_set: Option<std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
     /// Cached isolation level — copied from the store config at `begin_write`
     /// so the commit path doesn't re-read the config under a lock.
-    #[allow(dead_code)] // used in Task 7
     isolation_level: IsolationLevel,
     /// Pins `WriteTx` to its creating thread. A transaction must complete on
     /// the thread that opened it — the write-set tracking is not designed to
@@ -1557,6 +1556,15 @@ impl WriteTx {
                 return Err(conflict);
             }
 
+            if matches!(self.isolation_level, IsolationLevel::Serializable)
+                && let Some(conflict) = self.validate_read_set(&inner)
+            {
+                self.metrics.inc_serialization_failure();
+                drop(inner);
+                self.metrics.add_phase1(t1.elapsed().as_nanos() as u64);
+                return Err(conflict);
+            }
+
             // Pre-compute fast/slow-path flag for each dirty table under
             // the same read lock; avoids a second scan later.
             let flags: BTreeMap<String, bool> = self
@@ -1868,6 +1876,54 @@ impl WriteTx {
                         keys: conflicting,
                         version: cws.version,
                         wait_for: None,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Check Serializable read-set against `committed_write_sets`.
+    ///
+    /// Only invoked from [`commit_multi_writer`] when
+    /// `isolation_level == Serializable`. Returns `Some(SerializationFailure)`
+    /// on the first invalidated read; `None` if the read set is consistent
+    /// with all commits since `base.version`.
+    ///
+    /// Conflict criteria, per (table, entry) in the read set:
+    /// - Concurrent commit *deleted* a table we read → conflict.
+    /// - `entry.table_scan == true` and concurrent commit *modified any key*
+    ///   in that table → conflict (v1 coarse tracking; v2 may track ranges).
+    /// - `entry.table_scan == false` and concurrent commit modified a key
+    ///   we point-read → conflict.
+    fn validate_read_set(&self, inner: &StoreInner) -> Option<Error> {
+        let cell = self.read_set.as_ref()?;
+        let rs = cell.borrow();
+        let base_version = self.base.version;
+        for cws in &inner.committed_write_sets {
+            if cws.version <= base_version {
+                continue;
+            }
+            for (table_name, entry) in rs.iter() {
+                if cws.deleted_tables.contains(table_name) {
+                    return Some(Error::SerializationFailure {
+                        table: table_name.clone(),
+                        version: cws.version,
+                    });
+                }
+                if entry.table_scan {
+                    if cws.tables.contains_key(table_name) {
+                        return Some(Error::SerializationFailure {
+                            table: table_name.clone(),
+                            version: cws.version,
+                        });
+                    }
+                } else if let Some(their_keys) = cws.tables.get(table_name)
+                    && entry.keys.iter().any(|k| their_keys.contains(k))
+                {
+                    return Some(Error::SerializationFailure {
+                        table: table_name.clone(),
+                        version: cws.version,
                     });
                 }
             }

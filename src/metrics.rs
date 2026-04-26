@@ -222,7 +222,6 @@ impl StoreMetrics {
         emit("ultima.write_conflicts", &[], 1);
     }
 
-    #[allow(dead_code)] // wired up in Task 7
     pub(crate) fn inc_serialization_failure(&self) {
         self.serialization_failures.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
