@@ -19,6 +19,7 @@ pub struct MetricsSnapshot {
     pub gc_runs: u64,
     pub snapshots_collected: u64,
     pub write_conflicts: u64,
+    pub serialization_failures: u64,
     /// MultiWriter commit-phase cumulative wall time, in nanoseconds.
     /// Useful for profiling where commit-path time is actually spent.
     /// All four sum to approximately the total time inside `commit()`.
@@ -121,6 +122,7 @@ pub(crate) struct StoreMetrics {
     gc_runs: AtomicU64,
     snapshots_collected: AtomicU64,
     write_conflicts: AtomicU64,
+    serialization_failures: AtomicU64,
     commit_ns_phase0: AtomicU64,
     commit_ns_phase1: AtomicU64,
     commit_ns_phase2: AtomicU64,
@@ -149,6 +151,7 @@ impl StoreMetrics {
             gc_runs: AtomicU64::new(0),
             snapshots_collected: AtomicU64::new(0),
             write_conflicts: AtomicU64::new(0),
+            serialization_failures: AtomicU64::new(0),
             commit_ns_phase0: AtomicU64::new(0),
             commit_ns_phase1: AtomicU64::new(0),
             commit_ns_phase2: AtomicU64::new(0),
@@ -217,6 +220,13 @@ impl StoreMetrics {
         self.write_conflicts.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
         emit("ultima.write_conflicts", &[], 1);
+    }
+
+    #[allow(dead_code)] // wired up in Task 7
+    pub(crate) fn inc_serialization_failure(&self) {
+        self.serialization_failures.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        emit("ultima.serialization_failures", &[], 1);
     }
 
     // --- Table-level increments ---------------------------------------------
@@ -342,6 +352,7 @@ impl StoreMetrics {
             gc_runs: self.gc_runs.load(Ordering::Relaxed),
             snapshots_collected: self.snapshots_collected.load(Ordering::Relaxed),
             write_conflicts: self.write_conflicts.load(Ordering::Relaxed),
+            serialization_failures: self.serialization_failures.load(Ordering::Relaxed),
             commit_ns_phase0_acquire_locks: self.commit_ns_phase0.load(Ordering::Relaxed),
             commit_ns_phase1_read_validate: self.commit_ns_phase1.load(Ordering::Relaxed),
             commit_ns_phase2_merge: self.commit_ns_phase2.load(Ordering::Relaxed),
@@ -429,6 +440,15 @@ mod tests {
             .expect("by_customer index should exist");
         assert_eq!(idx.reads, 2);
         assert_eq!(idx.range_scans, 1);
+    }
+
+    #[test]
+    fn serialization_failures_counter_increments() {
+        let m = StoreMetrics::new();
+        assert_eq!(m.snapshot().serialization_failures, 0);
+        m.inc_serialization_failure();
+        m.inc_serialization_failure();
+        assert_eq!(m.snapshot().serialization_failures, 2);
     }
 
     #[test]
