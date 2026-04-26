@@ -769,7 +769,6 @@ impl ReadTx {
             table,
             metrics: &self.metrics,
             table_name: name.to_string(),
-            read_set: None,
         })
     }
 }
@@ -1209,11 +1208,6 @@ pub struct TableReader<'tx, R: Record> {
     table: &'tx Table<R>,
     metrics: &'tx StoreMetrics,
     table_name: String,
-    /// `Some` only when the parent `WriteTx` is in `Serializable` mode and
-    /// this reader was created via `WriteTx::open_table`. `ReadTx` always
-    /// passes `None`.
-    #[allow(dead_code)] // used in Task 6
-    read_set: Option<&'tx std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
 }
 
 /// Record a point-read against `table` for the given `id`. No-op when `rs`
