@@ -132,6 +132,54 @@ There is no `wait_for` (unlike `WriteConflict`) because the conflicting committe
 - `IsolationLevel::Serializable` + `WriterMode::MultiWriter`: one `BTreeSet::insert` per point read, one `bool` set per scan, plus one `committed_write_sets` walk at commit. Estimated <5% on write-heavy workloads (smallbank), 10–20% on read-heavy mixes (YCSB-B).
 - `ReadTx` (always, regardless of mode): zero overhead.
 
+### Using SSI correctly
+
+**SSI tracks reads only on the committing `WriteTx`, not on separate `ReadTx` instances.**
+The read set lives on `WriteTx`; `validate_read_set` walks *that* writer's recorded
+reads. A scan performed through a `ReadTx` opened earlier — even one second earlier,
+on the same thread, against the same snapshot — contributes nothing to the
+`WriteTx` that follows it, and the commit will not abort no matter what concurrent
+writers did to the rows the `ReadTx` observed.
+
+The wrong pattern bypasses SSI entirely:
+
+```rust
+// WRONG: read on ReadTx, then act on a separate WriteTx — no SSI protection.
+let rtx = store.begin_read(None)?;
+let observed = rtx.open_table::<u32>("doctors")?
+    .iter()
+    .filter(|(_, s)| **s == 1)
+    .count();
+drop(rtx);
+
+let mut wtx = store.begin_write(None)?;
+if observed >= 2 {
+    wtx.open_table::<u32>("doctors")?.update(1, 0)?;
+}
+wtx.commit()?; // wtx.read_set is empty — write skew is NOT detected.
+```
+
+The correct pattern routes the conditional read through the same `WriteTx`:
+
+```rust
+// RIGHT: read on the WriteTx so the scan is in its read set.
+let mut wtx = store.begin_write(None)?;
+let observed = wtx.open_table::<u32>("doctors")?
+    .iter()
+    .filter(|(_, s)| **s == 1)
+    .count();
+if observed >= 2 {
+    wtx.open_table::<u32>("doctors")?.update(1, 0)?;
+}
+wtx.commit()?; // SerializationFailure if any concurrent commit modified "doctors".
+```
+
+This is a deliberate design choice. `ReadTx` is read-only and cannot write-skew on
+its own, so tracking is per-writer: each `WriteTx` is the unit of "what did this
+transaction observe before deciding to write?", and the validator only needs to
+check the reads of the writer that's about to commit. If you need a serializable
+read-modify-write, do the read on the `WriteTx`.
+
 ### v1 caveats
 
 - **Range/scan reads use coarse table-scan tracking.** `iter`, `range`, `index_range`, `len`, `is_empty`, `first`, `last`, `get_unique`, `get_by_index`, `get_by_key`, `custom_index` flip the `table_scan` flag for the table; any concurrent commit on that table is then treated as a conflict at validation time. This produces **false positives** (a concurrent commit on a key outside the read range will still fail the SSI commit) but no **false negatives**. Range-key tracking is a v2 follow-up.

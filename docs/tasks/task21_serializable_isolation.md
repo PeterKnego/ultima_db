@@ -283,7 +283,11 @@ the project's edition).
   so this is fine for the SSI guarantee, but a "snapshot isolation
   read with a stable view across a longer multi-step computation"
   workflow that wants a serializable-equivalent guarantee against
-  in-flight committers would need a different mechanism.
+  in-flight committers would need a different mechanism. User-facing
+  guidance on the read-on-WriteTx vs read-on-ReadTx pattern (and the
+  foot-gun of doing the conditional read on a separate `ReadTx` before
+  the `WriteTx` that acts on it) lives in
+  `docs/isolation-levels.md` § "Using SSI correctly".
 
 ---
 
