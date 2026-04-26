@@ -2319,3 +2319,107 @@ fn si_allows_write_skew_table_scan() {
     // SI must not have incremented the SSI counter.
     assert_eq!(store.metrics().serialization_failures, 0);
 }
+
+// ---------------------------------------------------------------------------
+// SSI: point-read invalidation conflicts; disjoint point reads/writes don't.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssi_read_then_write_conflicts_on_concurrent_modify() {
+    use ultima_db::{IsolationLevel, StoreConfig, WriterMode};
+
+    // Tx A point-reads key=1, then writes key=2.
+    // Tx B (concurrent, same base) writes key=1.
+    // B commits first. A's commit must fail with SerializationFailure
+    // because A's read of key=1 was invalidated by B.
+    let store = Store::new(StoreConfig {
+        writer_mode: WriterMode::MultiWriter,
+        isolation_level: IsolationLevel::Serializable,
+        ..StoreConfig::default()
+    }).unwrap();
+
+    // Seed: three rows so we have keys 1, 2, 3 to play with.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        let id1 = t.insert("a".to_string()).unwrap();
+        let id2 = t.insert("b".to_string()).unwrap();
+        let id3 = t.insert("c".to_string()).unwrap();
+        assert_eq!((id1, id2, id3), (1, 2, 3));
+        wtx.commit().unwrap();
+    }
+
+    let mut wtx_a = store.begin_write(None).unwrap();
+    let mut wtx_b = store.begin_write(None).unwrap();
+
+    // A: point-read key=1, then write key=2.
+    {
+        let t = wtx_a.open_table::<String>("t").unwrap();
+        let _ = t.get(1);
+    }
+    {
+        let mut t = wtx_a.open_table::<String>("t").unwrap();
+        t.update(2, "a-modified".to_string()).unwrap();
+    }
+
+    // B: write key=1.
+    {
+        let mut t = wtx_b.open_table::<String>("t").unwrap();
+        t.update(1, "b-modified".to_string()).unwrap();
+    }
+
+    wtx_b.commit().expect("B should commit");
+
+    let res = wtx_a.commit();
+    assert!(
+        matches!(res, Err(Error::SerializationFailure { ref table, .. }) if table == "t"),
+        "expected SerializationFailure on 't', got {:?}", res
+    );
+}
+
+#[test]
+fn ssi_disjoint_point_reads_dont_conflict() {
+    use ultima_db::{IsolationLevel, StoreConfig, WriterMode};
+
+    // A point-reads key=1 and writes key=3.
+    // B writes key=2.
+    // A's read set: {t: keys={1}}. B's write set: {t: {2}}.
+    // Intersection empty → no SSI conflict, both commit.
+    let store = Store::new(StoreConfig {
+        writer_mode: WriterMode::MultiWriter,
+        isolation_level: IsolationLevel::Serializable,
+        ..StoreConfig::default()
+    }).unwrap();
+
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        t.insert("a".to_string()).unwrap();
+        t.insert("b".to_string()).unwrap();
+        t.insert("c".to_string()).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let mut wtx_a = store.begin_write(None).unwrap();
+    let mut wtx_b = store.begin_write(None).unwrap();
+
+    {
+        let t = wtx_a.open_table::<String>("t").unwrap();
+        let _ = t.get(1);
+    }
+    {
+        let mut t = wtx_a.open_table::<String>("t").unwrap();
+        t.update(3, "a-modified".to_string()).unwrap();
+    }
+
+    {
+        let mut t = wtx_b.open_table::<String>("t").unwrap();
+        t.update(2, "b-modified".to_string()).unwrap();
+    }
+
+    wtx_b.commit().expect("B commits");
+    wtx_a.commit().expect("A commits — disjoint read/write sets");
+
+    // No SSI failures recorded.
+    assert_eq!(store.metrics().serialization_failures, 0);
+}
