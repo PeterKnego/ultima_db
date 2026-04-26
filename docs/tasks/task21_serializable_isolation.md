@@ -311,8 +311,7 @@ the project's edition).
   - `ssi_in_single_writer_mode_is_noop` — SingleWriter+SSI no-op
     contract; metric counter stays 0.
 
-The existing 277 lib tests + 68 integration tests + 13 wal tests + 3
-checkpoint tests continue to pass with no behavioral change.
+The existing test suite continues to pass with no behavioral change.
 
 ---
 

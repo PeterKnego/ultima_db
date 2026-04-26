@@ -137,6 +137,8 @@ There is no `wait_for` (unlike `WriteConflict`) because the conflicting committe
 - **Range/scan reads use coarse table-scan tracking.** `iter`, `range`, `index_range`, `len`, `is_empty`, `first`, `last`, `get_unique`, `get_by_index`, `get_by_key`, `custom_index` flip the `table_scan` flag for the table; any concurrent commit on that table is then treated as a conflict at validation time. This produces **false positives** (a concurrent commit on a key outside the read range will still fail the SSI commit) but no **false negatives**. Range-key tracking is a v2 follow-up.
 - **No SSI for `update_batch` / `delete_batch` early-fail.** Those still rely on commit-time OCC (same as task 20's batch limitation).
 - **First-match validation** by `committed_write_sets` vector position. In MultiWriter the vector is naturally version-ordered; in SMR mode (explicit versions) ordering is the caller's responsibility.
+- **`get_many` / `resolve` allocate per id.** Batch reads call `record_point_read` once per id, each constructing a `String::from(table)` entry key. A batch-aware helper would collapse to one allocation; deferred until a profile shows it.
+- **`ReadTx` has no SSI tracking.** Read-only transactions cannot produce write skew, so tracking is intentionally not applied. A workflow needing a serializable-equivalent guarantee against in-flight committers across a longer read-only computation would need a different mechanism.
 
 ---
 
