@@ -129,7 +129,7 @@ There is no `wait_for` (unlike `WriteConflict`) because the conflicting committe
 
 - `IsolationLevel::SnapshotIsolation` (default): zero overhead. The `Option` is `None`, every `record_*` call short-circuits, the `validate_read_set` branch is elided.
 - `IsolationLevel::Serializable` + `WriterMode::SingleWriter`: zero overhead. Both validation AND tracking are skipped — the `read_set` is `None` (gated on `(Serializable, MultiWriter)` at `begin_write`), so `record_*` calls elide just like SI, and `commit_single_writer` skips `validate_read_set`.
-- `IsolationLevel::Serializable` + `WriterMode::MultiWriter`: one `BTreeSet::insert` per point read, one `bool` set per scan, plus one `committed_write_sets` walk at commit. Estimated <5% on write-heavy workloads (smallbank), 10–20% on read-heavy mixes (YCSB-B).
+- `IsolationLevel::Serializable` + `WriterMode::MultiWriter`: one `BTreeSet::insert` per point read, one `bool` set per scan, plus one `committed_write_sets` walk at commit. Measured on smallbank N=16, hot-keys=10, 500 bursts × 50 ops/writer (`examples/ssi_cost.rs`): SI ≈10.4–10.8k commits/s, SSI ≈10.3–10.5k commits/s, slowdown ranges from roughly **−0.4% to +4.9% across runs, mean ~1–2%** — within noise of the SI baseline on this write-heavy workload. SSI retry ratios are not elevated vs. SI (~6.5–6.9 either way), so the cost is per-read tracking, not extra aborts. Read-heavy YCSB-B is not yet measured (likely higher relative overhead because read-set bookkeeping is amortized over fewer mutations; TBD).
 - `ReadTx` (always, regardless of mode): zero overhead.
 
 ### Using SSI correctly

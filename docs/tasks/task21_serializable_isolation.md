@@ -332,10 +332,17 @@ The existing test suite continues to pass with no behavioral change.
   also skips `validate_read_set`. Net cost: nothing.
 - **`IsolationLevel::Serializable` + `WriterMode::MultiWriter`:** one
   `BTreeSet::insert` per point read, one `bool` set per scan, plus
-  one `committed_write_sets` walk at commit. Estimated <5% on
-  write-heavy workloads (smallbank), 10–20% on read-heavy mixes
-  (YCSB-B). No bench numbers in this task — an SSI-vs-SI bench sweep
-  is sized as follow-up work.
+  one `committed_write_sets` walk at commit. Measured on smallbank
+  N=16, hot-keys=10, 500 bursts × 50 ops/writer (`examples/ssi_cost.rs`):
+  SI ≈10.4–10.8k commits/s, SSI ≈10.3–10.5k commits/s, slowdown
+  fluctuates run-to-run between roughly **−0.4% and +4.9%, mean
+  ~1–2%** — i.e. within noise of the SI baseline. Retry ratios are
+  also indistinguishable (SI 6.5–6.9, SSI 6.5–6.8), so SSI is *not*
+  forcing additional aborts on this workload; the cost is just the
+  per-read `BTreeSet::insert` and one `committed_write_sets` walk
+  per commit. Read-heavy YCSB-B has no measurement yet — likely
+  higher relative overhead because the per-point-read tracking cost
+  is amortized over fewer mutations; left as TBD.
 - **`ReadTx` (always):** zero overhead. Read-only transactions cannot
   write-skew, so SSI tracking is not applied.
 
