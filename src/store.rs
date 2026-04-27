@@ -2203,6 +2203,99 @@ mod tests {
     }
 
     #[test]
+    fn ssi_read_set_records_get_unique_as_table_scan() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.define_index("by_val", crate::IndexKind::Unique, |s: &String| s.clone()).unwrap();
+            t.insert("alpha".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.get_unique("by_val", &"alpha".to_string()).unwrap();
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false),
+            "get_unique should set table_scan");
+    }
+
+    #[test]
+    fn ssi_read_set_records_index_range_as_table_scan() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.define_index("by_len", crate::IndexKind::NonUnique, |s: &String| s.len()).unwrap();
+            t.insert("a".to_string()).unwrap();
+            t.insert("ab".to_string()).unwrap();
+            t.insert("abc".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.index_range::<usize>("by_len", 1..3).unwrap();
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false),
+            "index_range should set table_scan (v1 coarse tracking)");
+    }
+
+    #[test]
+    fn ssi_read_set_records_custom_index_as_table_scan() {
+        use crate::CustomIndex;
+
+        #[derive(Clone, Default)]
+        struct CountIndex {
+            count: usize,
+        }
+        impl CustomIndex<String> for CountIndex {
+            fn on_insert(&mut self, _id: u64, _r: &String) -> crate::Result<()> {
+                self.count += 1;
+                Ok(())
+            }
+            fn on_update(&mut self, _id: u64, _o: &String, _n: &String) -> crate::Result<()> {
+                Ok(())
+            }
+            fn on_delete(&mut self, _id: u64, _r: &String) {
+                self.count = self.count.saturating_sub(1);
+            }
+        }
+
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.define_custom_index("ct", CountIndex::default()).unwrap();
+            t.insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<String>("t").unwrap();
+            let _ = t.custom_index::<CountIndex>("ct").unwrap();
+        }
+        let rs = wtx.read_set.as_ref().unwrap().borrow();
+        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false),
+            "custom_index lookup should set table_scan");
+    }
+
+    #[test]
     fn ssi_read_set_empty_in_si_mode() {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
