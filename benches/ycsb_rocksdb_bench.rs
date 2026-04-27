@@ -97,7 +97,7 @@ impl YcsbEngine for RocksDbEngine {
                 }
                 YcsbOp::ReadModifyWrite(key) => {
                     let k = encode_key(*key);
-                    if let Some(bytes) = self.db.get(&k).expect("get failed") {
+                    if let Some(bytes) = self.db.get(k).expect("get failed") {
                         let (mut record, _): (YcsbRecord, _) =
                             bincode::serde::decode_from_slice(&bytes, BINCODE_CFG)
                                 .expect("deserialize failed");

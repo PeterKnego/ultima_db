@@ -84,3 +84,7 @@ harness = false
 [[bench]]
 name = "smallbank_fjall_bench"
 harness = false
+
+[[example]]
+name = "profile_commit"
+required-features = ["persistence"]
