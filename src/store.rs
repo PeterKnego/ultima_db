@@ -361,9 +361,11 @@ impl Store {
             wal_ops: Vec::new(),
             #[cfg(feature = "persistence")]
             wal_enabled: inner.wal_handle.is_some(),
-            read_set: match isolation_level {
-                IsolationLevel::Serializable => Some(std::cell::RefCell::new(BTreeMap::new())),
-                IsolationLevel::SnapshotIsolation => None,
+            read_set: match (isolation_level, writer_mode) {
+                (IsolationLevel::Serializable, WriterMode::MultiWriter) => {
+                    Some(std::cell::RefCell::new(BTreeMap::new()))
+                }
+                _ => None,
             },
             isolation_level,
             _not_send: PhantomData,
@@ -838,9 +840,11 @@ pub struct WriteTx {
     /// Whether WAL tracking is active (true only when a WAL handle exists).
     #[cfg(feature = "persistence")]
     wal_enabled: bool,
-    /// Per-table read set tracked when `isolation == Serializable`. `None` in
-    /// `SnapshotIsolation` mode (zero overhead). `RefCell` because reads are
-    /// recorded through shared `&TableReader`/`&TableWriter` references.
+    /// Per-table read set tracked when `isolation == Serializable` AND
+    /// `writer_mode == MultiWriter`. `None` otherwise — SI never validates,
+    /// and SingleWriter has no concurrent writers, so allocating a read set
+    /// would be pure waste. `RefCell` because reads are recorded through
+    /// shared `&TableReader`/`&TableWriter` references.
     read_set: Option<std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
     /// Cached isolation level — copied from the store config at `begin_write`
     /// so the commit path doesn't re-read the config under a lock.
@@ -2216,6 +2220,17 @@ mod tests {
             let _ = t.get(1);
         }
         assert!(wtx.read_set.is_none());
+    }
+
+    #[test]
+    fn ssi_single_writer_skips_read_set_allocation() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::SingleWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        }).unwrap();
+        let wtx = store.begin_write(None).unwrap();
+        assert!(wtx.read_set.is_none(), "SingleWriter+SSI should not allocate a read_set");
     }
 
     #[test]

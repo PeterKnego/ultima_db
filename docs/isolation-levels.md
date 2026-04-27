@@ -30,7 +30,7 @@ SQL defines four isolation levels by which anomalies each one prevents:
 UltimaDB supports **two isolation levels**, selected via `StoreConfig::isolation_level`:
 
 - **`IsolationLevel::SnapshotIsolation`** (default) — equivalent to PostgreSQL's *Repeatable Read*. Zero overhead. Prevents dirty/nonrepeatable/phantom reads but **allows write skew**.
-- **`IsolationLevel::Serializable`** (opt-in) — Snapshot Isolation plus read-set tracking and commit-time validation. Additionally prevents write skew. Only takes effect under `WriterMode::MultiWriter`; in `SingleWriter` mode there are no concurrent writers and SSI degenerates to SI semantically (and pays no validation cost).
+- **`IsolationLevel::Serializable`** (opt-in) — Snapshot Isolation plus read-set tracking and commit-time validation. Additionally prevents write skew. Only takes effect under `WriterMode::MultiWriter`; in `SingleWriter` mode there are no concurrent writers and SSI degenerates to SI semantically (and pays no overhead — both tracking and validation are skipped).
 
 Both modes share the same SI guarantees for `ReadTx` (read-only transactions cannot write-skew, so SSI tracking is not applied to them).
 
@@ -87,7 +87,7 @@ Each `WriteTx` carries:
 read_set: Option<RefCell<BTreeMap<String, ReadSetEntry>>>
 ```
 
-`None` in `IsolationLevel::SnapshotIsolation` (zero overhead — branch elided). `Some(_)` in `IsolationLevel::Serializable`. Keyed by table name, with:
+`None` in `IsolationLevel::SnapshotIsolation` (zero overhead — branch elided). Also `None` under `IsolationLevel::Serializable` + `WriterMode::SingleWriter`, since SingleWriter has no concurrent writers and validation is unconditionally skipped (allocating a read set there would be pure waste). `Some(_)` only in `IsolationLevel::Serializable` + `WriterMode::MultiWriter`. Keyed by table name, with:
 
 ```rust
 struct ReadSetEntry {
@@ -123,12 +123,12 @@ Error::SerializationFailure { table: String, version: u64 }
 
 There is no `wait_for` (unlike `WriteConflict`) because the conflicting committer has **already finished** — there is nothing left to wait on. Retry must rebase against a fresh base (re-`begin_write` and replay).
 
-`commit_single_writer` does not call `validate_read_set`. SingleWriter has no concurrent writers, so SSI is correctly a no-op there (and pays no read-tracking cost beyond the `Option::Some` allocation per `WriteTx`).
+`commit_single_writer` does not call `validate_read_set`. SingleWriter has no concurrent writers, so SSI is correctly a no-op there. `begin_write` further gates the `read_set` allocation on `(Serializable, MultiWriter)`, so SingleWriter+SSI also pays nothing for per-read tracking — `record_*` short-circuits at `as_ref()?` exactly like SI.
 
 ### Cost
 
 - `IsolationLevel::SnapshotIsolation` (default): zero overhead. The `Option` is `None`, every `record_*` call short-circuits, the `validate_read_set` branch is elided.
-- `IsolationLevel::Serializable` + `WriterMode::SingleWriter`: zero validation overhead (SingleWriter commit path skips it). One `BTreeSet::insert` per point read and one `bool` set per scan are still paid, but they don't matter without concurrent writers.
+- `IsolationLevel::Serializable` + `WriterMode::SingleWriter`: zero overhead. Both validation AND tracking are skipped — the `read_set` is `None` (gated on `(Serializable, MultiWriter)` at `begin_write`), so `record_*` calls elide just like SI, and `commit_single_writer` skips `validate_read_set`.
 - `IsolationLevel::Serializable` + `WriterMode::MultiWriter`: one `BTreeSet::insert` per point read, one `bool` set per scan, plus one `committed_write_sets` walk at commit. Estimated <5% on write-heavy workloads (smallbank), 10–20% on read-heavy mixes (YCSB-B).
 - `ReadTx` (always, regardless of mode): zero overhead.
 

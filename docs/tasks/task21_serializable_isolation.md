@@ -325,9 +325,11 @@ The existing test suite continues to pass with no behavioral change.
   `Option` is `None`, every `record_*` call short-circuits at
   `as_ref()?`, the `validate_read_set` branch is elided.
 - **`IsolationLevel::Serializable` + `WriterMode::SingleWriter`:** zero
-  validation overhead (`commit_single_writer` skips `validate_read_set`).
-  Read-set entries are still inserted (one BTreeSet insert per point
-  read, one bool set per scan), but they're never read back.
+  overhead. Both validation AND tracking are skipped — `begin_write`
+  gates the `read_set` allocation on `(Serializable, MultiWriter)`, so
+  SingleWriter+SSI yields `read_set: None` and every `record_*` call
+  short-circuits at `as_ref()?` exactly like SI. `commit_single_writer`
+  also skips `validate_read_set`. Net cost: nothing.
 - **`IsolationLevel::Serializable` + `WriterMode::MultiWriter`:** one
   `BTreeSet::insert` per point read, one `bool` set per scan, plus
   one `committed_write_sets` walk at commit. Estimated <5% on
