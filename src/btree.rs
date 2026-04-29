@@ -70,6 +70,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     ///
     /// Debug-asserts strict ascending order and rejects duplicate keys.
     /// Caller is responsible for sort and dedup.
+    #[allow(dead_code)] // Phase 1 addition; consumed in Phases 2-3.
     pub(crate) fn from_sorted<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, Arc<V>)>,
@@ -703,13 +704,20 @@ fn merge_with_right<K: Clone, V>(
 // promoting on overflow. `finish` walks the levels bottom-up, redistributing
 // the rightmost (possibly underfull) node with its left sibling so every node
 // satisfies `MIN_KEYS` after the build.
+//
+// `from_sorted` and these helpers are pure additions for Phase 1 of the
+// bulk-load feature; Phase 2 (index backfill) and Phase 3 (table build) wire
+// them into `src/index.rs` and `src/table.rs`. Until then they are exercised
+// by tests only.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct LevelBuilder<K, V> {
     entries: Vec<(K, Arc<V>)>,
     children: Vec<Arc<BTreeNode<K, V>>>,
 }
 
+#[allow(dead_code)]
 impl<K, V> LevelBuilder<K, V> {
     fn new() -> Self {
         Self {
@@ -719,12 +727,14 @@ impl<K, V> LevelBuilder<K, V> {
     }
 }
 
+#[allow(dead_code)]
 struct BulkBuilder<K, V> {
     levels: Vec<LevelBuilder<K, V>>,
     len: usize,
     last_key: Option<K>,
 }
 
+#[allow(dead_code)]
 impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     fn new() -> Self {
         Self { levels: vec![LevelBuilder::new()], len: 0, last_key: None }
@@ -834,6 +844,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
 /// in half so both resulting nodes satisfy `MIN_KEYS`. The new left node and
 /// separator go back into the parent; the partial node receives the right
 /// half.
+#[allow(dead_code)]
 fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usize) {
     let is_leaf_level = level == 0;
     let (lower, upper) = levels.split_at_mut(level + 1);
@@ -844,14 +855,14 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     let separator = parent.entries.pop().expect("redistribute_tail: no separator");
 
     // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
-    let mut merged_entries: Vec<(K, Arc<V>)> = sibling.entries.iter().cloned().collect();
+    let mut merged_entries: Vec<(K, Arc<V>)> = sibling.entries.to_vec();
     merged_entries.push(separator);
     merged_entries.append(&mut lv.entries);
 
     let merged_children: Vec<Arc<BTreeNode<K, V>>> = if is_leaf_level {
         vec![]
     } else {
-        let mut c: Vec<Arc<BTreeNode<K, V>>> = sibling.children.iter().cloned().collect();
+        let mut c: Vec<Arc<BTreeNode<K, V>>> = sibling.children.to_vec();
         c.append(&mut lv.children);
         c
     };
@@ -862,7 +873,7 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     // list is split at `split_at + 1` so the left node owns one more child
     // than its entry count.
     let total = merged_entries.len();
-    debug_assert!(total >= 2 * MIN_KEYS + 1);
+    debug_assert!(total > 2 * MIN_KEYS);
     let split_at = total / 2;
     let mut right_entries = merged_entries.split_off(split_at);
     let new_separator = right_entries.remove(0);
@@ -896,6 +907,7 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     lv.children = new_right_children;
 }
 
+#[allow(dead_code)]
 fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
     Arc::new(BTreeNode {
         entries: std::mem::take(&mut lv.entries),
@@ -903,6 +915,7 @@ fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
     })
 }
 
+#[allow(dead_code)]
 fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
     let entries = std::mem::take(&mut lv.entries);
     let children = std::mem::take(&mut lv.children);
