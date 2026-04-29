@@ -35,10 +35,9 @@ const TOTAL_COMMITS: usize = NUM_THREADS * COMMITS_PER_THREAD;
 fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Store {
     let mut config = StoreConfig {
         num_snapshots_retained: 2,
-        auto_snapshot_gc: true,
         writer_mode: WriterMode::MultiWriter,
-        require_explicit_version: false,
         persistence: Persistence::None,
+        ..StoreConfig::default()
     };
     if let Some(dir) = tmpdir {
         config.persistence = match persistence {

@@ -18,12 +18,12 @@ const NUM_WRITERS: usize = 16;
 const OPS_PER_WRITER: usize = 50;
 const NUM_BURSTS: usize = 500;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Savings {
     customer_id: u64,
     balance: f64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Checking {
     customer_id: u64,
     balance: f64,
