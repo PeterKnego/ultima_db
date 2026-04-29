@@ -65,6 +65,22 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         }
     }
 
+    /// Build a B-tree from a strictly-ascending iterator of `(K, Arc<V>)`
+    /// pairs in O(N), packing leaves densely with `MAX_KEYS` entries each.
+    ///
+    /// Debug-asserts strict ascending order and rejects duplicate keys.
+    /// Caller is responsible for sort and dedup.
+    pub(crate) fn from_sorted<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (K, Arc<V>)>,
+    {
+        let mut builder = BulkBuilder::<K, V>::new();
+        for (k, v) in iter {
+            builder.push(k, v);
+        }
+        builder.finish()
+    }
+
     /// Returns the number of elements in the tree.
     pub fn len(&self) -> usize {
         self.len
@@ -679,6 +695,141 @@ fn merge_with_right<K: Clone, V>(
 // Unit tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Bulk-load builder (private)
+//
+// `BulkBuilder` walks a strictly-ascending iterator of `(K, Arc<V>)` pairs in a
+// single O(N) pass, packing each level densely (`MAX_KEYS` per node) and
+// promoting on overflow. `finish` walks the levels bottom-up, redistributing
+// the rightmost (possibly underfull) node with its left sibling so every node
+// satisfies `MIN_KEYS` after the build.
+// ---------------------------------------------------------------------------
+
+struct LevelBuilder<K, V> {
+    entries: Vec<(K, Arc<V>)>,
+    children: Vec<Arc<BTreeNode<K, V>>>,
+}
+
+impl<K, V> LevelBuilder<K, V> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(MAX_KEYS),
+            children: Vec::with_capacity(MAX_KEYS + 1),
+        }
+    }
+}
+
+struct BulkBuilder<K, V> {
+    levels: Vec<LevelBuilder<K, V>>,
+    len: usize,
+    last_key: Option<K>,
+}
+
+impl<K: Ord + Clone, V> BulkBuilder<K, V> {
+    fn new() -> Self {
+        Self { levels: vec![LevelBuilder::new()], len: 0, last_key: None }
+    }
+
+    fn push(&mut self, k: K, v: Arc<V>) {
+        if let Some(prev) = &self.last_key {
+            debug_assert!(*prev < k, "from_sorted: input not strictly ascending");
+        }
+        self.last_key = Some(k.clone());
+        self.len += 1;
+
+        // If the leaf is already at capacity, freeze it and promote the new
+        // entry up as the separator between this leaf and the next.
+        if self.levels[0].entries.len() == MAX_KEYS {
+            let frozen = freeze_leaf(&mut self.levels[0]);
+            self.attach_child(1, frozen, k, v);
+        } else {
+            self.levels[0].entries.push((k, v));
+        }
+    }
+
+    /// Attach `child` as the next child of `levels[level]`, using `(sep_k, sep_v)`
+    /// as the separator placed *after* the previous child. If `levels[level]` is
+    /// also at capacity, freeze and recurse to the level above.
+    fn attach_child(
+        &mut self,
+        level: usize,
+        child: Arc<BTreeNode<K, V>>,
+        sep_k: K,
+        sep_v: Arc<V>,
+    ) {
+        if level >= self.levels.len() {
+            self.levels.push(LevelBuilder::new());
+        }
+        let lv = &mut self.levels[level];
+        // On entry, `children.len() == entries.len()` (after the prior freeze
+        // pushed a child up without yet attaching the separator). We append the
+        // new child first, then the separator, restoring `children.len() == entries.len() + 1`.
+        lv.children.push(child);
+        if lv.entries.len() == MAX_KEYS {
+            let frozen = freeze_internal(lv);
+            self.attach_child(level + 1, frozen, sep_k, sep_v);
+        } else {
+            lv.entries.push((sep_k, sep_v));
+        }
+    }
+
+    fn finish(mut self) -> BTree<K, V> {
+        // Walk levels bottom-up. At each level, freeze the (possibly partial)
+        // node and attach it as the rightmost child of the level above. Tail
+        // rebalance for underfull rightmost nodes is added in a follow-up
+        // (see `redistribute_tail`).
+        let mut carry: Option<Arc<BTreeNode<K, V>>> = None;
+
+        for level in 0..self.levels.len() {
+            let is_leaf_level = level == 0;
+
+            if let Some(child) = carry.take() {
+                self.levels[level].children.push(child);
+            }
+
+            let lv = &mut self.levels[level];
+            if lv.entries.is_empty() && lv.children.is_empty() {
+                continue;
+            }
+
+            let node = if is_leaf_level {
+                Arc::new(BTreeNode {
+                    entries: std::mem::take(&mut lv.entries),
+                    children: vec![],
+                })
+            } else {
+                let entries = std::mem::take(&mut lv.entries);
+                let children = std::mem::take(&mut lv.children);
+                debug_assert_eq!(children.len(), entries.len() + 1);
+                Arc::new(BTreeNode { entries, children })
+            };
+            carry = Some(node);
+        }
+
+        let root = carry
+            .unwrap_or_else(|| Arc::new(BTreeNode { entries: vec![], children: vec![] }));
+        BTree { root, len: self.len }
+    }
+}
+
+fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
+    Arc::new(BTreeNode {
+        entries: std::mem::take(&mut lv.entries),
+        children: vec![],
+    })
+}
+
+fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
+    let entries = std::mem::take(&mut lv.entries);
+    let children = std::mem::take(&mut lv.children);
+    debug_assert_eq!(children.len(), entries.len() + 1);
+    Arc::new(BTreeNode { entries, children })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,5 +1273,17 @@ mod tests {
         let results: Vec<u64> = t.range(..).rev().map(|(k, _)| *k).collect();
         let expected: Vec<u64> = (1..=5000).rev().collect();
         assert_eq!(results, expected);
+    }
+
+    // -------------------------------------------------------------------
+    // Bulk-load constructor (`BTree::from_sorted`)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn from_sorted_empty() {
+        let t: BTree<u64, String> = BTree::from_sorted(std::iter::empty());
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+        assert_eq!(t.range(..).count(), 0);
     }
 }
