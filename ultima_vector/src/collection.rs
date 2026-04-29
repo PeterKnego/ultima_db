@@ -76,12 +76,23 @@ where
         &self.params
     }
 
-    fn data_name(&self) -> String {
+    /// Name of the underlying UltimaDB data table. Useful when defining
+    /// secondary indexes on the metadata for filtered search.
+    pub fn data_table_name(&self) -> String {
         format!("{}_data", self.base_name)
     }
 
-    fn entry_name(&self) -> String {
+    /// Name of the underlying entry-point singleton table.
+    pub fn entry_table_name(&self) -> String {
         format!("{}_entry", self.base_name)
+    }
+
+    fn data_name(&self) -> String {
+        self.data_table_name()
+    }
+
+    fn entry_name(&self) -> String {
+        self.entry_table_name()
     }
 
     /// Insert a single vector in its own write transaction.
