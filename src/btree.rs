@@ -774,10 +774,10 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     }
 
     fn finish(mut self) -> BTree<K, V> {
-        // Walk levels bottom-up. At each level, freeze the (possibly partial)
-        // node and attach it as the rightmost child of the level above. Tail
-        // rebalance for underfull rightmost nodes is added in a follow-up
-        // (see `redistribute_tail`).
+        // Walk levels bottom-up. At each level, redistribute the rightmost
+        // (partial) node with its left sibling if it would otherwise be
+        // underfull, then freeze the partial node and attach it as the
+        // rightmost child of the level above.
         let mut carry: Option<Arc<BTreeNode<K, V>>> = None;
 
         for level in 0..self.levels.len() {
@@ -785,6 +785,21 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
 
             if let Some(child) = carry.take() {
                 self.levels[level].children.push(child);
+            }
+
+            // Tail rebalance: if a parent level exists with a previously-frozen
+            // sibling, and our partial node is underfull, redistribute. This
+            // also covers the edge case where the leaf level was fully drained
+            // by a promotion (e.g. exactly `MAX_KEYS + 1` entries) — we still
+            // borrow from the sibling so the parent ends up with a proper
+            // rightmost child. The topmost level has no parent sibling and is
+            // allowed to be partial (it becomes the root).
+            let has_parent_sibling = self
+                .levels
+                .get(level + 1)
+                .is_some_and(|p| !p.children.is_empty());
+            if has_parent_sibling && self.levels[level].entries.len() < MIN_KEYS {
+                redistribute_tail::<K, V>(&mut self.levels, level);
             }
 
             let lv = &mut self.levels[level];
@@ -810,6 +825,75 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             .unwrap_or_else(|| Arc::new(BTreeNode { entries: vec![], children: vec![] }));
         BTree { root, len: self.len }
     }
+}
+
+/// Rebalance the underfull partial node at `levels[level]` with its left
+/// sibling — the most recently-frozen node sitting at the tail of
+/// `levels[level + 1].children`. Pops the sibling and the separator that
+/// linked them, merges everything in order, then splits the merged sequence
+/// in half so both resulting nodes satisfy `MIN_KEYS`. The new left node and
+/// separator go back into the parent; the partial node receives the right
+/// half.
+fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usize) {
+    let is_leaf_level = level == 0;
+    let (lower, upper) = levels.split_at_mut(level + 1);
+    let lv = &mut lower[level];
+    let parent = &mut upper[0]; // levels[level + 1]
+
+    let sibling = parent.children.pop().expect("redistribute_tail: no sibling");
+    let separator = parent.entries.pop().expect("redistribute_tail: no separator");
+
+    // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
+    let mut merged_entries: Vec<(K, Arc<V>)> = sibling.entries.iter().cloned().collect();
+    merged_entries.push(separator);
+    merged_entries.append(&mut lv.entries);
+
+    let merged_children: Vec<Arc<BTreeNode<K, V>>> = if is_leaf_level {
+        vec![]
+    } else {
+        let mut c: Vec<Arc<BTreeNode<K, V>>> = sibling.children.iter().cloned().collect();
+        c.append(&mut lv.children);
+        c
+    };
+
+    // Split the merged sequence around a new separator. We promote the entry
+    // at index `split_at`. The left node gets entries [0..split_at), the right
+    // node gets entries (split_at..total). For internal nodes, the children
+    // list is split at `split_at + 1` so the left node owns one more child
+    // than its entry count.
+    let total = merged_entries.len();
+    debug_assert!(total >= 2 * MIN_KEYS + 1);
+    let split_at = total / 2;
+    let mut right_entries = merged_entries.split_off(split_at);
+    let new_separator = right_entries.remove(0);
+    let new_left_entries = merged_entries;
+
+    let (new_left_children, new_right_children) = if is_leaf_level {
+        (vec![], vec![])
+    } else {
+        let mut left_c = merged_children;
+        let right_c = left_c.split_off(split_at + 1);
+        (left_c, right_c)
+    };
+
+    debug_assert!(new_left_entries.len() >= MIN_KEYS);
+    debug_assert!(new_left_entries.len() <= MAX_KEYS);
+    debug_assert!(right_entries.len() >= MIN_KEYS);
+    debug_assert!(right_entries.len() <= MAX_KEYS);
+    if !is_leaf_level {
+        debug_assert_eq!(new_left_children.len(), new_left_entries.len() + 1);
+        debug_assert_eq!(new_right_children.len(), right_entries.len() + 1);
+    }
+
+    let new_left = Arc::new(BTreeNode {
+        entries: new_left_entries,
+        children: new_left_children,
+    });
+
+    parent.children.push(new_left);
+    parent.entries.push(new_separator);
+    lv.entries = right_entries;
+    lv.children = new_right_children;
 }
 
 fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
@@ -1342,5 +1426,28 @@ mod tests {
         assert_eq!(t.get(&(n - 1)).copied(), Some(n - 1));
         let walked: usize = t.range(..).count();
         assert_eq!(walked, n as usize);
+    }
+
+    #[test]
+    fn from_sorted_tail_underfull() {
+        // Exactly MAX_KEYS + 1 entries: the leaf overflow drains the leaf
+        // builder, leaving a partial level above with one child but expecting
+        // two. Tail redistribution must split the merged sequence so both
+        // resulting leaves have >= MIN_KEYS entries.
+        let n = MAX_KEYS as u64 + 1;
+        let entries: Vec<_> = (0..n).map(|i| (i, Arc::new(i))).collect();
+        let t = BTree::<u64, u64>::from_sorted(entries);
+        assert_eq!(t.len(), n as usize);
+        let walked: Vec<u64> = t.range(..).map(|(k, _)| *k).collect();
+        let expected: Vec<u64> = (0..n).collect();
+        assert_eq!(walked, expected);
+
+        // Insert/remove around the boundary — the existing CoW algorithms
+        // would panic on a malformed tree.
+        let t2 = t.insert(n, n);
+        assert_eq!(t2.get(&n).copied(), Some(n));
+        let t3 = t2.remove(&0).unwrap();
+        assert_eq!(t3.get(&0), None);
+        assert_eq!(t3.len(), n as usize);
     }
 }
