@@ -1,0 +1,21 @@
+[package]
+name = "ultima-vector"
+version = "0.1.0"
+edition = "2024"
+description = "HNSW vector search built on UltimaDB"
+
+[features]
+default = []
+persistence = ["ultima-db/persistence", "dep:serde"]
+
+[dependencies]
+ultima-db = { path = ".." }
+smallvec = "1"
+roaring = "0.11"
+rand = "0.10"
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+rand = "0.10"
+tempfile = "3"

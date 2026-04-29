@@ -1,3 +1,6 @@
+[workspace]
+members = ["ultima_vector"]
+
 [package]
 name = "ultima-db"
 version = "0.1.0"
