@@ -1286,4 +1286,32 @@ mod tests {
         assert!(t.is_empty());
         assert_eq!(t.range(..).count(), 0);
     }
+
+    #[test]
+    fn from_sorted_single_entry() {
+        let t = BTree::<u64, &str>::from_sorted(std::iter::once((1u64, Arc::new("a"))));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get(&1), Some(&"a"));
+    }
+
+    #[test]
+    fn from_sorted_exact_max_keys() {
+        let entries: Vec<_> = (0..MAX_KEYS as u64).map(|i| (i, Arc::new(i))).collect();
+        let t = BTree::<u64, u64>::from_sorted(entries);
+        assert_eq!(t.len(), MAX_KEYS);
+        for i in 0..MAX_KEYS as u64 {
+            assert_eq!(t.get(&i).copied(), Some(i));
+        }
+    }
+
+    #[test]
+    fn from_sorted_max_keys_plus_one() {
+        let n = MAX_KEYS as u64 + 1;
+        let entries: Vec<_> = (0..n).map(|i| (i, Arc::new(i))).collect();
+        let t = BTree::<u64, u64>::from_sorted(entries);
+        assert_eq!(t.len(), n as usize);
+        for i in 0..n {
+            assert_eq!(t.get(&i).copied(), Some(i));
+        }
+    }
 }
