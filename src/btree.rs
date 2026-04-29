@@ -1314,4 +1314,33 @@ mod tests {
             assert_eq!(t.get(&i).copied(), Some(i));
         }
     }
+
+    #[test]
+    fn from_sorted_1k_matches_insert() {
+        let n = 1_000u64;
+        let entries: Vec<_> = (0..n).map(|i| (i, Arc::new(i * 10))).collect();
+        let by_bulk = BTree::<u64, u64>::from_sorted(entries.clone());
+        let mut by_insert = BTree::<u64, u64>::new();
+        for (k, v) in entries {
+            by_insert = by_insert.insert(k, *v);
+        }
+        let walked_bulk: Vec<(u64, u64)> = by_bulk.range(..).map(|(k, v)| (*k, *v)).collect();
+        let walked_insert: Vec<(u64, u64)> =
+            by_insert.range(..).map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(walked_bulk, walked_insert);
+        assert_eq!(by_bulk.len(), by_insert.len());
+    }
+
+    #[test]
+    fn from_sorted_100k() {
+        let n = 100_000u64;
+        let entries: Vec<_> = (0..n).map(|i| (i, Arc::new(i))).collect();
+        let t = BTree::<u64, u64>::from_sorted(entries);
+        assert_eq!(t.len(), n as usize);
+        assert_eq!(t.get(&0).copied(), Some(0));
+        assert_eq!(t.get(&(n / 2)).copied(), Some(n / 2));
+        assert_eq!(t.get(&(n - 1)).copied(), Some(n - 1));
+        let walked: usize = t.range(..).count();
+        assert_eq!(walked, n as usize);
+    }
 }
