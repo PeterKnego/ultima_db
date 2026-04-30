@@ -1,4 +1,4 @@
-use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, Store};
+use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, IndexKind, Store};
 
 #[test]
 fn bulk_load_replace_on_empty_store_creates_table() {
@@ -15,4 +15,86 @@ fn bulk_load_replace_on_empty_store_creates_table() {
     assert_eq!(t.get(1).map(String::as_str), Some("v1"));
     assert_eq!(t.get(1000).map(String::as_str), Some("v1000"));
     assert_eq!(t.len(), 1000);
+}
+
+#[test]
+fn bulk_load_replace_with_existing_data_rebuilds_indexes() {
+    let store = Store::default();
+
+    // Seed the store with a normal write that creates a table.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        t.insert("seed1".into()).unwrap();
+        t.insert("seed2".into()).unwrap();
+        // No indexes yet — simpler path. Indexed-replace exercised below.
+        wtx.commit().unwrap();
+    }
+
+    let rows: Vec<(u64, String)> = (1u64..=100).map(|i| (i, format!("v{i}"))).collect();
+    let v = store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<String>("t").unwrap();
+    assert_eq!(t.len(), 100);
+    assert_eq!(t.get(1).map(String::as_str), Some("v1"));
+    drop(rtx);
+
+    // A read at the prior version still sees the seed.
+    let rtx_old = store.begin_read(Some(v - 1)).unwrap();
+    let t_old = rtx_old.open_table::<String>("t").unwrap();
+    assert_eq!(t_old.len(), 2);
+}
+
+#[test]
+fn bulk_load_replace_preserves_index_definitions() {
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+    struct U {
+        email: String,
+    }
+
+    let store = Store::default();
+
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<U>("u").unwrap();
+        t.insert(U { email: "a@x".into() }).unwrap();
+        t.define_index("by_email", IndexKind::Unique, |u: &U| u.email.clone())
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let rows: Vec<(u64, U)> = (1u64..=10)
+        .map(|i| {
+            (
+                i,
+                U {
+                    email: format!("u{i}@x"),
+                },
+            )
+        })
+        .collect();
+    store
+        .bulk_load::<U>(
+            "u",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<U>("u").unwrap();
+    let (id, u) = t
+        .get_unique("by_email", &"u3@x".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 3);
+    assert_eq!(u.email, "u3@x");
 }
