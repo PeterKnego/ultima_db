@@ -1958,4 +1958,84 @@ mod tests {
         assert_eq!(id, 6);
     }
 
+    #[test]
+    fn from_bulk_with_indexes() {
+        use std::sync::Arc;
+        #[derive(Clone)]
+        struct U {
+            email: String,
+            age: u32,
+        }
+
+        // Build empty index defs to hand to from_bulk.
+        let unique_idx: Box<dyn IndexMaintainer<U>> = Box::new(
+            ManagedIndex::<U, String, UniqueStorage<String>>::new(
+                "by_email".into(),
+                IndexKind::Unique,
+                Arc::new(|u: &U| u.email.clone()),
+                UniqueStorage::new(),
+            ),
+        );
+        let nonunique_idx: Box<dyn IndexMaintainer<U>> = Box::new(
+            ManagedIndex::<U, u32, NonUniqueStorage<u32>>::new(
+                "by_age".into(),
+                IndexKind::NonUnique,
+                Arc::new(|u: &U| u.age),
+                NonUniqueStorage::new(),
+            ),
+        );
+
+        let rows: Vec<(u64, Arc<U>)> = (1u64..=5)
+            .map(|i| {
+                (
+                    i,
+                    Arc::new(U {
+                        email: format!("u{i}@x"),
+                        age: 10 * (i as u32 % 3),
+                    }),
+                )
+            })
+            .collect();
+
+        let t = Table::<U>::from_bulk(rows, 6, vec![unique_idx, nonunique_idx]).unwrap();
+        assert_eq!(t.len(), 5);
+        let (id, _) = t.get_unique("by_email", &"u3@x".to_string()).unwrap().unwrap();
+        assert_eq!(id, 3);
+        let ids: Vec<u64> = t
+            .get_by_index("by_age", &10u32)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids.len()
+                + t.get_by_index("by_age", &20u32).unwrap().len()
+                + t.get_by_index("by_age", &0u32).unwrap().len(),
+            5
+        );
+    }
+
+    #[test]
+    fn from_bulk_unique_collision_errors() {
+        use std::sync::Arc;
+        #[derive(Clone)]
+        struct U {
+            email: String,
+        }
+
+        let unique_idx: Box<dyn IndexMaintainer<U>> = Box::new(
+            ManagedIndex::<U, String, UniqueStorage<String>>::new(
+                "by_email".into(),
+                IndexKind::Unique,
+                Arc::new(|u: &U| u.email.clone()),
+                UniqueStorage::new(),
+            ),
+        );
+        let rows: Vec<(u64, Arc<U>)> = vec![
+            (1, Arc::new(U { email: "dup@x".into() })),
+            (2, Arc::new(U { email: "dup@x".into() })),
+        ];
+        let res = Table::<U>::from_bulk(rows, 3, vec![unique_idx]);
+        assert!(matches!(res, Err(Error::DuplicateKey(_))));
+    }
 }
