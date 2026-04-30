@@ -3,6 +3,8 @@
 //! All metrics return values where **smaller = closer**, so a single comparator
 //! drives the HNSW heaps regardless of which metric is in use.
 
+mod scalar;
+
 /// Distance function applied between two equal-length vectors.
 ///
 /// Implementors must return `0.0` for two identical vectors and otherwise
@@ -26,45 +28,19 @@ pub struct DotProduct;
 
 impl Distance for Cosine {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
-        let mut dot = 0.0f32;
-        let mut na = 0.0f32;
-        let mut nb = 0.0f32;
-        for i in 0..a.len() {
-            let ai = a[i];
-            let bi = b[i];
-            dot += ai * bi;
-            na += ai * ai;
-            nb += bi * bi;
-        }
-        if na == 0.0 || nb == 0.0 {
-            return 1.0;
-        }
-        let denom = (na * nb).sqrt();
-        1.0 - dot / denom
+        scalar::cosine(a, b)
     }
 }
 
 impl Distance for L2 {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
-        let mut sum = 0.0f32;
-        for i in 0..a.len() {
-            let d = a[i] - b[i];
-            sum += d * d;
-        }
-        sum
+        scalar::l2_squared(a, b)
     }
 }
 
 impl Distance for DotProduct {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
-        let mut dot = 0.0f32;
-        for i in 0..a.len() {
-            dot += a[i] * b[i];
-        }
-        -dot
+        -scalar::dot(a, b)
     }
 }
 
