@@ -616,46 +616,16 @@ impl Store {
         input: crate::bulk_load::BulkLoadInput<R>,
         opts: crate::bulk_load::BulkLoadOptions,
     ) -> Result<u64> {
-        use crate::bulk_load::{BulkLoadInput, materialize_source};
+        use crate::bulk_load::BulkLoadInput;
 
         match input {
-            BulkLoadInput::Replace(source) => {
-                // 1. Materialize sorted rows off-lock.
-                let mat = materialize_source::<R>(source)?;
-                let next_id = mat.max_id.map(|m| m + 1).unwrap_or(1);
-
-                // 2. Snapshot current state to read existing index defs (if any).
-                let base_snapshot = {
-                    let inner = self.inner.read().unwrap();
-                    inner.snapshots[&inner.latest_version].clone()
+            BulkLoadInput::Replace(_) => {
+                let add_opts = crate::bulk_load::AddOptions {
+                    create_if_missing: opts.create_if_missing,
                 };
-
-                let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R>>> =
-                    if let Some(existing) = base_snapshot.tables.get(table_name) {
-                        let typed = existing
-                            .as_any()
-                            .downcast_ref::<crate::table::Table<R>>()
-                            .ok_or_else(|| Error::TypeMismatch(table_name.to_string()))?;
-                        typed.empty_index_defs()
-                    } else if opts.create_if_missing {
-                        Vec::new()
-                    } else {
-                        return Err(Error::TableNotFound(table_name.to_string()));
-                    };
-
-                // 3. Build the new table off-lock.
-                let new_table: crate::table::Table<R> =
-                    crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
-
-                // 4. Install under the global write lock, mirroring the
-                //    install pattern used by `WriteTx::commit_single_writer`.
-                let new_version = self.install_replaced_table(table_name, new_table)?;
-
-                // 5. Optional checkpoint + WAL prune (Phase 8 wiring; no-op for now).
-                if opts.checkpoint_after {
-                    self.checkpoint_and_prune_after_bulk(new_version)?;
-                }
-                Ok(new_version)
+                let mut batch = self.bulk_load_batch();
+                batch.add(table_name, input, add_opts)?;
+                batch.commit(opts)
             }
             BulkLoadInput::Delta(delta) => {
                 use crate::bulk_load::materialize_delta;
@@ -704,48 +674,10 @@ impl Store {
         }
     }
 
-    /// Install a freshly-built table as a new snapshot. Mirrors the install
-    /// tail of `WriteTx::commit_single_writer`: forks the latest snapshot's
-    /// table map, swaps in the new table, bumps `latest_version`. Holds the
-    /// global write lock for the duration.
-    fn install_replaced_table<R: Record>(
-        &self,
-        name: &str,
-        new_table: crate::table::Table<R>,
-    ) -> Result<u64> {
-        let mut inner = self.inner.write().unwrap();
-
-        // Auto-assigned commit version: bump to latest_version + 1 so version
-        // order matches commit order, matching the WriteTx::commit pattern.
-        let new_version = inner.latest_version + 1;
-        if new_version >= inner.next_version {
-            inner.next_version = new_version + 1;
-        }
-
-        let prev = &inner.snapshots[&inner.latest_version];
-        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = prev
-            .tables
-            .iter()
-            .map(|(k, v)| (k.clone(), Arc::clone(v)))
-            .collect();
-        tables.insert(
-            name.to_string(),
-            Arc::new(new_table) as Arc<dyn MergeableTable>,
-        );
-
-        let snapshot = Arc::new(Snapshot { version: new_version, tables });
-        inner.snapshots.insert(new_version, snapshot);
-        inner.latest_version = new_version;
-        if inner.config.auto_snapshot_gc {
-            gc_inner(&mut inner);
-        }
-        Ok(new_version)
-    }
-
     /// Install a freshly-built table as a new snapshot, refusing the install
     /// if a concurrent commit advanced `latest_version` since the delta was
-    /// computed against `base_version`. Mirrors `install_replaced_table`,
-    /// adding the version-drift check up front.
+    /// computed against `base_version`. Mirrors the install tail of
+    /// `WriteTx::commit_single_writer`, adding the version-drift check up front.
     fn install_after_delta_check<R: Record>(
         &self,
         name: &str,
