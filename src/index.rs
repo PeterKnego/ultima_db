@@ -30,6 +30,16 @@ pub(crate) trait IndexMaintainer<R>: Send + Sync {
     fn clone_box(&self) -> Box<dyn IndexMaintainer<R>>;
     /// Returns a reference to the underlying index as `Any`.
     fn as_any(&self) -> &dyn Any;
+
+    /// Rebuild the index from a fully-built data tree using a sorted
+    /// bottom-up build. Default impl falls back to per-row `on_insert`
+    /// over an in-order walk; concrete implementations override for speed.
+    fn rebuild_from_sorted_data(&mut self, data: &BTree<u64, R>) -> Result<()> {
+        for (&id, record) in data.range(..) {
+            self.on_insert(id, record)?;
+        }
+        Ok(())
+    }
 }
 
 pub trait KeyExtractor<R, K>: Send + Sync {
@@ -134,6 +144,11 @@ impl<K: Ord + Clone + 'static> UniqueStorage<K> {
         Self { tree: BTree::new() }
     }
 
+    /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
+    pub(crate) fn from_btree(tree: BTree<K, u64>) -> Self {
+        Self { tree }
+    }
+
     pub fn get(&self, key: &K) -> Option<u64> {
         self.tree.get(key).copied()
     }
@@ -173,6 +188,11 @@ impl<K: Ord + Clone + 'static> NonUniqueStorage<K> {
     /// Creates a new, empty non-unique index storage.
     pub fn new() -> Self {
         Self { tree: BTree::new() }
+    }
+
+    /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
+    pub(crate) fn from_btree(tree: BTree<(K, u64), ()>) -> Self {
+        Self { tree }
     }
 
     pub fn get_ids(&self, key: &K) -> impl Iterator<Item = u64> + '_ {
@@ -550,6 +570,57 @@ mod tests {
             .unwrap()
             .inner();
         assert_eq!(orig_inner.total(), 50);
+    }
+
+    #[test]
+    fn rebuild_from_sorted_data_unique_matches_incremental() {
+        // Build the same index two ways: incrementally via on_insert vs.
+        // bulk via rebuild_from_sorted_data. Assert identical lookups.
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Row {
+            name: String,
+        }
+
+        let data: BTree<u64, Row> = {
+            let mut t = BTree::new();
+            for (id, name) in [(1u64, "a"), (2, "b"), (3, "c"), (4, "d")] {
+                t = t.insert(
+                    id,
+                    Row {
+                        name: name.to_string(),
+                    },
+                );
+            }
+            t
+        };
+
+        let extractor = Arc::new(|r: &Row| r.name.clone());
+        let mut incr: ManagedIndex<Row, String, UniqueStorage<String>> = ManagedIndex::new(
+            "idx".into(),
+            IndexKind::Unique,
+            extractor.clone(),
+            UniqueStorage::new(),
+        );
+        for (id, row) in data.range(..) {
+            incr.on_insert(*id, row).unwrap();
+        }
+
+        let mut bulk: ManagedIndex<Row, String, UniqueStorage<String>> = ManagedIndex::new(
+            "idx".into(),
+            IndexKind::Unique,
+            extractor,
+            UniqueStorage::new(),
+        );
+        bulk.rebuild_from_sorted_data(&data).unwrap();
+
+        for key in ["a", "b", "c", "d"] {
+            assert_eq!(
+                incr.storage().get(&key.to_string()),
+                bulk.storage().get(&key.to_string())
+            );
+        }
     }
 
     #[test]
