@@ -1463,4 +1463,22 @@ mod tests {
         assert_eq!(t3.get(&0), None);
         assert_eq!(t3.len(), n as usize);
     }
+
+    #[test]
+    fn from_sorted_level1_drain() {
+        // N = MAX_KEYS * (MAX_KEYS + 1) + 1 — the smallest input that drains
+        // the level-1 internal node during finish, forcing cascading
+        // redistribute_tail from level 1 borrowing from level 2.
+        let n = (MAX_KEYS as u64) * (MAX_KEYS as u64 + 1) + 1;
+        let entries: Vec<_> = (0..n).map(|i| (i, std::sync::Arc::new(i))).collect();
+        let t = BTree::<u64, u64>::from_sorted(entries);
+        assert_eq!(t.len(), n as usize);
+        // Round-trip via insert + remove proves the tree is well-formed —
+        // the existing CoW algorithms would panic on a malformed tree.
+        let t2 = t.insert(n, n);
+        assert_eq!(t2.get(&n).copied(), Some(n));
+        let t3 = t2.remove(&0).unwrap();
+        assert_eq!(t3.get(&0), None);
+        assert_eq!(t3.len(), n as usize);
+    }
 }
