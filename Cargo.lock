@@ -1210,6 +1210,7 @@ dependencies = [
 name = "ultima-vector"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pulp",
  "rand",
  "roaring",

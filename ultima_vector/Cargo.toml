@@ -20,6 +20,7 @@ pulp = "0.22"
 [dev-dependencies]
 rand = "0.10"
 tempfile = "3"
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[example]]
 name = "with_persistence"
