@@ -657,9 +657,50 @@ impl Store {
                 }
                 Ok(new_version)
             }
-            BulkLoadInput::Delta(_) => Err(Error::InvalidBulkLoadInput(
-                "Delta path implemented in Phase 6".to_string(),
-            )),
+            BulkLoadInput::Delta(delta) => {
+                use crate::bulk_load::materialize_delta;
+
+                // 1. Capture base snapshot + version.
+                let (base_snapshot, base_version) = {
+                    let inner = self.inner.read().unwrap();
+                    (
+                        inner.snapshots[&inner.latest_version].clone(),
+                        inner.latest_version,
+                    )
+                };
+
+                let base_table_arc = base_snapshot
+                    .tables
+                    .get(table_name)
+                    .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?
+                    .clone();
+                let base_typed = base_table_arc
+                    .as_any()
+                    .downcast_ref::<crate::table::Table<R>>()
+                    .ok_or_else(|| Error::TypeMismatch(table_name.to_string()))?;
+
+                // 2. Validate + materialize off-lock.
+                let mat = materialize_delta(delta, base_typed.data_ref())?;
+                let next_id = mat
+                    .max_id
+                    .map(|m| m + 1)
+                    .unwrap_or(base_typed.next_id())
+                    .max(base_typed.next_id());
+
+                let index_defs = base_typed.empty_index_defs();
+                let new_table: crate::table::Table<R> =
+                    crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
+
+                // 3. Conflict check + install. If `latest_version` advanced
+                //    since `base_version`, abort with WriteConflict.
+                let new_version =
+                    self.install_after_delta_check(table_name, new_table, base_version)?;
+
+                if opts.checkpoint_after {
+                    self.checkpoint_and_prune_after_bulk(new_version)?;
+                }
+                Ok(new_version)
+            }
         }
     }
 
@@ -676,6 +717,52 @@ impl Store {
 
         // Auto-assigned commit version: bump to latest_version + 1 so version
         // order matches commit order, matching the WriteTx::commit pattern.
+        let new_version = inner.latest_version + 1;
+        if new_version >= inner.next_version {
+            inner.next_version = new_version + 1;
+        }
+
+        let prev = &inner.snapshots[&inner.latest_version];
+        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = prev
+            .tables
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        tables.insert(
+            name.to_string(),
+            Arc::new(new_table) as Arc<dyn MergeableTable>,
+        );
+
+        let snapshot = Arc::new(Snapshot { version: new_version, tables });
+        inner.snapshots.insert(new_version, snapshot);
+        inner.latest_version = new_version;
+        if inner.config.auto_snapshot_gc {
+            gc_inner(&mut inner);
+        }
+        Ok(new_version)
+    }
+
+    /// Install a freshly-built table as a new snapshot, refusing the install
+    /// if a concurrent commit advanced `latest_version` since the delta was
+    /// computed against `base_version`. Mirrors `install_replaced_table`,
+    /// adding the version-drift check up front.
+    fn install_after_delta_check<R: Record>(
+        &self,
+        name: &str,
+        new_table: crate::table::Table<R>,
+        base_version: u64,
+    ) -> Result<u64> {
+        let mut inner = self.inner.write().unwrap();
+
+        if inner.latest_version != base_version {
+            return Err(Error::WriteConflict {
+                table: name.to_string(),
+                keys: vec![],
+                version: inner.latest_version,
+                wait_for: None,
+            });
+        }
+
         let new_version = inner.latest_version + 1;
         if new_version >= inner.next_version {
             inner.next_version = new_version + 1;

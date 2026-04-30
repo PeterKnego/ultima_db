@@ -1,4 +1,4 @@
-use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store};
+use ultima_db::{BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store};
 
 #[test]
 fn bulk_load_replace_on_empty_store_creates_table() {
@@ -131,6 +131,83 @@ fn bulk_load_replace_missing_table_without_create_errors() {
         "missing",
         BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
         opts,
+    );
+    assert!(matches!(res, Err(Error::TableNotFound(_))));
+}
+
+#[test]
+fn bulk_load_delta_applies_inserts_updates_deletes() {
+    let store = Store::default();
+    // Seed: ids 1..=10 with values "v1".."v10".
+    let seed: Vec<(u64, String)> = (1u64..=10).map(|i| (i, format!("v{i}"))).collect();
+    store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(seed)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let delta = BulkDelta {
+        inserts: vec![(11, "v11".into()), (12, "v12".into())],
+        updates: vec![(5, "v5_new".into())],
+        deletes: vec![3, 7],
+    };
+    store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Delta(delta),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<String>("t").unwrap();
+    assert_eq!(t.len(), 10); // 10 - 2 deletes + 2 inserts = 10
+    assert_eq!(t.get(3), None);
+    assert_eq!(t.get(7), None);
+    assert_eq!(t.get(5).map(String::as_str), Some("v5_new"));
+    assert_eq!(t.get(11).map(String::as_str), Some("v11"));
+    assert_eq!(t.get(12).map(String::as_str), Some("v12"));
+}
+
+#[test]
+fn bulk_load_delta_rejects_overlapping_ids_across_buckets() {
+    let store = Store::default();
+    let seed: Vec<(u64, String)> = vec![(1, "x".into())];
+    store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(seed)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let bad = BulkDelta {
+        inserts: vec![(2, "i".into())],
+        updates: vec![(2, "u".into())],
+        deletes: vec![],
+    };
+    let res = store.bulk_load::<String>(
+        "t",
+        BulkLoadInput::Delta(bad),
+        BulkLoadOptions::default(),
+    );
+    assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));
+}
+
+#[test]
+fn bulk_load_delta_missing_table_errors() {
+    let store = Store::default();
+    let bad = BulkDelta::<String> {
+        inserts: vec![(1, "x".into())],
+        updates: vec![],
+        deletes: vec![],
+    };
+    let res = store.bulk_load::<String>(
+        "missing",
+        BulkLoadInput::Delta(bad),
+        BulkLoadOptions::default(),
     );
     assert!(matches!(res, Err(Error::TableNotFound(_))));
 }

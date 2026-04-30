@@ -175,6 +175,12 @@ impl<R: Record> Table<R> {
         self.indexes.values().map(|i| i.empty_clone()).collect()
     }
 
+    /// Borrow the underlying data B-tree. Used by bulk-load Delta to walk
+    /// the captured base in id-order while materializing the merged rows.
+    pub(crate) fn data_ref(&self) -> &BTree<u64, R> {
+        &self.data
+    }
+
     /// Insert a record. Returns the auto-assigned ID, or an error if a unique
     /// index constraint is violated.
     pub fn insert(&mut self, record: R) -> Result<u64> {
