@@ -1410,6 +1410,97 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.resolve(ids)
     }
+
+    /// Insert-or-replace a record at an explicit ID. Maintains secondary
+    /// indexes, tracks the key in the write set, and emits the appropriate
+    /// WAL op (Insert if no prior, Update if replacing). Used internally
+    /// by [`Self::bulk_load`] to ingest rows with caller-supplied IDs.
+    fn upsert(&mut self, id: u64, record: R) -> Result<()> {
+        self.claim_intent(id)?;
+        let had_prior = self.table.contains(id);
+        #[cfg(feature = "persistence")]
+        let data = if self.wal_ops.is_some() {
+            Some(Self::serialize_record(&record)?)
+        } else {
+            None
+        };
+        self.table.upsert_arc(id, Arc::new(record))?;
+        if let Some(ws) = &mut self.write_set {
+            ws.insert(id);
+        }
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            let data = data.expect("serialized when wal_ops is Some");
+            let op = if had_prior {
+                crate::wal::WalOp::Update { table: w.table_name.clone(), id, data }
+            } else {
+                crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data }
+            };
+            w.ops.push(op);
+        }
+        if had_prior {
+            self.metrics.inc_updates(&self.table_name, 1);
+        } else {
+            self.metrics.inc_inserts(&self.table_name, 1);
+        }
+        Ok(())
+    }
+
+    /// Apply a [`BulkLoadInput`] within this `WriteTx`.
+    ///
+    /// This is a convenience wrapper around the existing `*_batch` methods —
+    /// it is **not** the bottom-up bulk-load fast path. For that, use
+    /// [`Store::bulk_load`], which builds a fresh tree off-lock and installs
+    /// it as a new snapshot atomically. This method participates in the
+    /// `WriteTx`'s normal commit-time OCC merge.
+    ///
+    /// Semantics:
+    /// - `Replace`: deletes all current rows, then inserts the new ones.
+    ///   For `Sorted`/`Unsorted` sources the caller-supplied IDs are used
+    ///   verbatim. For `AutoId`, IDs are auto-assigned starting from the
+    ///   table's current `next_id` — this *differs* from
+    ///   [`Store::bulk_load`]'s `AutoId` semantics (which assigns 1..=N on
+    ///   a fresh table); the WriteTx-scoped variant continues from the
+    ///   in-tx `next_id`, matching the natural in-tx behavior.
+    /// - `Delta`: applies `delete_batch` → `update_batch` → per-insert upsert.
+    ///   Validation is the per-op behavior of those batch methods.
+    ///
+    /// [`BulkLoadInput`]: crate::BulkLoadInput
+    /// [`Store::bulk_load`]: crate::Store::bulk_load
+    pub fn bulk_load(&mut self, input: crate::bulk_load::BulkLoadInput<R>) -> Result<()> {
+        use crate::bulk_load::{BulkLoadInput, BulkSource};
+        match input {
+            BulkLoadInput::Replace(source) => {
+                let ids: Vec<u64> = self.iter().map(|(id, _)| id).collect();
+                if !ids.is_empty() {
+                    self.delete_batch(&ids)?;
+                }
+                match source {
+                    BulkSource::Sorted(it) | BulkSource::Unsorted(it) => {
+                        for (id, r) in it {
+                            self.upsert(id, r)?;
+                        }
+                    }
+                    BulkSource::AutoId(it) => {
+                        self.insert_batch(it.collect())?;
+                    }
+                }
+                Ok(())
+            }
+            BulkLoadInput::Delta(delta) => {
+                if !delta.deletes.is_empty() {
+                    self.delete_batch(&delta.deletes)?;
+                }
+                if !delta.updates.is_empty() {
+                    self.update_batch(delta.updates)?;
+                }
+                for (id, r) in delta.inserts {
+                    self.upsert(id, r)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

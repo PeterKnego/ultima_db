@@ -213,6 +213,23 @@ fn bulk_load_delta_missing_table_errors() {
 }
 
 #[test]
+fn write_tx_table_bulk_load_via_batch() {
+    let store = Store::default();
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table::<String>("t").unwrap();
+    t.bulk_load(BulkLoadInput::Replace(BulkSource::auto_id_vec(
+        (0..50).map(|i| format!("v{i}")).collect(),
+    )))
+    .unwrap();
+    drop(t);
+    wtx.commit().unwrap();
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<String>("t").unwrap();
+    assert_eq!(t.len(), 50);
+}
+
+#[test]
 fn bulk_load_replace_does_not_disturb_existing_read_tx() {
     let store = Store::default();
     let seed: Vec<(u64, String)> = (1u64..=5).map(|i| (i, format!("old{i}"))).collect();
