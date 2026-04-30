@@ -439,3 +439,74 @@ fn recover_unregistered_table_returns_error() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bulk-load: persistence integration (Phase 8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bulk_load_persists_via_checkpoint_and_recovers() {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    {
+        let store = open_store(config.clone());
+        let rows: Vec<(u64, User)> = (1u64..=100)
+            .map(|i| (i, User { name: format!("v{i}"), age: i as u32 }))
+            .collect();
+        store
+            .bulk_load::<User>(
+                "users",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                BulkLoadOptions::default(),
+            )
+            .unwrap();
+    }
+
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 100);
+    assert_eq!(table.get(1).unwrap().name, "v1");
+    assert_eq!(table.get(100).unwrap().name, "v100");
+}
+
+#[test]
+fn bulk_load_skip_checkpoint_loses_data_on_crash() {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    {
+        let store = open_store(config.clone());
+        let rows: Vec<(u64, User)> = (1u64..=10)
+            .map(|i| (i, User { name: format!("v{i}"), age: i as u32 }))
+            .collect();
+        store
+            .bulk_load::<User>(
+                "users",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                BulkLoadOptions {
+                    create_if_missing: true,
+                    checkpoint_after: false,
+                },
+            )
+            .unwrap();
+    }
+
+    // Bulk load without checkpoint is in-memory only — not WAL'd. After
+    // reopen, the table is missing or empty.
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    let missing_or_empty = match rtx.open_table::<User>("users") {
+        Err(_) => true,
+        Ok(t) => t.is_empty(),
+    };
+    assert!(
+        missing_or_empty,
+        "bulk_load with checkpoint_after=false should not survive a restart",
+    );
+}

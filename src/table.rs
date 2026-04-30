@@ -1974,6 +1974,7 @@ mod tests {
     fn from_bulk_with_indexes() {
         use std::sync::Arc;
         #[derive(Clone)]
+        #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
         struct U {
             email: String,
             age: u32,
@@ -2031,6 +2032,7 @@ mod tests {
     fn from_bulk_unique_collision_errors() {
         use std::sync::Arc;
         #[derive(Clone)]
+        #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
         struct U {
             email: String,
         }

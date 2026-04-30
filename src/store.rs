@@ -788,10 +788,28 @@ impl Store {
         Ok(new_version)
     }
 
-    /// Checkpoint + WAL prune after a bulk load. Phase 8 will wire this up
-    /// to the persistence layer; for now it is a no-op so non-persistent
-    /// stores work and persistent stores fall back to normal WAL replay.
+    /// Checkpoint + WAL prune after a bulk load.
+    ///
+    /// In persistent modes (`Standalone`, `Smr`), writes a checkpoint at the
+    /// new version. `Store::checkpoint()` already prunes the WAL in
+    /// `Standalone` mode and cleans up older checkpoints, so this is the
+    /// single call needed to make the bulk load durable. For
+    /// `Persistence::None` this is a no-op (no disk to write to).
     fn checkpoint_and_prune_after_bulk(&self, _new_version: u64) -> Result<()> {
+        #[cfg(feature = "persistence")]
+        {
+            use crate::persistence::Persistence;
+            let is_persistent = {
+                let inner = self.inner.read().unwrap();
+                matches!(
+                    inner.config.persistence,
+                    Persistence::Standalone { .. } | Persistence::Smr { .. },
+                )
+            };
+            if is_persistent {
+                let _ = self.checkpoint()?;
+            }
+        }
         Ok(())
     }
 }

@@ -707,6 +707,7 @@ mod tests {
         use std::sync::Arc;
 
         #[derive(Clone)]
+        #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
         struct Row {
             name: String,
         }
@@ -756,6 +757,7 @@ mod tests {
         use std::sync::Arc;
 
         #[derive(Clone)]
+        #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
         struct Row {
             age: u32,
         }
@@ -800,6 +802,7 @@ mod tests {
     fn rebuild_from_sorted_data_unique_collision_errors() {
         use std::sync::Arc;
         #[derive(Clone)]
+        #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
         struct Row {
             name: String,
         }
