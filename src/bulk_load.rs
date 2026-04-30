@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
+use crate::{Error, Result};
+
 /// Top-level shape of a bulk load: replace the table or apply a delta.
 pub enum BulkLoadInput<R> {
     /// Replace all table contents with the provided rows. Index *definitions*
@@ -81,4 +85,66 @@ impl Default for BulkLoadOptions {
     }
 }
 
-// Internal helpers used by Store::bulk_load are added in Phase 5/6.
+// ---------------------------------------------------------------------------
+// Internal helpers used by Store::bulk_load
+// ---------------------------------------------------------------------------
+
+/// Result of materializing a `BulkSource` into sorted, deduped rows ready
+/// for `Table::from_bulk`. `max_id` is the largest assigned id, used to
+/// initialize the new table's `next_id`.
+pub(crate) struct MaterializedRows<R> {
+    pub rows: Vec<(u64, Arc<R>)>,
+    pub max_id: Option<u64>,
+}
+
+/// Drain a `BulkSource` into a strictly-ascending `Vec<(u64, Arc<R>)>`.
+/// Validates ordering and rejects duplicate ids; for `AutoId`, assigns
+/// sequential ids starting at `1`.
+pub(crate) fn materialize_source<R>(src: BulkSource<R>) -> Result<MaterializedRows<R>>
+where
+    R: Send + Sync + 'static,
+{
+    match src {
+        BulkSource::Sorted(iter) => {
+            let rows: Vec<(u64, Arc<R>)> = iter.map(|(id, r)| (id, Arc::new(r))).collect();
+            for w in rows.windows(2) {
+                if w[0].0 == w[1].0 {
+                    return Err(Error::InvalidBulkLoadInput(format!(
+                        "duplicate id {} in sorted source",
+                        w[0].0
+                    )));
+                }
+                if w[0].0 > w[1].0 {
+                    return Err(Error::InvalidBulkLoadInput(format!(
+                        "Sorted source not ascending: {} > {}",
+                        w[0].0, w[1].0
+                    )));
+                }
+            }
+            let max_id = rows.last().map(|(id, _)| *id);
+            Ok(MaterializedRows { rows, max_id })
+        }
+        BulkSource::Unsorted(iter) => {
+            let mut rows: Vec<(u64, Arc<R>)> = iter.map(|(id, r)| (id, Arc::new(r))).collect();
+            rows.sort_unstable_by_key(|(id, _)| *id);
+            for w in rows.windows(2) {
+                if w[0].0 == w[1].0 {
+                    return Err(Error::InvalidBulkLoadInput(format!(
+                        "duplicate id {}",
+                        w[0].0
+                    )));
+                }
+            }
+            let max_id = rows.last().map(|(id, _)| *id);
+            Ok(MaterializedRows { rows, max_id })
+        }
+        BulkSource::AutoId(iter) => {
+            let rows: Vec<(u64, Arc<R>)> = iter
+                .enumerate()
+                .map(|(i, r)| ((i as u64) + 1, Arc::new(r)))
+                .collect();
+            let max_id = rows.last().map(|(id, _)| *id);
+            Ok(MaterializedRows { rows, max_id })
+        }
+    }
+}

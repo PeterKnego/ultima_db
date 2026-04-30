@@ -169,6 +169,12 @@ impl<R: Record> Table<R> {
         Ok(Self { data, next_id, indexes })
     }
 
+    /// Clone each index's *definition* (extractor, name, kind, storage type)
+    /// with empty storage. Used by bulk-load to rebuild indexes from new data.
+    pub(crate) fn empty_index_defs(&self) -> Vec<Box<dyn IndexMaintainer<R>>> {
+        self.indexes.values().map(|i| i.empty_clone()).collect()
+    }
+
     /// Insert a record. Returns the auto-assigned ID, or an error if a unique
     /// index constraint is violated.
     pub fn insert(&mut self, record: R) -> Result<u64> {

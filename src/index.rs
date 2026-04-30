@@ -30,6 +30,11 @@ pub(crate) trait IndexMaintainer<R>: Send + Sync {
     fn name(&self) -> &str;
     /// Returns a boxed clone of this index maintainer.
     fn clone_box(&self) -> Box<dyn IndexMaintainer<R>>;
+    /// Clone the index *definition* (extractor, name, kind, storage shape)
+    /// with empty storage. Used by bulk-load to rebuild the index against
+    /// freshly-loaded data via [`rebuild_from_sorted_data`]. The returned
+    /// box must be ready to receive a full backfill.
+    fn empty_clone(&self) -> Box<dyn IndexMaintainer<R>>;
     /// Returns a reference to the underlying index as `Any`.
     fn as_any(&self) -> &dyn Any;
 
@@ -129,6 +134,15 @@ where
         })
     }
 
+    fn empty_clone(&self) -> Box<dyn IndexMaintainer<R>> {
+        Box::new(Self {
+            extractor: Arc::clone(&self.extractor),
+            storage: UniqueStorage::<K>::new(),
+            name: self.name.clone(),
+            kind: self.kind,
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -193,6 +207,15 @@ where
         Box::new(Self {
             extractor: Arc::clone(&self.extractor),
             storage: self.storage.clone(),
+            name: self.name.clone(),
+            kind: self.kind,
+        })
+    }
+
+    fn empty_clone(&self) -> Box<dyn IndexMaintainer<R>> {
+        Box::new(Self {
+            extractor: Arc::clone(&self.extractor),
+            storage: NonUniqueStorage::<K>::new(),
             name: self.name.clone(),
             kind: self.kind,
         })
@@ -406,6 +429,20 @@ impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R> for CustomIndexA
             name: self.name.clone(),
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    fn empty_clone(&self) -> Box<dyn IndexMaintainer<R>> {
+        // Custom indexes have user-defined internal state with no generic
+        // "make empty" hook; the bulk-load primitives don't yet support
+        // them. Until a `CustomIndex::empty` requirement (or similar)
+        // lands, the bulk-load Replace path can't preserve a custom-index
+        // definition and must reject the load explicitly. See
+        // `docs/tasks/task23_bulk_load.md`.
+        panic!(
+            "bulk_load: rebuilding custom index '{}' is not supported; \
+             drop the index before bulk-loading and redefine it after",
+            self.name
+        );
     }
 
     fn as_any(&self) -> &dyn Any {

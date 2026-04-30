@@ -594,6 +594,119 @@ impl Store {
     pub fn committed_write_set_count(&self) -> usize {
         self.inner.read().unwrap().committed_write_sets.len()
     }
+
+    // -----------------------------------------------------------------------
+    // Bulk-load
+    // -----------------------------------------------------------------------
+
+    /// Bulk-load rows into a table, producing a single new committed snapshot.
+    ///
+    /// For `Replace`, materializes the source into sorted rows off-lock,
+    /// builds a fresh data tree and indexes via `Table::from_bulk` (preserving
+    /// any existing index *definitions* with empty storage), then atomically
+    /// installs the result as a new MVCC snapshot.
+    ///
+    /// `Delta` is not implemented in this phase and returns
+    /// [`Error::InvalidBulkLoadInput`].
+    ///
+    /// See `docs/tasks/task23_bulk_load.md`.
+    pub fn bulk_load<R: Record>(
+        &self,
+        table_name: &str,
+        input: crate::bulk_load::BulkLoadInput<R>,
+        opts: crate::bulk_load::BulkLoadOptions,
+    ) -> Result<u64> {
+        use crate::bulk_load::{BulkLoadInput, materialize_source};
+
+        match input {
+            BulkLoadInput::Replace(source) => {
+                // 1. Materialize sorted rows off-lock.
+                let mat = materialize_source::<R>(source)?;
+                let next_id = mat.max_id.map(|m| m + 1).unwrap_or(1);
+
+                // 2. Snapshot current state to read existing index defs (if any).
+                let base_snapshot = {
+                    let inner = self.inner.read().unwrap();
+                    inner.snapshots[&inner.latest_version].clone()
+                };
+
+                let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R>>> =
+                    if let Some(existing) = base_snapshot.tables.get(table_name) {
+                        let typed = existing
+                            .as_any()
+                            .downcast_ref::<crate::table::Table<R>>()
+                            .ok_or_else(|| Error::TypeMismatch(table_name.to_string()))?;
+                        typed.empty_index_defs()
+                    } else if opts.create_if_missing {
+                        Vec::new()
+                    } else {
+                        return Err(Error::TableNotFound(table_name.to_string()));
+                    };
+
+                // 3. Build the new table off-lock.
+                let new_table: crate::table::Table<R> =
+                    crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
+
+                // 4. Install under the global write lock, mirroring the
+                //    install pattern used by `WriteTx::commit_single_writer`.
+                let new_version = self.install_replaced_table(table_name, new_table)?;
+
+                // 5. Optional checkpoint + WAL prune (Phase 8 wiring; no-op for now).
+                if opts.checkpoint_after {
+                    self.checkpoint_and_prune_after_bulk(new_version)?;
+                }
+                Ok(new_version)
+            }
+            BulkLoadInput::Delta(_) => Err(Error::InvalidBulkLoadInput(
+                "Delta path implemented in Phase 6".to_string(),
+            )),
+        }
+    }
+
+    /// Install a freshly-built table as a new snapshot. Mirrors the install
+    /// tail of `WriteTx::commit_single_writer`: forks the latest snapshot's
+    /// table map, swaps in the new table, bumps `latest_version`. Holds the
+    /// global write lock for the duration.
+    fn install_replaced_table<R: Record>(
+        &self,
+        name: &str,
+        new_table: crate::table::Table<R>,
+    ) -> Result<u64> {
+        let mut inner = self.inner.write().unwrap();
+
+        // Auto-assigned commit version: bump to latest_version + 1 so version
+        // order matches commit order, matching the WriteTx::commit pattern.
+        let new_version = inner.latest_version + 1;
+        if new_version >= inner.next_version {
+            inner.next_version = new_version + 1;
+        }
+
+        let prev = &inner.snapshots[&inner.latest_version];
+        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = prev
+            .tables
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        tables.insert(
+            name.to_string(),
+            Arc::new(new_table) as Arc<dyn MergeableTable>,
+        );
+
+        let snapshot = Arc::new(Snapshot { version: new_version, tables });
+        inner.snapshots.insert(new_version, snapshot);
+        inner.latest_version = new_version;
+        if inner.config.auto_snapshot_gc {
+            gc_inner(&mut inner);
+        }
+        Ok(new_version)
+    }
+
+    /// Checkpoint + WAL prune after a bulk load. Phase 8 will wire this up
+    /// to the persistence layer; for now it is a no-op so non-persistent
+    /// stores work and persistent stores fall back to normal WAL replay.
+    fn checkpoint_and_prune_after_bulk(&self, _new_version: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// RAII owner of a set of per-table commit locks acquired in canonical
