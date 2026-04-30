@@ -301,3 +301,72 @@ fn bulk_load_batch_two_tables_install_atomically() {
     assert_eq!(s.get(1).map(String::as_str), Some("s1"));
     assert_eq!(u.get(3).copied(), Some(300));
 }
+
+#[test]
+fn bulk_load_batch_drop_without_commit_is_noop() {
+    use ultima_db::{AddOptions, BulkLoadInput, BulkSource, Store};
+
+    let store = Store::default();
+    let v_before = store.latest_version();
+
+    {
+        let mut batch = store.bulk_load_batch();
+        batch
+            .add::<String>(
+                "t",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(vec![(1, "a".into())])),
+                AddOptions::default(),
+            )
+            .unwrap();
+        // Drop without commit.
+    }
+
+    assert_eq!(store.latest_version(), v_before);
+    let rtx = store.begin_read(None).unwrap();
+    assert!(matches!(
+        rtx.open_table::<String>("t"),
+        Err(ultima_db::Error::KeyNotFound),
+    ));
+}
+
+#[test]
+fn bulk_load_batch_conflict_detection() {
+    use ultima_db::{AddOptions, BulkLoadInput, BulkLoadOptions, BulkSource, Error, Store};
+
+    let store = Store::default();
+    let mut batch = store.bulk_load_batch();
+    batch
+        .add::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(vec![(1, "from-batch".into())])),
+            AddOptions::default(),
+        )
+        .unwrap();
+
+    // A concurrent writer commits between batch.add and batch.commit.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("other")
+            .unwrap()
+            .insert("x".into())
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let res = batch.commit(BulkLoadOptions::default());
+    assert!(matches!(res, Err(Error::WriteConflict { .. })));
+}
+
+#[test]
+fn bulk_load_batch_empty_commit_is_noop() {
+    use ultima_db::{BulkLoadOptions, Store};
+
+    let store = Store::default();
+    let v_before = store.latest_version();
+    let v = store
+        .bulk_load_batch()
+        .commit(BulkLoadOptions::default())
+        .unwrap();
+    assert_eq!(v, v_before);
+    assert_eq!(store.latest_version(), v_before);
+}
