@@ -141,6 +141,34 @@ impl<R: Record> Table<R> {
         Self { data: BTree::new(), next_id: 1, indexes: BTreeMap::new() }
     }
 
+    /// Build a table from sorted `(id, Arc<record>)` pairs and a list of
+    /// pre-defined indexes. Builds the data tree via `BTree::from_sorted`,
+    /// then backfills each index via `rebuild_from_sorted_data`. On any
+    /// index-build failure, returns `Err`; the original table (if any) is
+    /// untouched because we never mutate it.
+    #[allow(dead_code)]
+    pub(crate) fn from_bulk(
+        sorted_rows: Vec<(u64, Arc<R>)>,
+        next_id: u64,
+        mut index_defs: Vec<Box<dyn IndexMaintainer<R>>>,
+    ) -> Result<Self> {
+        // Debug-assert ascending unique ids.
+        debug_assert!(
+            sorted_rows.windows(2).all(|w| w[0].0 < w[1].0),
+            "from_bulk: rows must be strictly ascending by id"
+        );
+
+        let data: BTree<u64, R> = BTree::from_sorted(sorted_rows);
+
+        let mut indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>> = BTreeMap::new();
+        for mut idx in index_defs.drain(..) {
+            idx.rebuild_from_sorted_data(&data)?;
+            indexes.insert(idx.name().to_string(), idx);
+        }
+
+        Ok(Self { data, next_id, indexes })
+    }
+
     /// Insert a record. Returns the auto-assigned ID, or an error if a unique
     /// index constraint is violated.
     pub fn insert(&mut self, record: R) -> Result<u64> {
@@ -1915,4 +1943,19 @@ mod tests {
         // Total should still be 45
         assert_eq!(table.custom_index::<CappedSumIndex>("capped").unwrap().total, 45);
     }
+
+    #[test]
+    fn from_bulk_data_only_no_indexes() {
+        let rows: Vec<(u64, std::sync::Arc<String>)> =
+            (1u64..=5).map(|i| (i, std::sync::Arc::new(format!("v{i}")))).collect();
+        let t = Table::<String>::from_bulk(rows, 6, vec![]).unwrap();
+        assert_eq!(t.len(), 5);
+        assert_eq!(t.get(1).map(String::as_str), Some("v1"));
+        assert_eq!(t.get(5).map(String::as_str), Some("v5"));
+        // Inserting after bulk should continue from next_id.
+        let mut t2 = t;
+        let id = t2.insert("v6".to_string()).unwrap();
+        assert_eq!(id, 6);
+    }
+
 }

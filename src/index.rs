@@ -26,6 +26,8 @@ pub(crate) trait IndexMaintainer<R>: Send + Sync {
     fn on_delete(&mut self, id: u64, record: &R);
     /// Returns the kind of this index (Unique or NonUnique).
     fn kind(&self) -> IndexKind;
+    /// Returns the name of this index.
+    fn name(&self) -> &str;
     /// Returns a boxed clone of this index maintainer.
     fn clone_box(&self) -> Box<dyn IndexMaintainer<R>>;
     /// Returns a reference to the underlying index as `Any`.
@@ -114,6 +116,10 @@ where
         self.kind
     }
 
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
         Box::new(Self {
             extractor: Arc::clone(&self.extractor),
@@ -177,6 +183,10 @@ where
 
     fn kind(&self) -> IndexKind {
         self.kind
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
@@ -384,6 +394,10 @@ impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R> for CustomIndexA
 
     fn kind(&self) -> IndexKind {
         IndexKind::Custom
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
