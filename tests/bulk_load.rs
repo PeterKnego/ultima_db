@@ -370,3 +370,52 @@ fn bulk_load_batch_empty_commit_is_noop() {
     assert_eq!(v, v_before);
     assert_eq!(store.latest_version(), v_before);
 }
+
+#[test]
+fn bulk_load_batch_rejects_delta() {
+    use ultima_db::{AddOptions, BulkDelta, BulkLoadInput, Error, Store};
+
+    let store = Store::default();
+    let mut batch = store.bulk_load_batch();
+    let res = batch.add::<String>(
+        "t",
+        BulkLoadInput::Delta(BulkDelta::default()),
+        AddOptions::default(),
+    );
+    assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));
+}
+
+#[test]
+fn bulk_load_batch_create_if_missing_false_errors() {
+    use ultima_db::{AddOptions, BulkLoadInput, BulkSource, Error, Store};
+
+    let store = Store::default();
+    let mut batch = store.bulk_load_batch();
+    let res = batch.add::<String>(
+        "missing",
+        BulkLoadInput::Replace(BulkSource::sorted_vec(vec![(1, "x".into())])),
+        AddOptions {
+            create_if_missing: false,
+        },
+    );
+    assert!(matches!(res, Err(Error::TableNotFound(_))));
+}
+
+#[test]
+fn bulk_load_batch_add_validates_input_eagerly() {
+    use ultima_db::{AddOptions, BulkLoadInput, BulkSource, Error, Store};
+
+    let store = Store::default();
+    let mut batch = store.bulk_load_batch();
+    // BulkSource::Sorted with duplicate IDs — caught by materialize_source
+    // immediately at `add`, not deferred to commit.
+    let res = batch.add::<String>(
+        "t",
+        BulkLoadInput::Replace(BulkSource::sorted_vec(vec![
+            (1, "a".into()),
+            (1, "b".into()),
+        ])),
+        AddOptions::default(),
+    );
+    assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));
+}
