@@ -795,7 +795,7 @@ impl Store {
     /// `Standalone` mode and cleans up older checkpoints, so this is the
     /// single call needed to make the bulk load durable. For
     /// `Persistence::None` this is a no-op (no disk to write to).
-    fn checkpoint_and_prune_after_bulk(&self, _new_version: u64) -> Result<()> {
+    pub(crate) fn checkpoint_and_prune_after_bulk(&self, _new_version: u64) -> Result<()> {
         #[cfg(feature = "persistence")]
         {
             use crate::persistence::Persistence;
@@ -811,6 +811,111 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Begin a multi-table atomic bulk install. Captures the current
+    /// `latest_version` as the base — concurrent committers that advance the
+    /// version before [`BulkLoadBatch::commit`](crate::bulk_load::BulkLoadBatch::commit)
+    /// will trigger a [`Error::WriteConflict`].
+    pub fn bulk_load_batch(&self) -> crate::bulk_load::BulkLoadBatch<'_> {
+        let base_version = self.latest_version();
+        crate::bulk_load::BulkLoadBatch {
+            store: self,
+            pending: Vec::new(),
+            base_version,
+        }
+    }
+
+    /// Build a single replacement table from a `BulkSource` without installing.
+    /// Shared between `bulk_load` (single-table) and `bulk_load_batch` (multi).
+    ///
+    /// `_base_version` is captured for documentation purposes — future
+    /// extensions (e.g. delta-from-batch) may use it to validate against an
+    /// outdated base. Currently unused inside the helper.
+    pub(crate) fn build_replacement_table<R: Record>(
+        &self,
+        name: &str,
+        source: crate::bulk_load::BulkSource<R>,
+        create_if_missing: bool,
+        _base_version: u64,
+    ) -> Result<crate::table::Table<R>> {
+        use crate::bulk_load::materialize_source;
+
+        // 1. Materialize sorted rows off-lock.
+        let mat = materialize_source::<R>(source)?;
+        let next_id = mat.max_id.map(|m| m + 1).unwrap_or(1);
+
+        // 2. Snapshot to read existing index defs (if any).
+        let base_snapshot = {
+            let inner = self.inner.read().unwrap();
+            inner.snapshots[&inner.latest_version].clone()
+        };
+
+        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R>>> =
+            if let Some(existing) = base_snapshot.tables.get(name) {
+                let typed = existing
+                    .as_any()
+                    .downcast_ref::<crate::table::Table<R>>()
+                    .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
+                typed.empty_index_defs()
+            } else if create_if_missing {
+                Vec::new()
+            } else {
+                return Err(Error::TableNotFound(name.to_string()));
+            };
+
+        // 3. Build off-lock.
+        let new_table: crate::table::Table<R> =
+            crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
+        Ok(new_table)
+    }
+
+    /// Install N pre-built tables atomically as one snapshot. Mirrors
+    /// `install_after_delta_check` but for multiple tables: returns
+    /// [`Error::WriteConflict`] if `latest_version` advanced past
+    /// `base_version` since the batch was opened.
+    pub(crate) fn install_batch(
+        &self,
+        pending: Vec<crate::bulk_load::PendingTable>,
+        base_version: u64,
+    ) -> Result<u64> {
+        debug_assert!(!pending.is_empty(), "install_batch called with empty pending");
+        let mut inner = self.inner.write().unwrap();
+
+        if inner.latest_version != base_version {
+            return Err(Error::WriteConflict {
+                table: pending[0].name.clone(),
+                keys: vec![],
+                version: inner.latest_version,
+                wait_for: None,
+            });
+        }
+
+        let new_version = inner.latest_version + 1;
+        if new_version >= inner.next_version {
+            inner.next_version = new_version + 1;
+        }
+
+        let prev = &inner.snapshots[&inner.latest_version];
+        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = prev
+            .tables
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for p in pending {
+            tables.insert(p.name, p.table);
+        }
+
+        let snapshot = Arc::new(Snapshot {
+            version: new_version,
+            tables,
+        });
+        inner.snapshots.insert(new_version, snapshot);
+        inner.latest_version = new_version;
+        if inner.config.auto_snapshot_gc {
+            gc_inner(&mut inner);
+        }
+        Ok(new_version)
     }
 }
 

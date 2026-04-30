@@ -18,7 +18,9 @@ pub mod table;
 pub mod transaction;
 
 pub use btree::BTree;
-pub use bulk_load::{BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource};
+pub use bulk_load::{
+    AddOptions, BulkDelta, BulkLoadBatch, BulkLoadInput, BulkLoadOptions, BulkSource,
+};
 pub use error::{Error, Result};
 pub use intents::CommitWaiter;
 #[cfg(feature = "fulltext")]

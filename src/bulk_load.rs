@@ -10,6 +10,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::persistence::Record;
+use crate::store::Store;
+use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
 
 /// Top-level shape of a bulk load: replace the table or apply a delta.
@@ -285,4 +288,104 @@ where
 
     let max_id = rows.last().map(|(id, _)| *id);
     Ok(MaterializedRows { rows, max_id })
+}
+
+// ---------------------------------------------------------------------------
+// BulkLoadBatch — atomic multi-table install
+// ---------------------------------------------------------------------------
+
+/// Per-table options for `BulkLoadBatch::add`.
+#[derive(Debug, Clone)]
+pub struct AddOptions {
+    /// If true and the target table doesn't exist, create it. Default: true.
+    pub create_if_missing: bool,
+}
+
+impl Default for AddOptions {
+    fn default() -> Self {
+        Self {
+            create_if_missing: true,
+        }
+    }
+}
+
+/// A built-but-not-yet-installed table awaiting `BulkLoadBatch::commit`.
+pub(crate) struct PendingTable {
+    pub(crate) name: String,
+    pub(crate) table: Arc<dyn MergeableTable>,
+}
+
+/// Builder for an atomic multi-table bulk install. Build each table off-lock
+/// via repeated `add`, then `commit` to install all of them in a single new
+/// snapshot version.
+///
+/// Dropped without `commit` discards the built tables; the store is unchanged.
+///
+/// On `commit`, fails with [`Error::WriteConflict`] if any concurrent committer
+/// advanced `latest_version` past the version captured when the batch was
+/// opened.
+pub struct BulkLoadBatch<'s> {
+    pub(crate) store: &'s Store,
+    pub(crate) pending: Vec<PendingTable>,
+    pub(crate) base_version: u64,
+}
+
+impl<'s> BulkLoadBatch<'s> {
+    /// Stage a `Replace` input as a new (or replaced) table. Materializes and
+    /// builds off-lock immediately, so input errors (dim mismatch, duplicate
+    /// IDs, missing table when `create_if_missing` is false, etc.) surface
+    /// here rather than at `commit`.
+    ///
+    /// Rejects [`BulkLoadInput::Delta`] with [`Error::InvalidBulkLoadInput`] —
+    /// single-table delta stays on `Store::bulk_load`.
+    ///
+    /// If `name` was previously added to this batch, the new build replaces
+    /// the prior one (last-add-wins).
+    pub fn add<R: Record>(
+        &mut self,
+        name: &str,
+        input: BulkLoadInput<R>,
+        opts: AddOptions,
+    ) -> Result<()> {
+        let source = match input {
+            BulkLoadInput::Replace(s) => s,
+            BulkLoadInput::Delta(_) => {
+                return Err(Error::InvalidBulkLoadInput(
+                    "BulkLoadBatch supports Replace only \
+                     — use Store::bulk_load for Delta"
+                        .into(),
+                ));
+            }
+        };
+        let new_table: Table<R> = self.store.build_replacement_table::<R>(
+            name,
+            source,
+            opts.create_if_missing,
+            self.base_version,
+        )?;
+        let arc: Arc<dyn MergeableTable> = Arc::new(new_table);
+        // Last-add-wins for repeated names.
+        self.pending.retain(|p| p.name != name);
+        self.pending.push(PendingTable {
+            name: name.to_string(),
+            table: arc,
+        });
+        Ok(())
+    }
+
+    /// Atomically install all staged tables, producing one new snapshot
+    /// version. Optionally checkpoint + prune WAL.
+    ///
+    /// Empty batch (no `add` calls) is a no-op: returns `Ok(self.base_version)`
+    /// without locking, bumping, or checkpointing.
+    pub fn commit(self, opts: BulkLoadOptions) -> Result<u64> {
+        if self.pending.is_empty() {
+            return Ok(self.base_version);
+        }
+        let new_version = self.store.install_batch(self.pending, self.base_version)?;
+        if opts.checkpoint_after {
+            self.store.checkpoint_and_prune_after_bulk(new_version)?;
+        }
+        Ok(new_version)
+    }
 }

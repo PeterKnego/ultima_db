@@ -264,3 +264,40 @@ fn bulk_load_replace_does_not_disturb_existing_read_tx() {
     assert_eq!(t_post.get(1).map(String::as_str), Some("new1"));
     assert_eq!(t_post.get(5).map(String::as_str), Some("new5"));
 }
+
+#[test]
+fn bulk_load_batch_two_tables_install_atomically() {
+    use ultima_db::{AddOptions, BulkLoadInput, BulkLoadOptions, BulkSource, Store};
+
+    let store = Store::default();
+    let v_before = store.latest_version();
+
+    let str_rows: Vec<(u64, String)> = (1u64..=10).map(|i| (i, format!("s{i}"))).collect();
+    let u64_rows: Vec<(u64, u64)> = (1u64..=5).map(|i| (i, i * 100)).collect();
+
+    let mut batch = store.bulk_load_batch();
+    batch
+        .add::<String>(
+            "strings",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(str_rows)),
+            AddOptions::default(),
+        )
+        .unwrap();
+    batch
+        .add::<u64>(
+            "u64s",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(u64_rows)),
+            AddOptions::default(),
+        )
+        .unwrap();
+    let v_after = batch.commit(BulkLoadOptions::default()).unwrap();
+    assert!(v_after > v_before);
+
+    let rtx = store.begin_read(None).unwrap();
+    let s = rtx.open_table::<String>("strings").unwrap();
+    let u = rtx.open_table::<u64>("u64s").unwrap();
+    assert_eq!(s.len(), 10);
+    assert_eq!(u.len(), 5);
+    assert_eq!(s.get(1).map(String::as_str), Some("s1"));
+    assert_eq!(u.get(3).copied(), Some(300));
+}
