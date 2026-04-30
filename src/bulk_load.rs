@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{Error, Result};
@@ -147,4 +148,141 @@ where
             Ok(MaterializedRows { rows, max_id })
         }
     }
+}
+
+/// Validate and materialize a delta against a captured base data tree,
+/// producing the new sorted rows that the bulk loader will hand to
+/// `Table::from_bulk`.
+///
+/// Validation order matters: bucket-internal duplicates first, then
+/// cross-bucket overlap, then existence checks against `base`. Callers
+/// receive the most-local error first.
+pub(crate) fn materialize_delta<R>(
+    delta: BulkDelta<R>,
+    base: &crate::btree::BTree<u64, R>,
+) -> Result<MaterializedRows<R>>
+where
+    R: Send + Sync + 'static,
+{
+    let BulkDelta {
+        mut inserts,
+        mut updates,
+        mut deletes,
+    } = delta;
+
+    // 1. Within-bucket dedup checks.
+    inserts.sort_by_key(|(id, _)| *id);
+    updates.sort_by_key(|(id, _)| *id);
+    deletes.sort_unstable();
+    for w in inserts.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "duplicate id {} in inserts",
+                w[0].0
+            )));
+        }
+    }
+    for w in updates.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "duplicate id {} in updates",
+                w[0].0
+            )));
+        }
+    }
+    for w in deletes.windows(2) {
+        if w[0] == w[1] {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "duplicate id {} in deletes",
+                w[0]
+            )));
+        }
+    }
+
+    // 2. Cross-bucket overlap.
+    let mut seen: HashSet<u64> = HashSet::new();
+    for (id, _) in &inserts {
+        if !seen.insert(*id) {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "id {id} appears in multiple buckets"
+            )));
+        }
+    }
+    for (id, _) in &updates {
+        if !seen.insert(*id) {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "id {id} appears in multiple buckets"
+            )));
+        }
+    }
+    for id in &deletes {
+        if !seen.insert(*id) {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "id {id} appears in multiple buckets"
+            )));
+        }
+    }
+
+    // 3. Existence checks against base.
+    for (id, _) in &updates {
+        if base.get(id).is_none() {
+            return Err(Error::KeyNotFound);
+        }
+    }
+    for id in &deletes {
+        if base.get(id).is_none() {
+            return Err(Error::KeyNotFound);
+        }
+    }
+    for (id, _) in &inserts {
+        if base.get(id).is_some() {
+            return Err(Error::DuplicateKey(format!(
+                "bulk_delta insert id {id}"
+            )));
+        }
+    }
+
+    // 4. Materialize the merged sorted row vector.
+    //    Walk base in id-order; skip ids in `deletes`; replace ids in
+    //    `updates`; sort-merge inserts into the stream.
+    let updates_map: HashMap<u64, Arc<R>> =
+        updates.into_iter().map(|(id, r)| (id, Arc::new(r))).collect();
+    let deletes_set: HashSet<u64> = deletes.into_iter().collect();
+
+    let mut base_iter = base.range(..).peekable();
+    let mut insert_iter = inserts
+        .into_iter()
+        .map(|(id, r)| (id, Arc::new(r)))
+        .peekable();
+
+    let mut rows: Vec<(u64, Arc<R>)> = Vec::new();
+    loop {
+        // BTreeRange yields (&u64, &R), so peek returns Option<&(&u64, &R)>.
+        let take_base = match (base_iter.peek(), insert_iter.peek()) {
+            (Some((bid, _)), Some((iid, _))) => **bid < *iid,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_base {
+            let (id_ref, _) = base_iter.next().unwrap();
+            let id = *id_ref;
+            if deletes_set.contains(&id) {
+                continue;
+            }
+            if let Some(new_rec) = updates_map.get(&id) {
+                rows.push((id, new_rec.clone()));
+            } else {
+                // Reuse the existing Arc by cloning out of the data tree.
+                let arc = base.get_arc(&id).expect("present per peek");
+                rows.push((id, arc));
+            }
+        } else {
+            let (id, arc) = insert_iter.next().unwrap();
+            rows.push((id, arc));
+        }
+    }
+
+    let max_id = rows.last().map(|(id, _)| *id);
+    Ok(MaterializedRows { rows, max_id })
 }
