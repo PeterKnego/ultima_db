@@ -15,6 +15,9 @@ pub enum Error {
 
     #[error("invalid params: {0}")]
     InvalidParams(&'static str),
+
+    #[error("invalid HnswState at id {id}: level={level} but layers.len()={layers}")]
+    InvalidHnswState { id: u64, level: u8, layers: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

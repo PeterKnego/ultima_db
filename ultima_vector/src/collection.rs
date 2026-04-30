@@ -10,7 +10,6 @@ use crate::Distance;
 use crate::error::{Error, Result};
 use crate::hnsw::params::HnswParams;
 use crate::hnsw::{insert as hnsw_insert, search as hnsw_search};
-#[cfg(feature = "persistence")]
 use crate::row::{EntryPoint, VectorRow};
 
 pub struct VectorCollection<Meta, D> {
@@ -155,6 +154,69 @@ where
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    /// Atomically replace this collection's contents with the provided rows
+    /// and entry point. Existing rows in both backing tables are dropped;
+    /// pre-existing `ReadTx`s on prior snapshots continue to see the old
+    /// state via MVCC.
+    ///
+    /// Validates per-row that `embedding.len() == params.dim` and
+    /// `HnswState::layers_len() == level + 1`. Does not validate neighbor-id
+    /// integrity — bad refs surface as `NodeNotFound` at search time.
+    ///
+    /// `HnswState`'s safe constructors enforce the layer-count invariant; the
+    /// check guards against malformed deserialization (e.g. a corrupted
+    /// backup file).
+    ///
+    /// Returns the new committed snapshot version.
+    pub fn restore_iter<I>(&self, rows: I, entry_point: EntryPoint) -> Result<u64>
+    where
+        I: IntoIterator<Item = (u64, VectorRow<Meta>)>,
+    {
+        use ultima_db::{AddOptions, BulkLoadInput, BulkLoadOptions, BulkSource};
+
+        let mut materialized: Vec<(u64, VectorRow<Meta>)> = Vec::new();
+        for (id, row) in rows {
+            if row.embedding.len() != self.params.dim {
+                return Err(Error::DimMismatch {
+                    expected: self.params.dim,
+                    got: row.embedding.len(),
+                });
+            }
+            let level = row.hnsw.level();
+            let layers = row.hnsw.layers_len();
+            if layers != usize::from(level) + 1 {
+                return Err(Error::InvalidHnswState { id, level, layers });
+            }
+            materialized.push((id, row));
+        }
+
+        let data_input = BulkLoadInput::Replace(BulkSource::unsorted_vec(materialized));
+        let entry_input = BulkLoadInput::Replace(BulkSource::sorted_vec(vec![(1, entry_point)]));
+
+        let mut batch = self.store.bulk_load_batch();
+        batch.add::<VectorRow<Meta>>(
+            &self.data_table_name(),
+            data_input,
+            AddOptions::default(),
+        )?;
+        batch.add::<EntryPoint>(
+            &self.entry_table_name(),
+            entry_input,
+            AddOptions::default(),
+        )?;
+        let v = batch.commit(BulkLoadOptions::default())?;
+        Ok(v)
+    }
+
+    /// Convenience over [`restore_iter`](Self::restore_iter) for in-memory `Vec` input.
+    pub fn restore_vec(
+        &self,
+        rows: Vec<(u64, VectorRow<Meta>)>,
+        entry_point: EntryPoint,
+    ) -> Result<u64> {
+        self.restore_iter(rows, entry_point)
     }
 
     /// Delete a node by tombstoning it. Subsequent searches skip it.
