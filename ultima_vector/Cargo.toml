@@ -25,3 +25,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 [[example]]
 name = "with_persistence"
 required-features = ["persistence"]
+
+[[bench]]
+name = "distance"
+harness = false
