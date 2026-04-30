@@ -4,6 +4,11 @@
 //! drives the HNSW heaps regardless of which metric is in use.
 
 mod scalar;
+// `simd` is exercised by its own tests; public `Distance` impls will be
+// wired to it in a follow-up task (see plan task 5). Until then the items
+// look unused to dead-code analysis.
+#[allow(dead_code)]
+mod simd;
 
 /// Distance function applied between two equal-length vectors.
 ///
