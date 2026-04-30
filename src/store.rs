@@ -3790,4 +3790,36 @@ mod tests {
         // Index reads: get_unique = 1
         assert_eq!(m.tables["users"].indexes["value"].reads, 1);
     }
+
+    #[test]
+    fn bulk_load_install_after_delta_conflict_detection() {
+        use crate::table::Table;
+        let store = Store::default();
+        let v0 = store.latest_version();
+        let new_table: Table<String> = Table::from_bulk(vec![], 1, vec![]).unwrap();
+
+        // Manually bump latest_version under the write lock to simulate a
+        // concurrent commit that landed between Phase-3 build and install.
+        // Insert a fresh snapshot at the new version that mirrors the prior
+        // snapshot's tables, so begin_read at the new tip would still work.
+        {
+            let mut inner = store.inner.write().unwrap();
+            let prev = inner.snapshots[&inner.latest_version].clone();
+            let new_version = inner.latest_version + 1;
+            let fake = Arc::new(Snapshot {
+                version: new_version,
+                tables: prev.tables.clone(),
+            });
+            inner.snapshots.insert(new_version, fake);
+            inner.latest_version = new_version;
+            inner.next_version = new_version + 1;
+        }
+
+        // Calling install_after_delta_check with the stale base_version (v0)
+        // must surface a WriteConflict — the delta was computed against a
+        // snapshot that no longer represents the latest state.
+        let res: Result<u64> =
+            store.install_after_delta_check::<String>("t", new_table, v0);
+        assert!(matches!(res, Err(Error::WriteConflict { .. })));
+    }
 }

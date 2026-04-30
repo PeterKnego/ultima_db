@@ -211,3 +211,39 @@ fn bulk_load_delta_missing_table_errors() {
     );
     assert!(matches!(res, Err(Error::TableNotFound(_))));
 }
+
+#[test]
+fn bulk_load_replace_does_not_disturb_existing_read_tx() {
+    let store = Store::default();
+    let seed: Vec<(u64, String)> = (1u64..=5).map(|i| (i, format!("old{i}"))).collect();
+    let v1 = store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(seed)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let rtx_pre = store.begin_read(Some(v1)).unwrap();
+
+    let new_seed: Vec<(u64, String)> = (1u64..=5).map(|i| (i, format!("new{i}"))).collect();
+    let v2 = store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(new_seed)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+    assert!(v2 > v1);
+
+    // The pre-existing ReadTx pinned at v1 still sees the original data.
+    let t_pre = rtx_pre.open_table::<String>("t").unwrap();
+    assert_eq!(t_pre.get(1).map(String::as_str), Some("old1"));
+    assert_eq!(t_pre.get(5).map(String::as_str), Some("old5"));
+
+    // A fresh read sees the new snapshot.
+    let rtx_post = store.begin_read(None).unwrap();
+    let t_post = rtx_post.open_table::<String>("t").unwrap();
+    assert_eq!(t_post.get(1).map(String::as_str), Some("new1"));
+    assert_eq!(t_post.get(5).map(String::as_str), Some("new5"));
+}
