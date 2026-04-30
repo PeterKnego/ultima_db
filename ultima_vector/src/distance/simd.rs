@@ -106,23 +106,6 @@ impl<'a> WithSimd for CosineKernel<'a> {
     }
 }
 
-// ---------------- Public dispatch wrappers ----------------
-
-pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
-    arch().dispatch(DotKernel { a, b })
-}
-
-pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
-    arch().dispatch(L2Kernel { a, b })
-}
-
-pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
-    arch().dispatch(CosineKernel { a, b })
-}
-
 pub(crate) struct NormSquaredKernel<'a> {
     pub v: &'a [f32],
 }
@@ -164,6 +147,23 @@ impl<'a> WithSimd for ScaleInPlaceKernel<'a> {
             *x *= self.factor;
         }
     }
+}
+
+// ---------------- Public dispatch wrappers ----------------
+
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+    arch().dispatch(DotKernel { a, b })
+}
+
+pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+    arch().dispatch(L2Kernel { a, b })
+}
+
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+    arch().dispatch(CosineKernel { a, b })
 }
 
 pub(crate) fn norm_squared(v: &[f32]) -> f32 {
