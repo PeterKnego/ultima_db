@@ -1,4 +1,5 @@
 pub mod btree;
+pub mod bulk_load;
 pub mod error;
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
@@ -17,6 +18,7 @@ pub mod table;
 pub mod transaction;
 
 pub use btree::BTree;
+pub use bulk_load::{BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource};
 pub use error::{Error, Result};
 pub use intents::CommitWaiter;
 #[cfg(feature = "fulltext")]
