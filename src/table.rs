@@ -563,10 +563,8 @@ impl<R: Record> Table<R> {
                 return Err(Error::IndexTypeMismatch(name.to_string()));
             }
         };
-        // Backfill from existing data.
-        for (&id, record) in self.data.range(..) {
-            index.on_insert(id, record)?;
-        }
+        // Backfill via fast bulk-build primitive (falls back to per-row for custom indexes).
+        index.rebuild_from_sorted_data(&self.data)?;
         self.indexes.insert(name.to_string(), index);
         Ok(())
     }

@@ -70,7 +70,6 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     ///
     /// Debug-asserts strict ascending order and rejects duplicate keys.
     /// Caller is responsible for sort and dedup.
-    #[allow(dead_code)] // Phase 1 addition; consumed in Phases 2-3.
     pub(crate) fn from_sorted<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, Arc<V>)>,
