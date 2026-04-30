@@ -1,4 +1,4 @@
-use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, IndexKind, Store};
+use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store};
 
 #[test]
 fn bulk_load_replace_on_empty_store_creates_table() {
@@ -97,4 +97,40 @@ fn bulk_load_replace_preserves_index_definitions() {
         .unwrap();
     assert_eq!(id, 3);
     assert_eq!(u.email, "u3@x");
+}
+
+#[test]
+fn bulk_load_replace_auto_id_assigns_sequential_ids() {
+    let store = Store::default();
+    let rows: Vec<String> = (0..50).map(|i| format!("r{i}")).collect();
+    store
+        .bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::auto_id_vec(rows)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<String>("t").unwrap();
+    assert_eq!(t.len(), 50);
+    assert_eq!(t.get(1).map(String::as_str), Some("r0"));
+    assert_eq!(t.get(50).map(String::as_str), Some("r49"));
+    assert_eq!(t.get(51), None);
+}
+
+#[test]
+fn bulk_load_replace_missing_table_without_create_errors() {
+    let store = Store::default();
+    let rows: Vec<(u64, String)> = vec![(1, "x".into())];
+    let opts = BulkLoadOptions {
+        create_if_missing: false,
+        ..Default::default()
+    };
+    let res = store.bulk_load::<String>(
+        "missing",
+        BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+        opts,
+    );
+    assert!(matches!(res, Err(Error::TableNotFound(_))));
 }
