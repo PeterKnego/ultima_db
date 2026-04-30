@@ -7,7 +7,8 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::RngExt;
 use ultima_db::{Durability, Persistence, Store, StoreConfig};
-use ultima_vector::{Cosine, HnswParams, VectorCollection};
+use ultima_vector::row::{EntryPoint, HnswState};
+use ultima_vector::{Cosine, HnswParams, VectorCollection, VectorRow};
 
 const DIM: usize = 8;
 const N: usize = 200;
@@ -145,4 +146,53 @@ fn wal_only_recovery_works_without_checkpoint() {
     };
 
     assert_eq!(pre_top, post_top);
+}
+
+#[test]
+fn restore_through_bulk_load_persists() {
+    // Build a collection, restore a single hand-built row via `restore_vec`
+    // (which goes through bulk-load + checkpoint), drop the store, reopen
+    // the same dir, and verify search returns the restored id.
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path());
+
+    // Build phase: restore one row at id=42, checkpoint via bulk-load default.
+    {
+        let store = Store::new(config.clone()).unwrap();
+        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
+            store.clone(),
+            "vec",
+            HnswParams::for_dim(4),
+            Cosine,
+        )
+        .unwrap();
+        store.recover().unwrap();
+
+        let row = VectorRow {
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            meta: 42u64,
+            hnsw: HnswState::empty(0),
+        };
+        let entry = EntryPoint { node_id: Some(42), max_level: 0 };
+        coll.restore_vec(vec![(42, row)], entry).unwrap();
+    } // store dropped here; restore_vec's checkpoint should have flushed state.
+
+    // Recovery phase: reopen the same dir and verify the restored row is searchable.
+    {
+        let store = Store::new(config).unwrap();
+        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
+            store.clone(),
+            "vec",
+            HnswParams::for_dim(4),
+            Cosine,
+        )
+        .unwrap();
+        store.recover().unwrap();
+
+        let results = coll
+            .search(&[1.0, 0.0, 0.0, 0.0], 1, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 1, "expected exactly one result after reopen");
+        assert_eq!(results[0].0, 42, "expected restored id=42 to be the top hit");
+    }
 }
