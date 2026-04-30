@@ -1583,6 +1583,10 @@ fn multi_writer_overlapping_keys_conflict() {
             assert_eq!(table, "t");
             assert!(keys.contains(&1));
             assert!(wait_for.is_some(), "early-fail should carry a CommitWaiter");
+            // Exercise the CommitWaiter Debug impl — it must be opaque
+            // (not leak inner state) but still produce something.
+            let dbg = format!("{:?}", wait_for.unwrap());
+            assert_eq!(dbg, "CommitWaiter(..)");
         }
         other => panic!("expected WriteConflict, got {other:?}"),
     }
@@ -2464,4 +2468,149 @@ fn ssi_in_single_writer_mode_is_noop() {
         0,
         "SingleWriter+Serializable should never produce a serialization failure"
     );
+}
+
+// ---------------------------------------------------------------------------
+// TableReader (read-only) — index lookup methods
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+struct UserIdx {
+    email: String,
+    age: u32,
+    name: String,
+}
+
+fn seed_users_with_indexes(store: &Store) {
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut table = wtx.open_table::<UserIdx>("users").unwrap();
+    table
+        .define_index("by_email", IndexKind::Unique, |u: &UserIdx| u.email.clone())
+        .unwrap();
+    table
+        .define_index("by_age", IndexKind::NonUnique, |u: &UserIdx| u.age)
+        .unwrap();
+    for (email, age, name) in [
+        ("alice@x.com", 30, "Alice"),
+        ("bob@x.com", 25, "Bob"),
+        ("carol@x.com", 30, "Carol"),
+        ("dave@x.com", 40, "Dave"),
+    ] {
+        table
+            .insert(UserIdx {
+                email: email.into(),
+                age,
+                name: name.into(),
+            })
+            .unwrap();
+    }
+    wtx.commit().unwrap();
+}
+
+#[test]
+fn table_reader_get_unique_finds_record() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+    let hit = table
+        .get_unique::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap();
+    let (id, user) = hit.unwrap();
+    assert!(id >= 1);
+    assert_eq!(user.name, "Alice");
+}
+
+#[test]
+fn table_reader_get_unique_returns_none_for_missing_key() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+    let absent = table
+        .get_unique::<String>("by_email", &"nobody@x.com".to_string())
+        .unwrap();
+    assert!(absent.is_none());
+}
+
+#[test]
+fn table_reader_get_by_index_returns_all_matches() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+    let mut hits = table.get_by_index::<u32>("by_age", &30).unwrap();
+    hits.sort_by_key(|(id, _)| *id);
+    assert_eq!(hits.len(), 2);
+    let names: Vec<&str> = hits.iter().map(|(_, u)| u.name.as_str()).collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Carol"));
+}
+
+#[test]
+fn table_reader_get_by_key_works_for_unique_and_non_unique() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+
+    let unique = table
+        .get_by_key::<String>("by_email", &"alice@x.com".to_string())
+        .unwrap();
+    assert_eq!(unique.len(), 1);
+    assert_eq!(unique[0].1.name, "Alice");
+
+    let non_unique = table.get_by_key::<u32>("by_age", &30).unwrap();
+    assert_eq!(non_unique.len(), 2);
+}
+
+#[test]
+fn table_reader_index_range_returns_inclusive_range() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+    let in_range = table.index_range::<u32>("by_age", 25..=30).unwrap();
+    let mut ages: Vec<u32> = in_range.iter().map(|(_, u)| u.age).collect();
+    ages.sort_unstable();
+    assert_eq!(ages, vec![25, 30, 30]);
+}
+
+#[test]
+fn table_reader_resolve_returns_id_record_pairs() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+    // Resolve a subset of ids; nonexistent ids are silently skipped.
+    let mut all: Vec<u64> = table.iter().map(|(id, _)| id).collect();
+    all.sort_unstable();
+    let mut probe = all.clone();
+    probe.push(99_999); // missing id, must be skipped
+    let resolved = table.resolve(&probe);
+    assert_eq!(resolved.len(), all.len());
+}
+
+#[test]
+fn table_reader_first_last_get_many_iter() {
+    let store = Store::default();
+    seed_users_with_indexes(&store);
+    let rtx = store.begin_read(None).unwrap();
+    let table = rtx.open_table::<UserIdx>("users").unwrap();
+
+    let first = table.first().unwrap();
+    let last = table.last().unwrap();
+    assert!(first.0 < last.0);
+
+    let many = table.get_many(&[first.0, last.0, 99_999]);
+    assert_eq!(many.len(), 3);
+    assert!(many[0].is_some());
+    assert!(many[1].is_some());
+    assert!(many[2].is_none());
+
+    let scanned: Vec<_> = table.iter().collect();
+    assert_eq!(scanned.len(), table.len());
+    assert!(!table.is_empty());
+    assert!(table.contains(first.0));
 }

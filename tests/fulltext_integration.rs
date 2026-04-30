@@ -211,3 +211,28 @@ fn fulltext_ranking_across_transactions() {
     assert_eq!(results[0].id, 2);
     assert!(results[0].score > results[1].score);
 }
+
+#[test]
+fn fulltext_skips_records_with_no_indexable_tokens() {
+    // tokenize() filters punctuation and whitespace; an article whose
+    // text contains only such characters has zero tokens. add_doc and
+    // remove_doc must early-return without touching the postings/index
+    // state, leaving the index identical before and after the operation.
+    let mut table = Table::<Article>::new();
+    table.define_custom_index("search", make_index()).unwrap();
+
+    let id_real = table
+        .insert(article("Rust", "Systems language"))
+        .unwrap();
+    let id_empty = table.insert(article("   ", "...!?")).unwrap();
+
+    let idx = table.custom_index::<FullTextIndex<Article>>("search").unwrap();
+    assert_eq!(idx.search("rust").len(), 1);
+    assert_eq!(idx.search("rust")[0].id, id_real);
+
+    // Deleting the all-punctuation row hits the empty-tokens early-return
+    // in remove_doc and must leave search results stable.
+    table.delete(id_empty).unwrap();
+    let idx = table.custom_index::<FullTextIndex<Article>>("search").unwrap();
+    assert_eq!(idx.search("rust").len(), 1);
+}

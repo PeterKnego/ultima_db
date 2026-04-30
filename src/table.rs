@@ -2052,4 +2052,37 @@ mod tests {
         let res = Table::<U>::from_bulk(rows, 3, vec![unique_idx]);
         assert!(matches!(res, Err(Error::DuplicateKey(_))));
     }
+
+    #[test]
+    fn custom_index_on_update_runs_when_record_changes() {
+        // Exercises CustomIndex::on_update — increments-then-decrements
+        // through the index whenever a record's age changes.
+        let mut table = Table::<User>::new();
+        table
+            .define_custom_index("capped", CappedSumIndex::new(100))
+            .unwrap();
+        let id = table
+            .insert(User { email: "a@x".into(), age: 30, name: "A".into() })
+            .unwrap();
+        assert_eq!(table.custom_index::<CappedSumIndex>("capped").unwrap().total, 30);
+        table
+            .update(id, User { email: "a@x".into(), age: 50, name: "A".into() })
+            .unwrap();
+        assert_eq!(table.custom_index::<CappedSumIndex>("capped").unwrap().total, 50);
+    }
+
+    #[test]
+    fn custom_index_on_delete_decrements_total() {
+        // Exercises CustomIndex::on_delete — pulls the deleted record's
+        // contribution back out of the running total.
+        let mut table = Table::<User>::new();
+        table
+            .define_custom_index("capped", CappedSumIndex::new(100))
+            .unwrap();
+        let id = table
+            .insert(User { email: "a@x".into(), age: 30, name: "A".into() })
+            .unwrap();
+        table.delete(id).unwrap();
+        assert_eq!(table.custom_index::<CappedSumIndex>("capped").unwrap().total, 0);
+    }
 }

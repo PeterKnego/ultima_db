@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph
 
 build:
 	cargo build
@@ -17,6 +17,10 @@ lint:
 coverage:
 	cargo llvm-cov --features persistence,fulltext --html
 	@echo "Report: target/llvm-cov/html/index.html"
+
+coverage/vector:
+	cargo llvm-cov -p ultima-vector --features persistence --html --output-dir target/llvm-cov/vector
+	@echo "Report: target/llvm-cov/vector/html/index.html"
 
 clean:
 	cargo clean

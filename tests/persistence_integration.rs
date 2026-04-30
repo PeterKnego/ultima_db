@@ -510,3 +510,159 @@ fn bulk_load_skip_checkpoint_loses_data_on_crash() {
         "bulk_load with checkpoint_after=false should not survive a restart",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Persistence::None: checkpoint/recover/pending_wal_writes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checkpoint_on_persistence_none_errors() {
+    let store = Store::default();
+    let res = store.checkpoint();
+    assert!(res.is_err(), "checkpoint() must error in Persistence::None");
+}
+
+#[test]
+fn recover_on_persistence_none_is_noop() {
+    // Default Store has Persistence::None — recover must short-circuit Ok.
+    let store = Store::default();
+    store.recover().expect("recover is no-op for Persistence::None");
+}
+
+#[test]
+fn pending_wal_writes_zero_without_wal_handle() {
+    // Persistence::None has no WAL handle — pending_wal_writes must return 0.
+    let store = Store::default();
+    assert_eq!(store.pending_wal_writes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// update_batch + delete_batch through the WAL path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_batch_and_delete_batch_replay_through_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    // Seed three users.
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<User>("users").unwrap();
+        t.insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        t.insert(User { name: "Bob".into(), age: 25 }).unwrap();
+        t.insert(User { name: "Carol".into(), age: 40 }).unwrap();
+        drop(t);
+        wtx.commit().unwrap();
+    }
+
+    // Use update_batch and delete_batch — both must produce WAL ops.
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<User>("users").unwrap();
+        t.update_batch(vec![
+            (1, User { name: "Alice2".into(), age: 31 }),
+            (3, User { name: "Carol2".into(), age: 41 }),
+        ])
+        .unwrap();
+        t.delete_batch(&[2]).unwrap();
+        drop(t);
+        wtx.commit().unwrap();
+    }
+
+    // Reopen and confirm the batched edits replayed from the WAL.
+    let store = open_store(config);
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t.get(1).unwrap().age, 31);
+    assert_eq!(t.get(2), None);
+    assert_eq!(t.get(3).unwrap().name, "Carol2");
+}
+
+// ---------------------------------------------------------------------------
+// WriteTx::bulk_load via Delta + Replace — exercises in-tx upsert WAL branch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_tx_bulk_load_replays_through_wal() {
+    use ultima_db::{BulkDelta, BulkLoadInput, BulkSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<User>("users").unwrap();
+        t.bulk_load(BulkLoadInput::Replace(BulkSource::sorted_vec(vec![
+            (1, User { name: "Alice".into(), age: 30 }),
+            (2, User { name: "Bob".into(), age: 25 }),
+        ])))
+        .unwrap();
+        drop(t);
+        wtx.commit().unwrap();
+    }
+
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<User>("users").unwrap();
+        t.bulk_load(BulkLoadInput::Delta(BulkDelta {
+            inserts: vec![(10, User { name: "Eve".into(), age: 22 })],
+            updates: vec![(1, User { name: "Alice2".into(), age: 31 })],
+            deletes: vec![2],
+        }))
+        .unwrap();
+        drop(t);
+        wtx.commit().unwrap();
+    }
+
+    let store = open_store(config);
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.get(1).unwrap().name, "Alice2");
+    assert_eq!(t.get(2), None);
+    assert_eq!(t.get(10).unwrap().name, "Eve");
+}
+
+// ---------------------------------------------------------------------------
+// Read-only commit: ensures the empty-ops branch in commit-time WAL submit
+// is exercised when persistence is enabled.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_only_write_tx_commit_with_persistence_no_wal_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent);
+
+    // Seed.
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User { name: "Alice".into(), age: 30 })
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // Now open a WriteTx, only read, and commit. No WAL ops should be written.
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let t = wtx.open_table::<User>("users").unwrap();
+            assert_eq!(t.get(1).unwrap().name, "Alice");
+        }
+        wtx.commit().unwrap();
+    }
+
+    // Reopen — data must still be intact and recoverable.
+    let store = open_store(config);
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.get(1).unwrap().name, "Alice");
+}
