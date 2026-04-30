@@ -14,6 +14,16 @@ mod simd;
 /// the negated inner product so smaller-is-closer holds uniformly.
 pub trait Distance: Send + Sync + 'static {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32;
+
+    /// Compute `distance(query, targets[i])` for each `i`, writing into `out`.
+    /// Default impl loops `distance`; override on concrete impls when there is
+    /// per-query setup that can be amortized (e.g., `‖query‖²` for cosine).
+    fn distance_many(&self, query: &[f32], targets: &[&[f32]], out: &mut [f32]) {
+        debug_assert_eq!(targets.len(), out.len());
+        for (i, t) in targets.iter().enumerate() {
+            out[i] = self.distance(query, t);
+        }
+    }
 }
 
 /// `1 - cos_sim(a, b)`, in `[0, 2]`. Returns 1.0 if either operand is the zero vector.
@@ -31,6 +41,14 @@ pub struct DotProduct;
 impl Distance for Cosine {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         simd::cosine(a, b)
+    }
+
+    fn distance_many(&self, query: &[f32], targets: &[&[f32]], out: &mut [f32]) {
+        debug_assert_eq!(targets.len(), out.len());
+        let q_norm_sq = simd::norm_squared(query);
+        for (i, t) in targets.iter().enumerate() {
+            out[i] = simd::cosine_with_query_norm(query, t, q_norm_sq);
+        }
     }
 }
 
@@ -169,6 +187,38 @@ mod tests {
         let mut v = vec![0.0; 8];
         normalize_in_place(&mut v);
         assert!(v.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn distance_many_matches_loop_of_distance() {
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xBA7C);
+        let dim = 384;
+        let n = 50;
+        let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let targets: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
+            .collect();
+        let target_refs: Vec<&[f32]> = targets.iter().map(|v| v.as_slice()).collect();
+
+        for d in [
+            &Cosine as &dyn Distance,
+            &L2,
+            &DotProduct,
+            &CosineNormalized,
+        ] {
+            let mut out = vec![0.0; n];
+            d.distance_many(&query, &target_refs, &mut out);
+            for (i, t) in target_refs.iter().enumerate() {
+                let expected = d.distance(&query, t);
+                let tol = 1e-4 * expected.abs() + 1e-5;
+                assert!(
+                    (out[i] - expected).abs() < tol,
+                    "mismatch at {i}: {} vs {expected}",
+                    out[i]
+                );
+            }
+        }
     }
 
     #[test]

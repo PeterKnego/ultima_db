@@ -149,6 +149,40 @@ impl<'a> WithSimd for ScaleInPlaceKernel<'a> {
     }
 }
 
+/// Cosine distance when `‖query‖²` is known. Saves one FMA-chain per target
+/// in batched scans.
+pub(crate) struct CosineWithQNormKernel<'a> {
+    pub q: &'a [f32],
+    pub t: &'a [f32],
+    pub q_norm_sq: f32,
+}
+
+impl<'a> WithSimd for CosineWithQNormKernel<'a> {
+    type Output = f32;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let (q_head, q_tail) = S::as_simd_f32s(self.q);
+        let (t_head, t_tail) = S::as_simd_f32s(self.t);
+        let mut dot = simd.splat_f32s(0.0);
+        let mut nt = simd.splat_f32s(0.0);
+        for (qv, tv) in q_head.iter().zip(t_head.iter()) {
+            dot = simd.mul_add_f32s(*qv, *tv, dot);
+            nt = simd.mul_add_f32s(*tv, *tv, nt);
+        }
+        let mut dot_s = simd.reduce_sum_f32s(dot);
+        let mut nt_s = simd.reduce_sum_f32s(nt);
+        for (qv, tv) in q_tail.iter().zip(t_tail.iter()) {
+            dot_s += qv * tv;
+            nt_s += tv * tv;
+        }
+        if self.q_norm_sq == 0.0 || nt_s == 0.0 {
+            return 1.0;
+        }
+        1.0 - dot_s / (self.q_norm_sq * nt_s).sqrt()
+    }
+}
+
 // ---------------- Public dispatch wrappers ----------------
 
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -164,6 +198,11 @@ pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
     arch().dispatch(CosineKernel { a, b })
+}
+
+pub(crate) fn cosine_with_query_norm(q: &[f32], t: &[f32], q_norm_sq: f32) -> f32 {
+    debug_assert_eq!(q.len(), t.len(), "vector dim mismatch");
+    arch().dispatch(CosineWithQNormKernel { q, t, q_norm_sq })
 }
 
 pub(crate) fn norm_squared(v: &[f32]) -> f32 {

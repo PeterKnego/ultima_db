@@ -177,18 +177,25 @@ where
     Meta: Record,
     D: Distance,
 {
-    let mut scored: Vec<(u64, f32)> = Vec::with_capacity(filter.len() as usize);
+    // Gather live (id, embedding) pairs first; tombstoned rows are skipped
+    // *before* scoring to avoid paying the distance compute on them.
+    let cap = filter.len() as usize;
+    let mut ids: Vec<u64> = Vec::with_capacity(cap);
+    let mut targets: Vec<&[f32]> = Vec::with_capacity(cap);
     for id in filter.iter() {
         let Some(row) = table.get(id) else { continue };
         if row.hnsw.is_tombstoned() {
             continue;
         }
-        let d = distance.distance(query, &row.embedding);
-        scored.push((id, d));
+        ids.push(id);
+        targets.push(&row.embedding);
     }
-    scored.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+
+    let mut scores = vec![0.0f32; targets.len()];
+    distance.distance_many(query, &targets, &mut scores);
+
+    let mut scored: Vec<(u64, f32)> = ids.into_iter().zip(scores).collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
     Ok(scored)
 }
