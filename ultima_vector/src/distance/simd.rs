@@ -123,6 +123,57 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     arch().dispatch(CosineKernel { a, b })
 }
 
+pub(crate) struct NormSquaredKernel<'a> {
+    pub v: &'a [f32],
+}
+
+impl<'a> WithSimd for NormSquaredKernel<'a> {
+    type Output = f32;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let (head, tail) = S::as_simd_f32s(self.v);
+        let mut acc = simd.splat_f32s(0.0);
+        for x in head.iter() {
+            acc = simd.mul_add_f32s(*x, *x, acc);
+        }
+        let mut sum = simd.reduce_sum_f32s(acc);
+        for &x in tail.iter() {
+            sum += x * x;
+        }
+        sum
+    }
+}
+
+pub(crate) struct ScaleInPlaceKernel<'a> {
+    pub v: &'a mut [f32],
+    pub factor: f32,
+}
+
+impl<'a> WithSimd for ScaleInPlaceKernel<'a> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let factor_v = simd.splat_f32s(self.factor);
+        let (head, tail) = S::as_mut_simd_f32s(self.v);
+        for x in head.iter_mut() {
+            *x = simd.mul_f32s(*x, factor_v);
+        }
+        for x in tail.iter_mut() {
+            *x *= self.factor;
+        }
+    }
+}
+
+pub(crate) fn norm_squared(v: &[f32]) -> f32 {
+    arch().dispatch(NormSquaredKernel { v })
+}
+
+pub(crate) fn scale_in_place(v: &mut [f32], factor: f32) {
+    arch().dispatch(ScaleInPlaceKernel { v, factor });
+}
+
 // ---------------- Tests ----------------
 
 #[cfg(test)]
