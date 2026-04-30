@@ -3,11 +3,8 @@
 //! All metrics return values where **smaller = closer**, so a single comparator
 //! drives the HNSW heaps regardless of which metric is in use.
 
+#[cfg(test)]
 mod scalar;
-// `simd` is exercised by its own tests; public `Distance` impls will be
-// wired to it in a follow-up task (see plan task 5). Until then the items
-// look unused to dead-code analysis.
-#[allow(dead_code)]
 mod simd;
 
 /// Distance function applied between two equal-length vectors.
@@ -33,19 +30,19 @@ pub struct DotProduct;
 
 impl Distance for Cosine {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        scalar::cosine(a, b)
+        simd::cosine(a, b)
     }
 }
 
 impl Distance for L2 {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        scalar::l2_squared(a, b)
+        simd::l2_squared(a, b)
     }
 }
 
 impl Distance for DotProduct {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        -scalar::dot(a, b)
+        -simd::dot(a, b)
     }
 }
 
