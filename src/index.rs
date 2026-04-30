@@ -83,10 +83,9 @@ where
 
 }
 
-impl<R, K, S> IndexMaintainer<R> for ManagedIndex<R, K, S>
+impl<R, K> IndexMaintainer<R> for ManagedIndex<R, K, UniqueStorage<K>>
 where
     K: Ord + Clone + Send + Sync + 'static,
-    S: IndexStorage<K> + Clone + 'static,
     R: Record,
 {
     fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
@@ -126,6 +125,84 @@ where
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn rebuild_from_sorted_data(&mut self, data: &BTree<u64, R>) -> Result<()> {
+        // 1. Extract (key, id) pairs in data order.
+        let mut pairs: Vec<(K, u64)> = data
+            .range(..)
+            .map(|(&id, rec)| (self.extractor.extract(rec), id))
+            .collect();
+        // 2. Sort by key. Detect collisions for unique storage.
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for w in pairs.windows(2) {
+            if w[0].0 == w[1].0 {
+                return Err(Error::DuplicateKey(self.name.clone()));
+            }
+        }
+        // 3. Bulk-build the index B-tree.
+        let arc_pairs = pairs.into_iter().map(|(k, id)| (k, Arc::new(id)));
+        let new_tree: BTree<K, u64> = BTree::from_sorted(arc_pairs);
+        self.storage = UniqueStorage::from_btree(new_tree);
+        Ok(())
+    }
+}
+
+impl<R, K> IndexMaintainer<R> for ManagedIndex<R, K, NonUniqueStorage<K>>
+where
+    K: Ord + Clone + Send + Sync + 'static,
+    R: Record,
+{
+    fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
+        let key = self.extractor.extract(record);
+        self.storage.insert(key, id, &self.name)
+    }
+
+    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()> {
+        let old_key = self.extractor.extract(old);
+        let new_key = self.extractor.extract(new);
+        if old_key != new_key {
+            // Insert new key first — if it fails (e.g. unique constraint),
+            // old_key is still intact and no rollback is needed.
+            self.storage.insert(new_key, id, &self.name)?;
+            self.storage.delete(old_key, id);
+        }
+        Ok(())
+    }
+
+    fn on_delete(&mut self, id: u64, record: &R) {
+        let key = self.extractor.extract(record);
+        self.storage.delete(key, id);
+    }
+
+    fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
+        Box::new(Self {
+            extractor: Arc::clone(&self.extractor),
+            storage: self.storage.clone(),
+            name: self.name.clone(),
+            kind: self.kind,
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn rebuild_from_sorted_data(&mut self, data: &BTree<u64, R>) -> Result<()> {
+        // (key, id) is already strictly ordered when sorted because id is unique.
+        let mut pairs: Vec<((K, u64), ())> = data
+            .range(..)
+            .map(|(&id, rec)| ((self.extractor.extract(rec), id), ()))
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let arc_pairs = pairs.into_iter().map(|(k, _)| (k, Arc::new(())));
+        let new_tree: BTree<(K, u64), ()> = BTree::from_sorted(arc_pairs);
+        self.storage = NonUniqueStorage::from_btree(new_tree);
+        Ok(())
     }
 }
 
@@ -621,6 +698,75 @@ mod tests {
                 bulk.storage().get(&key.to_string())
             );
         }
+    }
+
+    #[test]
+    fn rebuild_from_sorted_data_non_unique_matches_incremental() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Row {
+            age: u32,
+        }
+
+        let data: BTree<u64, Row> = {
+            let mut t = BTree::new();
+            for (id, age) in [(1u64, 10u32), (2, 20), (3, 10), (4, 30), (5, 20)] {
+                t = t.insert(id, Row { age });
+            }
+            t
+        };
+
+        let extractor = Arc::new(|r: &Row| r.age);
+        let mut incr: ManagedIndex<Row, u32, NonUniqueStorage<u32>> = ManagedIndex::new(
+            "idx".into(),
+            IndexKind::NonUnique,
+            extractor.clone(),
+            NonUniqueStorage::new(),
+        );
+        for (id, row) in data.range(..) {
+            incr.on_insert(*id, row).unwrap();
+        }
+
+        let mut bulk: ManagedIndex<Row, u32, NonUniqueStorage<u32>> = ManagedIndex::new(
+            "idx".into(),
+            IndexKind::NonUnique,
+            extractor,
+            NonUniqueStorage::new(),
+        );
+        bulk.rebuild_from_sorted_data(&data).unwrap();
+
+        for key in [10u32, 20, 30] {
+            let mut a: Vec<u64> = incr.storage().get_ids(&key).collect();
+            a.sort();
+            let mut b: Vec<u64> = bulk.storage().get_ids(&key).collect();
+            b.sort();
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn rebuild_from_sorted_data_unique_collision_errors() {
+        use std::sync::Arc;
+        #[derive(Clone)]
+        struct Row {
+            name: String,
+        }
+
+        let data: BTree<u64, Row> = {
+            let mut t = BTree::new();
+            t = t.insert(1, Row { name: "dup".into() });
+            t = t.insert(2, Row { name: "dup".into() });
+            t
+        };
+        let mut idx: ManagedIndex<Row, String, UniqueStorage<String>> = ManagedIndex::new(
+            "idx".into(),
+            IndexKind::Unique,
+            Arc::new(|r: &Row| r.name.clone()),
+            UniqueStorage::new(),
+        );
+        let res = idx.rebuild_from_sorted_data(&data);
+        assert!(matches!(res, Err(Error::DuplicateKey(_))));
     }
 
     #[test]
