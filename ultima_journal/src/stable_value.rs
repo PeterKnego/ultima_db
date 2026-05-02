@@ -217,6 +217,27 @@ where
         Ok(Notifier::done())
     }
 
+    /// Durably clear the stored value (write a tombstone with state=0).
+    ///
+    /// Returns a `Notifier` that is already resolved (the fsync happens
+    /// synchronously inside `clear` when `Durability::Consistent`).
+    pub fn clear(&self) -> Result<Notifier, StableValueError> {
+        let mut inner = self.inner.lock().unwrap();
+        let slot = SvSlot { r#gen: inner.next_gen, state: 0, bytes: Vec::new() };
+        let buf = encode_slot(&slot, self.slot_size)?;
+        let offset =
+            SV_HEADER_SIZE as u64 + (inner.next_slot as u64) * (self.slot_size as u64);
+        inner.file.seek(SeekFrom::Start(offset))?;
+        inner.file.write_all(&buf)?;
+        if matches!(self.config.durability, Durability::Consistent) {
+            inner.file.sync_all()?;
+        }
+        inner.cached = None;
+        inner.next_gen += 1;
+        inner.next_slot ^= 1;
+        Ok(Notifier::done())
+    }
+
     /// Close the file handle. The `Drop` impl on `File` closes it anyway; this
     /// gives callers an explicit place to handle any errors.
     pub fn close(self) -> Result<(), StableValueError> {
@@ -350,5 +371,15 @@ mod sv_tests {
         sv.store(&Vote { term: 2, voted_for: 2 }).unwrap().wait().unwrap();
         sv.store(&Vote { term: 3, voted_for: 3 }).unwrap().wait().unwrap();
         assert_eq!(sv.load().unwrap().unwrap().term, 3);
+    }
+
+    #[test]
+    fn clear_makes_load_return_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sv");
+        let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+        sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();
+        sv.clear().unwrap().wait().unwrap();
+        assert_eq!(sv.load().unwrap(), None);
     }
 }
