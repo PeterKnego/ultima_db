@@ -114,6 +114,28 @@ impl Journal {
         inner.last_seq = Some(seq);
         Ok(Notifier::done())
     }
+
+    pub fn read(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
+        let inner = self.inner.lock().unwrap();
+        let Some(seg) = inner.segments.iter().rev()
+            .find(|s| s.base_seq() <= seq) else {
+                return Ok(None);
+            };
+        // NOTE: this initial impl scans the whole segment linearly — correctness-first.
+        // The sparse offset index built in Task 4 is unused here; the benchmark task will
+        // profile and add a binary_search over the index to seek near seq before the linear
+        // scan if read latency is too high.
+        let scan = seg.scan()?;
+        for r in &scan.records {
+            if r.seq == seq {
+                return Ok(Some((r.meta, r.payload.clone())));
+            }
+            if r.seq > seq {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -178,5 +200,26 @@ mod tests {
         let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
         assert_eq!(j2.first_seq(), Some(1));
         assert_eq!(j2.last_seq(), Some(2));
+    }
+
+    #[test]
+    fn read_returns_appended_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 100, b"alpha").unwrap().wait().unwrap();
+        j.append(2, 200, b"beta").unwrap().wait().unwrap();
+        j.append(3, 300, b"gamma").unwrap().wait().unwrap();
+
+        let (m, p) = j.read(2).unwrap().unwrap();
+        assert_eq!(m, 200);
+        assert_eq!(p, b"beta");
+    }
+
+    #[test]
+    fn read_missing_seq_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 0, b"x").unwrap().wait().unwrap();
+        assert!(j.read(99).unwrap().is_none());
     }
 }
