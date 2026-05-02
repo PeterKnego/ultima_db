@@ -20,6 +20,30 @@ pub enum JournalError {
     Closed,
 }
 
+impl Clone for JournalError {
+    fn clone(&self) -> Self {
+        use JournalError::*;
+        match self {
+            Io(e) => Io(std::io::Error::new(e.kind(), e.to_string())),
+            Corrupted { segment, offset, reason } => Corrupted {
+                segment: segment.clone(),
+                offset: *offset,
+                reason: reason.clone(),
+            },
+            NonMonotonicSeq { expected_gt, got } => NonMonotonicSeq {
+                expected_gt: *expected_gt,
+                got: *got,
+            },
+            SeqOutOfRange => SeqOutOfRange,
+            PayloadTooLargeForSegment { segment_size, record_size } => PayloadTooLargeForSegment {
+                segment_size: *segment_size,
+                record_size: *record_size,
+            },
+            Closed => Closed,
+        }
+    }
+}
+
 #[cfg(feature = "stable_value")]
 #[derive(Debug, Error)]
 pub enum StableValueError {
