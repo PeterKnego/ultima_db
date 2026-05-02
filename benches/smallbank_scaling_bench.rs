@@ -200,7 +200,8 @@ fn bench(c: &mut Criterion) {
                     pool[idx].clone()
                 },
                 |op_sets| {
-                    black_box(run_burst(&store, op_sets));
+                    run_burst(&store, op_sets);
+                    black_box(());
                 },
                 BatchSize::SmallInput,
             );

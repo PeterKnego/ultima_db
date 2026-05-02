@@ -142,8 +142,8 @@ fn run_burst(store: &Store, op_sets: &[Vec<Op>]) -> (u64, u64) {
     let barrier = Arc::new(Barrier::new(op_sets.len()));
     let handles: Vec<_> = op_sets
         .iter()
-        .cloned()
         .map(|ops| {
+            let ops = ops.clone();
             let store = store.clone();
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
@@ -223,8 +223,8 @@ fn main() {
         .collect();
 
     // Warmup.
-    for i in 0..20 {
-        let (_c, _r) = run_burst(&store, &bursts[i]);
+    for burst in bursts.iter().take(20) {
+        let (_c, _r) = run_burst(&store, burst);
     }
 
     // Baseline metrics *before* measurement window.
@@ -233,8 +233,8 @@ fn main() {
     let wall_start = Instant::now();
     let mut total_committed = 0u64;
     let mut total_retries = 0u64;
-    for i in 0..NUM_BURSTS {
-        let (c, r) = run_burst(&store, &bursts[i]);
+    for burst in bursts.iter().take(NUM_BURSTS) {
+        let (c, r) = run_burst(&store, burst);
         black_box(c);
         total_committed += c;
         total_retries += r;

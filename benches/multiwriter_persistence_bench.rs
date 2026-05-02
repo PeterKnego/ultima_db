@@ -123,7 +123,8 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
         let store = make_store(Persistence::None, None);
         group.bench_function("inmemory", |b| {
             b.iter(|| {
-                black_box(run_threaded_commits(&store));
+                run_threaded_commits(&store);
+                black_box(());
             });
         });
     }
@@ -140,7 +141,8 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
         );
         group.bench_function("standalone_consistent", |b| {
             b.iter(|| {
-                black_box(run_threaded_commits(&store));
+                run_threaded_commits(&store);
+                black_box(());
             });
         });
     }
@@ -157,7 +159,8 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
         );
         group.bench_function("standalone_eventual", |b| {
             b.iter(|| {
-                black_box(run_threaded_commits(&store));
+                run_threaded_commits(&store);
+                black_box(());
             });
         });
     }
