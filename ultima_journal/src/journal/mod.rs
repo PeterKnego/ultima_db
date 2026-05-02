@@ -523,7 +523,7 @@ mod tests {
         cfg.segment_size_bytes = 256;
         let j = Journal::open(cfg).unwrap();
         for i in 1..=12u64 {
-            j.append(i, 0, &vec![0u8; 100]).unwrap().wait().unwrap();
+            j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
         }
         j.truncate_after(4).unwrap().wait().unwrap();
         assert_eq!(j.last_seq(), Some(4));
