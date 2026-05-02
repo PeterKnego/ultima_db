@@ -153,9 +153,7 @@ impl SnapshotReader {
                         type_id: 0,
                     })?;
 
-                let serialized_rows = table_arc
-                    .collect_serialized_rows(serialize_fn)
-                    .map_err(|e| SnapshotStreamError::Bulk(e.to_string()))?;
+                let serialized_rows = table_arc.collect_serialized_rows(serialize_fn)?;
 
                 // Build index definitions for the table header.
                 let index_list = table_arc.index_list();

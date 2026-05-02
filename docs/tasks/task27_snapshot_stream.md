@@ -58,7 +58,7 @@ Self-describing, single-pass encode/decode. Every field is little-endian.
     bookend       8 bytes    b"ULTSNAP\0"
 ```
 
-**Indexes are not shipped as key bytes** — they are rebuilt on the receiver from the row data using the same `bulk_load`-side index rebuild primitive. Trades a little CPU on receive for a meaningfully smaller wire payload.
+**Indexes are not shipped as key bytes.** The wire format ships only index *names* and *kinds* (per-table-header `IndexDef`). The receiver's destination store must already have the matching `define_index` calls in place — the `KeyExtractor` closures live in the binary, not in the wire format. At install, the install path looks up the destination's existing table by name, clones its `empty_index_defs()`, and `Table::from_bulk` rebuilds them from the new rows via the existing `IndexMaintainer::rebuild_from_sorted_data` pass. Trades a little CPU on receive for a meaningfully smaller wire payload, with the constraint that index definitions must be code-resident on both sides.
 
 **Tables iterate in deterministic sorted-by-name order** so the build is reproducible across replicas.
 
@@ -125,7 +125,7 @@ impl Store {
     ) -> Result<u64>
     where
         R: Record,
-        I: IntoIterator<Item = Result<(u64, R), Error>>;
+        I: Iterator<Item = Result<(u64, R)>>;
 }
 ```
 
@@ -170,28 +170,32 @@ pub enum SnapshotStreamError {
     Truncated,
     BadCrc { table: Option<String> },
     UnknownTable { name: String, type_id: u64 },
-    BulkLoad(crate::Error),
+    RowCountMismatch { trailer: u64, actual: u64 },
+    BulkLoad(crate::Error),    // #[from] crate::Error — preserves WriteConflict etc.
 }
 ```
+
+`BulkLoad` carries the underlying `crate::Error` rather than a stringified version, so the future Raft adapter can pattern-match on `crate::Error::WriteConflict` to retry without parsing strings.
+
+`RowCountMismatch` catches a flipped-byte in the trailer's `total_rows` field. The trailer's `total_crc32` is finalized *before* `total_rows` is written (build-time ordering), so `total_rows` is cross-validated at install time against the sum of per-table `row_count`s in the headers (which *are* covered by `total_crc`).
 
 All install-path failures are atomic — destination Store is left untouched on any error.
 
 ## Tests
 
-14 integration tests in `tests/snapshot_stream.rs`:
+16 integration tests in `tests/snapshot_stream.rs`:
 
-- Magic-bytes header sanity
-- Build → install full roundtrip
-- Concurrent writes do not block build
-- Truncated wire bytes fail install without partial state
-- Corrupted bytes fail with `BadCrc`
-- Unknown-table policy variants (`Drop` / `Error`)
-- `list_checkpoints` returns versions
-- `open_checkpoint_reader` produces a wire-format stream
-- Empty store snapshot (zero tables)
-- Multi-table snapshots
-- Serialized row format roundtrip
-- Atomic-failure leaves destination unchanged
+- Magic-bytes header sanity.
+- Build → install full roundtrip (single-table).
+- Concurrent writes do not block build (frozen `Arc<Snapshot>` semantics).
+- Truncated wire bytes fail install without partial state.
+- Corrupted bytes fail with `BadCrc`.
+- Unknown-table policy variants (`Drop` / `Error`).
+- `list_checkpoints` returns versions.
+- `open_checkpoint_reader` produces a wire-format stream.
+- Secondary indexes survive a roundtrip (defines `by_email` on dst, installs, asserts `get_unique` works).
+- Multi-table roundtrip (two distinct record types — `accounts` + `txs`).
+- Plus several happy-path / format-validation cases.
 
 Plus 3 `bulk_load_stream` unit tests (build from iterator, iterator-error propagation, count-mismatch error).
 
@@ -199,12 +203,10 @@ Microbenchmarks at 1 K / 10 K / 100 K rows for both build and install paths in `
 
 ## Deferred work
 
-Tracked in design spec §12 (preserved at `docs/superpowers/specs/`).
-
 - **Streaming install consumer.** v1 drains the reader into memory before parsing. A streaming consumer that builds tables incrementally is the next optimization.
-- **`InstallOptions::commit_version`.** Wire-up to `BulkLoadBatch` once the latter exposes a version-override API.
-- **`OnUnknown::Keep`.** Currently treated as Drop with a doc comment; needs preservation logic from the current snapshot.
-- **Stable cross-build `record_type_id`.** Currently a `DefaultHasher::hash(&TypeId)` which is not stable across Rust builds. For cross-cluster safety the registry should adopt a user-supplied stable id at register time.
+- **`InstallOptions::commit_version`.** The field is kept on `InstallOptions` for forward compatibility but is **currently ignored** (the v1 `BulkLoadBatch` API has no version-override hook). Will be wired up once `BulkLoadBatch` exposes one. Documented as ignored in the field's doc comment.
+- **`OnUnknown::Keep`.** Currently treated identically to `Drop` (preserved-table logic out of scope for v1). Documented as such in the variant's doc comment.
+- **Stable cross-build `record_type_id`.** Currently `DefaultHasher::hash(&TypeId)` — stable within a process run, not across Rust builds. For cross-cluster safety the registry should adopt a user-supplied stable id at register time (e.g., a `&'static str` namespace). The install path tolerates a mismatched type_id when the table name is registered (it dispatches by name), so the field today is a best-effort hint, not a hard contract.
 
 ## Cross-references
 

@@ -28,6 +28,8 @@ pub enum SnapshotStreamError {
     BadCrc { table: Option<String> },
     #[error("unknown table {name} (type_id {type_id})")]
     UnknownTable { name: String, type_id: u64 },
+    #[error("row count mismatch: trailer claimed {trailer}, actual {actual}")]
+    RowCountMismatch { trailer: u64, actual: u64 },
     #[error("bulk load: {0}")]
-    Bulk(String),
+    BulkLoad(#[from] crate::Error),
 }

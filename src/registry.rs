@@ -35,8 +35,17 @@ type NewEmptyTableFn = Box<dyn Fn() -> Box<dyn MergeableTable> + Send + Sync>;
 /// it as `Box<dyn MergeableTable>`. Used by `install_snapshot_stream` to
 /// reconstruct a table from the wire format without a `R: 'static` bound at
 /// the call site.
-type BuildFromRawRowsFn =
-    Box<dyn Fn(Vec<(u64, Vec<u8>)>) -> Result<Box<dyn MergeableTable>> + Send + Sync>;
+///
+/// `existing` is the destination's current table by the same name, if any. The
+/// closure downcasts it to `&Table<R>` and clones its `empty_index_defs()` so
+/// secondary indexes survive the install (they're rebuilt from the new rows
+/// via `Table::from_bulk`'s `rebuild_from_sorted_data` pass). When `None`
+/// (fresh receiver with no prior table), the new table has no indexes.
+type BuildFromRawRowsFn = Box<
+    dyn Fn(Vec<(u64, Vec<u8>)>, Option<&dyn MergeableTable>) -> Result<Box<dyn MergeableTable>>
+        + Send
+        + Sync,
+>;
 
 /// Type-erased serialization functions for a single table type.
 pub(crate) struct TableTypeInfo {
@@ -59,9 +68,10 @@ pub(crate) struct TableTypeInfo {
     pub replay_update: ReplayUpdateFn,
     /// Delete a record from a `Table<R>` (as `&mut dyn Any`) by ID.
     pub replay_delete: ReplayDeleteFn,
-    /// Deserialize raw `(key, bytes)` pairs and build a fresh `Table<R>` as a
-    /// `Box<dyn MergeableTable>`. No index definitions are created — the caller
-    /// is responsible for defining indexes after install if needed.
+    /// Deserialize raw `(key, bytes)` pairs and build a fresh `Table<R>`.
+    /// If a destination table by the same name already exists, its index
+    /// definitions are cloned and rebuilt over the new rows so secondary
+    /// indexes survive the install.
     pub build_from_raw_rows: BuildFromRawRowsFn,
 }
 
@@ -137,7 +147,7 @@ impl TableRegistry {
                         table.delete(id)?;
                         Ok(())
                     }),
-                    build_from_raw_rows: Box::new(|raw_rows| {
+                    build_from_raw_rows: Box::new(|raw_rows, existing| {
                         let config = bincode::config::standard();
                         let mut sorted: Vec<(u64, std::sync::Arc<R>)> =
                             Vec::with_capacity(raw_rows.len());
@@ -148,7 +158,13 @@ impl TableRegistry {
                             sorted.push((key, std::sync::Arc::new(record)));
                         }
                         let next_id = sorted.last().map(|(id, _)| id + 1).unwrap_or(1);
-                        let table = Table::<R>::from_bulk(sorted, next_id, vec![])?;
+                        // Preserve secondary indexes by cloning the destination's
+                        // existing index definitions. Empty for a fresh receiver.
+                        let index_defs = existing
+                            .and_then(|t| t.as_any().downcast_ref::<Table<R>>())
+                            .map(|t| t.empty_index_defs())
+                            .unwrap_or_default();
+                        let table = Table::<R>::from_bulk(sorted, next_id, index_defs)?;
                         Ok(Box::new(table))
                     }),
                 });
@@ -215,9 +231,10 @@ impl TableRegistry {
         &self,
         name: &str,
         raw_rows: Vec<(u64, Vec<u8>)>,
+        existing: Option<&dyn MergeableTable>,
     ) -> Option<Result<Box<dyn MergeableTable>>> {
         let info = self.entries.get(name)?;
-        Some((info.build_from_raw_rows)(raw_rows))
+        Some((info.build_from_raw_rows)(raw_rows, existing))
     }
 }
 

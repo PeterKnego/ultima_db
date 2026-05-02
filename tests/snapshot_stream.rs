@@ -515,4 +515,120 @@ mod tests {
             buf.len()
         );
     }
+
+    /// Secondary indexes defined on the destination side must survive a
+    /// snapshot install. The wire format ships index names + kinds; the
+    /// install path clones the destination's existing index definitions
+    /// (KeyExtractors compiled into the dest binary) and rebuilds them
+    /// over the new rows.
+    #[test]
+    fn secondary_indexes_survive_install() {
+        use ultima_db::IndexKind;
+
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct User {
+            email: String,
+            age: u64,
+        }
+
+        // Source: populate with 10 users.
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<User>("users").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<User>("users").unwrap();
+            for i in 1..=10u64 {
+                t.insert(User {
+                    email: format!("u{i}@example.com"),
+                    age: 20 + i,
+                })
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination: register table + define the index in an empty
+        // table BEFORE install. install_snapshot_stream then clones the
+        // KeyExtractor and rebuilds the index over the installed rows.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<User>("users").unwrap();
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            let mut t = tx.open_table::<User>("users").unwrap();
+            t.define_index("by_email", IndexKind::Unique, |u: &User| u.email.clone())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+
+        // Read back via the secondary index — must work.
+        let read = dst.begin_read(None).unwrap();
+        let t = read.open_table::<User>("users").unwrap();
+        let by_email = t
+            .get_unique::<String>("by_email", &"u5@example.com".to_string())
+            .unwrap();
+        assert!(by_email.is_some(), "secondary index lookup failed");
+        assert_eq!(by_email.unwrap().1.age, 25);
+    }
+
+    /// Multi-table snapshots: a stream with two distinct record types must
+    /// roundtrip cleanly, with both tables installed atomically.
+    #[test]
+    fn multi_table_snapshot_roundtrips() {
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct Account {
+            balance: i64,
+        }
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct Tx {
+            note: String,
+        }
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Account>("accounts").unwrap();
+        src.register_table::<Tx>("txs").unwrap();
+        {
+            let mut wtx = src.begin_write(None).unwrap();
+            {
+                let mut a = wtx.open_table::<Account>("accounts").unwrap();
+                a.insert(Account { balance: 100 }).unwrap();
+                a.insert(Account { balance: 250 }).unwrap();
+            }
+            {
+                let mut t = wtx.open_table::<Tx>("txs").unwrap();
+                t.insert(Tx { note: "deposit".into() }).unwrap();
+                t.insert(Tx { note: "withdraw".into() }).unwrap();
+                t.insert(Tx { note: "transfer".into() }).unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Account>("accounts").unwrap();
+        dst.register_table::<Tx>("txs").unwrap();
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+
+        let read = dst.begin_read(None).unwrap();
+        let accounts = read.open_table::<Account>("accounts").unwrap();
+        assert_eq!(accounts.get(1).unwrap().balance, 100);
+        assert_eq!(accounts.get(2).unwrap().balance, 250);
+        let txs = read.open_table::<Tx>("txs").unwrap();
+        assert_eq!(txs.get(1).unwrap().note, "deposit");
+        assert_eq!(txs.get(3).unwrap().note, "transfer");
+    }
 }

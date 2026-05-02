@@ -605,8 +605,8 @@ impl Store {
             let snap = inner
                 .snapshots
                 .get(&v)
-                .ok_or_else(|| crate::snapshot_stream::SnapshotStreamError::Bulk(
-                    format!("version {v} not found")
+                .ok_or(crate::snapshot_stream::SnapshotStreamError::BulkLoad(
+                    crate::Error::VersionNotFound(v),
                 ))?
                 .clone();
             let registry = Arc::clone(&inner.registry);
@@ -682,9 +682,9 @@ impl Store {
             let dir = match &inner.config.persistence {
                 Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
                 Persistence::None => {
-                    return Err(SnapshotStreamError::Bulk(
+                    return Err(SnapshotStreamError::BulkLoad(crate::Error::Persistence(
                         "open_checkpoint_reader requires persistence to be configured".into(),
-                    ));
+                    )));
                 }
             };
             let registry = std::sync::Arc::clone(&inner.registry);
@@ -695,8 +695,7 @@ impl Store {
         let path = dir.join(format!("checkpoint_{version}.bin"));
 
         // Load without installing — reuse the existing checkpoint load path.
-        let snapshot = crate::checkpoint::load_checkpoint(&path, &registry)
-            .map_err(|e| SnapshotStreamError::Bulk(e.to_string()))?;
+        let snapshot = crate::checkpoint::load_checkpoint(&path, &registry)?;
 
         crate::snapshot_stream::build::SnapshotReader::new(std::sync::Arc::new(snapshot), registry)
     }

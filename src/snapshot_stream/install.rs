@@ -5,13 +5,19 @@
 //! stream, validates per-table and total CRCs, and atomically installs as the
 //! new latest snapshot via `install_batch`.
 
+#[cfg(feature = "persistence")]
 use std::io::Read;
+#[cfg(feature = "persistence")]
 use std::sync::Arc;
 
+#[cfg(feature = "persistence")]
 use crate::bulk_load::PendingTable;
+#[cfg(feature = "persistence")]
 use crate::table::MergeableTable;
 
+#[cfg(feature = "persistence")]
 use super::SnapshotStreamError;
+#[cfg(feature = "persistence")]
 use super::codec::{FILE_MAGIC, decode_file_header, decode_table_header};
 
 // ---------------------------------------------------------------------------
@@ -98,10 +104,16 @@ impl crate::store::Store {
         total_crc.update(&bytes[p..p + n]);
         p += n;
 
-        // Grab the registry once — we'll look up each table by name.
-        let registry = {
+        // Grab the registry + a snapshot of the destination's current state
+        // once. The current snapshot is consulted per-table to clone existing
+        // index definitions so secondary indexes survive the install.
+        let (registry, base_snapshot) = {
             let inner = self.inner.read().unwrap();
-            Arc::clone(&inner.registry)
+            let snap = inner
+                .snapshots
+                .get(&inner.latest_version)
+                .cloned();
+            (Arc::clone(&inner.registry), snap)
         };
 
         // Capture base_version before we start building tables.
@@ -109,12 +121,15 @@ impl crate::store::Store {
 
         // ── 3. Per-table parsing ──────────────────────────────────────────
         let mut pending: Vec<PendingTable> = Vec::new();
+        let mut declared_rows_total: u64 = 0;
 
         for _ in 0..file_header.table_count {
             // 3a. Table header.
             let (table_header, n) = decode_table_header(&bytes[p..])?;
             total_crc.update(&bytes[p..p + n]);
             p += n;
+            declared_rows_total =
+                declared_rows_total.saturating_add(table_header.row_count);
 
             // 3b. Rows: key(u64 LE) | val_len(u32 LE) | val(bytes).
             let mut table_crc = crc32fast::Hasher::new();
@@ -173,10 +188,15 @@ impl crate::store::Store {
             }
 
             // Deserialise raw bytes → Box<dyn MergeableTable> via the registry.
+            // Pass the destination's existing table (if any) so its secondary
+            // index definitions are cloned and rebuilt over the new rows.
+            let existing_table: Option<&dyn MergeableTable> = base_snapshot
+                .as_ref()
+                .and_then(|snap| snap.tables.get(&table_header.name))
+                .map(|t| t.as_ref() as &dyn MergeableTable);
             let table_box = registry
-                .build_table_from_raw(&table_header.name, rows)
-                .expect("contains() returned true, so entry must exist")
-                .map_err(|e| SnapshotStreamError::Bulk(e.to_string()))?;
+                .build_table_from_raw(&table_header.name, rows, existing_table)
+                .expect("contains() returned true, so entry must exist")?;
 
             let table_arc: Arc<dyn MergeableTable> = Arc::from(table_box);
             pending.push(PendingTable {
@@ -188,13 +208,21 @@ impl crate::store::Store {
         // ── 4. File trailer ───────────────────────────────────────────────
         // Layout: total_rows(u64 LE) + total_crc32(u32 LE) + bookend(8 bytes)
         //
-        // IMPORTANT: the build path finalises total_crc *before* writing
-        // total_rows (see build.rs State::BetweenTables).  So total_crc does
-        // NOT cover total_rows — we read it but do not feed it into the hasher.
+        // The build path finalises total_crc *before* writing total_rows, so
+        // total_crc does NOT cover the trailer's total_rows field. To still
+        // catch a flipped byte there, we cross-validate it against the sum of
+        // per-table row_counts (which ARE covered by total_crc through the
+        // table headers). Any mismatch → RowCountMismatch.
         if bytes.len() < p + 8 + 4 + 8 {
             return Err(SnapshotStreamError::Truncated);
         }
-        let _total_rows = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+        let trailer_total_rows = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+        if trailer_total_rows != declared_rows_total {
+            return Err(SnapshotStreamError::RowCountMismatch {
+                trailer: trailer_total_rows,
+                actual: declared_rows_total,
+            });
+        }
         let stored_total_crc = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap());
         let bookend = &bytes[p + 12..p + 20];
         if bookend != FILE_MAGIC {
@@ -215,9 +243,7 @@ impl crate::store::Store {
         // install_snapshot_stream.  The new snapshot always lands at
         // `latest_version + 1`.  The field is kept in `InstallOptions` for
         // future use but is ignored here.
-        let new_version = self
-            .install_batch(pending, base_version)
-            .map_err(|e| SnapshotStreamError::Bulk(e.to_string()))?;
+        let new_version = self.install_batch(pending, base_version)?;
 
         Ok(new_version)
     }
