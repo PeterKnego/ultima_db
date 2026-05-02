@@ -48,11 +48,9 @@ fn writer_loop(rx: Receiver<AppendRequest>, state: Arc<Mutex<WriterState>>) {
             batch.push(req);
         }
         let result = write_batch(&state, &batch);
-        let result_arc: Arc<Result<(), JournalError>> = Arc::new(
-            result.as_ref().map(|_| ()).map_err(clone_err),
-        );
+        let result: Result<(), JournalError> = result.as_ref().map(|_| ()).map_err(clone_err);
         for req in batch {
-            req.signal.complete_arc(Arc::clone(&result_arc));
+            req.signal.complete(result.clone());
         }
     }
 }
