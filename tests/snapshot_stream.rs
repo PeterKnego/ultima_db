@@ -442,4 +442,77 @@ mod tests {
         assert_eq!(&bytes[0..8], FILE_MAGIC, "must start with FILE_MAGIC");
         assert!(bytes.len() > 100, "stream too short: {} bytes", bytes.len());
     }
+
+    // ── Task 6 tests: concurrency test ─────────────────────────────────────
+
+    /// Snapshot build must not block concurrent writes. This test verifies
+    /// that writers can make progress while a snapshot stream is being read
+    /// from a frozen `Arc<Snapshot>`.
+    #[test]
+    fn snapshot_build_does_not_block_concurrent_writes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let store = Arc::new(Store::new(StoreConfig::default()).unwrap());
+        store.register_table::<Row>("rows").unwrap();
+
+        // Pre-populate with 10,000 rows to ensure the snapshot build takes
+        // non-trivial time.
+        {
+            let mut tx = store.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=10_000u64 {
+                t.insert(Row { value: i }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writes_done = Arc::new(AtomicU64::new(0));
+
+        // Spawn a writer thread that continuously inserts rows with value=u64::MAX
+        // until signaled to stop.
+        let store_w = Arc::clone(&store);
+        let stop_w = Arc::clone(&stop);
+        let writes_w = Arc::clone(&writes_done);
+        let writer = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::SeqCst) {
+                let mut tx = store_w.begin_write(None).unwrap();
+                let mut t = tx.open_table::<Row>("rows").unwrap();
+                t.insert(Row { value: u64::MAX }).unwrap();
+                tx.commit().unwrap();
+                writes_w.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Record the write count before snapshot build.
+        let pre_snapshot_writes = writes_done.load(Ordering::SeqCst);
+
+        // Build and drain the snapshot stream on the main thread.
+        let mut reader = store.snapshot_stream(None).unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+
+        // Record the write count after snapshot build completes.
+        let post_snapshot_writes = writes_done.load(Ordering::SeqCst);
+
+        // Signal the writer to stop and wait for it.
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+
+        // Verify that writes continued during the snapshot build.
+        assert!(
+            post_snapshot_writes > pre_snapshot_writes,
+            "writer did not progress during snapshot build (pre={}, post={})",
+            pre_snapshot_writes,
+            post_snapshot_writes
+        );
+
+        // Verify that the snapshot stream is non-trivially sized (contains data).
+        assert!(
+            buf.len() > 100_000,
+            "snapshot buffer too small: {} bytes",
+            buf.len()
+        );
+    }
 }
