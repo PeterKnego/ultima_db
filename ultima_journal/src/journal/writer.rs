@@ -42,11 +42,12 @@ impl Writer {
 }
 
 fn writer_loop(rx: Receiver<AppendRequest>, state: Arc<Mutex<WriterState>>) {
+    // Durability is fixed at Journal::open and never changes at runtime.
+    let durability = state.lock().unwrap().durability;
     let mut last_eventual_fsync = Instant::now();
     let eventual_interval = Duration::from_millis(50);
 
     loop {
-        let durability = state.lock().unwrap().durability;
         let timeout = match durability {
             Durability::Consistent => None,
             Durability::Eventual => {
