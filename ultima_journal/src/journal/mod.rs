@@ -6,7 +6,7 @@ pub mod segment;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::{Durability, JournalError};
+use crate::{Durability, JournalError, Notifier};
 use segment::SegmentFile;
 
 #[derive(Debug, Clone)]
@@ -31,9 +31,7 @@ pub struct Journal {
 }
 
 pub(crate) struct JournalInner {
-    #[allow(dead_code)]
     pub config: JournalConfig,
-    #[allow(dead_code)]
     pub segments: Vec<SegmentFile>,
     pub first_seq: Option<u64>,
     pub last_seq: Option<u64>,
@@ -84,6 +82,38 @@ impl Journal {
     pub fn last_seq(&self) -> Option<u64> {
         self.inner.lock().unwrap().last_seq
     }
+
+    pub fn append(&self, seq: u64, meta: u64, payload: &[u8]) -> Result<Notifier, JournalError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(last) = inner.last_seq
+            && seq <= last
+        {
+            return Err(JournalError::NonMonotonicSeq { expected_gt: last, got: seq });
+        }
+        // Size guard.
+        let body_len = 16 + payload.len();
+        let total = (4 + body_len + 4) as u64;
+        if total > inner.config.segment_size_bytes {
+            return Err(JournalError::PayloadTooLargeForSegment {
+                segment_size: inner.config.segment_size_bytes,
+                record_size: total,
+            });
+        }
+        // Open the active segment if no segments exist yet.
+        if inner.segments.is_empty() {
+            let path = inner.config.dir.join(format!("seg-{:020}.log", seq));
+            let seg = SegmentFile::create(&path, seq)?;
+            inner.segments.push(seg);
+        }
+        let seg = inner.segments.last_mut().unwrap();
+        seg.append_record(seq, meta, payload)?;
+        seg.fsync()?;
+        if inner.first_seq.is_none() {
+            inner.first_seq = Some(seq);
+        }
+        inner.last_seq = Some(seq);
+        Ok(Notifier::done())
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +135,48 @@ mod tests {
         let j = Journal::open(JournalConfig::new(&sub)).unwrap();
         assert!(sub.exists());
         assert_eq!(j.last_seq(), None);
+    }
+
+    #[test]
+    fn append_one_record_then_read_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        let n = j.append(1, 0, b"first").unwrap();
+        n.wait().unwrap();
+        assert_eq!(j.first_seq(), Some(1));
+        assert_eq!(j.last_seq(), Some(1));
+    }
+
+    #[test]
+    fn append_rejects_non_monotonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(5, 0, b"x").unwrap().wait().unwrap();
+        let err = j.append(3, 0, b"y").unwrap_err();
+        assert!(matches!(err, JournalError::NonMonotonicSeq { expected_gt: 5, got: 3 }));
+    }
+
+    #[test]
+    fn append_rejects_record_larger_than_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 256;
+        let j = Journal::open(cfg).unwrap();
+        let big = vec![0u8; 1024];
+        let err = j.append(1, 0, &big).unwrap_err();
+        assert!(matches!(err, JournalError::PayloadTooLargeForSegment { .. }));
+    }
+
+    #[test]
+    fn reopen_sees_appended_records() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+            j.append(1, 11, b"a").unwrap().wait().unwrap();
+            j.append(2, 22, b"bb").unwrap().wait().unwrap();
+        }
+        let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        assert_eq!(j2.first_seq(), Some(1));
+        assert_eq!(j2.last_seq(), Some(2));
     }
 }

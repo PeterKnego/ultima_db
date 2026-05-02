@@ -17,11 +17,22 @@ enum State {
     Done(Result<(), JournalError>),
 }
 
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            State::Pending(_) => f.debug_tuple("Pending").field(&"<callbacks>").finish(),
+            State::Done(r) => f.debug_tuple("Done").field(r).finish(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Inner {
     state: Mutex<State>,
     cv: Condvar,
 }
 
+#[derive(Debug)]
 pub struct Notifier {
     inner: Arc<Inner>,
 }
