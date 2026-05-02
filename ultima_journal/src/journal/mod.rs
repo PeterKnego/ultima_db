@@ -169,6 +169,15 @@ impl Journal {
         Ok(notifier)
     }
 
+    // NOTE: `read`, `read_range`, and `iter_range` all acquire `WriterState`'s mutex,
+    // which means reads are serialized with appends (and with each other).  This is
+    // correct and free of deadlocks — no caller holds the lock when calling these
+    // methods — but it does mean a slow read can block a concurrent append.
+    //
+    // A profile-driven optimization (lock-free reads via `Arc<RwLock<Vec<Arc<SegmentRef>>>>`)
+    // is deferred per the plan's open questions §12.  The refactor was scoped out of Task 15
+    // ("take option (a) — add the concurrency test, keep `Mutex<WriterState>`").
+
     pub fn read(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
         let st = self.state.lock().unwrap();
         let Some(seg) = st.segments.iter().rev().find(|s| s.base_seq() <= seq) else {
@@ -695,5 +704,39 @@ mod tests {
         assert_eq!(j2.last_seq(), Some(3));
         // The torn bytes should have been truncated; subsequent append must succeed.
         j2.append(4, 0, b"new").unwrap().wait().unwrap();
+    }
+
+    /// Validates that concurrent readers and a writer thread do not deadlock or
+    /// starve each other.  Reads and appends both acquire `WriterState`'s mutex,
+    /// so they serialise, but neither side holds the lock across I/O for long
+    /// enough to cause starvation in practice.
+    #[test]
+    fn concurrent_reads_during_appends() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let j = Arc::new(Journal::open(JournalConfig::new(dir.path())).unwrap());
+        for i in 1..=100u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let j2 = Arc::clone(&j);
+        let reader = std::thread::spawn(move || {
+            let mut count = 0u64;
+            while !stop2.load(Ordering::SeqCst) {
+                let v = j2.read_range(1..=50).unwrap();
+                assert_eq!(v.len(), 50);
+                count += 1;
+            }
+            count
+        });
+        for i in 101..=200u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let read_count = reader.join().unwrap();
+        assert!(read_count > 0);
+        assert_eq!(j.last_seq(), Some(200));
     }
 }
