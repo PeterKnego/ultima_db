@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::notifier::Signal;
 use crate::{Durability, JournalError};
@@ -41,7 +42,35 @@ impl Writer {
 }
 
 fn writer_loop(rx: Receiver<AppendRequest>, state: Arc<Mutex<WriterState>>) {
-    while let Ok(first) = rx.recv() {
+    let mut last_eventual_fsync = Instant::now();
+    let eventual_interval = Duration::from_millis(50);
+
+    loop {
+        let durability = state.lock().unwrap().durability;
+        let timeout = match durability {
+            Durability::Consistent => None,
+            Durability::Eventual => {
+                let elapsed = last_eventual_fsync.elapsed();
+                if elapsed >= eventual_interval {
+                    if fsync_active_segment(&state).is_err() {
+                        // Best-effort; ignore.
+                    }
+                    last_eventual_fsync = Instant::now();
+                }
+                Some(eventual_interval - last_eventual_fsync.elapsed())
+            }
+        };
+        let first = match timeout {
+            None => match rx.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            },
+            Some(t) => match rx.recv_timeout(t) {
+                Ok(r) => r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            },
+        };
         let mut batch = vec![first];
         // Drain anything already queued — this is the group-commit window.
         while let Ok(req) = rx.try_recv() {
@@ -95,6 +124,14 @@ fn write_batch(
     if matches!(st.durability, Durability::Consistent)
         && let Some(seg) = st.segments.last_mut()
     {
+        seg.fsync()?;
+    }
+    Ok(())
+}
+
+fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalError> {
+    let mut st = state.lock().unwrap();
+    if let Some(seg) = st.segments.last_mut() {
         seg.fsync()?;
     }
     Ok(())

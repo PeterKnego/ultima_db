@@ -413,4 +413,16 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
+
+    #[test]
+    fn eventual_mode_returns_already_done_notifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Eventual;
+        let j = Journal::open(cfg).unwrap();
+        let n = j.append(1, 0, b"x").unwrap();
+        // In Eventual mode, Notifier should resolve quickly without blocking
+        // on fsync; for the public contract we just check wait() succeeds.
+        n.wait().unwrap();
+    }
 }
