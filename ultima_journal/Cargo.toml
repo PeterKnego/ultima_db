@@ -1,0 +1,27 @@
+[package]
+name = "ultima-journal"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime-agnostic segmented append journal + durable atomic-value primitive"
+authors = ["Peter Knego"]
+license = "Apache-2.0"
+
+[dependencies]
+crc32fast = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
+
+[features]
+default = ["stable_value"]
+stable_value = ["dep:serde", "dep:bincode"]
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+criterion = { version = "0.8", features = ["html_reports"] }
+rand = "0.10"
+
+[[bench]]
+name = "append_throughput"
+harness = false

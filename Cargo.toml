@@ -1,5 +1,5 @@
 [workspace]
-members = ["ultima_vector"]
+members = ["ultima_vector", "ultima_journal"]
 
 [package]
 name = "ultima-db"
