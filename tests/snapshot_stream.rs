@@ -359,4 +359,87 @@ mod tests {
         let row_count = u64::from_le_bytes(buf[row_count_offset..row_count_offset + 8].try_into().unwrap());
         assert_eq!(row_count, 5, "streaming v1 should have 5 rows");
     }
+
+    // ── Task 5 tests: list_checkpoints + open_checkpoint_reader ─────────────
+
+    /// `list_checkpoints` returns the versions of all on-disk checkpoint files,
+    /// in ascending order.
+    #[test]
+    fn list_checkpoints_returns_versions() {
+        use ultima_db::Persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig {
+            persistence: Persistence::Smr { dir: dir.path().to_path_buf() },
+            ..StoreConfig::default()
+        };
+        let store = Store::new(cfg).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+
+        // First write + checkpoint.
+        {
+            let mut tx = store.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        store.checkpoint().unwrap();
+        let v1 = store.latest_version();
+
+        // Second write + checkpoint.
+        {
+            let mut tx = store.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 2 }).unwrap();
+            tx.commit().unwrap();
+        }
+        store.checkpoint().unwrap();
+        let v2 = store.latest_version();
+
+        // Note: checkpoint() prunes old checkpoints (keeps only the latest),
+        // so we only expect v2 to be present on disk.
+        let cps = store.list_checkpoints().unwrap();
+        assert!(cps.contains(&v2), "v2={v2} must be in checkpoint list: {cps:?}");
+        // v1 has been pruned by the second checkpoint().
+        // v1 < v2 always holds.
+        assert!(v1 < v2, "v1={v1} must be < v2={v2}");
+        assert!(cps.windows(2).all(|w| w[0] <= w[1]), "list must be sorted");
+    }
+
+    /// `open_checkpoint_reader` opens a specific on-disk checkpoint and returns
+    /// a valid `SnapshotReader` that emits the `ULTSNAP` wire format.
+    #[test]
+    fn open_checkpoint_reader_streams_disk_checkpoint() {
+        use ultima_db::Persistence;
+        use ultima_db::snapshot_stream::codec::FILE_MAGIC;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig {
+            persistence: Persistence::Smr { dir: dir.path().to_path_buf() },
+            ..StoreConfig::default()
+        };
+        let store = Store::new(cfg).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+
+        // Write 20 rows and checkpoint.
+        {
+            let mut tx = store.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=20u64 {
+                t.insert(Row { value: i }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        store.checkpoint().unwrap();
+        let v = store.latest_version();
+
+        // Open the checkpoint as a reader (without installing it).
+        let mut reader = store.open_checkpoint_reader(v).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+
+        // Verify wire format magic and minimum size.
+        assert_eq!(&bytes[0..8], FILE_MAGIC, "must start with FILE_MAGIC");
+        assert!(bytes.len() > 100, "stream too short: {} bytes", bytes.len());
+    }
 }
