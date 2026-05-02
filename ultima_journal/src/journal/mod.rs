@@ -99,8 +99,12 @@ impl Journal {
                 record_size: total,
             });
         }
-        // Open the active segment if no segments exist yet.
-        if inner.segments.is_empty() {
+        // Open new segment if none, or current segment exceeds size threshold.
+        let need_new = match inner.segments.last() {
+            None => true,
+            Some(seg) => seg.size()? >= inner.config.segment_size_bytes,
+        };
+        if need_new {
             let path = inner.config.dir.join(format!("seg-{:020}.log", seq));
             let seg = SegmentFile::create(&path, seq)?;
             inner.segments.push(seg);
@@ -221,5 +225,19 @@ mod tests {
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
         j.append(1, 0, b"x").unwrap().wait().unwrap();
         assert!(j.read(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn segment_rotates_when_size_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 512;
+        let j = Journal::open(cfg).unwrap();
+        let payload = vec![0xAB; 200];
+        for i in 1..=4u64 {
+            j.append(i, 0, &payload).unwrap().wait().unwrap();
+        }
+        let n = j.inner.lock().unwrap().segments.len();
+        assert!(n >= 2, "expected segment rotation, got {n} segments");
     }
 }
