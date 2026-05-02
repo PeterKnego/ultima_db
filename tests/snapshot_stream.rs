@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Integration tests for the snapshot_stream build path (Task 3).
+//! Integration tests for the snapshot_stream build and install paths
+//! (Tasks 3 and 4).
 //!
-//! These tests require the `persistence` feature because `Store::snapshot_stream`
-//! and `Store::register_table` are gated on it.
+//! These tests require the `persistence` feature because `Store::snapshot_stream`,
+//! `Store::install_snapshot_stream`, and `Store::register_table` are gated on it.
 
 #[cfg(feature = "persistence")]
 mod tests {
@@ -128,6 +129,196 @@ mod tests {
         let row_count_offset = p + 2 + name_len + 8; // skip name_len + name + type_id
         let row_count = u64::from_le_bytes(buf[row_count_offset..row_count_offset + 8].try_into().unwrap());
         assert_eq!(row_count, 42, "table header row_count mismatch");
+    }
+
+    // ── Task 4 tests: install_snapshot_stream ────────────────────────────────
+
+    /// Full roundtrip: build a snapshot stream from a source store, install
+    /// it into a fresh destination store, and verify all rows survive.
+    #[test]
+    fn build_then_install_roundtrips_full_state() {
+        // Source store: 100 rows.
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=100u64 {
+                t.insert(Row { value: i * 10 }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Drain snapshot to bytes.
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination store: install.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        let new_ver = dst
+            .install_snapshot_stream(
+                std::io::Cursor::new(&bytes),
+                Default::default(),
+            )
+            .unwrap();
+        assert!(new_ver > 0, "install must produce a positive version");
+
+        // Verify all 100 rows.
+        let read = dst.begin_read(None).unwrap();
+        let t = read.open_table::<Row>("rows").unwrap();
+        for i in 1..=100u64 {
+            let row = t.get(i).expect("key must exist");
+            assert_eq!(row.value, i * 10, "row value mismatch for id={i}");
+        }
+    }
+
+    /// Truncated wire bytes must fail cleanly without modifying the destination.
+    #[test]
+    fn truncated_wire_bytes_fail_install_cleanly() {
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=50u64 {
+                t.insert(Row { value: i }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+
+        // Truncate to half — must error.
+        let half = bytes.len() / 2;
+        let res = dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes[..half]),
+            Default::default(),
+        );
+        assert!(res.is_err(), "truncated stream must fail");
+
+        // Destination must remain empty — the table should not exist in the
+        // snapshot (open_table returns KeyNotFound for an unwritten table).
+        let read = dst.begin_read(None).unwrap();
+        let res = read.open_table::<Row>("rows");
+        assert!(
+            res.is_err(),
+            "destination must have no 'rows' table after failed install"
+        );
+    }
+
+    /// Corrupt a byte in the row data — the table CRC check must catch it.
+    #[test]
+    fn corrupted_byte_fails_crc_check() {
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=10u64 {
+                t.insert(Row { value: i }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Flip a byte roughly in the middle of the row data.
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        let res = dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            Default::default(),
+        );
+        assert!(
+            matches!(res, Err(ultima_db::SnapshotStreamError::BadCrc { .. })),
+            "corrupted bytes must produce BadCrc error, got: {res:?}"
+        );
+    }
+
+    /// Unknown table with OnUnknown::Drop should succeed (table is skipped).
+    #[test]
+    fn unknown_table_drop_succeeds() {
+        use ultima_db::snapshot_stream::install::{InstallOptions, OnUnknown};
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 42 }).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination does NOT register "rows" — it's unknown.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        let res = dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            InstallOptions {
+                on_unknown_tables: OnUnknown::Drop,
+                ..Default::default()
+            },
+        );
+        assert!(res.is_ok(), "Drop policy must succeed even with unknown table");
+    }
+
+    /// Unknown table with OnUnknown::Error must fail.
+    #[test]
+    fn unknown_table_error_fails() {
+        use ultima_db::snapshot_stream::install::{InstallOptions, OnUnknown};
+        use ultima_db::SnapshotStreamError;
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 7 }).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination does NOT register "rows".
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        let res = dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            InstallOptions {
+                on_unknown_tables: OnUnknown::Error,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(res, Err(SnapshotStreamError::UnknownTable { .. })),
+            "Error policy must produce UnknownTable, got: {res:?}"
+        );
     }
 
     /// Snapshot at a specific version streams from that frozen version, not latest.
