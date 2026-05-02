@@ -399,4 +399,60 @@ mod tests {
         assert_eq!(scan.records.len(), 1);
         assert!(scan.had_torn_tail);
     }
+
+    #[test]
+    fn header_too_short_errors() {
+        let bytes = vec![0u8; 10];
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(JournalError::Corrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn header_crc_mismatch_errors() {
+        let mut bytes = encode_header(&SegmentHeader {
+            format_ver: 1,
+            base_seq: 7,
+            created_at: 100,
+        });
+        // Flip a byte in the body so CRC over 0..26 no longer matches.
+        bytes[10] ^= 0xFF;
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(JournalError::Corrupted { reason, .. }) if reason.contains("crc")
+        ));
+    }
+
+    #[test]
+    fn record_body_len_too_small_errors() {
+        // Length prefix says 5 bytes (< minimum 16). Pad with garbage so the
+        // record looks "complete" — body_len < 16 must hit Err, not Ok(None).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5u32.to_le_bytes());     // body_len = 5
+        bytes.extend_from_slice(&[0u8; 5]);                // body
+        bytes.extend_from_slice(&[0u8; 4]);                // crc placeholder
+        assert!(matches!(
+            decode_record(&bytes, "seg", 0),
+            Err(JournalError::Corrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn open_for_read_corrupt_header_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        std::fs::write(&path, b"GARBAGE!").unwrap();
+        assert!(SegmentFile::open_for_read(&path).is_err());
+    }
+
+    #[test]
+    fn segment_index_snapshot_returns_built_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        seg.append_record(1, 0, b"a").unwrap();
+        // First record always indexed.
+        assert!(!seg.index_snapshot().is_empty());
+    }
 }

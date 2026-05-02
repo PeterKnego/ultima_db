@@ -177,4 +177,14 @@ mod tests {
         signal.complete(Err(crate::JournalError::Closed));
         assert!(matches!(n.wait(), Err(crate::JournalError::Closed)));
     }
+
+    #[test]
+    fn debug_prints_state_variants() {
+        let n = Notifier::done();
+        let s = format!("{:?}", n);
+        assert!(s.contains("Notifier"));
+        let (_signal, n2) = Notifier::pending();
+        let s = format!("{:?}", n2);
+        assert!(s.contains("Notifier"));
+    }
 }

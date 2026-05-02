@@ -44,6 +44,35 @@ impl Clone for JournalError {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_covers_every_variant() {
+        let cases = vec![
+            JournalError::Io(io::Error::other("boom")),
+            JournalError::Corrupted {
+                segment: "s".into(),
+                offset: 7,
+                reason: "r".into(),
+            },
+            JournalError::NonMonotonicSeq { expected_gt: 3, got: 1 },
+            JournalError::SeqOutOfRange,
+            JournalError::PayloadTooLargeForSegment {
+                segment_size: 64,
+                record_size: 128,
+            },
+            JournalError::Closed,
+        ];
+        for e in &cases {
+            // Ensure clone() doesn't panic and produces a value with the same Display.
+            let c = e.clone();
+            assert_eq!(format!("{e}"), format!("{c}"));
+        }
+    }
+}
+
 #[cfg(feature = "stable_value")]
 #[derive(Debug, Error)]
 pub enum StableValueError {

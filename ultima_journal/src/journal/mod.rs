@@ -711,6 +711,121 @@ mod tests {
     /// so they serialise, but neither side holds the lock across I/O for long
     /// enough to cause starvation in practice.
     #[test]
+    fn eventual_periodic_fsync_runs_on_idle() {
+        // Append once, then sit idle for > the bg writer's 50 ms periodic
+        // fsync interval. The timer path (RecvTimeoutError::Timeout +
+        // fsync_active_segment) must execute. We don't observe its effect
+        // directly — the test passes if the journal still works after.
+        use crate::Durability;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = Durability::Eventual;
+        let j = Journal::open(cfg).unwrap();
+        j.append(1, 0, b"x").unwrap().wait().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Append again to confirm the writer thread is still healthy.
+        j.append(2, 0, b"y").unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), Some(2));
+    }
+
+    #[test]
+    fn close_releases_writer_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 0, b"x").unwrap().wait().unwrap();
+        j.close().unwrap();
+    }
+
+    #[test]
+    fn truncate_after_below_first_seq_drops_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 5..=8u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        // keep_seq is below all base_seqs — drops every segment.
+        j.truncate_after(2).unwrap().wait().unwrap();
+        assert_eq!(j.first_seq(), None);
+        assert_eq!(j.last_seq(), None);
+        // Re-append from scratch must work.
+        j.append(10, 0, b"new").unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), Some(10));
+    }
+
+    #[test]
+    fn purge_below_threshold_protects_active_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=3u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        // Threshold above all records — would drop everything; the active segment
+        // must be retained so future appends still work.
+        j.purge_before(100).unwrap();
+        j.append(4, 0, b"y").unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), Some(4));
+    }
+
+    #[test]
+    fn bounds_to_inclusive_handles_excluded_variants() {
+        // Excluded lo: 2..hi → starts at 3.
+        let v: (u64, u64) = bounds_to_inclusive(
+            (Bound::Excluded(2u64), Bound::Excluded(8u64)),
+            Some(0),
+            Some(20),
+        );
+        assert_eq!(v, (3, 7));
+    }
+
+    #[test]
+    fn read_range_with_excluded_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=10u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        let v = j
+            .read_range((Bound::Excluded(2u64), Bound::Excluded(6u64)))
+            .unwrap();
+        let seqs: Vec<u64> = v.into_iter().map(|(s, _, _)| s).collect();
+        assert_eq!(seqs, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn read_below_first_seq_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(10, 0, b"x").unwrap().wait().unwrap();
+        // No segment has base_seq <= 5 — short-circuits.
+        assert!(j.read(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_seq_in_gap_returns_none() {
+        // Strictly-monotonic seqs allow gaps. Reading a seq between two records
+        // hits the early-termination branch in `read` (`r.seq > seq`).
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 0, b"a").unwrap().wait().unwrap();
+        j.append(5, 0, b"b").unwrap().wait().unwrap();
+        j.append(10, 0, b"c").unwrap().wait().unwrap();
+        assert!(j.read(3).unwrap().is_none());   // between 1 and 5
+        assert!(j.read(7).unwrap().is_none());   // between 5 and 10
+    }
+
+    #[test]
+    fn read_above_last_seq_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=3u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        // Linear scan walks past all records; r.seq > seq never triggers because
+        // the target is beyond the tail. Falls through to Ok(None).
+        assert!(j.read(99).unwrap().is_none());
+    }
+
+    #[test]
     fn concurrent_reads_during_appends() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;

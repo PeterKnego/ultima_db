@@ -318,6 +318,56 @@ mod tests {
         bytes[last] ^= 0xFF;
         assert!(decode_slot(&bytes).unwrap().is_none());
     }
+
+    #[test]
+    fn decode_header_too_short() {
+        let bytes = vec![0u8; 10];
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(StableValueError::Corrupted { reason }) if reason.contains("too short"),
+        ));
+    }
+
+    #[test]
+    fn decode_header_bad_magic() {
+        let mut bytes = encode_header(&SvHeader { format_ver: 1, slot_size: 1024 });
+        bytes[0] = b'X';
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(StableValueError::Corrupted { reason }) if reason.contains("magic"),
+        ));
+    }
+
+    #[test]
+    fn decode_header_crc_mismatch() {
+        let mut bytes = encode_header(&SvHeader { format_ver: 1, slot_size: 1024 });
+        bytes[10] ^= 0xFF;
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(StableValueError::Corrupted { reason }) if reason.contains("crc"),
+        ));
+    }
+
+    #[test]
+    fn encode_slot_rejects_oversized_payload() {
+        let s = SvSlot {
+            r#gen: 0,
+            state: 1,
+            bytes: vec![0u8; 1024],
+        };
+        // slot_size of 64 can hold at most 47 bytes of payload (64 - 17).
+        assert!(matches!(
+            encode_slot(&s, 64),
+            Err(StableValueError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_slot_too_short_returns_none() {
+        // Less than 17-byte minimum slot frame.
+        let bytes = vec![0u8; 10];
+        assert!(decode_slot(&bytes).unwrap().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -381,5 +431,80 @@ mod sv_tests {
         sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();
         sv.clear().unwrap().wait().unwrap();
         assert_eq!(sv.load().unwrap(), None);
+    }
+
+    #[test]
+    fn store_rejects_oversized_payload() {
+        // Tiny slot — payload bigger than max.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sv");
+        let mut cfg = StableValueConfig::new(&path);
+        cfg.max_payload_bytes = 16;  // very small
+        let sv = StableValue::<Vec<u8>>::open(cfg).unwrap();
+        let big = vec![0xABu8; 1024];
+        assert!(matches!(
+            sv.store(&big),
+            Err(StableValueError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn close_consumes_stable_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sv");
+        let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+        sv.close().unwrap();
+    }
+
+    #[test]
+    fn open_rejects_bad_format_version() {
+        // Hand-write a file with a mismatched format version in the header.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sv");
+        // Build a valid-CRC header but with format_ver = 99.
+        let bad_header = encode_header(&SvHeader { format_ver: 99, slot_size: 1024 });
+        // Two empty-ish slots so file size matches what `open` expects to read.
+        let empty = SvSlot { r#gen: 0, state: 0, bytes: Vec::new() };
+        let slot_bytes = encode_slot(&empty, 1024).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&bad_header);
+        buf.extend_from_slice(&slot_bytes);
+        buf.extend_from_slice(&slot_bytes);
+        std::fs::write(&path, &buf).unwrap();
+        assert!(matches!(
+            StableValue::<Vote>::open(StableValueConfig::new(&path)),
+            Err(StableValueError::Corrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn open_picks_only_valid_slot_when_other_corrupt() {
+        // Slot 0 corrupt, slot 1 valid → covers the (None, Some(b)) branch in pick_slot.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sv");
+        {
+            let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+            sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();  // slot 0
+            sv.store(&Vote { term: 2, voted_for: 2 }).unwrap().wait().unwrap();  // slot 1
+        }
+        // Reopen and corrupt slot 0 by zeroing its CRC area.
+        let header_size = SV_HEADER_SIZE as u64;
+        let slot_size = std::fs::metadata(&path).unwrap().len() / 2 - header_size / 2;
+        // Easier: read file, flip slot-0 CRC bytes, write back.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let crc_off = (header_size + slot_size - 4) as usize;
+        for i in 0..4 {
+            bytes[crc_off + i] ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+        // After the corruption the only valid slot is the *other* one. Which
+        // physical slot that is depends on the rotation order, but the
+        // surviving value must be one of the two we stored.
+        let v = sv.load().unwrap().unwrap();
+        assert!(
+            v == Vote { term: 1, voted_for: 1 } || v == Vote { term: 2, voted_for: 2 },
+            "unexpected surviving value: {v:?}",
+        );
     }
 }
