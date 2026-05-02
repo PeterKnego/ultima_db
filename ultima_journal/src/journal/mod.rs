@@ -2,40 +2,34 @@
 // Copyright 2026 Peter Knego
 
 pub mod segment;
+mod writer;
 
 use std::ops::{Bound, RangeBounds};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::{Durability, JournalError, Notifier};
-use segment::SegmentFile;
+use crate::{JournalError, Notifier};
+use writer::{AppendRequest, Writer, WriterState};
 
 #[derive(Debug, Clone)]
 pub struct JournalConfig {
-    pub dir: PathBuf,
+    pub dir: std::path::PathBuf,
     pub segment_size_bytes: u64,
-    pub durability: Durability,
+    pub durability: crate::Durability,
 }
 
 impl JournalConfig {
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             dir: dir.into(),
             segment_size_bytes: 64 * 1024 * 1024,
-            durability: Durability::Consistent,
+            durability: crate::Durability::Consistent,
         }
     }
 }
 
 pub struct Journal {
-    inner: Mutex<JournalInner>,
-}
-
-pub(crate) struct JournalInner {
-    pub config: JournalConfig,
-    pub segments: Vec<SegmentFile>,
-    pub first_seq: Option<u64>,
-    pub last_seq: Option<u64>,
+    pub(crate) state: Arc<Mutex<WriterState>>,
+    writer: Mutex<Option<Writer>>,
 }
 
 impl Journal {
@@ -55,7 +49,7 @@ impl Journal {
         let mut first_seq: Option<u64> = None;
         let mut last_seq: Option<u64> = None;
         for ent in entries {
-            let seg = SegmentFile::open_for_read(&ent.path())?;
+            let seg = segment::SegmentFile::open_for_read(&ent.path())?;
             let scan = seg.scan()?;
             if let Some(first) = scan.records.first()
                 && first_seq.is_none()
@@ -67,69 +61,75 @@ impl Journal {
             }
             segments.push(seg);
         }
+
+        let state = Arc::new(Mutex::new(WriterState {
+            dir: config.dir.clone(),
+            segment_size: config.segment_size_bytes,
+            durability: config.durability,
+            segments,
+            last_seq,
+            first_seq,
+        }));
+        let writer = Writer::spawn(Arc::clone(&state));
         Ok(Self {
-            inner: Mutex::new(JournalInner {
-                config,
-                segments,
-                first_seq,
-                last_seq,
-            }),
+            state,
+            writer: Mutex::new(Some(writer)),
         })
     }
 
     pub fn first_seq(&self) -> Option<u64> {
-        self.inner.lock().unwrap().first_seq
-    }
-    pub fn last_seq(&self) -> Option<u64> {
-        self.inner.lock().unwrap().last_seq
+        self.state.lock().unwrap().first_seq
     }
 
+    pub fn last_seq(&self) -> Option<u64> {
+        self.state.lock().unwrap().last_seq
+    }
+
+    /// Append a record.  Monotonicity is validated here under the state lock so
+    /// that concurrent callers claim seqs in a total order that matches the
+    /// channel submission order.  The bg writer fsyncs and signals the Notifier.
     pub fn append(&self, seq: u64, meta: u64, payload: &[u8]) -> Result<Notifier, JournalError> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(last) = inner.last_seq
-            && seq <= last
-        {
-            return Err(JournalError::NonMonotonicSeq { expected_gt: last, got: seq });
-        }
-        // Size guard.
+        // Size guard (cheap, no I/O needed).
         let body_len = 16 + payload.len();
         let total = (4 + body_len + 4) as u64;
-        if total > inner.config.segment_size_bytes {
-            return Err(JournalError::PayloadTooLargeForSegment {
-                segment_size: inner.config.segment_size_bytes,
-                record_size: total,
-            });
+
+        let (signal, notifier) = Notifier::pending();
+
+        {
+            let st = self.state.lock().unwrap();
+            if total > st.segment_size {
+                return Err(JournalError::PayloadTooLargeForSegment {
+                    segment_size: st.segment_size,
+                    record_size: total,
+                });
+            }
+            if let Some(last) = st.last_seq
+                && seq <= last
+            {
+                return Err(JournalError::NonMonotonicSeq { expected_gt: last, got: seq });
+            }
+            // Claim the seq under the lock: send to channel while still holding it,
+            // so the channel ordering matches the monotonic seq order.
+            let req = AppendRequest {
+                seq,
+                meta,
+                payload: payload.to_vec(),
+                signal,
+            };
+            let writer_guard = self.writer.lock().unwrap();
+            let w = writer_guard.as_ref().ok_or(JournalError::Closed)?;
+            w.tx.send(req).map_err(|_| JournalError::Closed)?;
         }
-        // Open new segment if none, or current segment exceeds size threshold.
-        let need_new = match inner.segments.last() {
-            None => true,
-            Some(seg) => seg.size()? >= inner.config.segment_size_bytes,
-        };
-        if need_new {
-            let path = inner.config.dir.join(format!("seg-{:020}.log", seq));
-            let seg = SegmentFile::create(&path, seq)?;
-            inner.segments.push(seg);
-        }
-        let seg = inner.segments.last_mut().unwrap();
-        seg.append_record(seq, meta, payload)?;
-        seg.fsync()?;
-        if inner.first_seq.is_none() {
-            inner.first_seq = Some(seq);
-        }
-        inner.last_seq = Some(seq);
-        Ok(Notifier::done())
+
+        Ok(notifier)
     }
 
     pub fn read(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
-        let inner = self.inner.lock().unwrap();
-        let Some(seg) = inner.segments.iter().rev()
-            .find(|s| s.base_seq() <= seq) else {
-                return Ok(None);
-            };
+        let st = self.state.lock().unwrap();
+        let Some(seg) = st.segments.iter().rev().find(|s| s.base_seq() <= seq) else {
+            return Ok(None);
+        };
         // NOTE: this initial impl scans the whole segment linearly — correctness-first.
-        // The sparse offset index built in Task 4 is unused here; the benchmark task will
-        // profile and add a binary_search over the index to seek near seq before the linear
-        // scan if read latency is too high.
         let scan = seg.scan()?;
         for r in &scan.records {
             if r.seq == seq {
@@ -147,9 +147,9 @@ impl Journal {
         range: impl RangeBounds<u64>,
     ) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
         let (lo, hi) = bounds_to_inclusive(range, self.first_seq(), self.last_seq());
-        let inner = self.inner.lock().unwrap();
+        let st = self.state.lock().unwrap();
         let mut out = Vec::new();
-        for seg in &inner.segments {
+        for seg in &st.segments {
             let scan = seg.scan()?;
             for r in scan.records {
                 if r.seq < lo {
@@ -164,15 +164,38 @@ impl Journal {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn iter_range(
         &self,
         range: impl RangeBounds<u64>,
-    ) -> Result<impl Iterator<Item = Result<(u64, u64, Vec<u8>), JournalError>> + '_, JournalError> {
-        // For simplicity this Vec-collects internally and returns its iterator.
-        // Performance-tuned streaming iterator is a future optimization (open
-        // questions §12 of design spec).
+    ) -> Result<impl Iterator<Item = Result<(u64, u64, Vec<u8>), JournalError>> + '_, JournalError>
+    {
+        // Vec-collects internally and returns its iterator.
         let v = self.read_range(range)?;
         Ok(v.into_iter().map(Ok))
+    }
+
+    pub fn close(self) -> Result<(), JournalError> {
+        let mut g = self.writer.lock().unwrap();
+        if let Some(w) = g.take() {
+            drop(w.tx);
+            if let Some(h) = w.handle {
+                let _ = h.join();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        let mut g = self.writer.lock().unwrap();
+        if let Some(w) = g.take() {
+            drop(w.tx);
+            if let Some(h) = w.handle {
+                let _ = h.join();
+            }
+        }
     }
 }
 
@@ -289,7 +312,7 @@ mod tests {
         for i in 1..=4u64 {
             j.append(i, 0, &payload).unwrap().wait().unwrap();
         }
-        let n = j.inner.lock().unwrap().segments.len();
+        let n = j.state.lock().unwrap().segments.len();
         assert!(n >= 2, "expected segment rotation, got {n} segments");
     }
 
@@ -332,5 +355,62 @@ mod tests {
         assert_eq!(v.len(), 6);
         assert_eq!(v.first().unwrap().0, 3);
         assert_eq!(v.last().unwrap().0, 8);
+    }
+
+    #[test]
+    fn many_appenders_complete() {
+        use std::sync::Arc;
+        // Concurrent appenders each claim a monotonic seq and append.
+        // The shared `seq_lock` serializes both seq assignment and channel
+        // submission so the channel always receives seqs in strictly increasing
+        // order, which is the contract the bg writer requires.
+        let dir = tempfile::tempdir().unwrap();
+        let j = Arc::new(Journal::open(JournalConfig::new(dir.path())).unwrap());
+        let seq_lock = Arc::new(Mutex::new(0u64));
+        let mut handles = Vec::new();
+        for _ in 0..200 {
+            let j2 = Arc::clone(&j);
+            let sl = Arc::clone(&seq_lock);
+            handles.push(std::thread::spawn(move || {
+                // Claim seq + submit to channel atomically under the external lock.
+                let notifier = {
+                    let mut g = sl.lock().unwrap();
+                    *g += 1;
+                    let seq = *g;
+                    j2.append(seq, 0, b"x").unwrap()
+                };
+                // Wait for durability outside the lock.
+                notifier.wait().unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(j.last_seq(), Some(200));
+    }
+
+    #[test]
+    fn callback_fires_after_durable() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        for i in 1..=10u64 {
+            let n = j.append(i, 0, b"x").unwrap();
+            let c = Arc::clone(&counter);
+            n.on_complete(move |r| {
+                r.as_ref().as_ref().unwrap();
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        // Spin briefly until all callbacks fire.
+        for _ in 0..1000 {
+            if counter.load(Ordering::SeqCst) == 10 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
 }

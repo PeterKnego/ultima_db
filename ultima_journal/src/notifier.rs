@@ -10,18 +10,18 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::JournalError;
 
-type Callback = Box<dyn FnOnce(Result<(), JournalError>) + Send + 'static>;
+type Callback = Box<dyn FnOnce(Arc<Result<(), JournalError>>) + Send + 'static>;
 
 enum State {
     Pending(Vec<Callback>),
-    Done(Result<(), JournalError>),
+    Done(Arc<Result<(), JournalError>>),
 }
 
 impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             State::Pending(_) => f.debug_tuple("Pending").field(&"<callbacks>").finish(),
-            State::Done(r) => f.debug_tuple("Done").field(r).finish(),
+            State::Done(r) => f.debug_tuple("Done").field(r.as_ref()).finish(),
         }
     }
 }
@@ -47,7 +47,7 @@ impl Notifier {
     pub fn done() -> Self {
         Self {
             inner: Arc::new(Inner {
-                state: Mutex::new(State::Done(Ok(()))),
+                state: Mutex::new(State::Done(Arc::new(Ok(())))),
                 cv: Condvar::new(),
             }),
         }
@@ -72,7 +72,7 @@ impl Notifier {
         let mut guard = self.inner.state.lock().unwrap();
         loop {
             match &*guard {
-                State::Done(r) => return r.clone(),
+                State::Done(r) => return r.as_ref().clone(),
                 State::Pending(_) => {
                     guard = self.inner.cv.wait(guard).unwrap();
                 }
@@ -81,20 +81,24 @@ impl Notifier {
     }
 
     /// Register a callback. If already done, fires inline on the calling
-    /// thread. Otherwise stored and fired on the producer's `Signal::complete`.
+    /// thread. Otherwise stored and fired on the producer's `Signal::complete`
+    /// or `Signal::complete_arc`. The callback receives an `Arc<Result<(), JournalError>>`
+    /// so batches can share a single allocation.
     pub fn on_complete<F>(self, f: F)
     where
-        F: FnOnce(Result<(), JournalError>) + Send + 'static,
+        F: FnOnce(Arc<Result<(), JournalError>>) + Send + 'static,
     {
         let mut guard = self.inner.state.lock().unwrap();
-        match &mut *guard {
+        match &*guard {
             State::Done(r) => {
-                let r = r.clone();
+                let r = Arc::clone(r);
                 drop(guard);
                 f(r);
             }
-            State::Pending(cbs) => {
-                cbs.push(Box::new(f));
+            State::Pending(_) => {
+                if let State::Pending(cbs) = &mut *guard {
+                    cbs.push(Box::new(f));
+                }
             }
         }
     }
@@ -104,9 +108,15 @@ impl Signal {
     /// Mark complete, wake all waiters, fire all callbacks. Double-complete
     /// is a no-op.
     pub fn complete(self, result: Result<(), JournalError>) {
+        self.complete_arc(Arc::new(result));
+    }
+
+    /// Variant where the result is already wrapped in an Arc (so multiple
+    /// signals from one batch share one allocation).
+    pub fn complete_arc(self, result: Arc<Result<(), JournalError>>) {
         let cbs = {
             let mut guard = self.inner.state.lock().unwrap();
-            let cbs = match std::mem::replace(&mut *guard, State::Done(result.clone())) {
+            let cbs = match std::mem::replace(&mut *guard, State::Done(Arc::clone(&result))) {
                 State::Pending(cbs) => cbs,
                 State::Done(_) => Vec::new(),
             };
@@ -114,7 +124,7 @@ impl Signal {
             cbs
         };
         for cb in cbs {
-            cb(result.clone());
+            cb(Arc::clone(&result));
         }
     }
 }
@@ -149,7 +159,7 @@ mod tests {
         let fired = Arc::new(AtomicBool::new(false));
         let f2 = Arc::clone(&fired);
         n.on_complete(move |r| {
-            r.unwrap();
+            r.as_ref().as_ref().unwrap();
             f2.store(true, Ordering::SeqCst);
         });
         assert!(fired.load(Ordering::SeqCst));
@@ -161,7 +171,7 @@ mod tests {
         let fired = Arc::new(AtomicBool::new(false));
         let f2 = Arc::clone(&fired);
         n.on_complete(move |r| {
-            r.unwrap();
+            r.as_ref().as_ref().unwrap();
             f2.store(true, Ordering::SeqCst);
         });
         assert!(!fired.load(Ordering::SeqCst));
