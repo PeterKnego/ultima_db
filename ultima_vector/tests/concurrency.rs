@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Concurrency smoke: readers on snapshot of a partially-built collection
 //! see internally consistent results while a writer keeps inserting.
 //!

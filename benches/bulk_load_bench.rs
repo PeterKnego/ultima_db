@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Compares `Store::bulk_load` (sorted, bottom-up build) against
 //! `TableWriter::insert_batch` (the existing batch-insert path) at 100k
 //! and 1M rows.

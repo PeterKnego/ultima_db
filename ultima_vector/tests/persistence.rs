@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Persistence round-trip: build an HNSW index, close the store, reopen
 //! from the WAL/checkpoint, and verify search results match.
 

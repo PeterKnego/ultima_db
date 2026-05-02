@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 pub mod btree;
 pub mod bulk_load;
 pub mod error;

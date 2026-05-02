@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Shared smallbank workload: record types, op types, Zipfian generator,
 //! workload generators, the `SmallBankEngine` trait that backends implement,
 //! and the pre-generated `WorkloadFixture` + reference implementation that

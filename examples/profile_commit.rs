@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Profile where MultiWriter commit time goes at N=16.
 //!
 //! Runs the smallbank contention workload (hot keys 1..=10) with 16

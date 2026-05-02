@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Filtered ANN search: assert results stay within filter and recall holds
 //! at varying selectivities, including the brute-force fallback regime.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 // Included via `#[path]` in multiple bench binaries, each using a different subset.
 #![allow(dead_code, unused_imports)]
 

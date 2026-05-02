@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! One-shot timing: how fast can we ingest 10M records via `Store::bulk_load`?
 //!
 //! Run: `cargo run --release --example bulk_load_10m`

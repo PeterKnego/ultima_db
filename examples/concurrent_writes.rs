@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Concurrent writes across multiple threads using `WriterMode::MultiWriter`.
 //!
 //! `Store` is `Send + Sync`, so each thread holds a `store.clone()` and opens

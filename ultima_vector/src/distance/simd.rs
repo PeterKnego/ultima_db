@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! SIMD kernels for distance metrics, dispatched at runtime via `pulp::Arch`.
 //!
 //! Each metric is a small struct implementing `pulp::WithSimd`. The struct

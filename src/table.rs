@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;

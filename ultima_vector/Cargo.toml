@@ -3,6 +3,8 @@ name = "ultima-vector"
 version = "0.1.0"
 edition = "2024"
 description = "HNSW vector search built on UltimaDB"
+authors = ["Peter Knego"]
+license = "Apache-2.0"
 
 [features]
 default = []

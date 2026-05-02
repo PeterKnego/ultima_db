@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 #![allow(clippy::redundant_iter_cloned)]
 
 //! YCSB-style benchmarks for multi-writer OCC, using real OS threads.

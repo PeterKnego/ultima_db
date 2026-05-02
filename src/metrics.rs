@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Metrics and observability for UltimaDB.
 //!
 //! This module provides atomic counters for store-level and table-level

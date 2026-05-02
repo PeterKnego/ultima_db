@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! End-to-end example: build a small in-memory index, search it.
 //!
 //!     cargo run --example quick_search -p ultima-vector

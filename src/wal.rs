@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Write-ahead log (WAL) for durable persistence.
 //!
 //! The WAL records row-level deltas for each committed transaction. In

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Distance kernel + end-to-end HNSW search benchmarks.
 //!
 //! Run with `cargo bench -p ultima-vector --bench distance`.

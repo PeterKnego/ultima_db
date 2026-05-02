@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 #![allow(clippy::redundant_iter_cloned)]
 
 //! SmallBank benchmark for RocksDB using OptimisticTransactionDB.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Recall integration test: assert HNSW top-K matches brute-force ground truth
 //! on random L2-normalized vectors.
 

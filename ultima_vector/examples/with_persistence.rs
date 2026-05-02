@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Persistence round-trip: build an index, checkpoint, drop the store,
 //! reopen from the same directory, and search again.
 //!

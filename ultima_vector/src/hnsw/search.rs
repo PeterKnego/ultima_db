@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! HNSW search: greedy descent through upper layers, then `ef`-bounded
 //! beam search at the target layer.
 

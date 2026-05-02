@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Restore a vector collection from previously-built rows.
 //!
 //! Run: `cargo run -p ultima-vector --example bulk_restore`

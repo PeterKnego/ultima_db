@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Multi-threaded writer benchmark with persistence.
 //!
 //! Measures the throughput benefit of three-phase commit: releasing the store

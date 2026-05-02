@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Persistence configuration and the [`Record`] trait.
 //!
 //! The `persistence` cargo feature gates Serde bounds on record types.

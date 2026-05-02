@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Checkpoint serialization and deserialization.
 //!
 //! A checkpoint is a full serialized snapshot of all tables at a specific version.

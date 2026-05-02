@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! SSI cost measurement: smallbank-style hot-key contention at N=16,
 //! same workload run twice (SI vs Serializable), throughput compared.
 //!

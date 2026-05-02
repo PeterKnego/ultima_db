@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Write-intent table for early-fail conflict detection.
 //!
 //! In [`crate::WriterMode::MultiWriter`], `TableWriter::update` and

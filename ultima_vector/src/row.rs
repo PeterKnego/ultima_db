@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Row types stored in UltimaDB tables.
 //!
 //! `VectorRow<Meta>` is the user-facing row in the data table. `HnswState`

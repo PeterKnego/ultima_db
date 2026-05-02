@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 #![allow(
     clippy::needless_borrows_for_generic_args,
     clippy::unnecessary_to_owned,

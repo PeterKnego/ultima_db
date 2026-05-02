@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Bulk-load API.
 //!
 //! Provides a fast path for ingesting many rows at once, primarily for full

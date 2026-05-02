@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 use ultima_db::{BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store};
 
 #[test]

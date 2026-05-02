@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Scalar reference implementations of distance metrics.
 //!
 //! These exist for two reasons:

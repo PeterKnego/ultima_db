@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Public façade: `VectorCollection<Meta, D>` ties an UltimaDB `Store` to
 //! an HNSW graph stored in two tables (`<name>_data`, `<name>_entry`).
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Integration test verifying the custom index public API.
 
 use ultima_db::{BTree, CustomIndex, Table, Result, Store};

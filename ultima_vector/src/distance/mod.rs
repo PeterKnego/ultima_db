@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Distance metrics for vector similarity search.
 //!
 //! All metrics return values where **smaller = closer**, so a single comparator

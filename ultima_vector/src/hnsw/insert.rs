@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! HNSW insert: sample level, descend through upper layers, build adjacency
 //! at every layer from `new_level` down to 0, M-prune neighbors as the new
 //! node's edges are added back-references on existing nodes.

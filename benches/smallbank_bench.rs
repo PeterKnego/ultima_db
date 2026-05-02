@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 #![allow(clippy::drop_non_drop, clippy::redundant_iter_cloned)]
 // drop(TableWriter) releases borrow, needed for multi-table txns.
 // redundant_iter_cloned: clippy's suggested fix doesn't compile when the

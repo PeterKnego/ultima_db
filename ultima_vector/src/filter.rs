@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Helpers for building `RoaringTreemap` filters that gate HNSW search.
 //!
 //! Re-exports `RoaringTreemap` so callers don't have to add `roaring` as a

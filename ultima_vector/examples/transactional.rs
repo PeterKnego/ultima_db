@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! Composing vector ops with a user-driven UltimaDB transaction.
 //!
 //! Uses the `_in` variants (`upsert_in`, `search_in`) so a vector insert

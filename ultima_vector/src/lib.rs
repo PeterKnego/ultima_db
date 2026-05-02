@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
 //! `ultima_vector` — HNSW vector search built on UltimaDB.
 
 pub mod collection;
