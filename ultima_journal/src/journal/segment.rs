@@ -99,7 +99,13 @@ pub fn decode_record(
     }
     let body_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let total = 4 + body_len + 4;
+
+    // If body_len is invalid and we don't have enough bytes to confirm corruption,
+    // treat it as a torn tail (incomplete/garbage record).
     if body_len < 16 {
+        if bytes.len() < total {
+            return Ok(None);  // torn tail (could be incomplete record with bad length)
+        }
         return Err(JournalError::Corrupted {
             segment: segment_name.into(),
             offset,
@@ -123,6 +129,166 @@ pub fn decode_record(
     let meta = u64::from_le_bytes(body[8..16].try_into().unwrap());
     let payload = body[16..].to_vec();
     Ok(Some((DecodedRecord { seq, meta, payload }, total)))
+}
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+/// One sparse-index entry every ~64 KiB of segment data. Trades a few KB of
+/// memory per segment for O(log N) seek to an offset near a target seq.
+const SPARSE_INDEX_GAP: u64 = 64 * 1024;
+
+#[derive(Debug)]
+pub struct ScanResult {
+    pub records: Vec<DecodedRecord>,
+    /// Byte offset just past the last good record.
+    pub last_durable_offset: u64,
+    /// True if there were trailing bytes that didn't form a valid record.
+    pub had_torn_tail: bool,
+    /// Sparse seq → byte offset index built during the scan.
+    pub index: Vec<(u64, u64)>,
+}
+
+/// On-disk segment file. Owned by the journal's bg writer when active; readers
+/// reopen via `open_for_read` and use `scan` / direct file reads.
+pub struct SegmentFile {
+    path: PathBuf,
+    file: File,
+    /// Current end-of-file (= last durable offset for the writer's view).
+    size: u64,
+    base_seq: u64,
+    /// Sparse seq → byte offset index. Maintained on append; rebuilt on scan.
+    index: Vec<(u64, u64)>,
+}
+
+impl SegmentFile {
+    pub fn create(path: &Path, base_seq: u64) -> Result<Self, JournalError> {
+        let mut file = OpenOptions::new()
+            .read(true).write(true).create_new(true).open(path)?;
+        let header = SegmentHeader {
+            format_ver: SEGMENT_FORMAT_V,
+            base_seq,
+            created_at: now_nanos(),
+        };
+        let bytes = encode_header(&header);
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size: SEGMENT_HEADER_SIZE as u64,
+            base_seq,
+            index: Vec::new(),
+        })
+    }
+
+    pub fn open_for_read(path: &Path) -> Result<Self, JournalError> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut hdr_bytes = [0u8; SEGMENT_HEADER_SIZE];
+        file.read_exact(&mut hdr_bytes).map_err(|e| JournalError::Corrupted {
+            segment: path.display().to_string(),
+            offset: 0,
+            reason: format!("header read failed: {e}"),
+        })?;
+        let header = decode_header(&hdr_bytes)?;
+        let size = file.metadata()?.len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size,
+            base_seq: header.base_seq,
+            index: Vec::new(),
+        })
+    }
+
+    pub fn base_seq(&self) -> u64 { self.base_seq }
+    pub fn size(&self) -> Result<u64, JournalError> { Ok(self.size) }
+    pub fn path(&self) -> &Path { &self.path }
+    pub fn index_snapshot(&self) -> &[(u64, u64)] { &self.index }
+
+    /// Append a record at end-of-file. Caller must enforce monotonic seq.
+    /// Updates the sparse index when the gap since the previous indexed
+    /// record exceeds `SPARSE_INDEX_GAP`.
+    pub fn append_record(
+        &mut self,
+        seq: u64,
+        meta: u64,
+        payload: &[u8],
+    ) -> Result<u64, JournalError> {
+        let bytes = encode_record(seq, meta, payload);
+        self.file.seek(SeekFrom::Start(self.size))?;
+        self.file.write_all(&bytes)?;
+        let written_offset = self.size;
+        self.size += bytes.len() as u64;
+        let want_index = self.index.last().is_none_or(|(_, off)| {
+            written_offset.saturating_sub(*off) >= SPARSE_INDEX_GAP
+        });
+        if want_index {
+            self.index.push((seq, written_offset));
+        }
+        Ok(written_offset)
+    }
+
+    pub fn fsync(&mut self) -> Result<(), JournalError> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Read the entire body (after header) and decode all records.
+    /// Tolerant of torn tail. Builds a fresh sparse index.
+    pub fn scan(&self) -> Result<ScanResult, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let mut records = Vec::new();
+        let mut index: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = 0usize;
+        let mut last_index_offset: u64 = 0;
+        loop {
+            let abs_offset = SEGMENT_HEADER_SIZE as u64 + cursor as u64;
+            match decode_record(&buf[cursor..], &segname, abs_offset)? {
+                Some((rec, n)) => {
+                    if index.is_empty()
+                        || abs_offset.saturating_sub(last_index_offset) >= SPARSE_INDEX_GAP
+                    {
+                        index.push((rec.seq, abs_offset));
+                        last_index_offset = abs_offset;
+                    }
+                    records.push(rec);
+                    cursor += n;
+                }
+                None => {
+                    let had_torn_tail = cursor < buf.len();
+                    return Ok(ScanResult {
+                        records,
+                        last_durable_offset: SEGMENT_HEADER_SIZE as u64 + cursor as u64,
+                        had_torn_tail,
+                        index,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Truncate the file to `len` bytes and fsync. Drops in-memory index
+    /// entries whose offset is past the new size.
+    pub fn truncate(&mut self, len: u64) -> Result<(), JournalError> {
+        self.file.set_len(len)?;
+        self.file.sync_all()?;
+        self.size = len;
+        self.index.retain(|(_, off)| *off < len);
+        Ok(())
+    }
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -169,5 +335,57 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         assert!(matches!(decode_record(&bytes, "seg", 0), Err(JournalError::Corrupted { .. })));
+    }
+
+    #[test]
+    fn segment_open_create_writes_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000010.log");
+        let _seg = SegmentFile::create(&path, 10).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), SEGMENT_HEADER_SIZE);
+        let h = decode_header(&bytes).unwrap();
+        assert_eq!(h.base_seq, 10);
+    }
+
+    #[test]
+    fn segment_append_and_scan_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        seg.append_record(1, 100, b"a").unwrap();
+        seg.append_record(2, 200, b"bb").unwrap();
+        seg.append_record(3, 300, b"ccc").unwrap();
+        seg.fsync().unwrap();
+
+        let opened = SegmentFile::open_for_read(&path).unwrap();
+        let scan = opened.scan().unwrap();
+        assert_eq!(scan.records.len(), 3);
+        assert_eq!(scan.records[0].seq, 1);
+        assert_eq!(scan.records[2].payload, b"ccc");
+        assert_eq!(scan.last_durable_offset, opened.size().unwrap());
+        assert!(!scan.had_torn_tail);
+        assert!(!scan.index.is_empty());
+    }
+
+    #[test]
+    fn segment_scan_handles_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        {
+            let mut seg = SegmentFile::create(&path, 1).unwrap();
+            seg.append_record(1, 0, b"good").unwrap();
+            seg.fsync().unwrap();
+        }
+        // Append garbage (simulated torn write).
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0u8; 5]).unwrap();
+        }
+        let opened = SegmentFile::open_for_read(&path).unwrap();
+        let scan = opened.scan().unwrap();
+        assert_eq!(scan.records.len(), 1);
+        assert!(scan.had_torn_tail);
     }
 }
