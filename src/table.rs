@@ -44,6 +44,21 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
         source: &dyn MergeableTable,
         keys: &BTreeSet<u64>,
     ) -> Result<()>;
+
+    /// List of (kind_byte, name) for each secondary index.
+    /// `kind_byte`: 0 = Unique, 1 = NonUnique, 2 = Custom.
+    /// Used by `SnapshotReader` to emit table headers.
+    #[cfg(feature = "persistence")]
+    fn index_list(&self) -> Vec<(u8, String)>;
+
+    /// Serialize every row to (key, bincode-bytes) pairs using the provided
+    /// type-erased serializer from the registry. Returns them in primary-key
+    /// order. Gated on `persistence` because it requires `serde + bincode`.
+    #[cfg(feature = "persistence")]
+    fn collect_serialized_rows(
+        &self,
+        serialize_record: &(dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync),
+    ) -> Result<Vec<(u64, Vec<u8>)>>;
 }
 
 impl<R: Record> MergeableTable for Table<R> {
@@ -88,6 +103,34 @@ impl<R: Record> MergeableTable for Table<R> {
             self.next_id = source.next_id;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "persistence")]
+    fn index_list(&self) -> Vec<(u8, String)> {
+        self.indexes
+            .iter()
+            .map(|(name, idx)| {
+                let kind_byte = match idx.kind() {
+                    IndexKind::Unique => 0u8,
+                    IndexKind::NonUnique => 1u8,
+                    IndexKind::Custom => 2u8,
+                };
+                (kind_byte, name.clone())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn collect_serialized_rows(
+        &self,
+        serialize_record: &(dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync),
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(self.data.len());
+        for (&id, record) in self.data.range(..) {
+            let bytes = serialize_record(record as &dyn Any)?;
+            out.push((id, bytes));
+        }
+        Ok(out)
     }
 }
 

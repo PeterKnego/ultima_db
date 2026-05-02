@@ -392,3 +392,135 @@ impl<'s> BulkLoadBatch<'s> {
         Ok(new_version)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Store::bulk_load_stream
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Streaming variant of [`Store::bulk_load`]. Consumes an iterator of
+    /// pre-sorted `(key, record)` tuples and atomically installs the table.
+    ///
+    /// Used by `install_snapshot_stream` and any streaming-restore use case
+    /// where rows arrive one-by-one (e.g. from a wire decoder) rather than
+    /// as a pre-built `Vec`.
+    ///
+    /// `row_count` **must** equal the number of items the iterator yields.
+    /// The mismatch is caught after collection and returned as an error.
+    ///
+    /// Iterator errors are propagated immediately — the function returns on
+    /// the first `Err` item without touching the store.
+    ///
+    /// Keys must be in strictly ascending order; out-of-order or duplicate
+    /// keys are also rejected before any install occurs.
+    pub fn bulk_load_stream<R, I>(
+        &self,
+        table_name: &str,
+        sorted: I,
+        row_count: u64,
+    ) -> Result<u64>
+    where
+        R: Record,
+        I: Iterator<Item = Result<(u64, R)>>,
+    {
+        // Collect into a Vec — the existing BTree::from_sorted already accepts
+        // a Vec; this wrapper validates row_count and propagates iterator
+        // errors. Future optimization: leaf-by-leaf streaming into the tree
+        // builder.
+        let mut collected: Vec<(u64, R)> = Vec::with_capacity(row_count as usize);
+        for item in sorted {
+            collected.push(item?);
+        }
+
+        if collected.len() as u64 != row_count {
+            return Err(Error::InvalidBulkLoadInput(format!(
+                "row_count mismatch: declared {}, got {}",
+                row_count,
+                collected.len()
+            )));
+        }
+
+        // Verify strictly-monotonic keys (defensive — callers should guarantee
+        // sorted order, but we check here to fail fast before any CoW work).
+        for window in collected.windows(2) {
+            if window[0].0 >= window[1].0 {
+                return Err(Error::InvalidBulkLoadInput(format!(
+                    "rows not strictly sorted: key {} >= {}",
+                    window[0].0, window[1].0
+                )));
+            }
+        }
+
+        // Delegate to the existing single-table bulk_load with checkpoint
+        // disabled — the snapshot install path manages checkpoints separately.
+        self.bulk_load(
+            table_name,
+            BulkLoadInput::Replace(BulkSource::sorted_vec(collected)),
+            BulkLoadOptions {
+                create_if_missing: true,
+                checkpoint_after: false,
+            },
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::Store;
+
+    #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Row {
+        name: String,
+        value: u64,
+    }
+
+    #[test]
+    fn bulk_load_stream_builds_table_from_iterator() {
+        let store = Store::default();
+
+        let rows: Vec<(u64, Row)> = (1..=1000u64)
+            .map(|i| (i, Row { name: format!("r{i}"), value: i * 2 }))
+            .collect();
+        let row_count = rows.len() as u64;
+
+        let new_ver = store
+            .bulk_load_stream::<Row, _>("rows", rows.into_iter().map(Ok), row_count)
+            .unwrap();
+        assert!(new_ver > 0);
+
+        let read = store.begin_read(None).unwrap();
+        let table = read.open_table::<Row>("rows").unwrap();
+        assert_eq!(table.get(500), Some(&Row { name: "r500".into(), value: 1000 }));
+        assert_eq!(table.get(1000), Some(&Row { name: "r1000".into(), value: 2000 }));
+    }
+
+    #[test]
+    fn bulk_load_stream_errors_on_iterator_error() {
+        let store = Store::default();
+
+        let bad: Vec<Result<(u64, Row)>> = vec![
+            Ok((1, Row { name: "a".into(), value: 1 })),
+            Err(Error::InvalidBulkLoadInput("simulated".into())),
+        ];
+        let res = store.bulk_load_stream::<Row, _>("rows", bad.into_iter(), 2);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn bulk_load_stream_errors_on_count_mismatch() {
+        let store = Store::default();
+
+        // Iterator yields 5 rows, but row_count declares 10.
+        let rows: Vec<(u64, Row)> = (1..=5u64)
+            .map(|i| (i, Row { name: format!("r{i}"), value: i }))
+            .collect();
+        let res = store.bulk_load_stream::<Row, _>("rows", rows.into_iter().map(Ok), 10);
+        assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));
+    }
+}

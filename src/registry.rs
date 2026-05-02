@@ -31,6 +31,12 @@ type ReplayInsertFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send 
 type ReplayUpdateFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
 type ReplayDeleteFn = Box<dyn Fn(&mut dyn Any, u64) -> Result<()> + Send + Sync>;
 type NewEmptyTableFn = Box<dyn Fn() -> Box<dyn MergeableTable> + Send + Sync>;
+/// Build a `Table<R>` from a list of raw (key, bincode-bytes) pairs and wrap
+/// it as `Box<dyn MergeableTable>`. Used by `install_snapshot_stream` to
+/// reconstruct a table from the wire format without a `R: 'static` bound at
+/// the call site.
+type BuildFromRawRowsFn =
+    Box<dyn Fn(Vec<(u64, Vec<u8>)>) -> Result<Box<dyn MergeableTable>> + Send + Sync>;
 
 /// Type-erased serialization functions for a single table type.
 pub(crate) struct TableTypeInfo {
@@ -53,6 +59,10 @@ pub(crate) struct TableTypeInfo {
     pub replay_update: ReplayUpdateFn,
     /// Delete a record from a `Table<R>` (as `&mut dyn Any`) by ID.
     pub replay_delete: ReplayDeleteFn,
+    /// Deserialize raw `(key, bytes)` pairs and build a fresh `Table<R>` as a
+    /// `Box<dyn MergeableTable>`. No index definitions are created — the caller
+    /// is responsible for defining indexes after install if needed.
+    pub build_from_raw_rows: BuildFromRawRowsFn,
 }
 
 /// Registry mapping table names to their type-erased serializers.
@@ -127,8 +137,43 @@ impl TableRegistry {
                         table.delete(id)?;
                         Ok(())
                     }),
+                    build_from_raw_rows: Box::new(|raw_rows| {
+                        let config = bincode::config::standard();
+                        let mut sorted: Vec<(u64, std::sync::Arc<R>)> =
+                            Vec::with_capacity(raw_rows.len());
+                        for (key, bytes) in raw_rows {
+                            let (record, _): (R, _) =
+                                bincode::serde::decode_from_slice(&bytes, config)
+                                    .map_err(|e| Error::Persistence(e.to_string()))?;
+                            sorted.push((key, std::sync::Arc::new(record)));
+                        }
+                        let next_id = sorted.last().map(|(id, _)| id + 1).unwrap_or(1);
+                        let table = Table::<R>::from_bulk(sorted, next_id, vec![])?;
+                        Ok(Box::new(table))
+                    }),
                 });
                 Ok(())
+            }
+        }
+    }
+
+    /// Returns a stable-within-process `u64` identifier for the registered
+    /// type of `table_name`. Used by `SnapshotReader` to populate the
+    /// `record_type_id` field in the wire-format table header.
+    ///
+    /// The value is derived by hashing the Rust `TypeId` with a deterministic
+    /// `DefaultHasher` seeded from 0. It is stable within a single process run
+    /// but not guaranteed stable across Rust versions — treat it as a best-effort
+    /// type-identity hint for install-time mismatch detection, not a persistent ID.
+    pub fn numeric_type_id(&self, name: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        match self.entries.get(name) {
+            None => 0,
+            Some(info) => {
+                let mut h = DefaultHasher::new();
+                info.type_id.hash(&mut h);
+                h.finish()
             }
         }
     }
@@ -157,6 +202,22 @@ impl TableRegistry {
     /// Returns the names of all registered tables.
     pub fn table_names(&self) -> Vec<&str> {
         self.entries.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Deserialize a list of raw `(key, bytes)` pairs and build a fresh
+    /// `Box<dyn MergeableTable>` for the named table. Returns `None` if the
+    /// table is not registered.
+    ///
+    /// Used by `Store::install_snapshot_stream` to reconstruct each table
+    /// from the snapshot wire format without requiring a generic `R` at the
+    /// call site.
+    pub fn build_table_from_raw(
+        &self,
+        name: &str,
+        raw_rows: Vec<(u64, Vec<u8>)>,
+    ) -> Option<Result<Box<dyn MergeableTable>>> {
+        let info = self.entries.get(name)?;
+        Some((info.build_from_raw_rows)(raw_rows))
     }
 }
 

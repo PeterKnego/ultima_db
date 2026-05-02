@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
 metrics = { version = "0.24", optional = true }
 dashmap = "6"
+crc32fast = "1"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -93,6 +94,11 @@ harness = false
 [[bench]]
 name = "bulk_load_bench"
 harness = false
+
+[[bench]]
+name = "snapshot_throughput"
+harness = false
+required-features = ["persistence"]
 
 [[example]]
 name = "profile_commit"

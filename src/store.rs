@@ -33,6 +33,15 @@ pub(crate) struct Snapshot {
     pub(crate) tables: BTreeMap<String, Arc<dyn MergeableTable>>,
 }
 
+impl Snapshot {
+    /// Returns the names of all tables in this snapshot, in sorted alphabetical order.
+    /// (BTreeMap keys are already sorted.)
+    #[cfg(feature = "persistence")]
+    pub(crate) fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WriterMode
 // ---------------------------------------------------------------------------
@@ -574,6 +583,122 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    // --- Snapshot stream ---
+
+    /// Build a streaming reader over a frozen snapshot.
+    ///
+    /// The returned [`SnapshotReader`] implements [`std::io::Read`] and emits the
+    /// `ULTSNAP` wire format (file header → per-table data → file trailer) without
+    /// holding any write lock — concurrent writes proceed normally thanks to MVCC.
+    ///
+    /// `version: None` reads the latest committed snapshot.
+    #[cfg(feature = "persistence")]
+    pub fn snapshot_stream(
+        &self,
+        version: Option<u64>,
+    ) -> std::result::Result<crate::snapshot_stream::SnapshotReader, crate::snapshot_stream::SnapshotStreamError> {
+        let (snap, registry) = {
+            let inner = self.inner.read().unwrap();
+            let v = version.unwrap_or(inner.latest_version);
+            let snap = inner
+                .snapshots
+                .get(&v)
+                .ok_or_else(|| crate::snapshot_stream::SnapshotStreamError::Bulk(
+                    format!("version {v} not found")
+                ))?
+                .clone();
+            let registry = Arc::clone(&inner.registry);
+            (snap, registry)
+        };
+        crate::snapshot_stream::build::SnapshotReader::new(snap, registry)
+    }
+
+    /// Return the versions of all on-disk checkpoints, in ascending order.
+    ///
+    /// Reads the persistence directory and parses filenames of the form
+    /// `checkpoint_{version}.bin`.  Returns an empty `Vec` when persistence is
+    /// `None` or the directory contains no checkpoint files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Persistence`] if the directory cannot be read.
+    #[cfg(feature = "persistence")]
+    pub fn list_checkpoints(&self) -> Result<Vec<u64>> {
+        use crate::persistence::Persistence;
+
+        let dir = {
+            let inner = self.inner.read().unwrap();
+            match &inner.config.persistence {
+                Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
+                Persistence::None => return Ok(Vec::new()),
+            }
+        };
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::Persistence(e.to_string())),
+        };
+
+        let mut versions = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(rest) = name_str.strip_prefix("checkpoint_")
+                && let Some(ver_str) = rest.strip_suffix(".bin")
+                && let Ok(v) = ver_str.parse::<u64>()
+            {
+                versions.push(v);
+            }
+        }
+        versions.sort();
+        Ok(versions)
+    }
+
+    /// Open a specific on-disk checkpoint as a [`SnapshotReader`] without
+    /// installing it into the store.
+    ///
+    /// Useful for replaying a previously-written checkpoint to a remote peer
+    /// (e.g., `RaftStateMachine::get_current_snapshot`) without disrupting the
+    /// live in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotStreamError::Bulk`] if the checkpoint file does not
+    /// exist, cannot be read, or fails CRC/deserialization checks.
+    #[cfg(feature = "persistence")]
+    pub fn open_checkpoint_reader(
+        &self,
+        version: u64,
+    ) -> std::result::Result<crate::snapshot_stream::SnapshotReader, crate::snapshot_stream::SnapshotStreamError> {
+        use crate::persistence::Persistence;
+        use crate::snapshot_stream::SnapshotStreamError;
+
+        let (dir, registry) = {
+            let inner = self.inner.read().unwrap();
+            let dir = match &inner.config.persistence {
+                Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
+                Persistence::None => {
+                    return Err(SnapshotStreamError::Bulk(
+                        "open_checkpoint_reader requires persistence to be configured".into(),
+                    ));
+                }
+            };
+            let registry = std::sync::Arc::clone(&inner.registry);
+            (dir, registry)
+        };
+
+        // Build the path: checkpoint_{version}.bin
+        let path = dir.join(format!("checkpoint_{version}.bin"));
+
+        // Load without installing — reuse the existing checkpoint load path.
+        let snapshot = crate::checkpoint::load_checkpoint(&path, &registry)
+            .map_err(|e| SnapshotStreamError::Bulk(e.to_string()))?;
+
+        crate::snapshot_stream::build::SnapshotReader::new(std::sync::Arc::new(snapshot), registry)
     }
 
     // --- Test helpers ---
