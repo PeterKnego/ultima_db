@@ -45,12 +45,55 @@ impl Journal {
             .collect();
         entries.sort_by_key(|e| e.file_name());
 
-        let mut segments = Vec::new();
+        // Phase 1: open each segment, fix any torn tail, collect (SegmentFile, ScanResult).
+        let mut segments_with_scan: Vec<(segment::SegmentFile, segment::ScanResult)> = Vec::new();
+        for ent in entries {
+            let mut seg = segment::SegmentFile::open_for_read(&ent.path())?;
+            let scan = seg.scan()?;
+            if scan.had_torn_tail {
+                seg.truncate(scan.last_durable_offset)?;
+            }
+            let scan = if scan.had_torn_tail { seg.scan()? } else { scan };
+            segments_with_scan.push((seg, scan));
+        }
+
+        // Phase 2: sentinel completion — search backwards for a sentinel as the
+        // last record of any segment.  A sentinel means a `truncate_after` started
+        // (wrote the sentinel + fsync'd) but crashed before removing the sentinel
+        // and/or unlinking later segments.  Complete the truncate now.
+        let mut sentinel_found_at: Option<(usize, u64)> = None; // (seg_idx, sentinel_byte_offset)
+        for (i, (_, scan)) in segments_with_scan.iter().enumerate().rev() {
+            if let Some(last_rec) = scan.records.last()
+                && segment::is_sentinel(last_rec)
+            {
+                // Compute the byte offset at which the sentinel record starts.
+                // That is: header + sum of all record sizes before the sentinel.
+                let sentinel_offset = segment::SEGMENT_HEADER_SIZE as u64
+                    + scan.records[..scan.records.len() - 1]
+                        .iter()
+                        .map(|r| (4 + 16 + r.payload.len() + 4) as u64)
+                        .sum::<u64>();
+                sentinel_found_at = Some((i, sentinel_offset));
+                break;
+            }
+        }
+        if let Some((idx, sentinel_offset)) = sentinel_found_at {
+            // Truncate the segment to just before the sentinel, removing it.
+            segments_with_scan[idx].0.truncate(sentinel_offset)?;
+            // Drop all later segments from disk.
+            let later = segments_with_scan.split_off(idx + 1);
+            for (seg, _) in later {
+                let _ = std::fs::remove_file(seg.path());
+            }
+            // Re-scan the modified segment so records/last_seq are accurate.
+            let new_scan = segments_with_scan[idx].0.scan()?;
+            segments_with_scan[idx].1 = new_scan;
+        }
+
+        // Phase 3: compute first_seq / last_seq from final state.
         let mut first_seq: Option<u64> = None;
         let mut last_seq: Option<u64> = None;
-        for ent in entries {
-            let seg = segment::SegmentFile::open_for_read(&ent.path())?;
-            let scan = seg.scan()?;
+        for (_, scan) in &segments_with_scan {
             if let Some(first) = scan.records.first()
                 && first_seq.is_none()
             {
@@ -59,8 +102,10 @@ impl Journal {
             if let Some(last) = scan.records.last() {
                 last_seq = Some(last.seq);
             }
-            segments.push(seg);
         }
+
+        let segments: Vec<segment::SegmentFile> =
+            segments_with_scan.into_iter().map(|(seg, _)| seg).collect();
 
         let state = Arc::new(Mutex::new(WriterState {
             dir: config.dir.clone(),
@@ -604,5 +649,51 @@ mod tests {
         assert!(n_after < n_before);
         // first_seq is now >= first kept segment's base_seq.
         assert!(j.first_seq().unwrap() <= 7);
+    }
+
+    #[test]
+    fn open_recovers_from_unfinished_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            for i in 1..=5u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+            // Manually inject a sentinel as if a truncate started but didn't
+            // complete the unlinks of later segments. Easiest: just simulate by
+            // appending a sentinel record by writing to the file directly.
+            let mut st = j.state.lock().unwrap();
+            let seg = st.segments.last_mut().unwrap();
+            seg.append_record(99, segment::SENTINEL_META, segment::SENTINEL_PAYLOAD).unwrap();
+            seg.fsync().unwrap();
+        }
+        // Reopen — recovery should treat sentinel as truncate marker, drop records >= sentinel seq.
+        let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+        // Sentinel at seq=99, but legit records were 1..=5. Sentinel marks "drop > 5".
+        assert_eq!(j2.last_seq(), Some(5));
+    }
+
+    #[test]
+    fn open_truncates_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            for i in 1..=3u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        // Append 5 garbage bytes to the only segment file.
+        let entries: Vec<_> = std::fs::read_dir(&dir_path).unwrap().collect();
+        let seg_path = entries[0].as_ref().unwrap().path();
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&seg_path).unwrap()
+            .write_all(&[0xAB; 5]).unwrap();
+        // Reopen — torn tail should be truncated.
+        let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+        assert_eq!(j2.last_seq(), Some(3));
+        // The torn bytes should have been truncated; subsequent append must succeed.
+        j2.append(4, 0, b"new").unwrap().wait().unwrap();
     }
 }
