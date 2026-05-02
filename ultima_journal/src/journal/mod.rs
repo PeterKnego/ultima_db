@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-pub mod segment;
+pub(crate) mod segment;
 mod writer;
 
 use std::ops::{Bound, RangeBounds};
@@ -200,8 +200,10 @@ impl Journal {
         &self,
         range: impl RangeBounds<u64>,
     ) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
-        let (lo, hi) = bounds_to_inclusive(range, self.first_seq(), self.last_seq());
+        // Compute bounds inside the locked scope so first/last_seq and the
+        // scan see the same atomic snapshot of state.
         let st = self.state.lock().unwrap();
+        let (lo, hi) = bounds_to_inclusive(range, st.first_seq, st.last_seq);
         let mut out = Vec::new();
         for seg in &st.segments {
             let scan = seg.scan()?;
@@ -218,13 +220,18 @@ impl Journal {
         Ok(out)
     }
 
+    /// Range read returning an iterator. Note: the v1 implementation is
+    /// **eager** — internally calls `read_range()` to collect into a `Vec`,
+    /// then returns its iterator. The signature is iterator-shaped to leave
+    /// room for a future streaming implementation; today's memory profile is
+    /// the same as `read_range()`. Callers that need streaming behavior over
+    /// large ranges should not assume laziness yet.
     #[allow(clippy::type_complexity)]
     pub fn iter_range(
         &self,
         range: impl RangeBounds<u64>,
     ) -> Result<impl Iterator<Item = Result<(u64, u64, Vec<u8>), JournalError>> + '_, JournalError>
     {
-        // Vec-collects internally and returns its iterator.
         let v = self.read_range(range)?;
         Ok(v.into_iter().map(Ok))
     }

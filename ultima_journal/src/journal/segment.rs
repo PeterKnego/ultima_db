@@ -157,7 +157,9 @@ pub struct ScanResult {
     pub last_durable_offset: u64,
     /// True if there were trailing bytes that didn't form a valid record.
     pub had_torn_tail: bool,
-    /// Sparse seq → byte offset index built during the scan.
+    /// Sparse seq → byte offset index built during the scan. Currently
+    /// unused by the read path (deferred sparse-index-seek optimization).
+    #[allow(dead_code)]
     pub index: Vec<(u64, u64)>,
 }
 
@@ -170,6 +172,9 @@ pub struct SegmentFile {
     size: u64,
     base_seq: u64,
     /// Sparse seq → byte offset index. Maintained on append; rebuilt on scan.
+    /// Currently unused on the read path (see deferred work in `task26_journal.md` —
+    /// `Journal::read` linear-scans rather than seeking via this index).
+    #[allow(dead_code)]
     index: Vec<(u64, u64)>,
 }
 
@@ -203,6 +208,16 @@ impl SegmentFile {
             reason: format!("header read failed: {e}"),
         })?;
         let header = decode_header(&hdr_bytes)?;
+        if header.format_ver != SEGMENT_FORMAT_V {
+            return Err(JournalError::Corrupted {
+                segment: path.display().to_string(),
+                offset: 0,
+                reason: format!(
+                    "unsupported segment format version {} (this build expects {})",
+                    header.format_ver, SEGMENT_FORMAT_V,
+                ),
+            });
+        }
         let size = file.metadata()?.len();
         Ok(Self {
             path: path.to_path_buf(),
@@ -216,6 +231,7 @@ impl SegmentFile {
     pub fn base_seq(&self) -> u64 { self.base_seq }
     pub fn size(&self) -> Result<u64, JournalError> { Ok(self.size) }
     pub fn path(&self) -> &Path { &self.path }
+    #[allow(dead_code)]  // Used by future sparse-index-seek read path.
     pub fn index_snapshot(&self) -> &[(u64, u64)] { &self.index }
 
     /// Append a record at end-of-file. Caller must enforce monotonic seq.

@@ -58,7 +58,14 @@ fn writer_loop(rx: Receiver<AppendRequest>, state: Arc<Mutex<WriterState>>) {
                     }
                     last_eventual_fsync = Instant::now();
                 }
-                Some(eventual_interval - last_eventual_fsync.elapsed())
+                // `checked_sub` avoids a panic if the OS preempted us long
+                // enough that elapsed > interval between the check above and
+                // here. We just fall through with a zero timeout.
+                Some(
+                    eventual_interval
+                        .checked_sub(last_eventual_fsync.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                )
             }
         };
         let first = match timeout {

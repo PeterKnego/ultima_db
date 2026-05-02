@@ -37,7 +37,9 @@ pub struct Notifier {
     inner: Arc<Inner>,
 }
 
-pub struct Signal {
+/// Producer side of a [`Notifier`]/`Signal` pair. Internal — held by the
+/// crate's bg writer threads. Not part of the public API surface.
+pub(crate) struct Signal {
     inner: Arc<Inner>,
 }
 
@@ -55,7 +57,7 @@ impl Notifier {
 
     /// Construct a pending pair: caller holds the `Notifier`, producer holds
     /// the `Signal`.
-    pub fn pending() -> (Signal, Notifier) {
+    pub(crate) fn pending() -> (Signal, Notifier) {
         let inner = Arc::new(Inner {
             state: Mutex::new(State::Pending(Vec::new())),
             cv: Condvar::new(),
@@ -105,7 +107,7 @@ impl Notifier {
 impl Signal {
     /// Mark complete, wake all waiters, fire all callbacks. Double-complete
     /// is a no-op.
-    pub fn complete(self, result: Result<(), JournalError>) {
+    pub(crate) fn complete(self, result: Result<(), JournalError>) {
         let cbs = {
             let mut guard = self.inner.state.lock().unwrap();
             let cbs = match std::mem::replace(&mut *guard, State::Done(result.clone())) {

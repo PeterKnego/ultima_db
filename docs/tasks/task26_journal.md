@@ -122,11 +122,15 @@ recv() first record  →  drain try_recv() into batch
 
 The append path validates monotonicity under the `WriterState` mutex *and* sends to the channel under the same lock, so channel order = seq order regardless of appender concurrency.
 
+**Caller-coordination caveat.** `Journal::append` validates `seq > last_seq` under the lock but does NOT update `last_seq` — only the bg writer does, after writing the record. So if two callers concurrently submit the same `seq`, both pass the public check (they see the same stale `last_seq`), both receive `Ok(Notifier)`, and the bg thread rejects the second one — its `Notifier` resolves to `Err(NonMonotonicSeq)`. The Raft adapter (and any caller-coordinated workload) must own seq assignment such that no two threads ever submit the same seq. Openraft's `RaftLogStorage` provides this guarantee by construction. The in-crate test `many_appenders_complete` demonstrates the pattern: an external `Mutex<u64>` serializes both seq assignment and the `append()` call.
+
 ### Crash safety
 
 - **Append (Consistent):** Notifier reflects actual fsync completion. Records that hadn't fsynced are absent on recovery.
 - **Append (Eventual):** caller is told "queued"; durability is best-effort up to the next periodic fsync.
-- **`truncate_after`:** Two-phase sentinel protocol. (1) truncate segment to `new_end`, (2) append a sentinel record (`meta = u64::MAX`, `payload = b"ULTJTRUNC"`) and fsync — intent is now durable, (3) truncate back to `new_end` removing the sentinel, (4) unlink later segments, fsync dir. Crash between (2) and (3) is recoverable: `Journal::open` detects the sentinel and re-runs the cleanup.
+- **`truncate_after`:** Four-phase sentinel protocol. (1) truncate segment to `new_end`, (2) append a sentinel record (`meta = u64::MAX`, `payload = b"ULTJTRUNC"`) and fsync — intent is now durable, (3) truncate back to `new_end` removing the sentinel, (4) unlink later segments, fsync dir.
+  - Crash between (2) and (3) is fully recoverable: `Journal::open` detects the sentinel and re-runs the cleanup, producing the same final state as if no crash had occurred.
+  - Crash between (1) and (2), or between (3) and (4), leaves orphaned later segments on disk with seq > `keep_seq`. Recovery cannot detect this case (no sentinel exists). The journal will reopen with those records still present. Raft tolerates this — those records are speculative uncommitted entries, and the leader's protocol re-truncates on reconnect. **Non-Raft callers must understand that `truncate_after` is durable only to the granularity of "either fully complete or producing extra speculative tail records."**
 - **`purge_before`:** Pure segment unlinks. Idempotent.
 - **Recovery (`Journal::open`):** Three phases —
   - **Torn-tail repair:** for each segment, if scan sees `had_torn_tail`, truncate to `last_durable_offset` + fsync.
@@ -207,15 +211,13 @@ Microbenchmarks live in `ultima_journal/benches/append_throughput.rs`:
 
 ## Deferred work
 
-Tracked in design spec §12 (preserved at `docs/superpowers/specs/2026-05-02-ultima-raft-storage-readiness-design.md`):
-
-- `Arc<RwLock<Vec<Arc<SegmentRef>>>>` refactor for lock-free concurrent reads against sealed segments.
-- Sparse-index seek in `Journal::read` (currently linear scan).
+- `Arc<RwLock<Vec<Arc<SegmentRef>>>>` refactor for lock-free concurrent reads against sealed segments. The current Mutex-serialized model is correct (verified by `concurrent_reads_during_appends` test) but reads block appends.
+- Sparse-index seek in `Journal::read` — currently linear scan via `scan()`. Each `SegmentFile` already maintains the sparse `(seq, byte_offset)` index needed; just unused on the read path.
+- Cache `last_seq` per `SegmentFile` so `purge_before` doesn't need to scan every segment to find its tail seq. Today's `purge_before` re-reads each segment from disk while holding the state mutex — fine for small journals, problematic for hundreds-of-segments deployments.
 - mmap for sealed segments (decide via benchmarks).
 - Tunable defaults (segment size, Eventual fsync interval, StableValue slot size).
 
 ## Cross-references
 
-- **Design spec (covers both this and the pending snapshot_stream work):** `docs/superpowers/specs/2026-05-02-ultima-raft-storage-readiness-design.md`.
-- **Pending companion plan:** `docs/superpowers/plans/2026-05-02-snapshot-stream-implementation.md` — `ultima_db::snapshot_stream` for `RaftStateMachine` build/install paths.
+- **Companion (state-machine-side) work:** [task27_snapshot_stream.md](task27_snapshot_stream.md) — `ultima_db::snapshot_stream` module.
 - **Future adapter:** the openraft `RaftLogStorage` + `RaftStateMachine` adapter is a downstream project. It depends on this crate plus the snapshot_stream work, plus a `_meta` table convention in the state machine to track `(applied_log_id, last_membership)` atomically with data writes.
