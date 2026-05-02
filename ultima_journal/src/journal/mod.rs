@@ -3,6 +3,7 @@
 
 pub mod segment;
 
+use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -140,6 +141,57 @@ impl Journal {
         }
         Ok(None)
     }
+
+    pub fn read_range(
+        &self,
+        range: impl RangeBounds<u64>,
+    ) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
+        let (lo, hi) = bounds_to_inclusive(range, self.first_seq(), self.last_seq());
+        let inner = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for seg in &inner.segments {
+            let scan = seg.scan()?;
+            for r in scan.records {
+                if r.seq < lo {
+                    continue;
+                }
+                if r.seq > hi {
+                    return Ok(out);
+                }
+                out.push((r.seq, r.meta, r.payload));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn iter_range(
+        &self,
+        range: impl RangeBounds<u64>,
+    ) -> Result<impl Iterator<Item = Result<(u64, u64, Vec<u8>), JournalError>> + '_, JournalError> {
+        // For simplicity this Vec-collects internally and returns its iterator.
+        // Performance-tuned streaming iterator is a future optimization (open
+        // questions §12 of design spec).
+        let v = self.read_range(range)?;
+        Ok(v.into_iter().map(Ok))
+    }
+}
+
+fn bounds_to_inclusive(
+    range: impl RangeBounds<u64>,
+    first: Option<u64>,
+    last: Option<u64>,
+) -> (u64, u64) {
+    let lo = match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n.saturating_add(1),
+        Bound::Unbounded => first.unwrap_or(0),
+    };
+    let hi = match range.end_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n.saturating_sub(1),
+        Bound::Unbounded => last.unwrap_or(u64::MAX),
+    };
+    (lo, hi)
 }
 
 #[cfg(test)]
@@ -239,5 +291,46 @@ mod tests {
         }
         let n = j.inner.lock().unwrap().segments.len();
         assert!(n >= 2, "expected segment rotation, got {n} segments");
+    }
+
+    #[test]
+    fn read_range_returns_inclusive_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=5u64 {
+            j.append(i, i * 10, format!("p{i}").as_bytes()).unwrap().wait().unwrap();
+        }
+        let v = j.read_range(2..=4).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], (2, 20, b"p2".to_vec()));
+        assert_eq!(v[2], (4, 40, b"p4".to_vec()));
+    }
+
+    #[test]
+    fn iter_range_streams_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=5u64 {
+            j.append(i, 0, format!("p{i}").as_bytes()).unwrap().wait().unwrap();
+        }
+        let it = j.iter_range(..).unwrap();
+        let collected: Vec<_> = it.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(collected.len(), 5);
+        assert_eq!(collected[4].0, 5);
+    }
+
+    #[test]
+    fn read_range_spans_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 256;
+        let j = Journal::open(cfg).unwrap();
+        for i in 1..=10u64 {
+            j.append(i, 0, &vec![0u8; 100]).unwrap().wait().unwrap();
+        }
+        let v = j.read_range(3..=8).unwrap();
+        assert_eq!(v.len(), 6);
+        assert_eq!(v.first().unwrap().0, 3);
+        assert_eq!(v.last().unwrap().0, 8);
     }
 }
