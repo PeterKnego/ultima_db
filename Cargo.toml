@@ -95,6 +95,11 @@ harness = false
 name = "bulk_load_bench"
 harness = false
 
+[[bench]]
+name = "snapshot_throughput"
+harness = false
+required-features = ["persistence"]
+
 [[example]]
 name = "profile_commit"
 required-features = ["persistence"]
