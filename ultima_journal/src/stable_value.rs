@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-use crate::StableValueError;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use serde::{Serialize, de::DeserializeOwned};
+
+use crate::{Durability, Notifier, StableValueError};
 
 pub const SV_MAGIC: &[u8; 8] = b"ULTSVAL\0";
 pub const SV_FORMAT_V: u16 = 1;
@@ -82,10 +89,186 @@ pub fn decode_slot(b: &[u8]) -> Result<Option<SvSlot>, StableValueError> {
     Ok(Some(SvSlot { r#gen, state, bytes }))
 }
 
-/// Placeholder — replaced in subsequent tasks.
-pub struct StableValue<T>(std::marker::PhantomData<T>);
-/// Placeholder — replaced in subsequent tasks.
-pub struct StableValueConfig;
+// ── StableValueConfig ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct StableValueConfig {
+    pub path: PathBuf,
+    pub durability: Durability,
+    pub max_payload_bytes: u32,
+}
+
+impl StableValueConfig {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        }
+    }
+}
+
+// ── StableValue<T> ─────────────────────────────────────────────────────────────
+
+pub struct StableValue<T> {
+    config: StableValueConfig,
+    slot_size: u32,
+    inner: Mutex<Inner<T>>,
+}
+
+struct Inner<T> {
+    file: File,
+    next_gen: u64,
+    next_slot: u8,     // 0 or 1 — alternates
+    cached: Option<T>,
+}
+
+impl<T> StableValue<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Open (or create) a StableValue file at `config.path`.
+    ///
+    /// On creation, writes the file header and two zeroed slots, then fsyncs.
+    /// On open, reads the header and both slots and picks the winning slot by
+    /// highest `gen`; falls back to the other slot if one is CRC-corrupt.
+    pub fn open(config: StableValueConfig) -> Result<Self, StableValueError> {
+        let exists = config.path.exists();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&config.path)?;
+
+        let slot_size = config.max_payload_bytes + 17;
+
+        if !exists {
+            // Initialize: header + two zeroed slots (state=0).
+            let header = encode_header(&SvHeader { format_ver: SV_FORMAT_V, slot_size });
+            file.write_all(&header)?;
+            let empty = SvSlot { r#gen: 0, state: 0, bytes: Vec::new() };
+            let slot_bytes = encode_slot(&empty, slot_size)?;
+            file.write_all(&slot_bytes)?; // slot 0
+            file.write_all(&slot_bytes)?; // slot 1
+            file.sync_all()?;
+        }
+
+        // Read header + both slots.
+        file.seek(SeekFrom::Start(0))?;
+        let mut hdr_bytes = [0u8; SV_HEADER_SIZE];
+        file.read_exact(&mut hdr_bytes)?;
+        let header = decode_header(&hdr_bytes)?;
+        if header.format_ver != SV_FORMAT_V {
+            return Err(StableValueError::Corrupted {
+                reason: format!("unsupported format version {}", header.format_ver),
+            });
+        }
+
+        let mut slot_bufs = [
+            vec![0u8; header.slot_size as usize],
+            vec![0u8; header.slot_size as usize],
+        ];
+        for buf in &mut slot_bufs {
+            file.read_exact(buf)?;
+        }
+        let s0 = decode_slot(&slot_bufs[0])?;
+        let s1 = decode_slot(&slot_bufs[1])?;
+        let (cached, next_gen, next_slot) = pick_slot::<T>(s0, s1)?;
+
+        Ok(Self {
+            config,
+            slot_size: header.slot_size,
+            inner: Mutex::new(Inner { file, next_gen, next_slot, cached }),
+        })
+    }
+
+    /// Return the last stored value, or `None` if never stored (or cleared).
+    pub fn load(&self) -> Result<Option<T>, StableValueError> {
+        Ok(self.inner.lock().unwrap().cached.clone())
+    }
+
+    /// Durably write `value` to the next slot, then rotate.
+    ///
+    /// Returns a `Notifier` that is already resolved (the fsync happens
+    /// synchronously inside `store` when `Durability::Consistent`).
+    pub fn store(&self, value: &T) -> Result<Notifier, StableValueError> {
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
+            .map_err(|e| StableValueError::Serialize(e.to_string()))?;
+        if (bytes.len() as u32) > self.slot_size - 17 {
+            return Err(StableValueError::PayloadTooLarge {
+                limit: self.slot_size - 17,
+                got: bytes.len() as u32,
+            });
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let slot = SvSlot { r#gen: inner.next_gen, state: 1, bytes };
+        let buf = encode_slot(&slot, self.slot_size)?;
+        let offset =
+            SV_HEADER_SIZE as u64 + (inner.next_slot as u64) * (self.slot_size as u64);
+        inner.file.seek(SeekFrom::Start(offset))?;
+        inner.file.write_all(&buf)?;
+        if matches!(self.config.durability, Durability::Consistent) {
+            inner.file.sync_all()?;
+        }
+        inner.cached = Some(value.clone());
+        inner.next_gen += 1;
+        inner.next_slot ^= 1;
+        Ok(Notifier::done())
+    }
+
+    /// Close the file handle. The `Drop` impl on `File` closes it anyway; this
+    /// gives callers an explicit place to handle any errors.
+    pub fn close(self) -> Result<(), StableValueError> {
+        Ok(())
+    }
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────────
+
+/// Choose the winning slot (highest `gen` among valid slots).
+///
+/// Returns `(cached_value, next_gen, next_slot_index)`.
+///
+/// If *both* slots are corrupt (CRC bad), returns `Corrupted`. A freshly
+/// created file has two valid slots with `state=0` and `gen=0` — the tie goes
+/// to slot 0.
+fn pick_slot<T: DeserializeOwned>(
+    s0: Option<SvSlot>,
+    s1: Option<SvSlot>,
+) -> Result<(Option<T>, u64, u8), StableValueError> {
+    let pick = match (&s0, &s1) {
+        (None, None) => {
+            return Err(StableValueError::Corrupted {
+                reason: "both slots invalid".into(),
+            })
+        }
+        (Some(a), None) => Some((a.clone(), 0u8)),
+        (None, Some(b)) => Some((b.clone(), 1u8)),
+        (Some(a), Some(b)) => {
+            if a.r#gen >= b.r#gen {
+                Some((a.clone(), 0u8))
+            } else {
+                Some((b.clone(), 1u8))
+            }
+        }
+    };
+    let (winner, slot_idx) = pick.unwrap();
+    let next_gen = winner.r#gen + 1;
+    let next_slot = slot_idx ^ 1;
+    let cached: Option<T> = if winner.state == 0 {
+        None
+    } else {
+        let v: T =
+            bincode::serde::decode_from_slice(&winner.bytes, bincode::config::standard())
+                .map_err(|e| StableValueError::Corrupted { reason: e.to_string() })?
+                .0;
+        Some(v)
+    };
+    Ok((cached, next_gen, next_slot))
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -113,5 +296,59 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         assert!(decode_slot(&bytes).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod sv_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+    struct Vote {
+        term: u64,
+        voted_for: u64,
+    }
+
+    #[test]
+    fn open_empty_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote.sv");
+        let cfg = StableValueConfig::new(&path);
+        let sv = StableValue::<Vote>::open(cfg).unwrap();
+        assert_eq!(sv.load().unwrap(), None);
+    }
+
+    #[test]
+    fn store_then_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote.sv");
+        let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+        let v = Vote { term: 5, voted_for: 42 };
+        sv.store(&v).unwrap().wait().unwrap();
+        assert_eq!(sv.load().unwrap(), Some(v));
+    }
+
+    #[test]
+    fn store_then_reopen_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote.sv");
+        {
+            let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+            sv.store(&Vote { term: 3, voted_for: 7 }).unwrap().wait().unwrap();
+        }
+        let sv2 = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+        assert_eq!(sv2.load().unwrap(), Some(Vote { term: 3, voted_for: 7 }));
+    }
+
+    #[test]
+    fn higher_gen_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote.sv");
+        let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
+        sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();
+        sv.store(&Vote { term: 2, voted_for: 2 }).unwrap().wait().unwrap();
+        sv.store(&Vote { term: 3, voted_for: 3 }).unwrap().wait().unwrap();
+        assert_eq!(sv.load().unwrap().unwrap().term, 3);
     }
 }
