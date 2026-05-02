@@ -22,6 +22,10 @@ coverage/vector:
 	cargo llvm-cov -p ultima-vector --features persistence --html --output-dir target/llvm-cov/vector
 	@echo "Report: target/llvm-cov/vector/html/index.html"
 
+coverage/journal:
+	cargo llvm-cov -p ultima-journal --html --output-dir target/llvm-cov/journal
+	@echo "Report: target/llvm-cov/journal/html/index.html"
+
 clean:
 	cargo clean
 
