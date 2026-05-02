@@ -261,6 +261,48 @@ impl Journal {
         Ok(Notifier::done())
     }
 
+    /// Drop full segments whose final record's seq <= `seq`.
+    /// Never drops the active (last) segment even if eligible, to ensure
+    /// future appends still have a place to go.
+    /// Updates `first_seq` after purging.
+    pub fn purge_before(&self, seq: u64) -> Result<(), JournalError> {
+        let mut st = self.state.lock().unwrap();
+
+        // Drop segments whose final record's seq <= seq.
+        let mut keep_idx = 0;
+        for (i, seg) in st.segments.iter().enumerate() {
+            let scan = seg.scan()?;
+            let last = scan.records.last().map(|r| r.seq);
+            if let Some(last) = last
+                && last <= seq
+            {
+                keep_idx = i + 1;
+                continue;
+            }
+            break;
+        }
+
+        // Never drop the active (last) segment even if its records all <= seq —
+        // we still need a place to append.
+        if keep_idx == st.segments.len() && !st.segments.is_empty() {
+            keep_idx -= 1;
+        }
+
+        let removed: Vec<_> = st.segments.drain(..keep_idx).collect();
+        for seg in removed {
+            let _ = std::fs::remove_file(seg.path());
+        }
+        if let Ok(d) = std::fs::File::open(&st.dir) {
+            let _ = d.sync_all();
+        }
+
+        // Recompute first_seq.
+        st.first_seq = st.segments.first().and_then(|s| s.scan().ok())
+            .and_then(|scan| scan.records.first().map(|r| r.seq));
+
+        Ok(())
+    }
+
     pub fn close(self) -> Result<(), JournalError> {
         let mut g = self.writer.lock().unwrap();
         if let Some(w) = g.take() {
@@ -545,5 +587,22 @@ mod tests {
         // In Eventual mode, Notifier should resolve quickly without blocking
         // on fsync; for the public contract we just check wait() succeeds.
         n.wait().unwrap();
+    }
+
+    #[test]
+    fn purge_before_drops_full_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 256;
+        let j = Journal::open(cfg).unwrap();
+        for i in 1..=12u64 {
+            j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
+        }
+        let n_before = j.state.lock().unwrap().segments.len();
+        j.purge_before(6).unwrap();
+        let n_after = j.state.lock().unwrap().segments.len();
+        assert!(n_after < n_before);
+        // first_seq is now >= first kept segment's base_seq.
+        assert!(j.first_seq().unwrap() <= 7);
     }
 }
