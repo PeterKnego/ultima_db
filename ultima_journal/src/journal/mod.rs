@@ -400,7 +400,7 @@ mod tests {
             let n = j.append(i, 0, b"x").unwrap();
             let c = Arc::clone(&counter);
             n.on_complete(move |r| {
-                r.as_ref().as_ref().unwrap();
+                r.unwrap();
                 c.fetch_add(1, Ordering::SeqCst);
             });
         }
