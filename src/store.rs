@@ -33,6 +33,15 @@ pub(crate) struct Snapshot {
     pub(crate) tables: BTreeMap<String, Arc<dyn MergeableTable>>,
 }
 
+impl Snapshot {
+    /// Returns the names of all tables in this snapshot, in sorted alphabetical order.
+    /// (BTreeMap keys are already sorted.)
+    #[cfg(feature = "persistence")]
+    pub(crate) fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WriterMode
 // ---------------------------------------------------------------------------
@@ -574,6 +583,36 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    // --- Snapshot stream ---
+
+    /// Build a streaming reader over a frozen snapshot.
+    ///
+    /// The returned [`SnapshotReader`] implements [`std::io::Read`] and emits the
+    /// `ULTSNAP` wire format (file header → per-table data → file trailer) without
+    /// holding any write lock — concurrent writes proceed normally thanks to MVCC.
+    ///
+    /// `version: None` reads the latest committed snapshot.
+    #[cfg(feature = "persistence")]
+    pub fn snapshot_stream(
+        &self,
+        version: Option<u64>,
+    ) -> std::result::Result<crate::snapshot_stream::SnapshotReader, crate::snapshot_stream::SnapshotStreamError> {
+        let (snap, registry) = {
+            let inner = self.inner.read().unwrap();
+            let v = version.unwrap_or(inner.latest_version);
+            let snap = inner
+                .snapshots
+                .get(&v)
+                .ok_or_else(|| crate::snapshot_stream::SnapshotStreamError::Bulk(
+                    format!("version {v} not found")
+                ))?
+                .clone();
+            let registry = Arc::clone(&inner.registry);
+            (snap, registry)
+        };
+        crate::snapshot_stream::build::SnapshotReader::new(snap, registry)
     }
 
     // --- Test helpers ---

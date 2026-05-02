@@ -4,9 +4,11 @@
 //! Streaming wire format for UltimaDB checkpoints.
 
 pub mod codec;
+#[cfg(feature = "persistence")]
 pub mod build;
 pub mod install;
 
+#[cfg(feature = "persistence")]
 pub use build::SnapshotReader;
 pub use install::{InstallOptions, OnUnknown};
 

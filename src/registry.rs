@@ -133,6 +133,27 @@ impl TableRegistry {
         }
     }
 
+    /// Returns a stable-within-process `u64` identifier for the registered
+    /// type of `table_name`. Used by `SnapshotReader` to populate the
+    /// `record_type_id` field in the wire-format table header.
+    ///
+    /// The value is derived by hashing the Rust `TypeId` with a deterministic
+    /// `DefaultHasher` seeded from 0. It is stable within a single process run
+    /// but not guaranteed stable across Rust versions — treat it as a best-effort
+    /// type-identity hint for install-time mismatch detection, not a persistent ID.
+    pub fn numeric_type_id(&self, name: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        match self.entries.get(name) {
+            None => 0,
+            Some(info) => {
+                let mut h = DefaultHasher::new();
+                info.type_id.hash(&mut h);
+                h.finish()
+            }
+        }
+    }
+
     /// Look up the type info for a table by name.
     pub fn get(&self, name: &str) -> Option<&TableTypeInfo> {
         self.entries.get(name)
