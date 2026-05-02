@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::{Rng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand::rngs::StdRng;
 use ultima_db::{Store, StoreConfig, WriterMode};
 
@@ -173,7 +173,8 @@ fn bench(c: &mut Criterion) {
                     pool[idx].clone()
                 },
                 |op_sets| {
-                    black_box(run_burst(&store, &names, op_sets));
+                    run_burst(&store, &names, op_sets);
+                    black_box(());
                 },
                 BatchSize::SmallInput,
             );
