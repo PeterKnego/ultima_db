@@ -14,6 +14,7 @@ pub(crate) mod checkpoint;
 #[cfg(feature = "persistence")]
 pub(crate) mod registry;
 pub mod metrics;
+pub mod snapshot_stream;
 pub mod store;
 #[cfg(feature = "persistence")]
 pub mod wal;
@@ -31,6 +32,7 @@ pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
 pub use persistence::{Durability, Persistence, Record};
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
+pub use snapshot_stream::{InstallOptions, OnUnknown, SnapshotReader, SnapshotStreamError};
 pub use store::{IsolationLevel, Readable, Store, StoreConfig, WriterMode};
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};
