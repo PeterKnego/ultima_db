@@ -175,6 +175,92 @@ impl Journal {
         Ok(v.into_iter().map(Ok))
     }
 
+    /// Truncate the journal so that only records with `seq <= keep_seq` remain.
+    ///
+    /// Crash-safe via a two-phase sentinel protocol:
+    /// 1. Truncate the tail segment to just past the last-kept record (`new_end`).
+    /// 2. Append a sentinel record at `new_end` and fsync — intent is now durable.
+    /// 3. Truncate back to `new_end`, removing the sentinel.
+    /// 4. Unlink any later segments, then fsync the directory.
+    ///
+    /// If a crash occurs between steps 2 and 3, Task 14 recovery detects the
+    /// sentinel on the next open and re-truncates.
+    ///
+    /// Returns a `Notifier::done()` — the operation is fully synchronous.
+    pub fn truncate_after(&self, keep_seq: u64) -> Result<Notifier, JournalError> {
+        let mut st = self.state.lock().unwrap();
+
+        // Find the last segment whose base_seq <= keep_seq.
+        let seg_idx = match st.segments.iter().rposition(|s| s.base_seq() <= keep_seq) {
+            Some(i) => i,
+            None => {
+                // keep_seq is below every segment — drop everything.
+                let paths: Vec<_> = st.segments.iter().map(|s| s.path().to_path_buf()).collect();
+                st.segments.clear();
+                for p in paths {
+                    let _ = std::fs::remove_file(&p);
+                }
+                if let Ok(d) = std::fs::File::open(&st.dir) {
+                    let _ = d.sync_all();
+                }
+                st.first_seq = None;
+                st.last_seq = None;
+                return Ok(Notifier::done());
+            }
+        };
+
+        // Compute the byte offset just past the last record with seq <= keep_seq.
+        let scan = st.segments[seg_idx].scan()?;
+        let new_end = scan
+            .records
+            .iter()
+            .position(|r| r.seq > keep_seq)
+            .map(|pos| {
+                segment::SEGMENT_HEADER_SIZE as u64
+                    + scan.records[..pos]
+                        .iter()
+                        .map(|r| (4 + 16 + r.payload.len() + 4) as u64)
+                        .sum::<u64>()
+            })
+            .unwrap_or(scan.last_durable_offset);
+
+        // Phase 1: truncate to new_end (remove records past keep_seq).
+        st.segments[seg_idx].truncate(new_end)?;
+
+        // Phase 2: write sentinel at new_end and fsync (crash-safety marker).
+        st.segments[seg_idx].append_record(
+            keep_seq.saturating_add(1),
+            segment::SENTINEL_META,
+            segment::SENTINEL_PAYLOAD,
+        )?;
+        st.segments[seg_idx].fsync()?;
+
+        // Phase 3: truncate back to new_end, removing the sentinel.
+        let after_sentinel = new_end;
+        st.segments[seg_idx].truncate(after_sentinel)?;
+
+        // Phase 4: unlink all later segments, then fsync directory.
+        let to_remove: Vec<_> = st.segments.drain(seg_idx + 1..).collect();
+        for seg in to_remove {
+            let _ = std::fs::remove_file(seg.path());
+        }
+        if let Ok(d) = std::fs::File::open(&st.dir) {
+            let _ = d.sync_all();
+        }
+
+        // Update in-memory state.
+        st.last_seq = if st.first_seq.is_none_or(|first| keep_seq >= first) {
+            Some(keep_seq)
+        } else {
+            None
+        };
+        if st.last_seq.is_none() {
+            st.first_seq = None;
+        }
+
+        Ok(Notifier::done())
+    }
+
     pub fn close(self) -> Result<(), JournalError> {
         let mut g = self.writer.lock().unwrap();
         if let Some(w) = g.take() {
@@ -412,6 +498,41 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    #[test]
+    fn truncate_after_drops_higher_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=10u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        j.truncate_after(5).unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), Some(5));
+        assert!(j.read(7).unwrap().is_none());
+        assert_eq!(j.read(5).unwrap().unwrap().1, b"x".to_vec());
+        // Re-append from new tail.
+        j.append(6, 0, b"new").unwrap().wait().unwrap();
+        assert_eq!(j.read(6).unwrap().unwrap().1, b"new".to_vec());
+    }
+
+    #[test]
+    fn truncate_after_across_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 256;
+        let j = Journal::open(cfg).unwrap();
+        for i in 1..=12u64 {
+            j.append(i, 0, &vec![0u8; 100]).unwrap().wait().unwrap();
+        }
+        j.truncate_after(4).unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), Some(4));
+        // Verify later segments unlinked.
+        let segs = std::fs::read_dir(j.state.lock().unwrap().dir.clone())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("seg-"))
+            .count();
+        assert!(segs <= 2);
     }
 
     #[test]

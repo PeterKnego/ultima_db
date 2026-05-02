@@ -7,6 +7,17 @@ pub const SEGMENT_MAGIC: &[u8; 8] = b"ULTJSEG\0";
 pub const SEGMENT_FORMAT_V: u16 = 1;
 pub const SEGMENT_HEADER_SIZE: usize = 32;
 
+/// Sentinel record constants — written briefly during `truncate_after` to mark
+/// intent on disk.  If a crash occurs after the sentinel fsync but before the
+/// final truncation, Task 14 recovery detects the sentinel and re-truncates.
+pub const SENTINEL_META: u64 = u64::MAX;
+pub const SENTINEL_PAYLOAD: &[u8] = b"ULTJTRUNC";
+
+/// Returns `true` if `rec` is a truncation sentinel written by `truncate_after`.
+pub fn is_sentinel(rec: &DecodedRecord) -> bool {
+    rec.meta == SENTINEL_META && rec.payload == SENTINEL_PAYLOAD
+}
+
 /// Segment header — fixed 32 bytes at the start of each segment file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
