@@ -81,7 +81,7 @@ pub fn decode_table_header(b: &[u8]) -> Result<(TableHeader, usize), SnapshotStr
         return Err(SnapshotStreamError::Truncated);
     }
     let name = std::str::from_utf8(&b[p..p + name_len])
-        .map_err(|_| SnapshotStreamError::Truncated)?
+        .map_err(|_| SnapshotStreamError::Malformed("invalid UTF-8 in table name"))?
         .to_string();
     p += name_len;
     if b.len() < p + 8 + 8 + 2 {
@@ -106,7 +106,7 @@ pub fn decode_table_header(b: &[u8]) -> Result<(TableHeader, usize), SnapshotStr
             return Err(SnapshotStreamError::Truncated);
         }
         let nname = std::str::from_utf8(&b[p..p + nlen])
-            .map_err(|_| SnapshotStreamError::Truncated)?
+            .map_err(|_| SnapshotStreamError::Malformed("invalid UTF-8 in index name"))?
             .to_string();
         p += nlen;
         indexes.push(IndexDef { kind, name: nname });

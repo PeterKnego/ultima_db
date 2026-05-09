@@ -427,7 +427,14 @@ impl Store {
         // a Vec; this wrapper validates row_count and propagates iterator
         // errors. Future optimization: leaf-by-leaf streaming into the tree
         // builder.
-        let mut collected: Vec<(u64, R)> = Vec::with_capacity(row_count as usize);
+        //
+        // Cap the pre-allocation at a sane bound. `row_count` is caller-supplied
+        // (and may originate from an untrusted wire stream upstream); a value
+        // like `u64::MAX` would otherwise abort the process on the
+        // `Vec::with_capacity` call.
+        const MAX_PRE_ALLOC: usize = 1 << 20;
+        let cap_hint = std::cmp::min(row_count as usize, MAX_PRE_ALLOC);
+        let mut collected: Vec<(u64, R)> = Vec::with_capacity(cap_hint);
         for item in sorted {
             collected.push(item?);
         }

@@ -92,6 +92,7 @@ impl Store {
 
 pub struct InstallOptions {
     pub on_unknown_tables: OnUnknown,    // Drop | Keep | Error (default Drop)
+    pub on_extra_tables: OnExtra,        // Keep | Drop (default Keep)
     pub commit_version: Option<u64>,     // currently ignored (v1 limitation)
 }
 ```
@@ -201,11 +202,26 @@ Plus 3 `bulk_load_stream` unit tests (build from iterator, iterator-error propag
 
 Microbenchmarks at 1 K / 10 K / 100 K rows for both build and install paths in `benches/snapshot_throughput.rs`.
 
+## Hardening notes
+
+The v1 install path treats the wire stream as untrusted input. Several hardening passes after the initial implementation:
+
+- **Bounded pre-allocation.** `row_count` is capped against the remaining stream bytes (each row is ≥ 12 bytes on the wire) before `Vec::with_capacity`, so a corrupted or malicious `u64::MAX` can't abort the process via allocator failure before the CRC check runs. Same fix in `bulk_load_stream`.
+- **Strict-ascending key check.** `build_from_raw_rows` validates strict-monotonic keys before calling `BTree::from_sorted` (which only `debug_assert!`s). Out-of-order or duplicate keys fail with `Error::Persistence` instead of silently corrupting the tree in release builds.
+- **`next_id` overflow guard.** `last_id + 1` uses `checked_add`; a wire stream with `u64::MAX` as the last key surfaces as a clean error rather than a debug-build panic / release-build wrap-to-0.
+- **Custom-index detection.** Before `Table::from_bulk` (which would `panic!` for `IndexKind::Custom`), the install path walks the destination's `index_list()` and returns `SnapshotStreamError::CustomIndexUnsupported { table, index }` if any custom index is present.
+- **Atomic capture of `(snapshot, version)`.** Captured under one read lock to close a race where a concurrent committer between two reads could let `install_batch`'s OCC pass while `base_snapshot` reflected stale state.
+- **`OnExtra` policy.** New `InstallOptions::on_extra_tables` controls whether tables present in the destination snapshot but absent from the wire stream survive the install. Default `Keep` preserves the v1 merge behaviour; `Drop` matches Raft `InstallSnapshot` exact-match semantics. Wired into `Store::install_batch_replace`, which filters the prev snapshot's tables by the stream's name set.
+- **Error taxonomy.**
+  - Invalid UTF-8 in the table-header decode reports `SnapshotStreamError::Malformed` (the bytes are present, they're just not valid UTF-8) rather than the misleading `Truncated`.
+  - `Store::snapshot_stream(missing_version)` reports `SnapshotStreamError::VersionNotFound(v)` instead of wrapping a `crate::Error::VersionNotFound` inside `BulkLoad`.
+
 ## Deferred work
 
 - **Streaming install consumer.** v1 drains the reader into memory before parsing. A streaming consumer that builds tables incrementally is the next optimization.
 - **`InstallOptions::commit_version`.** The field is kept on `InstallOptions` for forward compatibility but is **currently ignored** (the v1 `BulkLoadBatch` API has no version-override hook). Will be wired up once `BulkLoadBatch` exposes one. Documented as ignored in the field's doc comment.
 - **`OnUnknown::Keep`.** Currently treated identically to `Drop` (preserved-table logic out of scope for v1). Documented as such in the variant's doc comment.
+- **Custom-index restore.** A `CustomIndex::empty()` (or similar) hook would let custom indexes survive install/bulk-load instead of being rejected. Out of scope for v1.
 - **Stable cross-build `record_type_id`.** Currently `DefaultHasher::hash(&TypeId)` — stable within a process run, not across Rust builds. For cross-cluster safety the registry should adopt a user-supplied stable id at register time (e.g., a `&'static str` namespace). The install path tolerates a mismatched type_id when the table name is registered (it dispatches by name), so the field today is a best-effort hint, not a hard contract.
 
 ## Cross-references

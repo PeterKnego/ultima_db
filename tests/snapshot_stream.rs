@@ -631,4 +631,269 @@ mod tests {
         assert_eq!(txs.get(1).unwrap().note, "deposit");
         assert_eq!(txs.get(3).unwrap().note, "transfer");
     }
+
+    /// A wire stream declaring `row_count = u64::MAX` must NOT abort the
+    /// process via `Vec::with_capacity` — the install path must cap the
+    /// pre-allocation hint by the remaining bytes and surface the corruption
+    /// as a normal error.
+    #[test]
+    fn install_rejects_huge_row_count_without_aborting() {
+        use ultima_db::snapshot_stream::codec::{
+            FILE_FORMAT_V, FILE_MAGIC, FileHeader, TableHeader, encode_file_header,
+            encode_table_header,
+        };
+
+        let mut bytes = Vec::new();
+        encode_file_header(
+            &FileHeader {
+                format_ver: FILE_FORMAT_V,
+                store_ver: 1,
+                table_count: 1,
+            },
+            &mut bytes,
+        );
+        encode_table_header(
+            &TableHeader {
+                name: "rows".to_string(),
+                record_type_id: 0,
+                row_count: u64::MAX,
+                indexes: Vec::new(),
+            },
+            &mut bytes,
+        );
+        // No row payload, no trailer — install must fail cleanly long before
+        // allocating, and certainly without aborting.
+        bytes.extend_from_slice(FILE_MAGIC);
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        let res = dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default());
+        assert!(res.is_err(), "must fail rather than abort, got Ok");
+    }
+
+    /// A custom secondary index on the destination must not panic the
+    /// install path; the call must surface a clean `CustomIndexUnsupported`
+    /// error so callers can react.
+    #[test]
+    fn install_rejects_custom_index_on_destination() {
+        use ultima_db::snapshot_stream::install::InstallOptions;
+        use ultima_db::{CustomIndex, SnapshotStreamError};
+
+        #[derive(Clone)]
+        struct CountIndex {
+            count: usize,
+        }
+        impl CustomIndex<Row> for CountIndex {
+            fn on_insert(&mut self, _id: u64, _record: &Row) -> ultima_db::Result<()> {
+                self.count += 1;
+                Ok(())
+            }
+            fn on_update(
+                &mut self,
+                _id: u64,
+                _old: &Row,
+                _new: &Row,
+            ) -> ultima_db::Result<()> {
+                Ok(())
+            }
+            fn on_delete(&mut self, _id: u64, _record: &Row) {
+                self.count = self.count.saturating_sub(1);
+            }
+        }
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.define_custom_index("counter", CountIndex { count: 0 })
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let res = dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            InstallOptions::default(),
+        );
+        assert!(
+            matches!(res, Err(SnapshotStreamError::CustomIndexUnsupported { .. })),
+            "expected CustomIndexUnsupported, got: {res:?}"
+        );
+    }
+
+    /// `OnExtra::Drop` must remove tables present in the destination snapshot
+    /// but absent from the wire stream, matching Raft `InstallSnapshot`
+    /// semantics.
+    #[test]
+    fn install_drop_extras_replaces_destination_state() {
+        use ultima_db::snapshot_stream::install::{InstallOptions, OnExtra};
+
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct A {
+            v: u64,
+        }
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct B {
+            v: u64,
+        }
+
+        // Source has only table "a".
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<A>("a").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<A>("a").unwrap();
+            t.insert(A { v: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination has both "a" and a stray "b" populated.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<A>("a").unwrap();
+        dst.register_table::<B>("b").unwrap();
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            let mut ta = tx.open_table::<A>("a").unwrap();
+            ta.insert(A { v: 99 }).unwrap();
+            drop(ta);
+            let mut tb = tx.open_table::<B>("b").unwrap();
+            tb.insert(B { v: 7 }).unwrap();
+            drop(tb);
+            tx.commit().unwrap();
+        }
+
+        dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            InstallOptions {
+                on_extra_tables: OnExtra::Drop,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let read = dst.begin_read(None).unwrap();
+        // "a" replaced by source state.
+        let ta = read.open_table::<A>("a").unwrap();
+        assert_eq!(ta.get(1), Some(&A { v: 1 }));
+        // "b" must be absent from the new snapshot.
+        let tb = read.open_table::<B>("b");
+        assert!(tb.is_err(), "extra table 'b' must be dropped");
+    }
+
+    /// Default `OnExtra::Keep` preserves dst-only tables (backwards-compat
+    /// with pre-fix behaviour).
+    #[test]
+    fn install_keep_extras_preserves_destination_state() {
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct A {
+            v: u64,
+        }
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct B {
+            v: u64,
+        }
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<A>("a").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<A>("a").unwrap();
+            t.insert(A { v: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<A>("a").unwrap();
+        dst.register_table::<B>("b").unwrap();
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            let mut tb = tx.open_table::<B>("b").unwrap();
+            tb.insert(B { v: 7 }).unwrap();
+            tx.commit().unwrap();
+        }
+
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+
+        let read = dst.begin_read(None).unwrap();
+        let tb = read.open_table::<B>("b").unwrap();
+        assert_eq!(tb.get(1), Some(&B { v: 7 }), "extras must survive Keep");
+    }
+
+    /// `snapshot_stream` for a missing version must surface the dedicated
+    /// `VersionNotFound` variant rather than a misleading `BulkLoad` wrap.
+    #[test]
+    fn snapshot_stream_missing_version_returns_version_not_found() {
+        use ultima_db::SnapshotStreamError;
+
+        let store = Store::new(StoreConfig::default()).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+        let res = store.snapshot_stream(Some(999));
+        assert!(
+            matches!(&res, Err(SnapshotStreamError::VersionNotFound(999))),
+            "expected VersionNotFound(999)"
+        );
+        // ensure we don't accidentally make the result usable downstream
+        drop(res);
+    }
+
+    /// Invalid UTF-8 bytes inside a table-name length region must report the
+    /// dedicated `Malformed` error variant, not the misleading `Truncated`
+    /// (the bytes ARE present, they just aren't valid UTF-8).
+    #[test]
+    fn malformed_utf8_in_table_name_reports_malformed() {
+        use ultima_db::SnapshotStreamError;
+        use ultima_db::snapshot_stream::codec::{
+            FILE_FORMAT_V, FILE_MAGIC, FileHeader, encode_file_header,
+        };
+
+        let mut bytes = Vec::new();
+        encode_file_header(
+            &FileHeader {
+                format_ver: FILE_FORMAT_V,
+                store_ver: 1,
+                table_count: 1,
+            },
+            &mut bytes,
+        );
+        // Hand-roll a table header with invalid UTF-8 in the name slot.
+        let bad_name: [u8; 4] = [0xFF, 0xFE, 0xFD, 0xFC];
+        bytes.extend_from_slice(&(bad_name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&bad_name);
+        // Rest doesn't matter — decode bails on the UTF-8 error.
+        bytes.extend_from_slice(&[0u8; 18]);
+        bytes.extend_from_slice(FILE_MAGIC);
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        let res = dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default());
+        assert!(
+            matches!(res, Err(SnapshotStreamError::Malformed(_))),
+            "expected Malformed for bad UTF-8, got: {res:?}"
+        );
+    }
 }

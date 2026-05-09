@@ -605,9 +605,7 @@ impl Store {
             let snap = inner
                 .snapshots
                 .get(&v)
-                .ok_or(crate::snapshot_stream::SnapshotStreamError::BulkLoad(
-                    crate::Error::VersionNotFound(v),
-                ))?
+                .ok_or(crate::snapshot_stream::SnapshotStreamError::VersionNotFound(v))?
                 .clone();
             let registry = Arc::clone(&inner.registry);
             (snap, registry)
@@ -667,8 +665,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotStreamError::Bulk`] if the checkpoint file does not
-    /// exist, cannot be read, or fails CRC/deserialization checks.
+    /// Returns [`SnapshotStreamError::BulkLoad`] if the checkpoint file does
+    /// not exist, cannot be read, or fails CRC/deserialization checks.
     #[cfg(feature = "persistence")]
     pub fn open_checkpoint_reader(
         &self,
@@ -938,6 +936,29 @@ impl Store {
         pending: Vec<crate::bulk_load::PendingTable>,
         base_version: u64,
     ) -> Result<u64> {
+        self.install_batch_inner(pending, base_version, None)
+    }
+
+    /// Like [`install_batch`], but discards any tables in the previous
+    /// snapshot that are not in `keep_set` (in addition to the pending ones).
+    /// Used by `install_snapshot_stream` with `OnExtra::Drop` to make the
+    /// destination snapshot exactly mirror the wire stream.
+    #[cfg(feature = "persistence")]
+    pub(crate) fn install_batch_replace(
+        &self,
+        pending: Vec<crate::bulk_load::PendingTable>,
+        base_version: u64,
+        keep_set: std::collections::BTreeSet<String>,
+    ) -> Result<u64> {
+        self.install_batch_inner(pending, base_version, Some(keep_set))
+    }
+
+    fn install_batch_inner(
+        &self,
+        pending: Vec<crate::bulk_load::PendingTable>,
+        base_version: u64,
+        keep_set: Option<std::collections::BTreeSet<String>>,
+    ) -> Result<u64> {
         debug_assert!(!pending.is_empty(), "install_batch called with empty pending");
         let mut inner = self.inner.write().unwrap();
 
@@ -956,11 +977,19 @@ impl Store {
         }
 
         let prev = &inner.snapshots[&inner.latest_version];
-        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = prev
-            .tables
-            .iter()
-            .map(|(k, v)| (k.clone(), Arc::clone(v)))
-            .collect();
+        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = match &keep_set {
+            Some(keep) => prev
+                .tables
+                .iter()
+                .filter(|(k, _)| keep.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect(),
+            None => prev
+                .tables
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect(),
+        };
         for p in pending {
             tables.insert(p.name, p.table);
         }

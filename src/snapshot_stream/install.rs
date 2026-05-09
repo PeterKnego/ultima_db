@@ -37,19 +37,36 @@ pub enum OnUnknown {
     Error,
 }
 
+/// What to do with tables present in the destination snapshot but not in the
+/// incoming wire stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnExtra {
+    /// Preserve them in the new snapshot (default — backwards-compatible
+    /// merge semantics).
+    Keep,
+    /// Drop them — the new snapshot exactly mirrors the wire stream.
+    /// Required for Raft/SMR deployments where `InstallSnapshot` must make
+    /// the follower's state identical to the leader's.
+    Drop,
+}
+
 /// Options for [`Store::install_snapshot_stream`].
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     /// How to handle tables present in the stream but not registered in the
     /// destination store.
     pub on_unknown_tables: OnUnknown,
-    /// Install the snapshot at a specific store version. `None` (default)
-    /// uses `latest_version + 1`, the standard behaviour.
-    ///
-    /// Passing `Some(v)` installs the snapshot and then adjusts the internal
-    /// version counter so that the next auto-assigned write gets `v + 1`.
-    /// This is useful for SMR deployments that want the snapshot version to
-    /// match the log index from which it was produced.
+    /// How to handle tables present in the destination snapshot but absent
+    /// from the wire stream. Defaults to [`OnExtra::Keep`] (merge); set to
+    /// [`OnExtra::Drop`] to get strict replace semantics suitable for Raft
+    /// `InstallSnapshot`.
+    pub on_extra_tables: OnExtra,
+    /// **Currently ignored** (v1 limitation; the new snapshot always lands at
+    /// `latest_version + 1`). The field is reserved for a future API
+    /// extension where `Some(v)` will install the snapshot at version `v` and
+    /// adjust the internal version counter so the next auto-assigned write
+    /// gets `v + 1` — useful for SMR deployments that want the snapshot
+    /// version to match the log index from which it was produced.
     pub commit_version: Option<u64>,
 }
 
@@ -57,6 +74,7 @@ impl Default for InstallOptions {
     fn default() -> Self {
         Self {
             on_unknown_tables: OnUnknown::Drop,
+            on_extra_tables: OnExtra::Keep,
             commit_version: None,
         }
     }
@@ -104,37 +122,50 @@ impl crate::store::Store {
         total_crc.update(&bytes[p..p + n]);
         p += n;
 
-        // Grab the registry + a snapshot of the destination's current state
-        // once. The current snapshot is consulted per-table to clone existing
-        // index definitions so secondary indexes survive the install.
-        let (registry, base_snapshot) = {
+        // Capture the registry, the destination's current snapshot, and the
+        // base version atomically under a single read lock. Capturing these
+        // separately races with concurrent committers: a write that lands
+        // between reads would let `install_batch`'s OCC check pass while
+        // `base_snapshot` still reflects the pre-commit state, silently
+        // dropping any indexes added in the interim.
+        let (registry, base_snapshot, base_version) = {
             let inner = self.inner.read().unwrap();
-            let snap = inner
-                .snapshots
-                .get(&inner.latest_version)
-                .cloned();
-            (Arc::clone(&inner.registry), snap)
+            let v = inner.latest_version;
+            let snap = inner.snapshots.get(&v).cloned();
+            (Arc::clone(&inner.registry), snap, v)
         };
-
-        // Capture base_version before we start building tables.
-        let base_version = self.latest_version();
 
         // ── 3. Per-table parsing ──────────────────────────────────────────
         let mut pending: Vec<PendingTable> = Vec::new();
+        let mut stream_table_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         let mut declared_rows_total: u64 = 0;
+
+        // Cap pre-allocation against untrusted `row_count`. Each row on the
+        // wire is at minimum 12 bytes (u64 key + u32 val_len + 0-byte value),
+        // so any legitimate `row_count` cannot exceed `remaining_bytes / 12`.
+        // Without this, a malicious or corrupted `row_count = u64::MAX` would
+        // request a many-GB allocation and abort the process before the CRC
+        // check runs.
+        const MIN_ROW_BYTES: usize = 12;
 
         for _ in 0..file_header.table_count {
             // 3a. Table header.
             let (table_header, n) = decode_table_header(&bytes[p..])?;
             total_crc.update(&bytes[p..p + n]);
             p += n;
+            stream_table_names.insert(table_header.name.clone());
             declared_rows_total =
                 declared_rows_total.saturating_add(table_header.row_count);
 
             // 3b. Rows: key(u64 LE) | val_len(u32 LE) | val(bytes).
             let mut table_crc = crc32fast::Hasher::new();
-            let mut rows: Vec<(u64, Vec<u8>)> =
-                Vec::with_capacity(table_header.row_count as usize);
+            let remaining = bytes.len().saturating_sub(p);
+            let cap_hint = std::cmp::min(
+                table_header.row_count as usize,
+                remaining / MIN_ROW_BYTES,
+            );
+            let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(cap_hint);
 
             for _ in 0..table_header.row_count {
                 if bytes.len() < p + 12 {
@@ -194,6 +225,22 @@ impl crate::store::Store {
                 .as_ref()
                 .and_then(|snap| snap.tables.get(&table_header.name))
                 .map(|t| t.as_ref() as &dyn MergeableTable);
+
+            // Reject any custom secondary index up-front: the index-rebuild
+            // path inside `Table::from_bulk` panics for `IndexKind::Custom`
+            // because there is no generic "make empty" hook. Convert that
+            // latent panic into a clean error at this trust boundary.
+            if let Some(et) = existing_table {
+                for (kind_byte, idx_name) in et.index_list() {
+                    if kind_byte == 2 {
+                        return Err(SnapshotStreamError::CustomIndexUnsupported {
+                            table: table_header.name.clone(),
+                            index: idx_name,
+                        });
+                    }
+                }
+            }
+
             let table_box = registry
                 .build_table_from_raw(&table_header.name, rows, existing_table)
                 .expect("contains() returned true, so entry must exist")?;
@@ -233,17 +280,41 @@ impl crate::store::Store {
         }
 
         // ── 5. Atomic install ──────────────────────────────────────────────
-        // Empty stream (no registered tables) → nothing to install.
-        if pending.is_empty() {
-            // Return base_version unchanged — no new snapshot created.
-            return Ok(base_version);
-        }
-
         // commit_version: v1 does not support caller-supplied versions for
         // install_snapshot_stream.  The new snapshot always lands at
         // `latest_version + 1`.  The field is kept in `InstallOptions` for
         // future use but is ignored here.
-        let new_version = self.install_batch(pending, base_version)?;
+
+        // Empty pending + Keep semantics → nothing changes; skip the snapshot
+        // bump. With Drop semantics we must still install if extras would be
+        // dropped, so fall through.
+        if pending.is_empty() && opts.on_extra_tables == OnExtra::Keep {
+            return Ok(base_version);
+        }
+
+        let new_version = match opts.on_extra_tables {
+            OnExtra::Keep => self.install_batch(pending, base_version)?,
+            OnExtra::Drop => {
+                // Build keep-set of names that survived OnUnknown::Drop and
+                // OnUnknown::Keep — anything in the wire stream that's not
+                // forbidden by OnUnknown::Error policy. We track all
+                // stream-table names regardless of registration; unregistered
+                // ones are dropped from `pending` but still count as "in the
+                // stream" for replace semantics.
+                if pending.is_empty() {
+                    // Drop policy with no installable tables: degenerate case
+                    // — replace the snapshot with one containing only the
+                    // surviving extras (i.e., none if all dst tables are
+                    // declared in the stream). Without a pending table we
+                    // have nothing to install via install_batch_replace, so
+                    // just return base_version unchanged. Replicas should not
+                    // hit this in practice (an empty stream would mean an
+                    // empty leader state).
+                    return Ok(base_version);
+                }
+                self.install_batch_replace(pending, base_version, stream_table_names)?
+            }
+        };
 
         Ok(new_version)
     }

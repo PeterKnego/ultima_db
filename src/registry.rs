@@ -157,7 +157,28 @@ impl TableRegistry {
                                     .map_err(|e| Error::Persistence(e.to_string()))?;
                             sorted.push((key, std::sync::Arc::new(record)));
                         }
-                        let next_id = sorted.last().map(|(id, _)| id + 1).unwrap_or(1);
+                        // Validate strictly-ascending unique keys at this trust
+                        // boundary. `BTree::from_sorted` only debug-asserts, so
+                        // a malformed wire payload would silently corrupt the
+                        // tree in release builds.
+                        for w in sorted.windows(2) {
+                            if w[0].0 >= w[1].0 {
+                                return Err(Error::Persistence(format!(
+                                    "rows not strictly sorted: key {} >= {}",
+                                    w[0].0, w[1].0
+                                )));
+                            }
+                        }
+                        // `id + 1` would panic in debug / wrap to 0 in release
+                        // for `id == u64::MAX`. Fail loudly instead.
+                        let next_id = match sorted.last() {
+                            Some((id, _)) => id.checked_add(1).ok_or_else(|| {
+                                Error::Persistence(
+                                    "last row id is u64::MAX; next_id would overflow".into(),
+                                )
+                            })?,
+                            None => 1,
+                        };
                         // Preserve secondary indexes by cloning the destination's
                         // existing index definitions. Empty for a fresh receiver.
                         let index_defs = existing

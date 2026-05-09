@@ -32,7 +32,7 @@ pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
 pub use persistence::{Durability, Persistence, Record};
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
-pub use snapshot_stream::{InstallOptions, OnUnknown, SnapshotStreamError};
+pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;
 pub use store::{IsolationLevel, Readable, Store, StoreConfig, WriterMode};
