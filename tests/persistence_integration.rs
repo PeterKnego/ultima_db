@@ -52,11 +52,23 @@ fn standalone_wal_recovery_consistent() {
     {
         let store = open_store(config.clone());
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
         wtx.commit().unwrap();
 
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap().insert(User { name: "Bob".into(), age: 25 }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
         wtx.commit().unwrap();
     }
 
@@ -66,8 +78,20 @@ fn standalone_wal_recovery_consistent() {
     assert_eq!(rtx.version(), 2);
     let table = rtx.open_table::<User>("users").unwrap();
     assert_eq!(table.len(), 2);
-    assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
-    assert_eq!(table.get(2).unwrap(), &User { name: "Bob".into(), age: 25 });
+    assert_eq!(
+        table.get(1).unwrap(),
+        &User {
+            name: "Alice".into(),
+            age: 30
+        }
+    );
+    assert_eq!(
+        table.get(2).unwrap(),
+        &User {
+            name: "Bob".into(),
+            age: 25
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +106,13 @@ fn standalone_checkpoint_roundtrip() {
     {
         let store = open_store(config.clone());
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
         wtx.commit().unwrap();
         store.checkpoint().unwrap();
     }
@@ -92,7 +122,13 @@ fn standalone_checkpoint_roundtrip() {
     assert_eq!(rtx.version(), 1);
     let table = rtx.open_table::<User>("users").unwrap();
     assert_eq!(table.len(), 1);
-    assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
+    assert_eq!(
+        table.get(1).unwrap(),
+        &User {
+            name: "Alice".into(),
+            age: 30
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -108,10 +144,13 @@ fn standalone_checkpoint_plus_wal_recovery() {
         let store = open_store(config.clone());
         for i in 1..=3u32 {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<User>("users").unwrap().insert(User {
-                name: format!("User{i}"),
-                age: 20 + i,
-            }).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User {
+                    name: format!("User{i}"),
+                    age: 20 + i,
+                })
+                .unwrap();
             wtx.commit().unwrap();
         }
         // Checkpoint at v3 (prunes WAL)
@@ -120,10 +159,13 @@ fn standalone_checkpoint_plus_wal_recovery() {
         // Write 2 more (WAL only)
         for i in 4..=5u32 {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<User>("users").unwrap().insert(User {
-                name: format!("User{i}"),
-                age: 20 + i,
-            }).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User {
+                    name: format!("User{i}"),
+                    age: 20 + i,
+                })
+                .unwrap();
             wtx.commit().unwrap();
         }
     }
@@ -151,7 +193,13 @@ fn smr_checkpoint_recovery() {
     {
         let store = open_store(config.clone());
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
         wtx.commit().unwrap();
         store.checkpoint().unwrap();
     }
@@ -160,7 +208,13 @@ fn smr_checkpoint_recovery() {
     assert_eq!(store2.latest_version(), 1);
     let rtx = store2.begin_read(None).unwrap();
     let table = rtx.open_table::<User>("users").unwrap();
-    assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
+    assert_eq!(
+        table.get(1).unwrap(),
+        &User {
+            name: "Alice".into(),
+            age: 30
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -175,10 +229,13 @@ fn wal_pruned_after_checkpoint() {
     let store = open_store(config);
     for i in 1..=5u32 {
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap().insert(User {
-            name: format!("User{i}"),
-            age: 20 + i,
-        }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: format!("User{i}"),
+                age: 20 + i,
+            })
+            .unwrap();
         wtx.commit().unwrap();
     }
 
@@ -201,11 +258,24 @@ fn standalone_eventual_basic() {
 
     let store = open_store(config);
     let mut wtx = store.begin_write(None).unwrap();
-    wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+    wtx.open_table::<User>("users")
+        .unwrap()
+        .insert(User {
+            name: "Alice".into(),
+            age: 30,
+        })
+        .unwrap();
     wtx.commit().unwrap();
 
     let rtx = store.begin_read(None).unwrap();
-    assert_eq!(rtx.open_table::<User>("users").unwrap().get(1).unwrap().name, "Alice");
+    assert_eq!(
+        rtx.open_table::<User>("users")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .name,
+        "Alice"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -216,11 +286,24 @@ fn standalone_eventual_basic() {
 fn persistence_none_unchanged() {
     let store = Store::default();
     let mut wtx = store.begin_write(None).unwrap();
-    wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+    wtx.open_table::<User>("users")
+        .unwrap()
+        .insert(User {
+            name: "Alice".into(),
+            age: 30,
+        })
+        .unwrap();
     wtx.commit().unwrap();
 
     let rtx = store.begin_read(None).unwrap();
-    assert_eq!(rtx.open_table::<User>("users").unwrap().get(1).unwrap().name, "Alice");
+    assert_eq!(
+        rtx.open_table::<User>("users")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .name,
+        "Alice"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -237,16 +320,35 @@ fn wal_update_and_delete_recovery() {
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut t = wtx.open_table::<User>("users").unwrap();
-            t.insert(User { name: "Alice".into(), age: 30 }).unwrap();
-            t.insert(User { name: "Bob".into(), age: 25 }).unwrap();
-            t.insert(User { name: "Charlie".into(), age: 35 }).unwrap();
+            t.insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+            t.insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
+            t.insert(User {
+                name: "Charlie".into(),
+                age: 35,
+            })
+            .unwrap();
         }
         wtx.commit().unwrap();
 
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut t = wtx.open_table::<User>("users").unwrap();
-            t.update(1, User { name: "Alice Updated".into(), age: 31 }).unwrap();
+            t.update(
+                1,
+                User {
+                    name: "Alice Updated".into(),
+                    age: 31,
+                },
+            )
+            .unwrap();
             t.delete(2).unwrap();
         }
         wtx.commit().unwrap();
@@ -256,9 +358,21 @@ fn wal_update_and_delete_recovery() {
     let rtx = store2.begin_read(None).unwrap();
     let table = rtx.open_table::<User>("users").unwrap();
     assert_eq!(table.len(), 2);
-    assert_eq!(table.get(1).unwrap(), &User { name: "Alice Updated".into(), age: 31 });
+    assert_eq!(
+        table.get(1).unwrap(),
+        &User {
+            name: "Alice Updated".into(),
+            age: 31
+        }
+    );
     assert_eq!(table.get(2), None);
-    assert_eq!(table.get(3).unwrap(), &User { name: "Charlie".into(), age: 35 });
+    assert_eq!(
+        table.get(3).unwrap(),
+        &User {
+            name: "Charlie".into(),
+            age: 35
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +387,13 @@ fn wal_delete_table_recovery() {
     {
         let store = open_store(config.clone());
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
         wtx.commit().unwrap();
 
         let mut wtx = store.begin_write(None).unwrap();
@@ -381,7 +501,10 @@ fn consistent_checkpoint_plus_wal_recovery() {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<User>("users")
                 .unwrap()
-                .insert(User { name: format!("User_{i}"), age: i })
+                .insert(User {
+                    name: format!("User_{i}"),
+                    age: i,
+                })
                 .unwrap();
             wtx.commit().unwrap();
         }
@@ -392,7 +515,10 @@ fn consistent_checkpoint_plus_wal_recovery() {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<User>("users")
                 .unwrap()
-                .insert(User { name: format!("User_{i}"), age: i })
+                .insert(User {
+                    name: format!("User_{i}"),
+                    age: i,
+                })
                 .unwrap();
             wtx.commit().unwrap();
         }
@@ -422,8 +548,13 @@ fn recover_unregistered_table_returns_error() {
     {
         let store = open_store(config.clone());
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<User>("users").unwrap()
-            .insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
         wtx.commit().unwrap();
         store.checkpoint().unwrap();
     }
@@ -434,7 +565,10 @@ fn recover_unregistered_table_returns_error() {
         let store = Store::new(config).unwrap();
         // Deliberately do NOT call store.register_table::<User>("users")
         let result = store.recover();
-        assert!(result.is_err(), "recover() should return Err for unregistered table, not panic");
+        assert!(
+            result.is_err(),
+            "recover() should return Err for unregistered table, not panic"
+        );
         let err = result.unwrap_err();
         assert!(
             matches!(err, ultima_db::Error::TableNotRegistered(ref name) if name == "users"),
@@ -457,7 +591,15 @@ fn bulk_load_persists_via_checkpoint_and_recovers() {
     {
         let store = open_store(config.clone());
         let rows: Vec<(u64, User)> = (1u64..=100)
-            .map(|i| (i, User { name: format!("v{i}"), age: i as u32 }))
+            .map(|i| {
+                (
+                    i,
+                    User {
+                        name: format!("v{i}"),
+                        age: i as u32,
+                    },
+                )
+            })
             .collect();
         store
             .bulk_load::<User>(
@@ -486,7 +628,15 @@ fn bulk_load_skip_checkpoint_loses_data_on_crash() {
     {
         let store = open_store(config.clone());
         let rows: Vec<(u64, User)> = (1u64..=10)
-            .map(|i| (i, User { name: format!("v{i}"), age: i as u32 }))
+            .map(|i| {
+                (
+                    i,
+                    User {
+                        name: format!("v{i}"),
+                        age: i as u32,
+                    },
+                )
+            })
             .collect();
         store
             .bulk_load::<User>(
@@ -529,7 +679,9 @@ fn checkpoint_on_persistence_none_errors() {
 fn recover_on_persistence_none_is_noop() {
     // Default Store has Persistence::None — recover must short-circuit Ok.
     let store = Store::default();
-    store.recover().expect("recover is no-op for Persistence::None");
+    store
+        .recover()
+        .expect("recover is no-op for Persistence::None");
 }
 
 #[test]
@@ -553,9 +705,21 @@ fn update_batch_and_delete_batch_replay_through_wal() {
         let store = open_store(config.clone());
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<User>("users").unwrap();
-        t.insert(User { name: "Alice".into(), age: 30 }).unwrap();
-        t.insert(User { name: "Bob".into(), age: 25 }).unwrap();
-        t.insert(User { name: "Carol".into(), age: 40 }).unwrap();
+        t.insert(User {
+            name: "Alice".into(),
+            age: 30,
+        })
+        .unwrap();
+        t.insert(User {
+            name: "Bob".into(),
+            age: 25,
+        })
+        .unwrap();
+        t.insert(User {
+            name: "Carol".into(),
+            age: 40,
+        })
+        .unwrap();
         drop(t);
         wtx.commit().unwrap();
     }
@@ -566,8 +730,20 @@ fn update_batch_and_delete_batch_replay_through_wal() {
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<User>("users").unwrap();
         t.update_batch(vec![
-            (1, User { name: "Alice2".into(), age: 31 }),
-            (3, User { name: "Carol2".into(), age: 41 }),
+            (
+                1,
+                User {
+                    name: "Alice2".into(),
+                    age: 31,
+                },
+            ),
+            (
+                3,
+                User {
+                    name: "Carol2".into(),
+                    age: 41,
+                },
+            ),
         ])
         .unwrap();
         t.delete_batch(&[2]).unwrap();
@@ -601,8 +777,20 @@ fn write_tx_bulk_load_replays_through_wal() {
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<User>("users").unwrap();
         t.bulk_load(BulkLoadInput::Replace(BulkSource::sorted_vec(vec![
-            (1, User { name: "Alice".into(), age: 30 }),
-            (2, User { name: "Bob".into(), age: 25 }),
+            (
+                1,
+                User {
+                    name: "Alice".into(),
+                    age: 30,
+                },
+            ),
+            (
+                2,
+                User {
+                    name: "Bob".into(),
+                    age: 25,
+                },
+            ),
         ])))
         .unwrap();
         drop(t);
@@ -614,8 +802,20 @@ fn write_tx_bulk_load_replays_through_wal() {
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<User>("users").unwrap();
         t.bulk_load(BulkLoadInput::Delta(BulkDelta {
-            inserts: vec![(10, User { name: "Eve".into(), age: 22 })],
-            updates: vec![(1, User { name: "Alice2".into(), age: 31 })],
+            inserts: vec![(
+                10,
+                User {
+                    name: "Eve".into(),
+                    age: 22,
+                },
+            )],
+            updates: vec![(
+                1,
+                User {
+                    name: "Alice2".into(),
+                    age: 31,
+                },
+            )],
             deletes: vec![2],
         }))
         .unwrap();
@@ -647,7 +847,10 @@ fn read_only_write_tx_commit_with_persistence_no_wal_entry() {
         let mut wtx = store.begin_write(None).unwrap();
         wtx.open_table::<User>("users")
             .unwrap()
-            .insert(User { name: "Alice".into(), age: 30 })
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
             .unwrap();
         wtx.commit().unwrap();
     }

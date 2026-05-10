@@ -69,4 +69,3 @@ pub enum Persistence {
         dir: PathBuf,
     },
 }
-

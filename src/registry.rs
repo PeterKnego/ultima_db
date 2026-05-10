@@ -23,10 +23,8 @@ use crate::{Error, Result};
 // `MergeableTable::as_any_mut()` — keeping `dyn Any` here avoids pulling
 // MergeableTable into every closure's body.
 type SerializeAnyFn = Box<dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync>;
-type DeserializeRecordFn =
-    Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>;
-type DeserializeTableFn =
-    Box<dyn Fn(&[u8]) -> Result<Box<dyn MergeableTable>> + Send + Sync>;
+type DeserializeRecordFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>;
+type DeserializeTableFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn MergeableTable>> + Send + Sync>;
 type ReplayInsertFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
 type ReplayUpdateFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
 type ReplayDeleteFn = Box<dyn Fn(&mut dyn Any, u64) -> Result<()> + Send + Sync>;
@@ -124,8 +122,9 @@ impl TableRegistry {
                     }),
                     new_empty_table: Box::new(|| Box::new(Table::<R>::new())),
                     replay_insert: Box::new(|table_any, id, data| {
-                        let table = table_any.downcast_mut::<Table<R>>()
-                            .ok_or_else(|| Error::TypeMismatch("replay_insert downcast failed".into()))?;
+                        let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_insert downcast failed".into())
+                        })?;
                         let (record, _): (R, _) =
                             bincode::serde::decode_from_slice(data, bincode::config::standard())
                                 .map_err(|e| Error::Persistence(e.to_string()))?;
@@ -133,8 +132,9 @@ impl TableRegistry {
                         Ok(())
                     }),
                     replay_update: Box::new(|table_any, id, data| {
-                        let table = table_any.downcast_mut::<Table<R>>()
-                            .ok_or_else(|| Error::TypeMismatch("replay_update downcast failed".into()))?;
+                        let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_update downcast failed".into())
+                        })?;
                         let (record, _): (R, _) =
                             bincode::serde::decode_from_slice(data, bincode::config::standard())
                                 .map_err(|e| Error::Persistence(e.to_string()))?;
@@ -142,8 +142,9 @@ impl TableRegistry {
                         Ok(())
                     }),
                     replay_delete: Box::new(|table_any, id| {
-                        let table = table_any.downcast_mut::<Table<R>>()
-                            .ok_or_else(|| Error::TypeMismatch("replay_delete downcast failed".into()))?;
+                        let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_delete downcast failed".into())
+                        })?;
                         table.delete(id)?;
                         Ok(())
                     }),
@@ -291,26 +292,22 @@ fn deserialize_table<R: Record>(bytes: &[u8]) -> Result<Table<R>> {
     let config = bincode::config::standard();
     let mut offset = 0;
 
-    let (next_id, read): (u64, _) =
-        bincode::decode_from_slice(&bytes[offset..], config)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
+    let (next_id, read): (u64, _) = bincode::decode_from_slice(&bytes[offset..], config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
     offset += read;
 
-    let (count, read): (u64, _) =
-        bincode::decode_from_slice(&bytes[offset..], config)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
+    let (count, read): (u64, _) = bincode::decode_from_slice(&bytes[offset..], config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
     offset += read;
 
     let mut table = Table::<R>::new();
     for _ in 0..count {
-        let (id, read): (u64, _) =
-            bincode::decode_from_slice(&bytes[offset..], config)
-                .map_err(|e| Error::Persistence(e.to_string()))?;
+        let (id, read): (u64, _) = bincode::decode_from_slice(&bytes[offset..], config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
         offset += read;
 
-        let (record, read): (R, _) =
-            bincode::serde::decode_from_slice(&bytes[offset..], config)
-                .map_err(|e| Error::Persistence(e.to_string()))?;
+        let (record, read): (R, _) = bincode::serde::decode_from_slice(&bytes[offset..], config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
         offset += read;
 
         table.insert_with_id(id, record)?;
@@ -335,7 +332,10 @@ mod tests {
         let mut reg = TableRegistry::default();
         reg.register::<TestUser>("users").unwrap();
 
-        let user = TestUser { name: "Alice".into(), age: 30 };
+        let user = TestUser {
+            name: "Alice".into(),
+            age: 30,
+        };
         let info = reg.get("users").unwrap();
         let bytes = (info.serialize_record)(&user).unwrap();
         let any = (info.deserialize_record)(&bytes).unwrap();
@@ -349,16 +349,38 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
 
         let mut table = Table::<TestUser>::new();
-        table.insert(TestUser { name: "Alice".into(), age: 30 }).unwrap();
-        table.insert(TestUser { name: "Bob".into(), age: 25 }).unwrap();
+        table
+            .insert(TestUser {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+        table
+            .insert(TestUser {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
 
         let info = reg.get("users").unwrap();
         let bytes = (info.serialize_table)(&table).unwrap();
         let any = (info.deserialize_table)(&bytes).unwrap();
         let recovered = any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(recovered.len(), 2);
-        assert_eq!(recovered.get(1).unwrap(), &TestUser { name: "Alice".into(), age: 30 });
-        assert_eq!(recovered.get(2).unwrap(), &TestUser { name: "Bob".into(), age: 25 });
+        assert_eq!(
+            recovered.get(1).unwrap(),
+            &TestUser {
+                name: "Alice".into(),
+                age: 30
+            }
+        );
+        assert_eq!(
+            recovered.get(2).unwrap(),
+            &TestUser {
+                name: "Bob".into(),
+                age: 25
+            }
+        );
     }
 
     #[test]
@@ -372,7 +394,10 @@ mod tests {
     fn register_duplicate_different_type_errors() {
         let mut reg = TableRegistry::default();
         reg.register::<TestUser>("users").unwrap();
-        assert!(matches!(reg.register::<String>("users"), Err(Error::TypeMismatch(_))));
+        assert!(matches!(
+            reg.register::<String>("users"),
+            Err(Error::TypeMismatch(_))
+        ));
     }
 
     #[test]
@@ -386,7 +411,10 @@ mod tests {
     fn validate_type_mismatch() {
         let mut reg = TableRegistry::default();
         reg.register::<TestUser>("users").unwrap();
-        assert!(matches!(reg.validate_type::<String>("users"), Err(Error::TypeMismatch(_))));
+        assert!(matches!(
+            reg.validate_type::<String>("users"),
+            Err(Error::TypeMismatch(_))
+        ));
     }
 
     #[test]
@@ -426,7 +454,10 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
         let info = reg.get("users").unwrap();
         let table_any = (info.new_empty_table)();
-        let table = table_any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_any
+            .as_any()
+            .downcast_ref::<Table<TestUser>>()
+            .unwrap();
         assert_eq!(table.len(), 0);
     }
 
@@ -440,26 +471,41 @@ mod tests {
         let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
 
         // Replay insert
-        let user = TestUser { name: "Alice".into(), age: 30 };
+        let user = TestUser {
+            name: "Alice".into(),
+            age: 30,
+        };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
         (info.replay_insert)(table_box.as_any_mut(), 1, &data).unwrap();
 
-        let table = table_box.as_any().downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_box
+            .as_any()
+            .downcast_ref::<Table<TestUser>>()
+            .unwrap();
         assert_eq!(table.len(), 1);
         assert_eq!(table.get(1).unwrap().name, "Alice");
 
         // Replay update
-        let updated = TestUser { name: "Alice Updated".into(), age: 31 };
+        let updated = TestUser {
+            name: "Alice Updated".into(),
+            age: 31,
+        };
         let data = bincode::serde::encode_to_vec(&updated, bincode::config::standard()).unwrap();
         (info.replay_update)(table_box.as_any_mut(), 1, &data).unwrap();
 
-        let table = table_box.as_any().downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_box
+            .as_any()
+            .downcast_ref::<Table<TestUser>>()
+            .unwrap();
         assert_eq!(table.get(1).unwrap().name, "Alice Updated");
 
         // Replay delete
         (info.replay_delete)(table_box.as_any_mut(), 1).unwrap();
 
-        let table = table_box.as_any().downcast_ref::<Table<TestUser>>().unwrap();
+        let table = table_box
+            .as_any()
+            .downcast_ref::<Table<TestUser>>()
+            .unwrap();
         assert_eq!(table.len(), 0);
     }
 
@@ -470,7 +516,10 @@ mod tests {
         let info = reg.get("users").unwrap();
 
         let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
-        let user = TestUser { name: "Alice".into(), age: 30 };
+        let user = TestUser {
+            name: "Alice".into(),
+            age: 30,
+        };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
         (info.replay_insert)(table_box.as_any_mut(), 1, &data).unwrap();
         // Insert same ID again
@@ -485,7 +534,10 @@ mod tests {
         let info = reg.get("users").unwrap();
 
         let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
-        let user = TestUser { name: "Alice".into(), age: 30 };
+        let user = TestUser {
+            name: "Alice".into(),
+            age: 30,
+        };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
         let result = (info.replay_update)(table_box.as_mut(), 99, &data);
         assert!(result.is_err());
@@ -531,7 +583,10 @@ mod tests {
         let info = reg.get("users").unwrap();
 
         let mut wrong_table: Box<dyn Any + Send + Sync> = Box::new(Table::<String>::new());
-        let user = TestUser { name: "Alice".into(), age: 30 };
+        let user = TestUser {
+            name: "Alice".into(),
+            age: 30,
+        };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
         let result = (info.replay_insert)(wrong_table.as_mut(), 1, &data);
         assert!(matches!(result, Err(Error::TypeMismatch(_))));
@@ -544,7 +599,10 @@ mod tests {
         let info = reg.get("users").unwrap();
 
         let mut wrong_table: Box<dyn Any + Send + Sync> = Box::new(Table::<String>::new());
-        let user = TestUser { name: "Alice".into(), age: 30 };
+        let user = TestUser {
+            name: "Alice".into(),
+            age: 30,
+        };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
         let result = (info.replay_update)(wrong_table.as_mut(), 1, &data);
         assert!(matches!(result, Err(Error::TypeMismatch(_))));
@@ -581,8 +639,18 @@ mod tests {
         reg.register::<TestUser>("users").unwrap();
 
         let mut table = Table::<TestUser>::new();
-        table.insert(TestUser { name: "A".into(), age: 1 }).unwrap();
-        table.insert(TestUser { name: "B".into(), age: 2 }).unwrap();
+        table
+            .insert(TestUser {
+                name: "A".into(),
+                age: 1,
+            })
+            .unwrap();
+        table
+            .insert(TestUser {
+                name: "B".into(),
+                age: 2,
+            })
+            .unwrap();
         table.delete(2).unwrap(); // next_id stays at 3
 
         let info = reg.get("users").unwrap();

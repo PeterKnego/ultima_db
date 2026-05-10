@@ -66,9 +66,18 @@ impl FjallEngine {
 
         for i in 1..=NUM_ACCOUNTS {
             let k = encode_key(i);
-            let a = Account { customer_id: i, name: format!("Customer_{i}") };
-            let s = Savings { customer_id: i, balance: INITIAL_SAVINGS };
-            let c = Checking { customer_id: i, balance: INITIAL_CHECKING };
+            let a = Account {
+                customer_id: i,
+                name: format!("Customer_{i}"),
+            };
+            let s = Savings {
+                customer_id: i,
+                balance: INITIAL_SAVINGS,
+            };
+            let c = Checking {
+                customer_id: i,
+                balance: INITIAL_CHECKING,
+            };
             ks_accounts
                 .insert(k, bincode::serde::encode_to_vec(&a, BINCODE_CFG).unwrap())
                 .unwrap();
@@ -96,12 +105,10 @@ fn apply_op_in_txn(
     ks_checking: &OptimisticTxKeyspace,
     op: &SmallBankOp,
 ) {
-    let decode_sav = |b: &[u8]| -> Savings {
-        bincode::serde::decode_from_slice(b, BINCODE_CFG).unwrap().0
-    };
-    let decode_chk = |b: &[u8]| -> Checking {
-        bincode::serde::decode_from_slice(b, BINCODE_CFG).unwrap().0
-    };
+    let decode_sav =
+        |b: &[u8]| -> Savings { bincode::serde::decode_from_slice(b, BINCODE_CFG).unwrap().0 };
+    let decode_chk =
+        |b: &[u8]| -> Checking { bincode::serde::decode_from_slice(b, BINCODE_CFG).unwrap().0 };
 
     match op {
         SmallBankOp::Balance(_) => {
@@ -178,7 +185,11 @@ fn apply_op_in_txn(
                 );
             }
         }
-        SmallBankOp::SendPayment { source, dest, amount } => {
+        SmallBankOp::SendPayment {
+            source,
+            dest,
+            amount,
+        } => {
             let src_k = encode_key(*source);
             let dst_k = encode_key(*dest);
             if let Some(src_bytes) = txn.get(ks_checking, &src_k).unwrap() {
@@ -215,12 +226,16 @@ impl SmallBankEngine for FjallEngine {
             std::collections::BTreeMap::new();
         for guard in self.ks_savings.inner().iter() {
             let v = guard.value().unwrap();
-            let s: Savings = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            let s: Savings = bincode::serde::decode_from_slice(&v, BINCODE_CFG)
+                .unwrap()
+                .0;
             accounts.entry(s.customer_id).or_default().savings = s.balance;
         }
         for guard in self.ks_checking.inner().iter() {
             let v = guard.value().unwrap();
-            let c: Checking = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            let c: Checking = bincode::serde::decode_from_slice(&v, BINCODE_CFG)
+                .unwrap()
+                .0;
             accounts.entry(c.customer_id).or_default().checking = c.balance;
         }
         hash_accounts(accounts)
@@ -267,7 +282,12 @@ impl SmallBankEngine for FjallEngine {
                     loop {
                         let mut txn = db.write_tx().expect("write_tx failed");
                         for op in &ops {
-                            apply_op_in_txn(&mut txn, ks_savings.as_ref(), ks_checking.as_ref(), op);
+                            apply_op_in_txn(
+                                &mut txn,
+                                ks_savings.as_ref(),
+                                ks_checking.as_ref(),
+                                op,
+                            );
                         }
                         match txn.commit().expect("io error") {
                             Ok(()) => return (1u64, retries),

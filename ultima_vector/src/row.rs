@@ -38,7 +38,11 @@ impl HnswState {
     /// New state for a node at the given top level, with empty adjacency lists.
     pub fn empty(level: u8) -> Self {
         let layers = vec![Vec::new(); usize::from(level) + 1];
-        Self { level, tombstoned: false, layers }
+        Self {
+            level,
+            tombstoned: false,
+            layers,
+        }
     }
 
     pub fn level(&self) -> u8 {
@@ -71,7 +75,11 @@ impl HnswState {
     /// node's `level` (callers must respect node level invariants).
     pub fn set_neighbors(&mut self, layer: u8, neighbors: Vec<u64>) {
         let idx = usize::from(layer);
-        assert!(idx < self.layers.len(), "layer {layer} above node level {}", self.level);
+        assert!(
+            idx < self.layers.len(),
+            "layer {layer} above node level {}",
+            self.level
+        );
         self.layers[idx] = neighbors;
     }
 }
@@ -131,7 +139,10 @@ mod tests {
     #[test]
     fn neighbors_above_level_is_empty() {
         let s = HnswState::empty(0);
-        assert!(s.neighbors(5).is_empty(), "out-of-bounds layer returns empty");
+        assert!(
+            s.neighbors(5).is_empty(),
+            "out-of-bounds layer returns empty"
+        );
     }
 
     #[test]

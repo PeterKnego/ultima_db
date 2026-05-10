@@ -62,7 +62,12 @@ impl Notifier {
             state: Mutex::new(State::Pending(Vec::new())),
             cv: Condvar::new(),
         });
-        (Signal { inner: Arc::clone(&inner) }, Notifier { inner })
+        (
+            Signal {
+                inner: Arc::clone(&inner),
+            },
+            Notifier { inner },
+        )
     }
 
     pub fn is_done(&self) -> bool {

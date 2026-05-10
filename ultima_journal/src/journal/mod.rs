@@ -53,7 +53,11 @@ impl Journal {
             if scan.had_torn_tail {
                 seg.truncate(scan.last_durable_offset)?;
             }
-            let scan = if scan.had_torn_tail { seg.scan()? } else { scan };
+            let scan = if scan.had_torn_tail {
+                seg.scan()?
+            } else {
+                scan
+            };
             segments_with_scan.push((seg, scan));
         }
 
@@ -151,7 +155,10 @@ impl Journal {
             if let Some(last) = st.last_seq
                 && seq <= last
             {
-                return Err(JournalError::NonMonotonicSeq { expected_gt: last, got: seq });
+                return Err(JournalError::NonMonotonicSeq {
+                    expected_gt: last,
+                    got: seq,
+                });
             }
             // Claim the seq under the lock: send to channel while still holding it,
             // so the channel ordering matches the monotonic seq order.
@@ -358,7 +365,10 @@ impl Journal {
         }
 
         // Recompute first_seq.
-        st.first_seq = st.segments.first().and_then(|s| s.scan().ok())
+        st.first_seq = st
+            .segments
+            .first()
+            .and_then(|s| s.scan().ok())
             .and_then(|scan| scan.records.first().map(|r| r.seq));
 
         Ok(())
@@ -443,7 +453,13 @@ mod tests {
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
         j.append(5, 0, b"x").unwrap().wait().unwrap();
         let err = j.append(3, 0, b"y").unwrap_err();
-        assert!(matches!(err, JournalError::NonMonotonicSeq { expected_gt: 5, got: 3 }));
+        assert!(matches!(
+            err,
+            JournalError::NonMonotonicSeq {
+                expected_gt: 5,
+                got: 3
+            }
+        ));
     }
 
     #[test]
@@ -454,7 +470,10 @@ mod tests {
         let j = Journal::open(cfg).unwrap();
         let big = vec![0u8; 1024];
         let err = j.append(1, 0, &big).unwrap_err();
-        assert!(matches!(err, JournalError::PayloadTooLargeForSegment { .. }));
+        assert!(matches!(
+            err,
+            JournalError::PayloadTooLargeForSegment { .. }
+        ));
     }
 
     #[test]
@@ -510,7 +529,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
         for i in 1..=5u64 {
-            j.append(i, i * 10, format!("p{i}").as_bytes()).unwrap().wait().unwrap();
+            j.append(i, i * 10, format!("p{i}").as_bytes())
+                .unwrap()
+                .wait()
+                .unwrap();
         }
         let v = j.read_range(2..=4).unwrap();
         assert_eq!(v.len(), 3);
@@ -523,7 +545,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
         for i in 1..=5u64 {
-            j.append(i, 0, format!("p{i}").as_bytes()).unwrap().wait().unwrap();
+            j.append(i, 0, format!("p{i}").as_bytes())
+                .unwrap()
+                .wait()
+                .unwrap();
         }
         let it = j.iter_range(..).unwrap();
         let collected: Vec<_> = it.collect::<Result<Vec<_>, _>>().unwrap();
@@ -580,8 +605,8 @@ mod tests {
 
     #[test]
     fn callback_fires_after_durable() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
         let counter = Arc::new(AtomicU64::new(0));
@@ -633,7 +658,13 @@ mod tests {
         // Verify later segments unlinked.
         let segs = std::fs::read_dir(j.state.lock().unwrap().dir.clone())
             .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("seg-"))
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("seg-")
+            })
             .count();
         assert!(segs <= 2);
     }
@@ -681,7 +712,8 @@ mod tests {
             // appending a sentinel record by writing to the file directly.
             let mut st = j.state.lock().unwrap();
             let seg = st.segments.last_mut().unwrap();
-            seg.append_record(99, segment::SENTINEL_META, segment::SENTINEL_PAYLOAD).unwrap();
+            seg.append_record(99, segment::SENTINEL_META, segment::SENTINEL_PAYLOAD)
+                .unwrap();
             seg.fsync().unwrap();
         }
         // Reopen — recovery should treat sentinel as truncate marker, drop records >= sentinel seq.
@@ -704,8 +736,12 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&dir_path).unwrap().collect();
         let seg_path = entries[0].as_ref().unwrap().path();
         use std::io::Write;
-        std::fs::OpenOptions::new().append(true).open(&seg_path).unwrap()
-            .write_all(&[0xAB; 5]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg_path)
+            .unwrap()
+            .write_all(&[0xAB; 5])
+            .unwrap();
         // Reopen — torn tail should be truncated.
         let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
         assert_eq!(j2.last_seq(), Some(3));
@@ -816,8 +852,8 @@ mod tests {
         j.append(1, 0, b"a").unwrap().wait().unwrap();
         j.append(5, 0, b"b").unwrap().wait().unwrap();
         j.append(10, 0, b"c").unwrap().wait().unwrap();
-        assert!(j.read(3).unwrap().is_none());   // between 1 and 5
-        assert!(j.read(7).unwrap().is_none());   // between 5 and 10
+        assert!(j.read(3).unwrap().is_none()); // between 1 and 5
+        assert!(j.read(7).unwrap().is_none()); // between 5 and 10
     }
 
     #[test]
@@ -834,8 +870,8 @@ mod tests {
 
     #[test]
     fn concurrent_reads_during_appends() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let j = Arc::new(Journal::open(JournalConfig::new(dir.path())).unwrap());
         for i in 1..=100u64 {

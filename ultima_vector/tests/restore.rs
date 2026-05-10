@@ -4,10 +4,10 @@
 //! Integration tests for VectorCollection restore.
 
 use ultima_db::Store;
+use ultima_vector::VectorCollection;
 use ultima_vector::distance::Cosine;
 use ultima_vector::hnsw::params::HnswParams;
 use ultima_vector::row::{EntryPoint, VectorRow};
-use ultima_vector::VectorCollection;
 
 fn open_coll(store: Store) -> VectorCollection<u64, Cosine> {
     VectorCollection::open(store, "v", HnswParams::for_dim(4), Cosine).unwrap()
@@ -38,11 +38,8 @@ fn restore_round_trip_preserves_search_results() {
     let data_t = rtx
         .open_table::<VectorRow<u64>>(data_name.as_str())
         .unwrap();
-    let entry_t = rtx
-        .open_table::<EntryPoint>(entry_name.as_str())
-        .unwrap();
-    let rows: Vec<(u64, VectorRow<u64>)> =
-        data_t.iter().map(|(id, r)| (id, r.clone())).collect();
+    let entry_t = rtx.open_table::<EntryPoint>(entry_name.as_str()).unwrap();
+    let rows: Vec<(u64, VectorRow<u64>)> = data_t.iter().map(|(id, r)| (id, r.clone())).collect();
     let ep = entry_t.get(1).cloned().unwrap_or_default();
     drop(rtx);
 
@@ -76,7 +73,10 @@ fn restore_replace_drops_old_data() {
             hnsw: ultima_vector::row::HnswState::empty(0),
         },
     )];
-    let ep = EntryPoint { node_id: Some(100), max_level: 0 };
+    let ep = EntryPoint {
+        node_id: Some(100),
+        max_level: 0,
+    };
     coll.restore_vec(new_rows, ep).unwrap();
 
     // Old IDs are gone.
@@ -109,7 +109,10 @@ fn restore_dim_mismatch_errors_before_install() {
     let res = coll.restore_vec(bad, EntryPoint::default());
     assert!(matches!(
         res,
-        Err(Error::DimMismatch { expected: 4, got: 2 })
+        Err(Error::DimMismatch {
+            expected: 4,
+            got: 2
+        })
     ));
     assert_eq!(
         store.latest_version(),
@@ -197,7 +200,10 @@ fn restore_concurrent_read_unaffected() {
             hnsw: ultima_vector::row::HnswState::empty(0),
         },
     )];
-    let ep = EntryPoint { node_id: Some(50), max_level: 0 };
+    let ep = EntryPoint {
+        node_id: Some(50),
+        max_level: 0,
+    };
     coll.restore_vec(new_rows, ep).unwrap();
 
     // Pre-restore reader still sees the seed.

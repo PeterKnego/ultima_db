@@ -10,15 +10,15 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace};
 use tempfile::TempDir;
 
 #[path = "ycsb_common.rs"]
 mod ycsb_common;
 use ycsb_common::{
-    bench_multiwriter_workloads, ycsb_criterion, BurstResult, MultiWriterEngine, YcsbRecord,
-    NUM_RECORDS,
+    BurstResult, MultiWriterEngine, NUM_RECORDS, YcsbRecord, bench_multiwriter_workloads,
+    ycsb_criterion,
 };
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
@@ -109,7 +109,10 @@ impl MultiWriterEngine for FjallMultiWriterEngine {
             committed += c;
             conflicts += x;
         }
-        BurstResult { committed, conflicts }
+        BurstResult {
+            committed,
+            conflicts,
+        }
     }
 
     fn verify_key(&self, key: u64) -> bool {

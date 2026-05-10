@@ -9,9 +9,9 @@
 //!
 //!     cargo run --example transactional -p ultima-vector
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{Store, StoreConfig};
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 

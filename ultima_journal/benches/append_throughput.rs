@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use ultima_journal::{Durability, Journal, JournalConfig};
 
@@ -62,5 +62,10 @@ fn bench_iter_range(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_append_consistent, bench_append_eventual, bench_iter_range);
+criterion_group!(
+    benches,
+    bench_append_consistent,
+    bench_append_eventual,
+    bench_iter_range
+);
 criterion_main!(benches);

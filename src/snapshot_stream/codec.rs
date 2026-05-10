@@ -23,7 +23,7 @@ pub struct TableHeader {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDef {
-    pub kind: u8,    // 0 = Unique, 1 = NonUnique
+    pub kind: u8, // 0 = Unique, 1 = NonUnique
     pub name: String,
 }
 

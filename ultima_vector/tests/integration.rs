@@ -4,9 +4,9 @@
 //! Recall integration test: assert HNSW top-K matches brute-force ground truth
 //! on random L2-normalized vectors.
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{Store, StoreConfig};
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 
@@ -25,11 +25,7 @@ fn random_unit_vec(rng: &mut StdRng, dim: usize) -> Vec<f32> {
     v
 }
 
-fn brute_force_top_k(
-    query: &[f32],
-    vectors: &[(u64, Vec<f32>)],
-    k: usize,
-) -> Vec<u64> {
+fn brute_force_top_k(query: &[f32], vectors: &[(u64, Vec<f32>)], k: usize) -> Vec<u64> {
     use std::cmp::Ordering;
     let mut scored: Vec<(u64, f32)> = vectors
         .iter()
@@ -50,13 +46,8 @@ fn recall_at_10_meets_floor_on_random_vectors() {
     let mut rng = StdRng::seed_from_u64(0xBEEF);
 
     let store = Store::new(StoreConfig::default()).unwrap();
-    let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-        store,
-        "vec",
-        HnswParams::for_dim(DIM),
-        Cosine,
-    )
-    .unwrap();
+    let coll: VectorCollection<u64, Cosine> =
+        VectorCollection::open(store, "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
 
     // Build the index in a single write transaction for speed.
     let mut vectors: Vec<(u64, Vec<f32>)> = Vec::with_capacity(N);

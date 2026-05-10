@@ -6,9 +6,9 @@
 //! Run: `cargo run -p ultima-vector --example bulk_restore`
 
 use ultima_db::Store;
-use ultima_vector::{VectorCollection, hnsw::params::HnswParams};
 use ultima_vector::distance::Cosine;
 use ultima_vector::row::{EntryPoint, VectorRow};
+use ultima_vector::{VectorCollection, hnsw::params::HnswParams};
 
 fn main() {
     // 1. Build a "source" collection the normal way.
@@ -28,13 +28,18 @@ fn main() {
     let rtx = store_a.begin_read(None).unwrap();
     let data_name = coll_a.data_table_name();
     let entry_name = coll_a.entry_table_name();
-    let data_t = rtx.open_table::<VectorRow<u64>>(data_name.as_str()).unwrap();
+    let data_t = rtx
+        .open_table::<VectorRow<u64>>(data_name.as_str())
+        .unwrap();
     let entry_t = rtx.open_table::<EntryPoint>(entry_name.as_str()).unwrap();
-    let rows: Vec<(u64, VectorRow<u64>)> =
-        data_t.iter().map(|(id, r)| (id, r.clone())).collect();
+    let rows: Vec<(u64, VectorRow<u64>)> = data_t.iter().map(|(id, r)| (id, r.clone())).collect();
     let ep = entry_t.get(1).cloned().unwrap_or_default();
     drop(rtx);
-    println!("Captured {} rows + entry-point id={:?}", rows.len(), ep.node_id);
+    println!(
+        "Captured {} rows + entry-point id={:?}",
+        rows.len(),
+        ep.node_id
+    );
 
     // 3. Restore into a fresh store + collection.
     let t0 = std::time::Instant::now();

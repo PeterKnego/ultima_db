@@ -34,10 +34,7 @@ pub enum Error {
     /// against a fresh base; there is no `wait_for` because the conflicting
     /// writer has already finished.
     #[error("serialization failure on table '{table}' (conflicting version {version})")]
-    SerializationFailure {
-        table: String,
-        version: u64,
-    },
+    SerializationFailure { table: String, version: u64 },
     /// Returned when `begin_write` is called while another write transaction
     /// is active in [`WriterMode::SingleWriter`] mode.
     #[error("another write transaction is active (SingleWriter mode)")]
@@ -103,19 +100,28 @@ mod tests {
             version: 3,
             wait_for: None,
         };
-        assert_eq!(e.to_string(), "write conflict on table 'users', keys [1, 2] (conflicting version 3)");
+        assert_eq!(
+            e.to_string(),
+            "write conflict on table 'users', keys [1, 2] (conflicting version 3)"
+        );
     }
 
     #[test]
     fn error_writer_busy_displays() {
         let e = Error::WriterBusy;
-        assert_eq!(e.to_string(), "another write transaction is active (SingleWriter mode)");
+        assert_eq!(
+            e.to_string(),
+            "another write transaction is active (SingleWriter mode)"
+        );
     }
 
     #[test]
     fn error_type_mismatch_displays() {
         let e = Error::TypeMismatch("users".to_string());
-        assert_eq!(e.to_string(), "table 'users' was opened with a different type");
+        assert_eq!(
+            e.to_string(),
+            "table 'users' was opened with a different type"
+        );
     }
 
     #[test]
@@ -133,7 +139,10 @@ mod tests {
     #[test]
     fn error_index_type_mismatch_displays() {
         let e = Error::IndexTypeMismatch("by_email".to_string());
-        assert_eq!(e.to_string(), "index 'by_email' queried with wrong key type");
+        assert_eq!(
+            e.to_string(),
+            "index 'by_email' queried with wrong key type"
+        );
     }
 
     #[test]

@@ -86,32 +86,49 @@ fn apply(wtx: &mut ultima_db::WriteTx, ops: &[Op]) -> Result<(), ultima_db::Erro
             Op::DepositChecking(cid, amount) => {
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
                 if let Some((id, rec)) = c.get_unique::<u64>("customer_id", cid).unwrap() {
-                    let new = Checking { balance: rec.balance + amount, ..*rec };
+                    let new = Checking {
+                        balance: rec.balance + amount,
+                        ..*rec
+                    };
                     c.update(id, new)?;
                 }
             }
             Op::TransactSavings(cid, amount) => {
                 let mut s = wtx.open_table::<Savings>("savings").unwrap();
                 if let Some((id, rec)) = s.get_unique::<u64>("customer_id", cid).unwrap() {
-                    let new = Savings { balance: rec.balance + amount, ..*rec };
+                    let new = Savings {
+                        balance: rec.balance + amount,
+                        ..*rec
+                    };
                     s.update(id, new)?;
                 }
             }
             Op::Amalgamate { source, dest } => {
                 let mut s = wtx.open_table::<Savings>("savings").unwrap();
-                let amt = if let Some((id, rec)) =
-                    s.get_unique::<u64>("customer_id", source).unwrap()
-                {
-                    let a = rec.balance;
-                    s.update(id, Savings { balance: 0.0, ..*rec })?;
-                    a
-                } else {
-                    0.0
-                };
+                let amt =
+                    if let Some((id, rec)) = s.get_unique::<u64>("customer_id", source).unwrap() {
+                        let a = rec.balance;
+                        s.update(
+                            id,
+                            Savings {
+                                balance: 0.0,
+                                ..*rec
+                            },
+                        )?;
+                        a
+                    } else {
+                        0.0
+                    };
                 drop(s);
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
                 if let Some((id, rec)) = c.get_unique::<u64>("customer_id", dest).unwrap() {
-                    c.update(id, Checking { balance: rec.balance + amt, ..*rec })?;
+                    c.update(
+                        id,
+                        Checking {
+                            balance: rec.balance + amt,
+                            ..*rec
+                        },
+                    )?;
                 }
             }
             Op::WriteCheck(cid, amount) => {
@@ -126,19 +143,34 @@ fn apply(wtx: &mut ultima_db::WriteTx, ops: &[Op]) -> Result<(), ultima_db::Erro
                 if let Some((id, rec)) = c.get_unique::<u64>("customer_id", cid).unwrap() {
                     let total = sbal + rec.balance;
                     let penalty = if total < *amount { 1.0 } else { 0.0 };
-                    c.update(id, Checking { balance: rec.balance - amount - penalty, ..*rec })?;
+                    c.update(
+                        id,
+                        Checking {
+                            balance: rec.balance - amount - penalty,
+                            ..*rec
+                        },
+                    )?;
                 }
             }
-            Op::SendPayment { source, dest, amount } => {
+            Op::SendPayment {
+                source,
+                dest,
+                amount,
+            } => {
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
-                if let Some((src_id, src_rec)) =
-                    c.get_unique::<u64>("customer_id", source).unwrap()
+                if let Some((src_id, src_rec)) = c.get_unique::<u64>("customer_id", source).unwrap()
                     && src_rec.balance >= *amount
                     && let Some((dst_id, dst_rec)) =
                         c.get_unique::<u64>("customer_id", dest).unwrap()
                 {
-                    let src_new = Checking { balance: src_rec.balance - amount, ..*src_rec };
-                    let dst_new = Checking { balance: dst_rec.balance + amount, ..*dst_rec };
+                    let src_new = Checking {
+                        balance: src_rec.balance - amount,
+                        ..*src_rec
+                    };
+                    let dst_new = Checking {
+                        balance: dst_rec.balance + amount,
+                        ..*dst_rec
+                    };
                     c.update(src_id, src_new)?;
                     c.update(dst_id, dst_new)?;
                 }
@@ -221,19 +253,29 @@ fn run(label: &str, isolation: IsolationLevel) -> (u64, u64, Duration) {
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut s = wtx.open_table::<Savings>("savings").unwrap();
-            s.define_index("customer_id", IndexKind::Unique, |r: &Savings| r.customer_id)
-                .unwrap();
+            s.define_index("customer_id", IndexKind::Unique, |r: &Savings| {
+                r.customer_id
+            })
+            .unwrap();
             let batch: Vec<Savings> = (1..=NUM_ACCOUNTS)
-                .map(|i| Savings { customer_id: i, balance: 10_000.0 })
+                .map(|i| Savings {
+                    customer_id: i,
+                    balance: 10_000.0,
+                })
                 .collect();
             s.insert_batch(batch).unwrap();
         }
         {
             let mut c = wtx.open_table::<Checking>("checking").unwrap();
-            c.define_index("customer_id", IndexKind::Unique, |r: &Checking| r.customer_id)
-                .unwrap();
+            c.define_index("customer_id", IndexKind::Unique, |r: &Checking| {
+                r.customer_id
+            })
+            .unwrap();
             let batch: Vec<Checking> = (1..=NUM_ACCOUNTS)
-                .map(|i| Checking { customer_id: i, balance: 5_000.0 })
+                .map(|i| Checking {
+                    customer_id: i,
+                    balance: 5_000.0,
+                })
                 .collect();
             c.insert_batch(batch).unwrap();
         }
@@ -281,8 +323,14 @@ fn main() {
 
     println!();
     println!("=== Summary ===");
-    println!("SI  throughput:  {:>8.0} commits/s  (retry ratio {:.2})", si_throughput, si_retry_ratio);
-    println!("SSI throughput:  {:>8.0} commits/s  (retry ratio {:.2})", ssi_throughput, ssi_retry_ratio);
+    println!(
+        "SI  throughput:  {:>8.0} commits/s  (retry ratio {:.2})",
+        si_throughput, si_retry_ratio
+    );
+    println!(
+        "SSI throughput:  {:>8.0} commits/s  (retry ratio {:.2})",
+        ssi_throughput, ssi_retry_ratio
+    );
     println!(
         "Slowdown:        {:>8.1}%  (SSI vs SI on smallbank N={NUM_WRITERS}, hot-keys=10, {NUM_BURSTS} bursts)",
         slowdown_pct

@@ -107,12 +107,7 @@ where
 
     /// Insert a vector under an existing write transaction (composes with
     /// caller-driven txs).
-    pub fn upsert_in(
-        &self,
-        tx: &mut WriteTx,
-        embedding: Vec<f32>,
-        meta: Meta,
-    ) -> Result<u64> {
+    pub fn upsert_in(&self, tx: &mut WriteTx, embedding: Vec<f32>, meta: Meta) -> Result<u64> {
         // Per-call RNG seeded from system entropy via the thread-local RNG.
         // Tests that need determinism use the lower-level `hnsw::insert::insert`
         // directly with a seeded RNG.
@@ -199,16 +194,8 @@ where
         let entry_input = BulkLoadInput::Replace(BulkSource::sorted_vec(vec![(1, entry_point)]));
 
         let mut batch = self.store.bulk_load_batch();
-        batch.add::<VectorRow<Meta>>(
-            &self.data_table_name(),
-            data_input,
-            AddOptions::default(),
-        )?;
-        batch.add::<EntryPoint>(
-            &self.entry_table_name(),
-            entry_input,
-            AddOptions::default(),
-        )?;
+        batch.add::<VectorRow<Meta>>(&self.data_table_name(), data_input, AddOptions::default())?;
+        batch.add::<EntryPoint>(&self.entry_table_name(), entry_input, AddOptions::default())?;
         let v = batch.commit(BulkLoadOptions::default())?;
         Ok(v)
     }
@@ -270,7 +257,10 @@ where
         ef: Option<usize>,
     ) -> Result<Vec<(u64, f32)>> {
         if query.len() != self.params.dim {
-            return Err(Error::DimMismatch { expected: self.params.dim, got: query.len() });
+            return Err(Error::DimMismatch {
+                expected: self.params.dim,
+                got: query.len(),
+            });
         }
         let ef = ef.unwrap_or(self.params.ef_search_default);
         hnsw_search::search::<Meta, D>(
@@ -343,7 +333,10 @@ mod tests {
         coll.delete(a).unwrap();
         let res = coll.search(&[1.0, 0.0], 5, None, None).unwrap();
         let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
-        assert!(!ids.contains(&a), "deleted id {a} should not appear in results");
+        assert!(
+            !ids.contains(&a),
+            "deleted id {a} should not appear in results"
+        );
         assert!(ids.contains(&b));
         assert!(ids.contains(&c));
     }
@@ -425,7 +418,7 @@ mod tests {
             VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
         let items = vec![
             (vec![1.0, 0.0], 1u64),
-            (vec![1.0, 0.0, 0.0], 2),     // wrong dim
+            (vec![1.0, 0.0, 0.0], 2), // wrong dim
         ];
         let err = coll.bulk_insert(items).unwrap_err();
         assert!(matches!(err, crate::Error::DimMismatch { .. }));

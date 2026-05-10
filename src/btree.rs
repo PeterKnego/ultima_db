@@ -52,7 +52,10 @@ enum InsertResult<K, V> {
 
 enum DeleteResult<K, V> {
     NotFound,
-    Removed { node: Arc<BTreeNode<K, V>>, underfull: bool },
+    Removed {
+        node: Arc<BTreeNode<K, V>>,
+        underfull: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +66,10 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Creates a new, empty B-tree.
     pub fn new() -> Self {
         BTree {
-            root: Arc::new(BTreeNode { entries: vec![], children: vec![] }),
+            root: Arc::new(BTreeNode {
+                entries: vec![],
+                children: vec![],
+            }),
             len: 0,
         }
     }
@@ -118,15 +124,26 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         match insert_into_node(&self.root, key, val_arc) {
             InsertResult::Fit(new_root, replaced) => {
                 let new_len = if replaced { self.len } else { self.len + 1 };
-                BTree { root: new_root, len: new_len }
+                BTree {
+                    root: new_root,
+                    len: new_len,
+                }
             }
-            InsertResult::Split { left, median, right, replaced } => {
+            InsertResult::Split {
+                left,
+                median,
+                right,
+                replaced,
+            } => {
                 let new_len = if replaced { self.len } else { self.len + 1 };
                 let new_root = Arc::new(BTreeNode {
                     entries: vec![median],
                     children: vec![left, right],
                 });
-                BTree { root: new_root, len: new_len }
+                BTree {
+                    root: new_root,
+                    len: new_len,
+                }
             }
         }
     }
@@ -139,13 +156,15 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             DeleteResult::Removed { node: new_root, .. } => {
                 // If the root is now an internal node with no entries but one
                 // child, collapse the tree height by one.
-                let actual_root =
-                    if new_root.entries.is_empty() && !new_root.children.is_empty() {
-                        Arc::clone(&new_root.children[0])
-                    } else {
-                        new_root
-                    };
-                Ok(BTree { root: actual_root, len: self.len - 1 })
+                let actual_root = if new_root.entries.is_empty() && !new_root.children.is_empty() {
+                    Arc::clone(&new_root.children[0])
+                } else {
+                    new_root
+                };
+                Ok(BTree {
+                    root: actual_root,
+                    len: self.len - 1,
+                })
             }
         }
     }
@@ -172,7 +191,10 @@ impl<K: Ord + Clone, V> BTree<K, V> {
 impl<K, V> Clone for BTree<K, V> {
     /// O(1): increments the root `Arc` reference count.
     fn clone(&self) -> Self {
-        BTree { root: Arc::clone(&self.root), len: self.len }
+        BTree {
+            root: Arc::clone(&self.root),
+            len: self.len,
+        }
     }
 }
 
@@ -419,7 +441,11 @@ fn get_arc_in_node<K: Ord, V>(node: &BTreeNode<K, V>, key: &K) -> Option<Arc<V>>
 }
 
 /// Recursively inserts a key-value pair into a node, potentially splitting it.
-fn insert_into_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: K, val: Arc<V>) -> InsertResult<K, V> {
+fn insert_into_node<K: Ord + Clone, V>(
+    node: &Arc<BTreeNode<K, V>>,
+    key: K,
+    val: Arc<V>,
+) -> InsertResult<K, V> {
     let mut entries = node.entries.clone();
 
     match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
@@ -442,7 +468,12 @@ fn insert_into_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: K, val:
                         children[pos] = new_child;
                         InsertResult::Fit(Arc::new(BTreeNode { entries, children }), replaced)
                     }
-                    InsertResult::Split { left, median, right, replaced } => {
+                    InsertResult::Split {
+                        left,
+                        median,
+                        right,
+                        replaced,
+                    } => {
                         entries.insert(pos, median);
                         children[pos] = left;
                         children.insert(pos + 1, right);
@@ -476,9 +507,15 @@ fn maybe_split<K: Clone, V>(
         };
 
         InsertResult::Split {
-            left: Arc::new(BTreeNode { entries: left_entries, children: left_children }),
+            left: Arc::new(BTreeNode {
+                entries: left_entries,
+                children: left_children,
+            }),
             median,
-            right: Arc::new(BTreeNode { entries: right_entries, children: right_children }),
+            right: Arc::new(BTreeNode {
+                entries: right_entries,
+                children: right_children,
+            }),
             replaced,
         }
     }
@@ -497,7 +534,10 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
                 entries.remove(i);
                 let underfull = entries.len() < MIN_KEYS;
                 DeleteResult::Removed {
-                    node: Arc::new(BTreeNode { entries, children: vec![] }),
+                    node: Arc::new(BTreeNode {
+                        entries,
+                        children: vec![],
+                    }),
                     underfull,
                 }
             }
@@ -526,7 +566,10 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
                 // Key is in a subtree.
                 match delete_from_node(&node.children[child_idx], key) {
                     DeleteResult::NotFound => DeleteResult::NotFound,
-                    DeleteResult::Removed { node: new_child, underfull } => {
+                    DeleteResult::Removed {
+                        node: new_child,
+                        underfull,
+                    } => {
                         let mut entries = node.entries.clone();
                         let mut children = node.children.clone();
                         children[child_idx] = new_child;
@@ -548,12 +591,21 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
 /// Remove and return the leftmost (minimum-key) entry from the subtree.
 /// Returns `(entry, new_root, is_underfull)`.
 #[allow(clippy::type_complexity)]
-fn remove_leftmost<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>) -> ((K, Arc<V>), Arc<BTreeNode<K, V>>, bool) {
+fn remove_leftmost<K: Ord + Clone, V>(
+    node: &Arc<BTreeNode<K, V>>,
+) -> ((K, Arc<V>), Arc<BTreeNode<K, V>>, bool) {
     if node.children.is_empty() {
         let mut entries = node.entries.clone();
         let first = entries.remove(0);
         let underfull = entries.len() < MIN_KEYS;
-        (first, Arc::new(BTreeNode { entries, children: vec![] }), underfull)
+        (
+            first,
+            Arc::new(BTreeNode {
+                entries,
+                children: vec![],
+            }),
+            underfull,
+        )
     } else {
         let (entry, new_first_child, child_underfull) = remove_leftmost(&node.children[0]);
         let mut entries = node.entries.clone();
@@ -615,10 +667,14 @@ fn rotate_right<K: Clone, V>(
         new_right_children.insert(0, sc);
     }
 
-    children[idx - 1] =
-        Arc::new(BTreeNode { entries: new_left_entries, children: new_left_children });
-    children[idx] =
-        Arc::new(BTreeNode { entries: new_right_entries, children: new_right_children });
+    children[idx - 1] = Arc::new(BTreeNode {
+        entries: new_left_entries,
+        children: new_left_children,
+    });
+    children[idx] = Arc::new(BTreeNode {
+        entries: new_right_entries,
+        children: new_right_children,
+    });
 }
 
 /// Rotates an entry from the right sibling into the current child.
@@ -649,10 +705,14 @@ fn rotate_left<K: Clone, V>(
         new_left_children.push(sc);
     }
 
-    children[idx] =
-        Arc::new(BTreeNode { entries: new_left_entries, children: new_left_children });
-    children[idx + 1] =
-        Arc::new(BTreeNode { entries: new_right_entries, children: new_right_children });
+    children[idx] = Arc::new(BTreeNode {
+        entries: new_left_entries,
+        children: new_left_children,
+    });
+    children[idx + 1] = Arc::new(BTreeNode {
+        entries: new_right_entries,
+        children: new_right_children,
+    });
 }
 
 /// Merges an underfull child with its left sibling.
@@ -671,8 +731,10 @@ fn merge_with_left<K: Clone, V>(
     let mut merged_children = children[idx - 1].children.clone();
     merged_children.extend(right.children.iter().cloned());
 
-    children[idx - 1] =
-        Arc::new(BTreeNode { entries: merged_entries, children: merged_children });
+    children[idx - 1] = Arc::new(BTreeNode {
+        entries: merged_entries,
+        children: merged_children,
+    });
 }
 
 /// Merges an underfull child with its right sibling.
@@ -691,7 +753,10 @@ fn merge_with_right<K: Clone, V>(
     let mut merged_children = children[idx].children.clone();
     merged_children.extend(right.children.iter().cloned());
 
-    children[idx] = Arc::new(BTreeNode { entries: merged_entries, children: merged_children });
+    children[idx] = Arc::new(BTreeNode {
+        entries: merged_entries,
+        children: merged_children,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -739,7 +804,11 @@ struct BulkBuilder<K, V> {
 #[allow(dead_code)]
 impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     fn new() -> Self {
-        Self { levels: vec![LevelBuilder::new()], len: 0, last_key: None }
+        Self {
+            levels: vec![LevelBuilder::new()],
+            len: 0,
+            last_key: None,
+        }
     }
 
     fn push(&mut self, k: K, v: Arc<V>) {
@@ -762,13 +831,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     /// Attach `child` as the next child of `levels[level]`, using `(sep_k, sep_v)`
     /// as the separator placed *after* the previous child. If `levels[level]` is
     /// also at capacity, freeze and recurse to the level above.
-    fn attach_child(
-        &mut self,
-        level: usize,
-        child: Arc<BTreeNode<K, V>>,
-        sep_k: K,
-        sep_v: Arc<V>,
-    ) {
+    fn attach_child(&mut self, level: usize, child: Arc<BTreeNode<K, V>>, sep_k: K, sep_v: Arc<V>) {
         if level >= self.levels.len() {
             self.levels.push(LevelBuilder::new());
         }
@@ -833,9 +896,16 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             carry = Some(node);
         }
 
-        let root = carry
-            .unwrap_or_else(|| Arc::new(BTreeNode { entries: vec![], children: vec![] }));
-        BTree { root, len: self.len }
+        let root = carry.unwrap_or_else(|| {
+            Arc::new(BTreeNode {
+                entries: vec![],
+                children: vec![],
+            })
+        });
+        BTree {
+            root,
+            len: self.len,
+        }
     }
 }
 
@@ -853,8 +923,14 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     let lv = &mut lower[level];
     let parent = &mut upper[0]; // levels[level + 1]
 
-    let sibling = parent.children.pop().expect("redistribute_tail: no sibling");
-    let separator = parent.entries.pop().expect("redistribute_tail: no separator");
+    let sibling = parent
+        .children
+        .pop()
+        .expect("redistribute_tail: no sibling");
+    let separator = parent
+        .entries
+        .pop()
+        .expect("redistribute_tail: no separator");
 
     // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
     let mut merged_entries: Vec<(K, Arc<V>)> = sibling.entries.to_vec();
@@ -1142,14 +1218,20 @@ mod tests {
     #[test]
     fn range_exclusive_start() {
         let t = insert_range(1, 10);
-        let results: Vec<u64> = t.range((Bound::Excluded(5u64), Bound::Included(8u64))).map(|(k, _)| *k).collect();
+        let results: Vec<u64> = t
+            .range((Bound::Excluded(5u64), Bound::Included(8u64)))
+            .map(|(k, _)| *k)
+            .collect();
         assert_eq!(results, vec![6, 7, 8]);
     }
 
     #[test]
     fn range_with_both_excluded() {
         let t = insert_range(1, 10);
-        let results: Vec<u64> = t.range((Bound::Excluded(5u64), Bound::Excluded(8u64))).map(|(k, _)| *k).collect();
+        let results: Vec<u64> = t
+            .range((Bound::Excluded(5u64), Bound::Excluded(8u64)))
+            .map(|(k, _)| *k)
+            .collect();
         assert_eq!(results, vec![6, 7]);
     }
 
@@ -1301,13 +1383,7 @@ mod tests {
         assert_eq!(t.len(), 3);
         // Range scan for all "alice" entries
         let results: Vec<_> = t
-            .range((
-                "alice".to_string(),
-                0u64,
-            )..=(
-                "alice".to_string(),
-                u64::MAX,
-            ))
+            .range(("alice".to_string(), 0u64)..=("alice".to_string(), u64::MAX))
             .collect();
         assert_eq!(results.len(), 2);
     }
@@ -1424,8 +1500,7 @@ mod tests {
             by_insert = by_insert.insert(k, *v);
         }
         let walked_bulk: Vec<(u64, u64)> = by_bulk.range(..).map(|(k, v)| (*k, *v)).collect();
-        let walked_insert: Vec<(u64, u64)> =
-            by_insert.range(..).map(|(k, v)| (*k, *v)).collect();
+        let walked_insert: Vec<(u64, u64)> = by_insert.range(..).map(|(k, v)| (*k, *v)).collect();
         assert_eq!(walked_bulk, walked_insert);
         assert_eq!(by_bulk.len(), by_insert.len());
     }

@@ -7,9 +7,7 @@
 
 use std::time::Instant;
 
-use ultima_db::{
-    BulkLoadInput, BulkLoadOptions, BulkSource, IndexKind, Store,
-};
+use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, IndexKind, Store};
 
 #[derive(Clone)]
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
@@ -50,9 +48,7 @@ fn main() {
 
     // ---- 1. Generate input once (don't include this in measured time). ----
     let gen_start = Instant::now();
-    let rows_string: Vec<(u64, String)> = (1u64..=n as u64)
-        .map(|i| (i, format!("v{i}")))
-        .collect();
+    let rows_string: Vec<(u64, String)> = (1u64..=n as u64).map(|i| (i, format!("v{i}"))).collect();
     println!(
         "  (input generation: {:.2}s for {} String rows)\n",
         gen_start.elapsed().as_secs_f64(),
@@ -63,11 +59,16 @@ fn main() {
     let rows = rows_string.clone();
     measure("bulk_load Replace sorted, no indexes", n, || {
         let store = Store::default();
-        store.bulk_load::<String>(
-            "t",
-            BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
-            BulkLoadOptions { checkpoint_after: false, ..Default::default() },
-        ).unwrap();
+        store
+            .bulk_load::<String>(
+                "t",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                BulkLoadOptions {
+                    checkpoint_after: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         store
     });
 
@@ -75,19 +76,36 @@ fn main() {
     let mut rows = rows_string.clone();
     // Reverse so sort has work to do (worst case for already-sorted detection).
     rows.reverse();
-    measure("bulk_load Replace unsorted (reverse), no indexes", n, || {
-        let store = Store::default();
-        store.bulk_load::<String>(
-            "t",
-            BulkLoadInput::Replace(BulkSource::unsorted_vec(rows)),
-            BulkLoadOptions { checkpoint_after: false, ..Default::default() },
-        ).unwrap();
-        store
-    });
+    measure(
+        "bulk_load Replace unsorted (reverse), no indexes",
+        n,
+        || {
+            let store = Store::default();
+            store
+                .bulk_load::<String>(
+                    "t",
+                    BulkLoadInput::Replace(BulkSource::unsorted_vec(rows)),
+                    BulkLoadOptions {
+                        checkpoint_after: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+        },
+    );
 
     // ---- 4. With one unique secondary index ----
     let row_data: Vec<(u64, Row)> = (1u64..=n as u64)
-        .map(|i| (i, Row { name: format!("user_{i}"), bucket: (i % 1024) as u32 }))
+        .map(|i| {
+            (
+                i,
+                Row {
+                    name: format!("user_{i}"),
+                    bucket: (i % 1024) as u32,
+                },
+            )
+        })
         .collect();
 
     measure("bulk_load Replace sorted + 1 unique index", n, || {
@@ -96,41 +114,59 @@ fn main() {
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<Row>("t").unwrap();
-            t.define_index("by_name", IndexKind::Unique, |r: &Row| r.name.clone()).unwrap();
+            t.define_index("by_name", IndexKind::Unique, |r: &Row| r.name.clone())
+                .unwrap();
             wtx.commit().unwrap();
         }
-        store.bulk_load::<Row>(
-            "t",
-            BulkLoadInput::Replace(BulkSource::sorted_vec(row_data.clone())),
-            BulkLoadOptions { checkpoint_after: false, ..Default::default() },
-        ).unwrap();
+        store
+            .bulk_load::<Row>(
+                "t",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(row_data.clone())),
+                BulkLoadOptions {
+                    checkpoint_after: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         store
     });
 
     // ---- 5. With one unique + one non-unique secondary index ----
-    measure("bulk_load Replace sorted + unique + non-unique idx", n, || {
-        let store = Store::default();
-        {
-            let mut wtx = store.begin_write(None).unwrap();
-            let mut t = wtx.open_table::<Row>("t").unwrap();
-            t.define_index("by_name", IndexKind::Unique, |r: &Row| r.name.clone()).unwrap();
-            t.define_index("by_bucket", IndexKind::NonUnique, |r: &Row| r.bucket).unwrap();
-            wtx.commit().unwrap();
-        }
-        store.bulk_load::<Row>(
-            "t",
-            BulkLoadInput::Replace(BulkSource::sorted_vec(row_data.clone())),
-            BulkLoadOptions { checkpoint_after: false, ..Default::default() },
-        ).unwrap();
-        store
-    });
+    measure(
+        "bulk_load Replace sorted + unique + non-unique idx",
+        n,
+        || {
+            let store = Store::default();
+            {
+                let mut wtx = store.begin_write(None).unwrap();
+                let mut t = wtx.open_table::<Row>("t").unwrap();
+                t.define_index("by_name", IndexKind::Unique, |r: &Row| r.name.clone())
+                    .unwrap();
+                t.define_index("by_bucket", IndexKind::NonUnique, |r: &Row| r.bucket)
+                    .unwrap();
+                wtx.commit().unwrap();
+            }
+            store
+                .bulk_load::<Row>(
+                    "t",
+                    BulkLoadInput::Replace(BulkSource::sorted_vec(row_data.clone())),
+                    BulkLoadOptions {
+                        checkpoint_after: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+        },
+    );
 
     // ---- 6. Reference: insert_batch via WriteTx (the slow path) ----
     measure("insert_batch via WriteTx (reference)", n, || {
         let store = Store::default();
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<String>("t").unwrap();
-        t.insert_batch((1..=n).map(|i| format!("v{i}")).collect()).unwrap();
+        t.insert_batch((1..=n).map(|i| format!("v{i}")).collect())
+            .unwrap();
         wtx.commit().unwrap();
         store
     });

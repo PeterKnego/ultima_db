@@ -6,11 +6,11 @@
 //!
 //!     cargo run --example filtered_search -p ultima-vector
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{IndexKind, Store, StoreConfig};
-use ultima_vector::filter::{from_id_record_pairs, RoaringTreemap};
+use ultima_vector::filter::{RoaringTreemap, from_id_record_pairs};
 use ultima_vector::row::VectorRow;
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 

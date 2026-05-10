@@ -10,9 +10,9 @@
 
 #![cfg(feature = "persistence")]
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{Durability, Persistence, Store, StoreConfig};
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 
@@ -48,7 +48,11 @@ fn main() {
     println!("persistence dir: {}", dir.path().display());
 
     let mut rng = StdRng::seed_from_u64(0xD15C);
-    let docs: Vec<Doc> = (0..100).map(|i| Doc { title: format!("doc-{i}") }).collect();
+    let docs: Vec<Doc> = (0..100)
+        .map(|i| Doc {
+            title: format!("doc-{i}"),
+        })
+        .collect();
     let vectors: Vec<Vec<f32>> = (0..100).map(|_| random_unit_vec(&mut rng, DIM)).collect();
     let query = vectors[0].clone();
 

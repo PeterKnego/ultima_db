@@ -14,16 +14,16 @@ use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use rand::rngs::StdRng;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use ultima_db::{Store, StoreConfig, WriterMode};
 
 #[path = "ycsb_common.rs"]
 mod ycsb_common;
 use ycsb_common::{
-    bench_multiwriter_workloads, ycsb_criterion, BurstResult, MultiWriterEngine, YcsbRecord,
-    ZipfianGenerator, MW_OPS_PER_WRITER, MW_WRITERS, NUM_RECORDS,
+    BurstResult, MW_OPS_PER_WRITER, MW_WRITERS, MultiWriterEngine, NUM_RECORDS, YcsbRecord,
+    ZipfianGenerator, bench_multiwriter_workloads, ycsb_criterion,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,8 @@ fn make_store(mode: WriterMode) -> Store {
         auto_snapshot_gc: true,
         writer_mode: mode,
         ..StoreConfig::default()
-    }).unwrap();
+    })
+    .unwrap();
     // Preload table with NUM_RECORDS rows
     let mut wtx = store.begin_write(None).unwrap();
     {
@@ -109,7 +110,10 @@ impl MultiWriterEngine for UltimaMultiWriterEngine {
             committed += c;
             conflicts += x;
         }
-        BurstResult { committed, conflicts }
+        BurstResult {
+            committed,
+            conflicts,
+        }
     }
 
     fn verify_key(&self, key: u64) -> bool {
@@ -159,7 +163,8 @@ fn bench_no_contention(c: &mut Criterion) {
         auto_snapshot_gc: true,
         writer_mode: WriterMode::MultiWriter,
         ..StoreConfig::default()
-    }).unwrap();
+    })
+    .unwrap();
     // Preload each writer's table
     for w in 0..MW_WRITERS {
         let mut wtx = store.begin_write(None).unwrap();
@@ -187,7 +192,11 @@ fn bench_no_contention(c: &mut Criterion) {
                 // Generate per-thread key sequences deterministically in the setup
                 // phase so RNG state stays off the hot path.
                 (0..MW_WRITERS)
-                    .map(|_| (0..MW_OPS_PER_WRITER).map(|_| zipf.next(&mut rng)).collect::<Vec<u64>>())
+                    .map(|_| {
+                        (0..MW_OPS_PER_WRITER)
+                            .map(|_| zipf.next(&mut rng))
+                            .collect::<Vec<u64>>()
+                    })
                     .collect::<Vec<_>>()
             },
             |key_sets| {

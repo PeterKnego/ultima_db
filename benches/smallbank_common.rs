@@ -89,7 +89,13 @@ impl ZipfianGenerator {
         let zeta_n = Self::zeta(item_count, theta);
         let alpha = 1.0 / (1.0 - theta);
         let eta = (1.0 - (2.0 / item_count as f64).powf(1.0 - theta)) / (1.0 - zeta_2 / zeta_n);
-        Self { item_count, theta, zeta_n, alpha, eta }
+        Self {
+            item_count,
+            theta,
+            zeta_n,
+            alpha,
+            eta,
+        }
     }
 
     fn zeta(n: u64, theta: f64) -> f64 {
@@ -219,10 +225,7 @@ pub fn gen_write_heavy_workload(rng: &mut impl Rng, zipf: &ZipfianGenerator) -> 
         .collect()
 }
 
-pub fn gen_contention_ops(
-    rng: &mut impl Rng,
-    zipf: &ZipfianGenerator,
-) -> Vec<Vec<SmallBankOp>> {
+pub fn gen_contention_ops(rng: &mut impl Rng, zipf: &ZipfianGenerator) -> Vec<Vec<SmallBankOp>> {
     (0..NUM_WRITERS)
         .map(|_| gen_mixed_workload_n(rng, zipf, OPS_PER_WRITER))
         .collect()
@@ -388,7 +391,11 @@ impl ReferenceState {
                     a.checking -= amount + penalty;
                 }
             }
-            SmallBankOp::SendPayment { source, dest, amount } => {
+            SmallBankOp::SendPayment {
+                source,
+                dest,
+                amount,
+            } => {
                 let allow = self
                     .accounts
                     .get(source)
@@ -494,10 +501,7 @@ pub fn assert_matches_reference(engine: &mut impl SmallBankEngine) {
 // duplicate writes nor drop them.
 // ---------------------------------------------------------------------------
 
-pub fn gen_commutative_burst(
-    rng: &mut impl Rng,
-    zipf: &ZipfianGenerator,
-) -> Vec<Vec<SmallBankOp>> {
+pub fn gen_commutative_burst(rng: &mut impl Rng, zipf: &ZipfianGenerator) -> Vec<Vec<SmallBankOp>> {
     // INTEGER amounts only. f64 addition is non-associative for general
     // values, so with commit-order-dependent sum order, per-account balances
     // would differ bit-for-bit across engines even when the ops are

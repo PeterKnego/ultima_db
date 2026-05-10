@@ -2,7 +2,7 @@
 // Copyright 2026 Peter Knego
 
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -37,7 +37,10 @@ impl Writer {
     pub fn spawn(state: Arc<Mutex<WriterState>>) -> Self {
         let (tx, rx) = channel::<AppendRequest>();
         let handle = thread::spawn(move || writer_loop(rx, state));
-        Self { tx, handle: Some(handle) }
+        Self {
+            tx,
+            handle: Some(handle),
+        }
     }
 }
 
@@ -149,18 +152,27 @@ pub(crate) fn clone_err(e: &JournalError) -> JournalError {
     use JournalError::*;
     match e {
         Io(io) => Io(std::io::Error::new(io.kind(), io.to_string())),
-        Corrupted { segment, offset, reason } => Corrupted {
+        Corrupted {
+            segment,
+            offset,
+            reason,
+        } => Corrupted {
             segment: segment.clone(),
             offset: *offset,
             reason: reason.clone(),
         },
-        NonMonotonicSeq { expected_gt, got } => {
-            NonMonotonicSeq { expected_gt: *expected_gt, got: *got }
-        }
+        NonMonotonicSeq { expected_gt, got } => NonMonotonicSeq {
+            expected_gt: *expected_gt,
+            got: *got,
+        },
         SeqOutOfRange => SeqOutOfRange,
-        PayloadTooLargeForSegment { segment_size, record_size } => {
-            PayloadTooLargeForSegment { segment_size: *segment_size, record_size: *record_size }
-        }
+        PayloadTooLargeForSegment {
+            segment_size,
+            record_size,
+        } => PayloadTooLargeForSegment {
+            segment_size: *segment_size,
+            record_size: *record_size,
+        },
         Closed => Closed,
     }
 }

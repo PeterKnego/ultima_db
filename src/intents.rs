@@ -146,7 +146,10 @@ impl IntentMap {
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                e.insert(IntentEntry { holder: writer_id, queue: VecDeque::new() });
+                e.insert(IntentEntry {
+                    holder: writer_id,
+                    queue: VecDeque::new(),
+                });
                 Ok(())
             }
         }
@@ -234,7 +237,10 @@ mod tests {
         let wb = IntentWaiter::new();
         map.try_acquire("t", 1, 100, &wa).unwrap();
         let got = map.try_acquire("t", 1, 200, &wb).unwrap_err();
-        assert!(Arc::ptr_eq(&got, &wb), "caller should receive its own waiter");
+        assert!(
+            Arc::ptr_eq(&got, &wb),
+            "caller should receive its own waiter"
+        );
         assert_eq!(map.queue_len("t", 1), 1);
     }
 
@@ -273,7 +279,10 @@ mod tests {
         map.release_all_for(100, &wa);
         // Head (wb) was popped and signaled.
         assert!(wb.is_signaled(), "head successor wb should be signaled");
-        assert!(!wc.is_signaled(), "queued successor wc should NOT be signaled yet");
+        assert!(
+            !wc.is_signaled(),
+            "queued successor wc should NOT be signaled yet"
+        );
         // Entry still present with wc in queue.
         assert_eq!(map.queue_len("t", 1), 1);
     }

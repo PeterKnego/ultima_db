@@ -3,7 +3,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ultima_db::{Store, StoreConfig};
 
 #[path = "ycsb_common.rs"]
@@ -24,7 +24,8 @@ impl UltimaEngine {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();

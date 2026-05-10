@@ -7,8 +7,8 @@
 //! operations, along with snapshot types for reading the current values.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Public snapshot types
@@ -180,7 +180,9 @@ impl StoreMetrics {
 
     pub(crate) fn register_table(&self, name: &str) {
         let mut tables = self.tables.write().unwrap();
-        tables.entry(name.to_string()).or_insert_with(TableMetrics::new);
+        tables
+            .entry(name.to_string())
+            .or_insert_with(TableMetrics::new);
     }
 
     pub(crate) fn register_index(&self, table: &str, index: &str) {
@@ -238,11 +240,7 @@ impl StoreMetrics {
         if let Some(t) = tables.get(table) {
             t.inserts.fetch_add(n, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
-            emit(
-                "ultima.table.inserts",
-                &[("table", table.to_string())],
-                n,
-            );
+            emit("ultima.table.inserts", &[("table", table.to_string())], n);
         }
     }
 
@@ -251,11 +249,7 @@ impl StoreMetrics {
         if let Some(t) = tables.get(table) {
             t.updates.fetch_add(n, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
-            emit(
-                "ultima.table.updates",
-                &[("table", table.to_string())],
-                n,
-            );
+            emit("ultima.table.updates", &[("table", table.to_string())], n);
         }
     }
 
@@ -264,11 +258,7 @@ impl StoreMetrics {
         if let Some(t) = tables.get(table) {
             t.deletes.fetch_add(n, Ordering::Relaxed);
             #[cfg(feature = "metrics")]
-            emit(
-                "ultima.table.deletes",
-                &[("table", table.to_string())],
-                n,
-            );
+            emit("ultima.table.deletes", &[("table", table.to_string())], n);
         }
     }
 
@@ -309,10 +299,7 @@ impl StoreMetrics {
                 #[cfg(feature = "metrics")]
                 emit(
                     "ultima.index.reads",
-                    &[
-                        ("table", table.to_string()),
-                        ("index", index.to_string()),
-                    ],
+                    &[("table", table.to_string()), ("index", index.to_string())],
                     1,
                 );
             }
@@ -328,10 +315,7 @@ impl StoreMetrics {
                 #[cfg(feature = "metrics")]
                 emit(
                     "ultima.index.range_scans",
-                    &[
-                        ("table", table.to_string()),
-                        ("index", index.to_string()),
-                    ],
+                    &[("table", table.to_string()), ("index", index.to_string())],
                     1,
                 );
             }

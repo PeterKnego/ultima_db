@@ -26,11 +26,26 @@ use crate::{Error, Result};
 /// A single mutation within a transaction.
 #[derive(Debug, Clone)]
 pub enum WalOp {
-    Insert { table: String, id: u64, data: Vec<u8> },
-    Update { table: String, id: u64, data: Vec<u8> },
-    Delete { table: String, id: u64 },
-    CreateTable { name: String },
-    DeleteTable { name: String },
+    Insert {
+        table: String,
+        id: u64,
+        data: Vec<u8>,
+    },
+    Update {
+        table: String,
+        id: u64,
+        data: Vec<u8>,
+    },
+    Delete {
+        table: String,
+        id: u64,
+    },
+    CreateTable {
+        name: String,
+    },
+    DeleteTable {
+        name: String,
+    },
 }
 
 /// A complete WAL entry for one committed transaction.
@@ -125,24 +140,35 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
 
         match tag {
             TAG_INSERT | TAG_UPDATE => {
-                let (table, read): (String, _) = bincode::decode_from_slice(&data[offset..], config)
-                    .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+                let (table, read): (String, _) =
+                    bincode::decode_from_slice(&data[offset..], config)
+                        .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
                 let (id, read): (u64, _) = bincode::decode_from_slice(&data[offset..], config)
                     .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (blob, read): (Vec<u8>, _) = bincode::decode_from_slice(&data[offset..], config)
-                    .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+                let (blob, read): (Vec<u8>, _) =
+                    bincode::decode_from_slice(&data[offset..], config)
+                        .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
                 if tag == TAG_INSERT {
-                    ops.push(WalOp::Insert { table, id, data: blob });
+                    ops.push(WalOp::Insert {
+                        table,
+                        id,
+                        data: blob,
+                    });
                 } else {
-                    ops.push(WalOp::Update { table, id, data: blob });
+                    ops.push(WalOp::Update {
+                        table,
+                        id,
+                        data: blob,
+                    });
                 }
             }
             TAG_DELETE => {
-                let (table, read): (String, _) = bincode::decode_from_slice(&data[offset..], config)
-                    .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+                let (table, read): (String, _) =
+                    bincode::decode_from_slice(&data[offset..], config)
+                        .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
                 let (id, read): (u64, _) = bincode::decode_from_slice(&data[offset..], config)
                     .map_err(|e| Error::WalCorrupted(e.to_string()))?;
@@ -224,9 +250,7 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
 
     while offset + 4 <= all_bytes.len() {
         // Read length
-        let len = u32::from_le_bytes(
-            all_bytes[offset..offset + 4].try_into().unwrap(),
-        ) as usize;
+        let len = u32::from_le_bytes(all_bytes[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         if offset + len + 4 > all_bytes.len() {
@@ -237,9 +261,7 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
         let data = &all_bytes[offset..offset + len];
         offset += len;
 
-        let stored_crc = u32::from_le_bytes(
-            all_bytes[offset..offset + 4].try_into().unwrap(),
-        );
+        let stored_crc = u32::from_le_bytes(all_bytes[offset..offset + 4].try_into().unwrap());
         offset += 4;
 
         if crc32(data) != stored_crc {
@@ -268,7 +290,8 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
 /// is only called after a successful checkpoint, no committed data is lost.
 pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
     let entries = read_wal(path)?;
-    let remaining: Vec<&WalEntry> = entries.iter()
+    let remaining: Vec<&WalEntry> = entries
+        .iter()
         .filter(|e| e.version > up_to_version)
         .collect();
 
@@ -288,8 +311,7 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
         buf.extend_from_slice(&checksum.to_le_bytes());
     }
 
-    let mut file = File::create(path)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut file = File::create(path).map_err(|e| Error::Persistence(e.to_string()))?;
     file.write_all(&buf)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     file.sync_all()
@@ -316,14 +338,21 @@ pub(crate) enum SyncWaiter {
     /// Already durable or fire-and-forget (Eventual).
     Done,
     /// Block until the background thread fsyncs past this epoch.
-    WaitForEpoch { epoch: u64, state: Arc<WalSyncState> },
+    WaitForEpoch {
+        epoch: u64,
+        state: Arc<WalSyncState>,
+    },
 }
 
 impl SyncWaiter {
     pub fn wait(self) {
         if let SyncWaiter::WaitForEpoch { epoch, state } = self {
             let mut guard = state.mu.lock().unwrap();
-            while state.fsynced_epoch.load(std::sync::atomic::Ordering::Acquire) < epoch {
+            while state
+                .fsynced_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                < epoch
+            {
                 guard = state.condvar.wait(guard).unwrap();
             }
         }
@@ -356,8 +385,7 @@ impl WalHandle {
     /// Create a new WAL handle. Opens (or creates) the WAL file.
     /// Both modes use a background thread for batched writes.
     pub fn new(dir: &Path, consistent: bool) -> Result<Self> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
+        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
 
         let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -405,7 +433,9 @@ impl WalHandle {
                 // waiter enters condvar.wait(), causing it to block forever.
                 if let Some(state) = &bg_sync_state {
                     let _guard = state.mu.lock().unwrap();
-                    state.fsynced_epoch.fetch_add(count, std::sync::atomic::Ordering::Release);
+                    state
+                        .fsynced_epoch
+                        .fetch_add(count, std::sync::atomic::Ordering::Release);
                     state.condvar.notify_all();
                 }
             }
@@ -427,14 +457,21 @@ impl WalHandle {
     /// - **Eventual**: returns `SyncWaiter::Done` — no wait needed.
     pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
         let sender = self.sender.as_ref().expect("WalHandle used after drop");
-        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        sender.send(entry)
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sender
+            .send(entry)
             .map_err(|e| Error::Persistence(e.to_string()))?;
 
         if self.consistent {
             let state = self.sync_state.as_ref().unwrap();
-            let epoch = state.next_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(SyncWaiter::WaitForEpoch { epoch, state: Arc::clone(state) })
+            let epoch = state
+                .next_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(SyncWaiter::WaitForEpoch {
+                epoch,
+                state: Arc::clone(state),
+            })
         } else {
             Ok(SyncWaiter::Done)
         }
@@ -485,10 +522,10 @@ impl MockWal {
     /// Submit a WAL entry. Returns a SyncWaiter that blocks until `flush()`.
     pub fn write(&self, entry: WalEntry) -> SyncWaiter {
         self.entries.lock().unwrap().push(entry);
-        let epoch = self.sync_state.next_epoch.fetch_add(
-            1,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let epoch = self
+            .sync_state
+            .next_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SyncWaiter::WaitForEpoch {
             epoch,
             state: Arc::clone(&self.sync_state),
@@ -498,23 +535,36 @@ impl MockWal {
     /// Advance fsynced_epoch to release all currently blocked waiters.
     /// Sets fsynced_epoch to next_epoch - 1 (the highest assigned epoch).
     pub fn flush(&self) {
-        let current_next = self.sync_state.next_epoch.load(std::sync::atomic::Ordering::Relaxed);
-        self.sync_state.fsynced_epoch.store(current_next - 1, std::sync::atomic::Ordering::Release);
+        let current_next = self
+            .sync_state
+            .next_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.sync_state
+            .fsynced_epoch
+            .store(current_next - 1, std::sync::atomic::Ordering::Release);
         let _guard = self.sync_state.mu.lock().unwrap();
         self.sync_state.condvar.notify_all();
     }
 
     /// Advance fsynced_epoch by 1, releasing only the next blocked waiter.
     pub fn flush_one(&self) {
-        self.sync_state.fsynced_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.sync_state
+            .fsynced_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         let _guard = self.sync_state.mu.lock().unwrap();
         self.sync_state.condvar.notify_all();
     }
 
     /// Number of entries not yet flushed.
     pub fn pending(&self) -> usize {
-        let next = self.sync_state.next_epoch.load(std::sync::atomic::Ordering::Relaxed);
-        let fsynced = self.sync_state.fsynced_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        let next = self
+            .sync_state
+            .next_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let fsynced = self
+            .sync_state
+            .fsynced_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
         (next.saturating_sub(fsynced).saturating_sub(1)) as usize
     }
 }
@@ -548,7 +598,8 @@ mod tests {
                 durability: crate::Durability::Consistent,
             },
             ..crate::StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         (store, dir)
     }
 
@@ -558,9 +609,24 @@ mod tests {
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut t = wtx.open_table::<User>("users").unwrap();
-            t.insert(User { name: "Alice".into(), age: 30 }).unwrap();
-            t.insert(User { name: "Bob".into(), age: 25 }).unwrap();
-            t.update(1, User { name: "Alice Updated".into(), age: 31 }).unwrap();
+            t.insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+            t.insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
+            t.update(
+                1,
+                User {
+                    name: "Alice Updated".into(),
+                    age: 31,
+                },
+            )
+            .unwrap();
             t.delete(2).unwrap();
         }
         assert_eq!(wtx.wal_ops.len(), 4);
@@ -575,7 +641,13 @@ mod tests {
         let (store, _dir) = wal_store();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User {
+                    name: "Alice".into(),
+                    age: 30,
+                })
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx = store.begin_write(None).unwrap();
@@ -591,9 +663,16 @@ mod tests {
         {
             let mut t = wtx.open_table::<User>("users").unwrap();
             t.insert_batch(vec![
-                User { name: "Alice".into(), age: 30 },
-                User { name: "Bob".into(), age: 25 },
-            ]).unwrap();
+                User {
+                    name: "Alice".into(),
+                    age: 30,
+                },
+                User {
+                    name: "Bob".into(),
+                    age: 25,
+                },
+            ])
+            .unwrap();
             t.delete_batch(&[1, 2]).unwrap();
         }
         assert_eq!(wtx.wal_ops.len(), 4); // 2 inserts + 2 deletes
@@ -604,11 +683,26 @@ mod tests {
         let entry = WalEntry {
             version: 42,
             ops: vec![
-                WalOp::Insert { table: "users".into(), id: 1, data: vec![1, 2, 3] },
-                WalOp::Update { table: "users".into(), id: 1, data: vec![4, 5, 6] },
-                WalOp::Delete { table: "users".into(), id: 1 },
-                WalOp::CreateTable { name: "orders".into() },
-                WalOp::DeleteTable { name: "temp".into() },
+                WalOp::Insert {
+                    table: "users".into(),
+                    id: 1,
+                    data: vec![1, 2, 3],
+                },
+                WalOp::Update {
+                    table: "users".into(),
+                    id: 1,
+                    data: vec![4, 5, 6],
+                },
+                WalOp::Delete {
+                    table: "users".into(),
+                    id: 1,
+                },
+                WalOp::CreateTable {
+                    name: "orders".into(),
+                },
+                WalOp::DeleteTable {
+                    name: "temp".into(),
+                },
             ],
         };
         let data = serialize_entry(&entry).unwrap();
@@ -625,8 +719,21 @@ mod tests {
         // Write entries
         {
             let mut file = File::create(&path).unwrap();
-            let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), id: 1, data: vec![10] }] };
-            let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), id: 1 }] };
+            let e1 = WalEntry {
+                version: 1,
+                ops: vec![WalOp::Insert {
+                    table: "t".into(),
+                    id: 1,
+                    data: vec![10],
+                }],
+            };
+            let e2 = WalEntry {
+                version: 2,
+                ops: vec![WalOp::Delete {
+                    table: "t".into(),
+                    id: 1,
+                }],
+            };
             write_entry_to_file(&mut file, &e1).unwrap();
             write_entry_to_file(&mut file, &e2).unwrap();
             file.sync_all().unwrap();
@@ -646,7 +753,14 @@ mod tests {
 
         {
             let mut file = File::create(&path).unwrap();
-            let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), id: 1, data: vec![10] }] };
+            let e1 = WalEntry {
+                version: 1,
+                ops: vec![WalOp::Insert {
+                    table: "t".into(),
+                    id: 1,
+                    data: vec![10],
+                }],
+            };
             write_entry_to_file(&mut file, &e1).unwrap();
             file.sync_all().unwrap();
         }
@@ -669,7 +783,10 @@ mod tests {
         {
             let mut file = File::create(&path).unwrap();
             for v in 1..=5 {
-                let entry = WalEntry { version: v, ops: vec![] };
+                let entry = WalEntry {
+                    version: v,
+                    ops: vec![],
+                };
                 write_entry_to_file(&mut file, &entry).unwrap();
             }
             file.sync_all().unwrap();
@@ -686,8 +803,18 @@ mod tests {
     fn wal_handle_consistent_write() {
         let dir = tempfile::tempdir().unwrap();
         let handle = WalHandle::new(dir.path(), true).unwrap();
-        let w1 = handle.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
-        let w2 = handle.write(WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
+        let w1 = handle
+            .write(WalEntry {
+                version: 1,
+                ops: vec![WalOp::CreateTable { name: "t".into() }],
+            })
+            .unwrap();
+        let w2 = handle
+            .write(WalEntry {
+                version: 2,
+                ops: vec![WalOp::DeleteTable { name: "t".into() }],
+            })
+            .unwrap();
         // Wait for both fsyncs to complete.
         w1.wait();
         w2.wait();
@@ -700,7 +827,12 @@ mod tests {
     fn wal_handle_eventual_write() {
         let dir = tempfile::tempdir().unwrap();
         let handle = WalHandle::new(dir.path(), false).unwrap();
-        handle.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        handle
+            .write(WalEntry {
+                version: 1,
+                ops: vec![WalOp::CreateTable { name: "t".into() }],
+            })
+            .unwrap();
         // Drop flushes the background thread.
         drop(handle);
 
@@ -713,7 +845,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = WalHandle::new(dir.path(), false).unwrap();
         assert_eq!(handle.pending_writes(), 0);
-        handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        handle
+            .write(WalEntry {
+                version: 1,
+                ops: vec![],
+            })
+            .unwrap();
         // pending_writes may be 1 or 0 depending on bg thread speed, but
         // it should not panic. After drop it must be 0.
         drop(handle);
@@ -725,7 +862,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = WalHandle::new(dir.path(), true).unwrap();
         assert_eq!(handle.pending_writes(), 0);
-        let w = handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        let w = handle
+            .write(WalEntry {
+                version: 1,
+                ops: vec![],
+            })
+            .unwrap();
         // Before wait, in_flight should be >= 1.
         w.wait();
         // After wait + bg thread sync, pending should be 0 (eventually).
@@ -741,8 +883,14 @@ mod tests {
 
         {
             let mut file = File::create(&path).unwrap();
-            let e1 = WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] };
-            let e2 = WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] };
+            let e1 = WalEntry {
+                version: 1,
+                ops: vec![WalOp::CreateTable { name: "t".into() }],
+            };
+            let e2 = WalEntry {
+                version: 2,
+                ops: vec![WalOp::DeleteTable { name: "t".into() }],
+            };
             write_entry_to_file(&mut file, &e1).unwrap();
             write_entry_to_file(&mut file, &e2).unwrap();
             file.sync_all().unwrap();
@@ -826,7 +974,10 @@ mod tests {
         {
             let mut file = File::create(&path).unwrap();
             for v in 5..=7 {
-                let entry = WalEntry { version: v, ops: vec![] };
+                let entry = WalEntry {
+                    version: v,
+                    ops: vec![],
+                };
                 write_entry_to_file(&mut file, &entry).unwrap();
             }
             file.sync_all().unwrap();

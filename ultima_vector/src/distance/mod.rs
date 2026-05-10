@@ -226,11 +226,7 @@ mod tests {
 
     #[test]
     fn normalize_many_normalizes_each_independently() {
-        let mut vs: Vec<Vec<f32>> = vec![
-            vec![3.0, 4.0],
-            vec![1.0, 0.0, 0.0],
-            vec![0.0; 4],
-        ];
+        let mut vs: Vec<Vec<f32>> = vec![vec![3.0, 4.0], vec![1.0, 0.0, 0.0], vec![0.0; 4]];
         normalize_many(&mut vs);
         let n0: f32 = vs[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         let n1: f32 = vs[1].iter().map(|x| x * x).sum::<f32>().sqrt();

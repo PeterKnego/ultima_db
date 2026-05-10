@@ -16,9 +16,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rocksdb::{
-    ColumnFamilyDescriptor, OptimisticTransactionDB, Options, SingleThreaded,
-};
+use rocksdb::{ColumnFamilyDescriptor, OptimisticTransactionDB, Options, SingleThreaded};
 use tempfile::TempDir;
 
 #[path = "smallbank_common.rs"]
@@ -73,8 +71,14 @@ impl RocksDbEngine {
                     customer_id: i,
                     name: format!("Customer_{i}"),
                 };
-                let s = Savings { customer_id: i, balance: INITIAL_SAVINGS };
-                let c = Checking { customer_id: i, balance: INITIAL_CHECKING };
+                let s = Savings {
+                    customer_id: i,
+                    balance: INITIAL_SAVINGS,
+                };
+                let c = Checking {
+                    customer_id: i,
+                    balance: INITIAL_CHECKING,
+                };
                 db.put_cf_opt(
                     &cf_acc,
                     k,
@@ -99,27 +103,28 @@ impl RocksDbEngine {
             }
         }
 
-        Self { db: Arc::new(db), _tmpdir: tmpdir }
+        Self {
+            db: Arc::new(db),
+            _tmpdir: tmpdir,
+        }
     }
 
-    fn get_savings(
-        db: &OptimisticTransactionDB<SingleThreaded>,
-        cid: u64,
-    ) -> Option<Savings> {
+    fn get_savings(db: &OptimisticTransactionDB<SingleThreaded>, cid: u64) -> Option<Savings> {
         let cf = db.cf_handle(CF_SAVINGS).unwrap();
-        db.get_cf(&cf, encode_key(cid))
-            .unwrap()
-            .map(|bytes| bincode::serde::decode_from_slice(&bytes, BINCODE_CFG).unwrap().0)
+        db.get_cf(&cf, encode_key(cid)).unwrap().map(|bytes| {
+            bincode::serde::decode_from_slice(&bytes, BINCODE_CFG)
+                .unwrap()
+                .0
+        })
     }
 
-    fn get_checking(
-        db: &OptimisticTransactionDB<SingleThreaded>,
-        cid: u64,
-    ) -> Option<Checking> {
+    fn get_checking(db: &OptimisticTransactionDB<SingleThreaded>, cid: u64) -> Option<Checking> {
         let cf = db.cf_handle(CF_CHECKING).unwrap();
-        db.get_cf(&cf, encode_key(cid))
-            .unwrap()
-            .map(|bytes| bincode::serde::decode_from_slice(&bytes, BINCODE_CFG).unwrap().0)
+        db.get_cf(&cf, encode_key(cid)).unwrap().map(|bytes| {
+            bincode::serde::decode_from_slice(&bytes, BINCODE_CFG)
+                .unwrap()
+                .0
+        })
     }
 
     /// Apply one op on the shared db using a fresh small transaction per op.
@@ -154,14 +159,18 @@ fn apply_op_in_txn(
     let cf_chk = db.cf_handle(CF_CHECKING).unwrap();
 
     let get_sav = |cid: u64| -> Option<Savings> {
-        txn.get_cf(&cf_sav, encode_key(cid))
-            .unwrap()
-            .map(|b| bincode::serde::decode_from_slice(&b, BINCODE_CFG).unwrap().0)
+        txn.get_cf(&cf_sav, encode_key(cid)).unwrap().map(|b| {
+            bincode::serde::decode_from_slice(&b, BINCODE_CFG)
+                .unwrap()
+                .0
+        })
     };
     let get_chk = |cid: u64| -> Option<Checking> {
-        txn.get_cf(&cf_chk, encode_key(cid))
-            .unwrap()
-            .map(|b| bincode::serde::decode_from_slice(&b, BINCODE_CFG).unwrap().0)
+        txn.get_cf(&cf_chk, encode_key(cid)).unwrap().map(|b| {
+            bincode::serde::decode_from_slice(&b, BINCODE_CFG)
+                .unwrap()
+                .0
+        })
     };
     let put_sav = |cid: u64, s: &Savings| {
         txn.put_cf(
@@ -217,7 +226,11 @@ fn apply_op_in_txn(
                 put_chk(*cid, &c);
             }
         }
-        SmallBankOp::SendPayment { source, dest, amount } => {
+        SmallBankOp::SendPayment {
+            source,
+            dest,
+            amount,
+        } => {
             if let Some(mut src) = get_chk(*source)
                 && src.balance >= *amount
                 && let Some(mut dst) = get_chk(*dest)
@@ -243,12 +256,16 @@ impl SmallBankEngine for RocksDbEngine {
             std::collections::BTreeMap::new();
         for item in self.db.iterator_cf(&cf_sav, rocksdb::IteratorMode::Start) {
             let (_k, v) = item.unwrap();
-            let s: Savings = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            let s: Savings = bincode::serde::decode_from_slice(&v, BINCODE_CFG)
+                .unwrap()
+                .0;
             accounts.entry(s.customer_id).or_default().savings = s.balance;
         }
         for item in self.db.iterator_cf(&cf_chk, rocksdb::IteratorMode::Start) {
             let (_k, v) = item.unwrap();
-            let c: Checking = bincode::serde::decode_from_slice(&v, BINCODE_CFG).unwrap().0;
+            let c: Checking = bincode::serde::decode_from_slice(&v, BINCODE_CFG)
+                .unwrap()
+                .0;
             accounts.entry(c.customer_id).or_default().checking = c.balance;
         }
         hash_accounts(accounts)

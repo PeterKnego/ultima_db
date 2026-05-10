@@ -19,7 +19,10 @@ impl LevelSampler {
     pub fn new(m: usize, max_level: u8) -> Self {
         assert!(m >= 2, "m must be >= 2");
         let inv_ln_m = 1.0 / (m as f64).ln();
-        Self { inv_ln_m, max_level }
+        Self {
+            inv_ln_m,
+            max_level,
+        }
     }
 
     /// Sample a level in `[0, max_level]`. Geometric in `m` with the given cap.

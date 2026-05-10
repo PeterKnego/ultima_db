@@ -2,13 +2,16 @@
 // Copyright 2026 Peter Knego
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::io::Read;
+use serde::{Deserialize, Serialize};
 use std::hint::black_box;
-use serde::{Serialize, Deserialize};
+use std::io::Read;
 use ultima_db::{Store, StoreConfig};
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Row { v: u64, name: String }
+struct Row {
+    v: u64,
+    name: String,
+}
 
 fn bench_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("snapshot_build");
@@ -20,7 +23,11 @@ fn bench_build(c: &mut Criterion) {
             let mut tx = store.begin_write(None).unwrap();
             let mut t = tx.open_table::<Row>("rows").unwrap();
             for i in 1..=n as u64 {
-                t.insert(Row { v: i, name: format!("r{i}") }).unwrap();
+                t.insert(Row {
+                    v: i,
+                    name: format!("r{i}"),
+                })
+                .unwrap();
             }
             tx.commit().unwrap();
             b.iter(|| {
@@ -45,18 +52,23 @@ fn bench_install(c: &mut Criterion) {
             let mut tx = src.begin_write(None).unwrap();
             let mut t = tx.open_table::<Row>("rows").unwrap();
             for i in 1..=n as u64 {
-                t.insert(Row { v: i, name: format!("r{i}") }).unwrap();
+                t.insert(Row {
+                    v: i,
+                    name: format!("r{i}"),
+                })
+                .unwrap();
             }
             tx.commit().unwrap();
             let mut bytes = Vec::new();
-            src.snapshot_stream(None).unwrap().read_to_end(&mut bytes).unwrap();
+            src.snapshot_stream(None)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
             b.iter(|| {
                 let dst = Store::new(StoreConfig::default()).unwrap();
                 dst.register_table::<Row>("rows").unwrap();
-                dst.install_snapshot_stream(
-                    std::io::Cursor::new(&bytes),
-                    Default::default(),
-                ).unwrap();
+                dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+                    .unwrap();
             });
         });
     }

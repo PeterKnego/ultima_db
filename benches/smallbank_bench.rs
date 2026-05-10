@@ -97,7 +97,9 @@ impl UltimaEngine {
         {
             let mut accounts = wtx.open_table::<Account>("accounts").unwrap();
             accounts
-                .define_index("customer_id", IndexKind::Unique, |a: &Account| a.customer_id)
+                .define_index("customer_id", IndexKind::Unique, |a: &Account| {
+                    a.customer_id
+                })
                 .unwrap();
             let batch: Vec<Account> = (1..=NUM_ACCOUNTS)
                 .map(|i| Account {
@@ -110,7 +112,9 @@ impl UltimaEngine {
         {
             let mut savings = wtx.open_table::<Savings>("savings").unwrap();
             savings
-                .define_index("customer_id", IndexKind::Unique, |s: &Savings| s.customer_id)
+                .define_index("customer_id", IndexKind::Unique, |s: &Savings| {
+                    s.customer_id
+                })
                 .unwrap();
             let batch: Vec<Savings> = (1..=NUM_ACCOUNTS)
                 .map(|i| Savings {
@@ -158,8 +162,7 @@ impl UltimaEngine {
                 let mut wtx = store.begin_write(None).unwrap();
                 {
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
-                    if let Some((id, rec)) =
-                        checking.get_unique::<u64>("customer_id", cid).unwrap()
+                    if let Some((id, rec)) = checking.get_unique::<u64>("customer_id", cid).unwrap()
                     {
                         let new = Checking {
                             balance: rec.balance + amount,
@@ -174,8 +177,7 @@ impl UltimaEngine {
                 let mut wtx = store.begin_write(None).unwrap();
                 {
                     let mut savings = wtx.open_table::<Savings>("savings").unwrap();
-                    if let Some((id, rec)) =
-                        savings.get_unique::<u64>("customer_id", cid).unwrap()
+                    if let Some((id, rec)) = savings.get_unique::<u64>("customer_id", cid).unwrap()
                     {
                         let new = Savings {
                             balance: rec.balance + amount,
@@ -190,22 +192,21 @@ impl UltimaEngine {
                 let mut wtx = store.begin_write(None).unwrap();
                 {
                     let mut savings = wtx.open_table::<Savings>("savings").unwrap();
-                    let source_amount =
-                        if let Some((id, rec)) =
-                            savings.get_unique::<u64>("customer_id", source).unwrap()
-                        {
-                            let amt = rec.balance;
-                            let _ = savings.update(
-                                id,
-                                Savings {
-                                    balance: 0.0,
-                                    ..*rec
-                                },
-                            );
-                            amt
-                        } else {
-                            0.0
-                        };
+                    let source_amount = if let Some((id, rec)) =
+                        savings.get_unique::<u64>("customer_id", source).unwrap()
+                    {
+                        let amt = rec.balance;
+                        let _ = savings.update(
+                            id,
+                            Savings {
+                                balance: 0.0,
+                                ..*rec
+                            },
+                        );
+                        amt
+                    } else {
+                        0.0
+                    };
                     drop(savings);
 
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
@@ -235,8 +236,7 @@ impl UltimaEngine {
                     drop(savings);
 
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
-                    if let Some((id, rec)) =
-                        checking.get_unique::<u64>("customer_id", cid).unwrap()
+                    if let Some((id, rec)) = checking.get_unique::<u64>("customer_id", cid).unwrap()
                     {
                         let total = sbal + rec.balance;
                         let penalty = if total < *amount { 1.0 } else { 0.0 };
@@ -251,7 +251,11 @@ impl UltimaEngine {
                 }
                 wtx.commit().unwrap();
             }
-            SmallBankOp::SendPayment { source, dest, amount } => {
+            SmallBankOp::SendPayment {
+                source,
+                dest,
+                amount,
+            } => {
                 let mut wtx = store.begin_write(None).unwrap();
                 {
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
@@ -296,19 +300,23 @@ impl UltimaEngine {
                 SmallBankOp::Balance(_) => {}
                 SmallBankOp::DepositChecking(cid, amount) => {
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
-                    if let Some((id, rec)) =
-                        checking.get_unique::<u64>("customer_id", cid).unwrap()
+                    if let Some((id, rec)) = checking.get_unique::<u64>("customer_id", cid).unwrap()
                     {
-                        let new = Checking { balance: rec.balance + amount, ..*rec };
+                        let new = Checking {
+                            balance: rec.balance + amount,
+                            ..*rec
+                        };
                         checking.update(id, new)?;
                     }
                 }
                 SmallBankOp::TransactSavings(cid, amount) => {
                     let mut savings = wtx.open_table::<Savings>("savings").unwrap();
-                    if let Some((id, rec)) =
-                        savings.get_unique::<u64>("customer_id", cid).unwrap()
+                    if let Some((id, rec)) = savings.get_unique::<u64>("customer_id", cid).unwrap()
                     {
-                        let new = Savings { balance: rec.balance + amount, ..*rec };
+                        let new = Savings {
+                            balance: rec.balance + amount,
+                            ..*rec
+                        };
                         savings.update(id, new)?;
                     }
                 }
@@ -318,7 +326,13 @@ impl UltimaEngine {
                         savings.get_unique::<u64>("customer_id", source).unwrap()
                     {
                         let amt = rec.balance;
-                        savings.update(id, Savings { balance: 0.0, ..*rec })?;
+                        savings.update(
+                            id,
+                            Savings {
+                                balance: 0.0,
+                                ..*rec
+                            },
+                        )?;
                         amt
                     } else {
                         0.0
@@ -331,7 +345,10 @@ impl UltimaEngine {
                     {
                         checking.update(
                             id,
-                            Checking { balance: rec.balance + source_amount, ..*rec },
+                            Checking {
+                                balance: rec.balance + source_amount,
+                                ..*rec
+                            },
                         )?;
                     }
                 }
@@ -345,8 +362,7 @@ impl UltimaEngine {
                     drop(savings);
 
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
-                    if let Some((id, rec)) =
-                        checking.get_unique::<u64>("customer_id", cid).unwrap()
+                    if let Some((id, rec)) = checking.get_unique::<u64>("customer_id", cid).unwrap()
                     {
                         let total = sbal + rec.balance;
                         let penalty = if total < *amount { 1.0 } else { 0.0 };
@@ -359,17 +375,27 @@ impl UltimaEngine {
                         )?;
                     }
                 }
-                SmallBankOp::SendPayment { source, dest, amount } => {
+                SmallBankOp::SendPayment {
+                    source,
+                    dest,
+                    amount,
+                } => {
                     let mut checking = wtx.open_table::<Checking>("checking").unwrap();
                     if let Some((src_id, src_rec)) =
                         checking.get_unique::<u64>("customer_id", source).unwrap()
                         && src_rec.balance >= *amount
                     {
-                        let src_new = Checking { balance: src_rec.balance - amount, ..*src_rec };
+                        let src_new = Checking {
+                            balance: src_rec.balance - amount,
+                            ..*src_rec
+                        };
                         if let Some((dst_id, dst_rec)) =
                             checking.get_unique::<u64>("customer_id", dest).unwrap()
                         {
-                            let dst_new = Checking { balance: dst_rec.balance + amount, ..*dst_rec };
+                            let dst_new = Checking {
+                                balance: dst_rec.balance + amount,
+                                ..*dst_rec
+                            };
                             checking.update(src_id, src_new)?;
                             checking.update(dst_id, dst_new)?;
                         }
@@ -425,7 +451,9 @@ impl SmallBankEngine for UltimaEngine {
                             Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
                                 drop(wtx);
                                 retries += 1;
-                                if let Some(w) = wait_for { w.wait(); }
+                                if let Some(w) = wait_for {
+                                    w.wait();
+                                }
                                 continue;
                             }
                             Err(e) => panic!("unexpected error during ops: {e}"),
@@ -434,7 +462,9 @@ impl SmallBankEngine for UltimaEngine {
                             Ok(_) => return (1u64, retries),
                             Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
                                 retries += 1;
-                                if let Some(w) = wait_for { w.wait(); }
+                                if let Some(w) = wait_for {
+                                    w.wait();
+                                }
                                 continue;
                             }
                             Err(e) => panic!("unexpected error: {e}"),

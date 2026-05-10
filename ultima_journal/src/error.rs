@@ -9,12 +9,18 @@ pub enum JournalError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("corrupted segment {segment} at offset {offset}: {reason}")]
-    Corrupted { segment: String, offset: u64, reason: String },
+    Corrupted {
+        segment: String,
+        offset: u64,
+        reason: String,
+    },
     #[error("non-monotonic seq: expected > {expected_gt}, got {got}")]
     NonMonotonicSeq { expected_gt: u64, got: u64 },
     #[error("seq out of range")]
     SeqOutOfRange,
-    #[error("payload too large for segment: segment_size={segment_size}, record_size={record_size}")]
+    #[error(
+        "payload too large for segment: segment_size={segment_size}, record_size={record_size}"
+    )]
     PayloadTooLargeForSegment { segment_size: u64, record_size: u64 },
     #[error("journal closed")]
     Closed,
@@ -25,7 +31,11 @@ impl Clone for JournalError {
         use JournalError::*;
         match self {
             Io(e) => Io(std::io::Error::new(e.kind(), e.to_string())),
-            Corrupted { segment, offset, reason } => Corrupted {
+            Corrupted {
+                segment,
+                offset,
+                reason,
+            } => Corrupted {
                 segment: segment.clone(),
                 offset: *offset,
                 reason: reason.clone(),
@@ -35,7 +45,10 @@ impl Clone for JournalError {
                 got: *got,
             },
             SeqOutOfRange => SeqOutOfRange,
-            PayloadTooLargeForSegment { segment_size, record_size } => PayloadTooLargeForSegment {
+            PayloadTooLargeForSegment {
+                segment_size,
+                record_size,
+            } => PayloadTooLargeForSegment {
                 segment_size: *segment_size,
                 record_size: *record_size,
             },
@@ -57,7 +70,10 @@ mod tests {
                 offset: 7,
                 reason: "r".into(),
             },
-            JournalError::NonMonotonicSeq { expected_gt: 3, got: 1 },
+            JournalError::NonMonotonicSeq {
+                expected_gt: 3,
+                got: 1,
+            },
             JournalError::SeqOutOfRange,
             JournalError::PayloadTooLargeForSegment {
                 segment_size: 64,

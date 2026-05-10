@@ -3,10 +3,10 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use redb::{
-    backends::InMemoryBackend, Database, Durability, ReadableDatabase, ReadableTable,
-    TableDefinition,
+    Database, Durability, ReadableDatabase, ReadableTable, TableDefinition,
+    backends::InMemoryBackend,
 };
 
 #[path = "ycsb_common.rs"]
@@ -76,7 +76,8 @@ impl YcsbEngine for RedbEngine {
 
         if has_writes {
             let mut tx = self.db.begin_write().expect("begin_write failed");
-            tx.set_durability(Durability::None).expect("set_durability failed");
+            tx.set_durability(Durability::None)
+                .expect("set_durability failed");
             {
                 let mut table = tx.open_table(TABLE).expect("open_table failed");
                 for op in ops {
@@ -118,8 +119,7 @@ impl YcsbEngine for RedbEngine {
                                     let (mut record, _): (YcsbRecord, _) =
                                         bincode::serde::decode_from_slice(g.value(), BINCODE_CFG)
                                             .expect("deserialize failed");
-                                    record.field0 =
-                                        std::iter::repeat_n('X', FIELD_SIZE).collect();
+                                    record.field0 = std::iter::repeat_n('X', FIELD_SIZE).collect();
                                     bincode::serde::encode_to_vec(record, BINCODE_CFG)
                                         .expect("serialize failed")
                                 })

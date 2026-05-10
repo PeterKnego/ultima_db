@@ -242,17 +242,17 @@ where
     }
     for (id, _) in &inserts {
         if base.get(id).is_some() {
-            return Err(Error::DuplicateKey(format!(
-                "bulk_delta insert id {id}"
-            )));
+            return Err(Error::DuplicateKey(format!("bulk_delta insert id {id}")));
         }
     }
 
     // 4. Materialize the merged sorted row vector.
     //    Walk base in id-order; skip ids in `deletes`; replace ids in
     //    `updates`; sort-merge inserts into the stream.
-    let updates_map: HashMap<u64, Arc<R>> =
-        updates.into_iter().map(|(id, r)| (id, Arc::new(r))).collect();
+    let updates_map: HashMap<u64, Arc<R>> = updates
+        .into_iter()
+        .map(|(id, r)| (id, Arc::new(r)))
+        .collect();
     let deletes_set: HashSet<u64> = deletes.into_iter().collect();
 
     let mut base_iter = base.range(..).peekable();
@@ -413,12 +413,7 @@ impl Store {
     ///
     /// Keys must be in strictly ascending order; out-of-order or duplicate
     /// keys are also rejected before any install occurs.
-    pub fn bulk_load_stream<R, I>(
-        &self,
-        table_name: &str,
-        sorted: I,
-        row_count: u64,
-    ) -> Result<u64>
+    pub fn bulk_load_stream<R, I>(&self, table_name: &str, sorted: I, row_count: u64) -> Result<u64>
     where
         R: Record,
         I: Iterator<Item = Result<(u64, R)>>,
@@ -492,7 +487,15 @@ mod stream_tests {
         let store = Store::default();
 
         let rows: Vec<(u64, Row)> = (1..=1000u64)
-            .map(|i| (i, Row { name: format!("r{i}"), value: i * 2 }))
+            .map(|i| {
+                (
+                    i,
+                    Row {
+                        name: format!("r{i}"),
+                        value: i * 2,
+                    },
+                )
+            })
             .collect();
         let row_count = rows.len() as u64;
 
@@ -503,8 +506,20 @@ mod stream_tests {
 
         let read = store.begin_read(None).unwrap();
         let table = read.open_table::<Row>("rows").unwrap();
-        assert_eq!(table.get(500), Some(&Row { name: "r500".into(), value: 1000 }));
-        assert_eq!(table.get(1000), Some(&Row { name: "r1000".into(), value: 2000 }));
+        assert_eq!(
+            table.get(500),
+            Some(&Row {
+                name: "r500".into(),
+                value: 1000
+            })
+        );
+        assert_eq!(
+            table.get(1000),
+            Some(&Row {
+                name: "r1000".into(),
+                value: 2000
+            })
+        );
     }
 
     #[test]
@@ -512,7 +527,13 @@ mod stream_tests {
         let store = Store::default();
 
         let bad: Vec<Result<(u64, Row)>> = vec![
-            Ok((1, Row { name: "a".into(), value: 1 })),
+            Ok((
+                1,
+                Row {
+                    name: "a".into(),
+                    value: 1,
+                },
+            )),
             Err(Error::InvalidBulkLoadInput("simulated".into())),
         ];
         let res = store.bulk_load_stream::<Row, _>("rows", bad.into_iter(), 2);
@@ -525,7 +546,15 @@ mod stream_tests {
 
         // Iterator yields 5 rows, but row_count declares 10.
         let rows: Vec<(u64, Row)> = (1..=5u64)
-            .map(|i| (i, Row { name: format!("r{i}"), value: i }))
+            .map(|i| {
+                (
+                    i,
+                    Row {
+                        name: format!("r{i}"),
+                        value: i,
+                    },
+                )
+            })
             .collect();
         let res = store.bulk_load_stream::<Row, _>("rows", rows.into_iter().map(Ok), 10);
         assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));

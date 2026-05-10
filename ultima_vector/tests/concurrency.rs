@@ -10,9 +10,9 @@
 use std::sync::Arc;
 use std::thread;
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{Store, StoreConfig};
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 
@@ -33,13 +33,8 @@ fn random_unit_vec(rng: &mut StdRng, dim: usize) -> Vec<f32> {
 #[test]
 fn readers_see_stable_snapshot_under_writer() {
     let store = Store::new(StoreConfig::default()).unwrap();
-    let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-        store.clone(),
-        "vec",
-        HnswParams::for_dim(DIM),
-        Cosine,
-    )
-    .unwrap();
+    let coll: VectorCollection<u64, Cosine> =
+        VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
 
     // Seed.
     let mut rng = StdRng::seed_from_u64(0xACE);

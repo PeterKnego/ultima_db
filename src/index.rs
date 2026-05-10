@@ -83,14 +83,23 @@ where
     S: IndexStorage<K> + 'static,
     R: 'static,
 {
-    pub fn new(name: String, kind: IndexKind, extractor: Arc<dyn KeyExtractor<R, K>>, storage: S) -> Self {
-        Self { name, kind, extractor, storage }
+    pub fn new(
+        name: String,
+        kind: IndexKind,
+        extractor: Arc<dyn KeyExtractor<R, K>>,
+        storage: S,
+    ) -> Self {
+        Self {
+            name,
+            kind,
+            extractor,
+            storage,
+        }
     }
 
     pub fn storage(&self) -> &S {
         &self.storage
     }
-
 }
 
 impl<R, K> IndexMaintainer<R> for ManagedIndex<R, K, UniqueStorage<K>>
@@ -266,7 +275,10 @@ impl<K: Ord + Clone + 'static> UniqueStorage<K> {
         self.tree.get(key).copied()
     }
 
-    pub fn range_ids<'a>(&'a self, range: impl std::ops::RangeBounds<K> + 'a) -> impl Iterator<Item = (&'a K, u64)> + 'a {
+    pub fn range_ids<'a>(
+        &'a self,
+        range: impl std::ops::RangeBounds<K> + 'a,
+    ) -> impl Iterator<Item = (&'a K, u64)> + 'a {
         self.tree.range(range).map(|(k, v)| (k, *v))
     }
 }
@@ -314,7 +326,11 @@ impl<K: Ord + Clone + 'static> NonUniqueStorage<K> {
             .map(|((_, id), _)| *id)
     }
 
-    pub fn range_ids(&self, start: std::ops::Bound<&K>, end: std::ops::Bound<&K>) -> impl Iterator<Item = (&K, u64)> + '_ {
+    pub fn range_ids(
+        &self,
+        start: std::ops::Bound<&K>,
+        end: std::ops::Bound<&K>,
+    ) -> impl Iterator<Item = (&K, u64)> + '_ {
         use std::ops::Bound;
         let range_start = match start {
             Bound::Included(k) => Bound::Included((k.clone(), 0u64)),
@@ -471,8 +487,16 @@ mod tests {
     #[test]
     fn unique_index_insert_and_lookup() {
         let ext: Arc<dyn KeyExtractor<User, String>> = Arc::new(|u: &User| u.email.clone());
-        let mut idx = ManagedIndex::new("by_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let user = User { email: "alice@example.com".to_string(), age: 30 };
+        let mut idx = ManagedIndex::new(
+            "by_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let user = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &user).unwrap();
         assert_eq!(idx.storage().get(&"alice@example.com".to_string()), Some(1));
         assert_eq!(idx.storage().get(&"bob@example.com".to_string()), None);
@@ -481,9 +505,20 @@ mod tests {
     #[test]
     fn unique_index_rejects_duplicate() {
         let ext: Arc<dyn KeyExtractor<User, String>> = Arc::new(|u: &User| u.email.clone());
-        let mut idx = ManagedIndex::new("by_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let u1 = User { email: "alice@example.com".to_string(), age: 30 };
-        let u2 = User { email: "alice@example.com".to_string(), age: 25 };
+        let mut idx = ManagedIndex::new(
+            "by_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let u1 = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
+        let u2 = User {
+            email: "alice@example.com".to_string(),
+            age: 25,
+        };
         idx.on_insert(1, &u1).unwrap();
         assert!(matches!(idx.on_insert(2, &u2), Err(Error::DuplicateKey(_))));
     }
@@ -491,10 +526,21 @@ mod tests {
     #[test]
     fn unique_index_update_changes_key() {
         let ext: Arc<dyn KeyExtractor<User, String>> = Arc::new(|u: &User| u.email.clone());
-        let mut idx = ManagedIndex::new("by_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let old = User { email: "alice@old.com".to_string(), age: 30 };
+        let mut idx = ManagedIndex::new(
+            "by_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let old = User {
+            email: "alice@old.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &old).unwrap();
-        let new = User { email: "alice@new.com".to_string(), age: 30 };
+        let new = User {
+            email: "alice@new.com".to_string(),
+            age: 30,
+        };
         idx.on_update(1, &old, &new).unwrap();
         assert_eq!(idx.storage().get(&"alice@old.com".to_string()), None);
         assert_eq!(idx.storage().get(&"alice@new.com".to_string()), Some(1));
@@ -503,14 +549,31 @@ mod tests {
     #[test]
     fn unique_index_update_rejects_conflict() {
         let ext: Arc<dyn KeyExtractor<User, String>> = Arc::new(|u: &User| u.email.clone());
-        let mut idx = ManagedIndex::new("by_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let u1 = User { email: "alice@example.com".to_string(), age: 30 };
-        let u2 = User { email: "bob@example.com".to_string(), age: 25 };
+        let mut idx = ManagedIndex::new(
+            "by_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let u1 = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
+        let u2 = User {
+            email: "bob@example.com".to_string(),
+            age: 25,
+        };
         idx.on_insert(1, &u1).unwrap();
         idx.on_insert(2, &u2).unwrap();
         // Try to update bob's email to alice's — should fail
-        let u2_new = User { email: "alice@example.com".to_string(), age: 25 };
-        assert!(matches!(idx.on_update(2, &u2, &u2_new), Err(Error::DuplicateKey(_))));
+        let u2_new = User {
+            email: "alice@example.com".to_string(),
+            age: 25,
+        };
+        assert!(matches!(
+            idx.on_update(2, &u2, &u2_new),
+            Err(Error::DuplicateKey(_))
+        ));
         // Bob's old email should still be in the index (rollback)
         assert_eq!(idx.storage().get(&"bob@example.com".to_string()), Some(2));
     }
@@ -518,8 +581,16 @@ mod tests {
     #[test]
     fn unique_index_delete() {
         let ext: Arc<dyn KeyExtractor<User, String>> = Arc::new(|u: &User| u.email.clone());
-        let mut idx = ManagedIndex::new("by_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let user = User { email: "alice@example.com".to_string(), age: 30 };
+        let mut idx = ManagedIndex::new(
+            "by_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let user = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &user).unwrap();
         idx.on_delete(1, &user);
         assert_eq!(idx.storage().get(&"alice@example.com".to_string()), None);
@@ -528,10 +599,24 @@ mod tests {
     #[test]
     fn non_unique_index_insert_and_lookup() {
         let ext: Arc<dyn KeyExtractor<User, u32>> = Arc::new(|u: &User| u.age);
-        let mut idx = ManagedIndex::new("by_age".to_string(), IndexKind::NonUnique, ext, NonUniqueStorage::new());
-        let u1 = User { email: "alice@example.com".to_string(), age: 30 };
-        let u2 = User { email: "bob@example.com".to_string(), age: 30 };
-        let u3 = User { email: "charlie@example.com".to_string(), age: 25 };
+        let mut idx = ManagedIndex::new(
+            "by_age".to_string(),
+            IndexKind::NonUnique,
+            ext,
+            NonUniqueStorage::new(),
+        );
+        let u1 = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
+        let u2 = User {
+            email: "bob@example.com".to_string(),
+            age: 30,
+        };
+        let u3 = User {
+            email: "charlie@example.com".to_string(),
+            age: 25,
+        };
         idx.on_insert(1, &u1).unwrap();
         idx.on_insert(2, &u2).unwrap();
         idx.on_insert(3, &u3).unwrap();
@@ -546,10 +631,21 @@ mod tests {
     #[test]
     fn non_unique_index_update() {
         let ext: Arc<dyn KeyExtractor<User, u32>> = Arc::new(|u: &User| u.age);
-        let mut idx = ManagedIndex::new("by_age".to_string(), IndexKind::NonUnique, ext, NonUniqueStorage::new());
-        let old = User { email: "alice@example.com".to_string(), age: 30 };
+        let mut idx = ManagedIndex::new(
+            "by_age".to_string(),
+            IndexKind::NonUnique,
+            ext,
+            NonUniqueStorage::new(),
+        );
+        let old = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &old).unwrap();
-        let new = User { email: "alice@example.com".to_string(), age: 31 };
+        let new = User {
+            email: "alice@example.com".to_string(),
+            age: 31,
+        };
         idx.on_update(1, &old, &new).unwrap();
         assert_eq!(idx.storage().get_ids(&30).count(), 0);
         let ids_31: Vec<u64> = idx.storage().get_ids(&31).collect();
@@ -559,9 +655,20 @@ mod tests {
     #[test]
     fn non_unique_index_delete() {
         let ext: Arc<dyn KeyExtractor<User, u32>> = Arc::new(|u: &User| u.age);
-        let mut idx = ManagedIndex::new("by_age".to_string(), IndexKind::NonUnique, ext, NonUniqueStorage::new());
-        let u1 = User { email: "alice@example.com".to_string(), age: 30 };
-        let u2 = User { email: "bob@example.com".to_string(), age: 30 };
+        let mut idx = ManagedIndex::new(
+            "by_age".to_string(),
+            IndexKind::NonUnique,
+            ext,
+            NonUniqueStorage::new(),
+        );
+        let u1 = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
+        let u2 = User {
+            email: "bob@example.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &u1).unwrap();
         idx.on_insert(2, &u2).unwrap();
         idx.on_delete(1, &u1);
@@ -572,19 +679,36 @@ mod tests {
     #[test]
     fn clone_box_produces_independent_copy() {
         let ext: Arc<dyn KeyExtractor<User, String>> = Arc::new(|u: &User| u.email.clone());
-        let mut idx = ManagedIndex::new("by_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let user = User { email: "alice@example.com".to_string(), age: 30 };
+        let mut idx = ManagedIndex::new(
+            "by_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let user = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &user).unwrap();
 
         let cloned = idx.clone_box();
         // Mutate original
-        let user2 = User { email: "bob@example.com".to_string(), age: 25 };
+        let user2 = User {
+            email: "bob@example.com".to_string(),
+            age: 25,
+        };
         idx.on_insert(2, &user2).unwrap();
 
         // Clone should not see the new insert
-        let cloned = cloned.as_any().downcast_ref::<ManagedIndex<User, String, UniqueStorage<String>>>().unwrap();
+        let cloned = cloned
+            .as_any()
+            .downcast_ref::<ManagedIndex<User, String, UniqueStorage<String>>>()
+            .unwrap();
         assert_eq!(cloned.storage().get(&"bob@example.com".to_string()), None);
-        assert_eq!(cloned.storage().get(&"alice@example.com".to_string()), Some(1));
+        assert_eq!(
+            cloned.storage().get(&"alice@example.com".to_string()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -633,7 +757,10 @@ mod tests {
         let sum = SumIndex::new();
         let mut adapter = CustomIndexAdapter::new("sum".to_string(), sum);
 
-        let u1 = User { email: "a@x.com".to_string(), age: 30 };
+        let u1 = User {
+            email: "a@x.com".to_string(),
+            age: 30,
+        };
         adapter.on_insert(1, &u1).unwrap();
 
         let inner = adapter
@@ -643,7 +770,10 @@ mod tests {
             .inner();
         assert_eq!(inner.total(), 30);
 
-        let u2 = User { email: "b@x.com".to_string(), age: 20 };
+        let u2 = User {
+            email: "b@x.com".to_string(),
+            age: 20,
+        };
         adapter.on_insert(2, &u2).unwrap();
 
         let inner = adapter
@@ -653,7 +783,10 @@ mod tests {
             .inner();
         assert_eq!(inner.total(), 50);
 
-        let u1_new = User { email: "a@x.com".to_string(), age: 35 };
+        let u1_new = User {
+            email: "a@x.com".to_string(),
+            age: 35,
+        };
         adapter.on_update(1, &u1, &u1_new).unwrap();
 
         let inner = adapter
@@ -680,12 +813,18 @@ mod tests {
         let sum = SumIndex::new();
         let mut adapter = CustomIndexAdapter::new("sum".to_string(), sum);
 
-        let u1 = User { email: "a@x.com".to_string(), age: 30 };
+        let u1 = User {
+            email: "a@x.com".to_string(),
+            age: 30,
+        };
         adapter.on_insert(1, &u1).unwrap();
 
         let cloned = adapter.clone_box();
 
-        let u2 = User { email: "b@x.com".to_string(), age: 20 };
+        let u2 = User {
+            email: "b@x.com".to_string(),
+            age: 20,
+        };
         adapter.on_insert(2, &u2).unwrap();
 
         let cloned_inner = cloned
@@ -828,16 +967,37 @@ mod tests {
 
     #[test]
     fn unique_compound_index() {
-        let ext: Arc<dyn KeyExtractor<User, (u32, String)>> = Arc::new(|u: &User| (u.age, u.email.clone()));
-        let mut idx = ManagedIndex::new("by_age_email".to_string(), IndexKind::Unique, ext, UniqueStorage::new());
-        let user = User { email: "alice@example.com".to_string(), age: 30 };
+        let ext: Arc<dyn KeyExtractor<User, (u32, String)>> =
+            Arc::new(|u: &User| (u.age, u.email.clone()));
+        let mut idx = ManagedIndex::new(
+            "by_age_email".to_string(),
+            IndexKind::Unique,
+            ext,
+            UniqueStorage::new(),
+        );
+        let user = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
         idx.on_insert(1, &user).unwrap();
 
-        assert_eq!(idx.storage().get(&(30, "alice@example.com".to_string())), Some(1));
-        assert_eq!(idx.storage().get(&(30, "bob@example.com".to_string())), None);
+        assert_eq!(
+            idx.storage().get(&(30, "alice@example.com".to_string())),
+            Some(1)
+        );
+        assert_eq!(
+            idx.storage().get(&(30, "bob@example.com".to_string())),
+            None
+        );
 
         // Reject duplicate (age, email)
-        let user_dup = User { email: "alice@example.com".to_string(), age: 30 };
-        assert!(matches!(idx.on_insert(2, &user_dup), Err(Error::DuplicateKey(_))));
+        let user_dup = User {
+            email: "alice@example.com".to_string(),
+            age: 30,
+        };
+        assert!(matches!(
+            idx.on_insert(2, &user_dup),
+            Err(Error::DuplicateKey(_))
+        ));
     }
 }

@@ -150,7 +150,10 @@ where
 
     let start_row = table.get(start_id).ok_or(Error::NodeNotFound(start_id))?;
     let start_dist = distance.distance(query, &start_row.embedding);
-    let mut current = vec![Candidate { id: start_id, dist: start_dist }];
+    let mut current = vec![Candidate {
+        id: start_id,
+        dist: start_dist,
+    }];
 
     // Greedy descent through upper layers (no filter).
     let mut layer = ep.max_level;

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-use std::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use dashmap::DashMap;
 
@@ -243,7 +243,10 @@ impl Store {
         };
 
         let metrics = Arc::new(StoreMetrics::new());
-        let empty = Arc::new(Snapshot { version: 0, tables: BTreeMap::new() });
+        let empty = Arc::new(Snapshot {
+            version: 0,
+            tables: BTreeMap::new(),
+        });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
         Ok(Self {
@@ -286,7 +289,11 @@ impl Store {
             .ok_or(Error::VersionNotFound(v))?
             .clone();
         let metrics = Arc::clone(&inner.metrics);
-        Ok(ReadTx { snapshot, metrics, _not_send: PhantomData })
+        Ok(ReadTx {
+            snapshot,
+            metrics,
+            _not_send: PhantomData,
+        })
     }
 
     /// Open a write transaction.
@@ -325,7 +332,7 @@ impl Store {
                     keys: vec![],
                     version: inner.latest_version,
                     wait_for: None,
-                })
+                });
             }
         };
         // Keep next_version ahead of any explicitly requested version.
@@ -415,9 +422,11 @@ impl Store {
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
         Arc::get_mut(&mut inner.registry)
-            .ok_or_else(|| Error::Persistence(
-                "cannot register table: registry is in use (checkpoint in progress?)".into(),
-            ))?
+            .ok_or_else(|| {
+                Error::Persistence(
+                    "cannot register table: registry is in use (checkpoint in progress?)".into(),
+                )
+            })?
             .register::<R>(name)
     }
 
@@ -437,7 +446,9 @@ impl Store {
                 crate::persistence::Persistence::Standalone { dir, .. }
                 | crate::persistence::Persistence::Smr { dir } => dir.clone(),
                 crate::persistence::Persistence::None => {
-                    return Err(Error::Persistence("checkpoint requires persistence to be configured".into()));
+                    return Err(Error::Persistence(
+                        "checkpoint requires persistence to be configured".into(),
+                    ));
                 }
             };
             let snap = inner.snapshots[&inner.latest_version].clone();
@@ -449,7 +460,10 @@ impl Store {
 
         // Prune WAL in Standalone mode
         let inner = self.inner.read().unwrap();
-        if matches!(inner.config.persistence, crate::persistence::Persistence::Standalone { .. }) {
+        if matches!(
+            inner.config.persistence,
+            crate::persistence::Persistence::Standalone { .. }
+        ) {
             let wal_path = crate::wal::wal_path(&dir);
             crate::wal::prune_wal(&wal_path, version)?;
         }
@@ -507,7 +521,8 @@ impl Store {
                 let base_version = inner.latest_version;
                 drop(inner);
 
-                let to_replay: Vec<_> = entries.iter()
+                let to_replay: Vec<_> = entries
+                    .iter()
                     .filter(|e| e.version > base_version)
                     .collect();
 
@@ -518,7 +533,9 @@ impl Store {
                     let base_snap = &inner.snapshots[&inner.latest_version];
                     let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
                     for (name, arc) in &base_snap.tables {
-                        let info = inner.registry.get(name)
+                        let info = inner
+                            .registry
+                            .get(name)
                             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
                         let bytes = (info.serialize_table)(arc.as_ref().as_any())?;
                         let new_table = (info.deserialize_table)(&bytes)?;
@@ -531,18 +548,26 @@ impl Store {
                             match op {
                                 crate::wal::WalOp::Insert { table, id, data }
                                 | crate::wal::WalOp::Update { table, id, data } => {
-                                    let info = inner.registry.get(table)
+                                    let info = inner
+                                        .registry
+                                        .get(table)
                                         .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
 
                                     if !tables.contains_key(table) {
-                                        tables.insert(table.clone(), Arc::from((info.new_empty_table)()));
+                                        tables.insert(
+                                            table.clone(),
+                                            Arc::from((info.new_empty_table)()),
+                                        );
                                     }
 
                                     let table_arc = tables.get_mut(table).unwrap();
                                     let table_mut = Arc::get_mut(table_arc)
-                                        .ok_or_else(|| Error::Persistence(
-                                            "table Arc has multiple references during replay".into()
-                                        ))?
+                                        .ok_or_else(|| {
+                                            Error::Persistence(
+                                                "table Arc has multiple references during replay"
+                                                    .into(),
+                                            )
+                                        })?
                                         .as_any_mut();
 
                                     if matches!(op, crate::wal::WalOp::Insert { .. }) {
@@ -552,7 +577,9 @@ impl Store {
                                     }
                                 }
                                 crate::wal::WalOp::Delete { table, id } => {
-                                    let info = inner.registry.get(table)
+                                    let info = inner
+                                        .registry
+                                        .get(table)
                                         .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
                                     if let Some(table_arc) = tables.get_mut(table) {
                                         let table_mut = Arc::get_mut(table_arc)
@@ -572,7 +599,10 @@ impl Store {
                         latest_version = entry.version;
                     }
 
-                    let snapshot = Arc::new(Snapshot { version: latest_version, tables });
+                    let snapshot = Arc::new(Snapshot {
+                        version: latest_version,
+                        tables,
+                    });
                     inner.snapshots.insert(latest_version, snapshot);
                     inner.latest_version = latest_version;
                     if latest_version >= inner.next_version {
@@ -598,7 +628,10 @@ impl Store {
     pub fn snapshot_stream(
         &self,
         version: Option<u64>,
-    ) -> std::result::Result<crate::snapshot_stream::SnapshotReader, crate::snapshot_stream::SnapshotStreamError> {
+    ) -> std::result::Result<
+        crate::snapshot_stream::SnapshotReader,
+        crate::snapshot_stream::SnapshotStreamError,
+    > {
         let (snap, registry) = {
             let inner = self.inner.read().unwrap();
             let v = version.unwrap_or(inner.latest_version);
@@ -671,7 +704,10 @@ impl Store {
     pub fn open_checkpoint_reader(
         &self,
         version: u64,
-    ) -> std::result::Result<crate::snapshot_stream::SnapshotReader, crate::snapshot_stream::SnapshotStreamError> {
+    ) -> std::result::Result<
+        crate::snapshot_stream::SnapshotReader,
+        crate::snapshot_stream::SnapshotStreamError,
+    > {
         use crate::persistence::Persistence;
         use crate::snapshot_stream::SnapshotStreamError;
 
@@ -699,7 +735,6 @@ impl Store {
     }
 
     // --- Test helpers ---
-
 
     #[cfg(test)]
     fn snapshot_count(&self) -> usize {
@@ -836,7 +871,10 @@ impl Store {
             Arc::new(new_table) as Arc<dyn MergeableTable>,
         );
 
-        let snapshot = Arc::new(Snapshot { version: new_version, tables });
+        let snapshot = Arc::new(Snapshot {
+            version: new_version,
+            tables,
+        });
         inner.snapshots.insert(new_version, snapshot);
         inner.latest_version = new_version;
         if inner.config.auto_snapshot_gc {
@@ -959,7 +997,10 @@ impl Store {
         base_version: u64,
         keep_set: Option<std::collections::BTreeSet<String>>,
     ) -> Result<u64> {
-        debug_assert!(!pending.is_empty(), "install_batch called with empty pending");
+        debug_assert!(
+            !pending.is_empty(),
+            "install_batch called with empty pending"
+        );
         let mut inner = self.inner.write().unwrap();
 
         if inner.latest_version != base_version {
@@ -1072,7 +1113,11 @@ impl Drop for TableLockGuards {
 /// `prune_write_sets` can discard write sets no longer needed.
 /// Uses `swap_remove` for O(1) removal (order doesn't matter).
 fn remove_active_writer(inner: &mut StoreInner, base_version: u64) {
-    if let Some(pos) = inner.active_writer_base_versions.iter().position(|&v| v == base_version) {
+    if let Some(pos) = inner
+        .active_writer_base_versions
+        .iter()
+        .position(|&v| v == base_version)
+    {
         inner.active_writer_base_versions.swap_remove(pos);
     }
 }
@@ -1085,7 +1130,9 @@ fn remove_active_writer(inner: &mut StoreInner, base_version: u64) {
 /// the entire log is cleared.
 fn prune_write_sets(inner: &mut StoreInner) {
     if let Some(&min_base) = inner.active_writer_base_versions.iter().min() {
-        inner.committed_write_sets.retain(|cws| cws.version > min_base);
+        inner
+            .committed_write_sets
+            .retain(|cws| cws.version > min_base);
     } else {
         // No active writers — discard everything.
         inner.committed_write_sets.clear();
@@ -1103,9 +1150,9 @@ fn gc_inner(inner: &mut StoreInner) {
     let protected: BTreeSet<u64> = versions[cutoff_idx..].iter().copied().collect();
 
     let before = inner.snapshots.len();
-    inner.snapshots.retain(|&v, snapshot| {
-        protected.contains(&v) || Arc::strong_count(snapshot) > 1
-    });
+    inner
+        .snapshots
+        .retain(|&v, snapshot| protected.contains(&v) || Arc::strong_count(snapshot) > 1);
     let removed = (before - inner.snapshots.len()) as u64;
     inner.metrics.inc_gc_run();
     if removed > 0 {
@@ -1169,7 +1216,8 @@ impl ReadTx {
     /// record type.
     pub fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<TableReader<'_, R>> {
         let name = opener.table_name();
-        let table = self.snapshot
+        let table = self
+            .snapshot
             .tables
             .get(name)
             .ok_or(Error::KeyNotFound)?
@@ -1351,8 +1399,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(w) = &mut self.wal_ops {
             let data = Self::serialize_record(&record)?;
             let id = self.table.insert(record)?;
-            if let Some(ws) = &mut self.write_set { ws.insert(id); }
-            w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data });
+            if let Some(ws) = &mut self.write_set {
+                ws.insert(id);
+            }
+            w.ops.push(crate::wal::WalOp::Insert {
+                table: w.table_name.clone(),
+                id,
+                data,
+            });
             self.metrics.inc_inserts(&self.table_name, 1);
             return Ok(id);
         }
@@ -1371,8 +1425,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(w) = &mut self.wal_ops {
             let data = Self::serialize_record(&record)?;
             self.table.update(id, record)?;
-            if let Some(ws) = &mut self.write_set { ws.insert(id); }
-            w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
+            if let Some(ws) = &mut self.write_set {
+                ws.insert(id);
+            }
+            w.ops.push(crate::wal::WalOp::Update {
+                table: w.table_name.clone(),
+                id,
+                data,
+            });
             self.metrics.inc_updates(&self.table_name, 1);
             return Ok(());
         }
@@ -1393,7 +1453,10 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            w.ops.push(crate::wal::WalOp::Delete { table: w.table_name.clone(), id });
+            w.ops.push(crate::wal::WalOp::Delete {
+                table: w.table_name.clone(),
+                id,
+            });
         }
         self.metrics.inc_deletes(&self.table_name, 1);
         Ok(old)
@@ -1403,13 +1466,20 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            let data_list: Vec<Vec<u8>> = records.iter()
+            let data_list: Vec<Vec<u8>> = records
+                .iter()
                 .map(|r| Self::serialize_record(r))
                 .collect::<Result<_>>()?;
             let ids = self.table.insert_batch(records)?;
-            if let Some(ws) = &mut self.write_set { ws.extend(ids.iter().copied()); }
+            if let Some(ws) = &mut self.write_set {
+                ws.extend(ids.iter().copied());
+            }
             for (id, data) in ids.iter().zip(data_list) {
-                w.ops.push(crate::wal::WalOp::Insert { table: w.table_name.clone(), id: *id, data });
+                w.ops.push(crate::wal::WalOp::Insert {
+                    table: w.table_name.clone(),
+                    id: *id,
+                    data,
+                });
             }
             self.metrics.inc_inserts(&self.table_name, ids.len() as u64);
             return Ok(ids);
@@ -1432,14 +1502,21 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     pub fn update_batch(&mut self, updates: Vec<(u64, R)>) -> Result<()> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            let ops_data: Vec<(u64, Vec<u8>)> = updates.iter()
+            let ops_data: Vec<(u64, Vec<u8>)> = updates
+                .iter()
                 .map(|(id, r)| Self::serialize_record(r).map(|d| (*id, d)))
                 .collect::<Result<_>>()?;
             let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
             self.table.update_batch(updates)?;
-            if let Some(ws) = &mut self.write_set { ws.extend(ids.iter()); }
+            if let Some(ws) = &mut self.write_set {
+                ws.extend(ids.iter());
+            }
             for (id, data) in ops_data {
-                w.ops.push(crate::wal::WalOp::Update { table: w.table_name.clone(), id, data });
+                w.ops.push(crate::wal::WalOp::Update {
+                    table: w.table_name.clone(),
+                    id,
+                    data,
+                });
             }
             self.metrics.inc_updates(&self.table_name, ids.len() as u64);
             return Ok(());
@@ -1463,7 +1540,10 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             for &id in ids {
-                w.ops.push(crate::wal::WalOp::Delete { table: w.table_name.clone(), id });
+                w.ops.push(crate::wal::WalOp::Delete {
+                    table: w.table_name.clone(),
+                    id,
+                });
             }
         }
         self.metrics.inc_deletes(&self.table_name, ids.len() as u64);
@@ -1486,7 +1566,10 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     }
 
     /// Returns an iterator over records within the specified ID range.
-    pub fn range<'a>(&'a self, range: impl std::ops::RangeBounds<u64> + 'a) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+    pub fn range<'a>(
+        &'a self,
+        range: impl std::ops::RangeBounds<u64> + 'a,
+    ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
         record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_primary_key_scans(&self.table_name);
         self.table.range(range)
@@ -1536,8 +1619,11 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     /// Look up multiple records by ID.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
-        for id in ids { record_point_read(self.read_set, &self.table_name, *id); }
-        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        for id in ids {
+            record_point_read(self.read_set, &self.table_name, *id);
+        }
+        self.metrics
+            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.get_many(ids)
     }
 
@@ -1594,7 +1680,8 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         range: impl std::ops::RangeBounds<K>,
     ) -> Result<Vec<(u64, &R)>> {
         record_table_scan(self.read_set, &self.table_name);
-        self.metrics.inc_index_range_scans(&self.table_name, index_name);
+        self.metrics
+            .inc_index_range_scans(&self.table_name, index_name);
         self.table.index_range(index_name, range)
     }
 
@@ -1617,8 +1704,11 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Resolve a slice of record IDs to `(id, &record)` pairs.
     /// IDs that don't exist in the table are silently skipped.
     pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
-        for id in ids { record_point_read(self.read_set, &self.table_name, *id); }
-        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        for id in ids {
+            record_point_read(self.read_set, &self.table_name, *id);
+        }
+        self.metrics
+            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.resolve(ids)
     }
 
@@ -1643,9 +1733,17 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(w) = &mut self.wal_ops {
             let data = data.expect("serialized when wal_ops is Some");
             let op = if had_prior {
-                crate::wal::WalOp::Update { table: w.table_name.clone(), id, data }
+                crate::wal::WalOp::Update {
+                    table: w.table_name.clone(),
+                    id,
+                    data,
+                }
             } else {
-                crate::wal::WalOp::Insert { table: w.table_name.clone(), id, data }
+                crate::wal::WalOp::Insert {
+                    table: w.table_name.clone(),
+                    id,
+                    data,
+                }
             };
             w.ops.push(op);
         }
@@ -1737,18 +1835,22 @@ fn record_point_read(
     id: u64,
 ) {
     if let Some(cell) = rs {
-        cell.borrow_mut().entry(table.to_string()).or_default().keys.insert(id);
+        cell.borrow_mut()
+            .entry(table.to_string())
+            .or_default()
+            .keys
+            .insert(id);
     }
 }
 
 /// Record a range/scan/index read against `table`. No-op when `rs` is `None`.
 #[inline]
-fn record_table_scan(
-    rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
-    table: &str,
-) {
+fn record_table_scan(rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>, table: &str) {
     if let Some(cell) = rs {
-        cell.borrow_mut().entry(table.to_string()).or_default().table_scan = true;
+        cell.borrow_mut()
+            .entry(table.to_string())
+            .or_default()
+            .table_scan = true;
     }
 }
 
@@ -1760,7 +1862,10 @@ impl<'tx, R: Record> TableReader<'tx, R> {
     }
 
     /// Returns an iterator over records within the specified ID range.
-    pub fn range<'a>(&'a self, range: impl std::ops::RangeBounds<u64> + 'a) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+    pub fn range<'a>(
+        &'a self,
+        range: impl std::ops::RangeBounds<u64> + 'a,
+    ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
         self.metrics.inc_primary_key_scans(&self.table_name);
         self.table.range(range)
     }
@@ -1803,13 +1908,16 @@ impl<'tx, R: Record> TableReader<'tx, R> {
 
     /// Look up multiple records by ID.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
-        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.metrics
+            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.get_many(ids)
     }
 
     /// Look up a single record by a unique index.
     pub fn get_unique<K: Ord + Clone + Send + Sync + 'static>(
-        &self, index_name: &str, key: &K,
+        &self,
+        index_name: &str,
+        key: &K,
     ) -> Result<Option<(u64, &R)>> {
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_unique(index_name, key)
@@ -1817,7 +1925,9 @@ impl<'tx, R: Record> TableReader<'tx, R> {
 
     /// Look up records by a non-unique index key.
     pub fn get_by_index<K: Ord + Clone + Send + Sync + 'static>(
-        &self, index_name: &str, key: &K,
+        &self,
+        index_name: &str,
+        key: &K,
     ) -> Result<Vec<(u64, &R)>> {
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_index(index_name, key)
@@ -1825,7 +1935,9 @@ impl<'tx, R: Record> TableReader<'tx, R> {
 
     /// Look up records by index key (works for both unique and non-unique).
     pub fn get_by_key<K: Ord + Clone + Send + Sync + 'static>(
-        &self, index_name: &str, key: &K,
+        &self,
+        index_name: &str,
+        key: &K,
     ) -> Result<Vec<(u64, &R)>> {
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_key(index_name, key)
@@ -1833,9 +1945,12 @@ impl<'tx, R: Record> TableReader<'tx, R> {
 
     /// Range scan on an index (works for both unique and non-unique).
     pub fn index_range<K: Ord + Clone + Send + Sync + 'static>(
-        &self, index_name: &str, range: impl std::ops::RangeBounds<K>,
+        &self,
+        index_name: &str,
+        range: impl std::ops::RangeBounds<K>,
     ) -> Result<Vec<(u64, &R)>> {
-        self.metrics.inc_index_range_scans(&self.table_name, index_name);
+        self.metrics
+            .inc_index_range_scans(&self.table_name, index_name);
         self.table.index_range(index_name, range)
     }
 
@@ -1847,7 +1962,8 @@ impl<'tx, R: Record> TableReader<'tx, R> {
     /// Resolve a slice of record IDs to `(id, &record)` pairs.
     /// IDs that don't exist in the table are silently skipped.
     pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
-        self.metrics.inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.metrics
+            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
         self.table.resolve(ids)
     }
 }
@@ -1872,7 +1988,10 @@ impl WriteTx {
     ///
     /// Returns a [`TableWriter`] that tracks modified keys for OCC validation
     /// in [`WriterMode::MultiWriter`] mode.
-    pub fn open_table<R: Record>(&mut self, opener: impl TableOpener<R>) -> Result<TableWriter<'_, R>> {
+    pub fn open_table<R: Record>(
+        &mut self,
+        opener: impl TableOpener<R>,
+    ) -> Result<TableWriter<'_, R>> {
         let name = opener.table_name();
         if !self.dirty.contains_key(name) {
             let table: Table<R> = if self.deleted_tables.contains(name) {
@@ -1891,7 +2010,8 @@ impl WriteTx {
             self.dirty.insert(name.to_string(), Box::new(table));
         }
         let name_str = name.to_string();
-        let table = self.dirty
+        let table = self
+            .dirty
             .get_mut(&name_str)
             .unwrap()
             .as_any_mut()
@@ -1960,7 +2080,10 @@ impl WriteTx {
         let waiter = if let Some(wal) = &inner.wal_handle {
             let ops = std::mem::take(&mut self.wal_ops);
             if !ops.is_empty() {
-                let entry = crate::wal::WalEntry { version: self.version, ops };
+                let entry = crate::wal::WalEntry {
+                    version: self.version,
+                    ops,
+                };
                 Some(wal.write(entry)?)
             } else {
                 None
@@ -1971,7 +2094,10 @@ impl WriteTx {
 
         #[cfg(all(test, feature = "persistence"))]
         let mock_waiter = inner.mock_wal.as_ref().map(|mock| {
-            mock.write(crate::wal::WalEntry { version: self.version, ops: vec![] })
+            mock.write(crate::wal::WalEntry {
+                version: self.version,
+                ops: vec![],
+            })
         });
 
         // SingleWriter: nobody else commits concurrently, so the fast
@@ -1989,7 +2115,10 @@ impl WriteTx {
             new_tables.remove(name);
         }
 
-        let snapshot = Arc::new(Snapshot { version: self.version, tables: new_tables });
+        let snapshot = Arc::new(Snapshot {
+            version: self.version,
+            tables: new_tables,
+        });
         let v = snapshot.version;
         inner.active_writer_count -= 1;
         self.needs_cleanup = false;
@@ -1999,7 +2128,9 @@ impl WriteTx {
             #[allow(unused_mut)]
             let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
             #[cfg(test)]
-            { w = w || mock_waiter.is_some(); }
+            {
+                w = w || mock_waiter.is_some();
+            }
             w
         };
         #[cfg(not(feature = "persistence"))]
@@ -2009,18 +2140,30 @@ impl WriteTx {
             drop(inner);
             #[cfg(feature = "persistence")]
             {
-                if let Some(w) = waiter { w.wait(); }
+                if let Some(w) = waiter {
+                    w.wait();
+                }
                 #[cfg(test)]
-                if let Some(w) = mock_waiter { w.wait(); }
+                if let Some(w) = mock_waiter {
+                    w.wait();
+                }
             }
             let mut inner = self.store_inner.write().unwrap();
             inner.snapshots.insert(v, snapshot);
-            if v > inner.latest_version { inner.latest_version = v; }
-            if inner.config.auto_snapshot_gc { gc_inner(&mut inner); }
+            if v > inner.latest_version {
+                inner.latest_version = v;
+            }
+            if inner.config.auto_snapshot_gc {
+                gc_inner(&mut inner);
+            }
         } else {
             inner.snapshots.insert(v, snapshot);
-            if v > inner.latest_version { inner.latest_version = v; }
-            if inner.config.auto_snapshot_gc { gc_inner(&mut inner); }
+            if v > inner.latest_version {
+                inner.latest_version = v;
+            }
+            if inner.config.auto_snapshot_gc {
+                gc_inner(&mut inner);
+            }
         }
 
         self.metrics.inc_commit();
@@ -2073,16 +2216,16 @@ impl WriteTx {
 
             // Pre-compute fast/slow-path flag for each dirty table under
             // the same read lock; avoids a second scan later.
-            let flags: BTreeMap<String, bool> = self
-                .dirty
-                .keys()
-                .map(|n| {
-                    let has = inner.committed_write_sets.iter().any(|cws| {
-                        cws.version > self.base.version && cws.tables.contains_key(n)
-                    });
-                    (n.clone(), has)
-                })
-                .collect();
+            let flags: BTreeMap<String, bool> =
+                self.dirty
+                    .keys()
+                    .map(|n| {
+                        let has = inner.committed_write_sets.iter().any(|cws| {
+                            cws.version > self.base.version && cws.tables.contains_key(n)
+                        });
+                        (n.clone(), has)
+                    })
+                    .collect();
             (inner.snapshots[&inner.latest_version].tables.clone(), flags)
         };
         self.metrics.add_phase1(t1.elapsed().as_nanos() as u64);
@@ -2150,7 +2293,10 @@ impl WriteTx {
         let waiter = if let Some(wal) = &inner.wal_handle {
             let ops = std::mem::take(&mut self.wal_ops);
             if !ops.is_empty() {
-                let entry = crate::wal::WalEntry { version: self.version, ops };
+                let entry = crate::wal::WalEntry {
+                    version: self.version,
+                    ops,
+                };
                 Some(wal.write(entry)?)
             } else {
                 None
@@ -2162,7 +2308,10 @@ impl WriteTx {
         // Test-only: mock WAL produces a waiter for controlled fsync testing.
         #[cfg(all(test, feature = "persistence"))]
         let mock_waiter = inner.mock_wal.as_ref().map(|mock| {
-            mock.write(crate::wal::WalEntry { version: self.version, ops: vec![] })
+            mock.write(crate::wal::WalEntry {
+                version: self.version,
+                ops: vec![],
+            })
         });
 
         // Fork from the *current* latest (may have advanced since phase 1
@@ -2180,7 +2329,10 @@ impl WriteTx {
             new_tables.remove(name);
         }
 
-        let snapshot = Arc::new(Snapshot { version: self.version, tables: new_tables });
+        let snapshot = Arc::new(Snapshot {
+            version: self.version,
+            tables: new_tables,
+        });
         let v = snapshot.version;
 
         // Record write set (under write lock so concurrent OCC sees it).
@@ -2200,7 +2352,9 @@ impl WriteTx {
             #[allow(unused_mut)]
             let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
             #[cfg(test)]
-            { w = w || mock_waiter.is_some(); }
+            {
+                w = w || mock_waiter.is_some();
+            }
             w
         };
         #[cfg(not(feature = "persistence"))]
@@ -2268,7 +2422,9 @@ impl WriteTx {
         }
         #[cfg(feature = "persistence")]
         if existed && self.wal_enabled {
-            self.wal_ops.push(crate::wal::WalOp::DeleteTable { name: name.to_string() });
+            self.wal_ops.push(crate::wal::WalOp::DeleteTable {
+                name: name.to_string(),
+            });
         }
         existed
     }
@@ -2375,8 +2531,7 @@ impl WriteTx {
                 if let Some(their_keys) = cws.tables.get(table_name)
                     && !my_keys.is_disjoint(their_keys)
                 {
-                    let conflicting: Vec<u64> =
-                        my_keys.intersection(their_keys).copied().collect();
+                    let conflicting: Vec<u64> = my_keys.intersection(their_keys).copied().collect();
                     return Some(Error::WriteConflict {
                         table: table_name.clone(),
                         keys: conflicting,
@@ -2507,7 +2662,10 @@ mod tests {
     #[test]
     fn begin_read_nonexistent_version_errors() {
         let store = Store::default();
-        assert!(matches!(store.begin_read(Some(99)), Err(Error::VersionNotFound(99))));
+        assert!(matches!(
+            store.begin_read(Some(99)),
+            Err(Error::VersionNotFound(99))
+        ));
     }
 
     #[test]
@@ -2527,7 +2685,10 @@ mod tests {
     #[test]
     fn begin_write_explicit_version_equal_latest_is_conflict() {
         let store = Store::default(); // latest = 0
-        assert!(matches!(store.begin_write(Some(0)), Err(Error::WriteConflict { .. })));
+        assert!(matches!(
+            store.begin_write(Some(0)),
+            Err(Error::WriteConflict { .. })
+        ));
     }
 
     #[test]
@@ -2537,7 +2698,10 @@ mod tests {
         let wtx = store.begin_write(Some(3)).unwrap();
         wtx.commit().unwrap();
         // Now latest = 3; requesting version 2 should conflict
-        assert!(matches!(store.begin_write(Some(2)), Err(Error::WriteConflict { .. })));
+        assert!(matches!(
+            store.begin_write(Some(2)),
+            Err(Error::WriteConflict { .. })
+        ));
     }
 
     #[test]
@@ -2563,7 +2727,10 @@ mod tests {
     fn read_tx_open_nonexistent_table_errors() {
         let store = Store::default();
         let rtx = store.begin_read(None).unwrap();
-        assert!(matches!(rtx.open_table::<String>("nope"), Err(Error::KeyNotFound)));
+        assert!(matches!(
+            rtx.open_table::<String>("nope"),
+            Err(Error::KeyNotFound)
+        ));
     }
 
     #[test]
@@ -2571,11 +2738,17 @@ mod tests {
         let store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("hi".to_string()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("hi".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let rtx = store.begin_read(None).unwrap();
-        assert!(matches!(rtx.open_table::<u64>("t"), Err(Error::TypeMismatch(_))));
+        assert!(matches!(
+            rtx.open_table::<u64>("t"),
+            Err(Error::TypeMismatch(_))
+        ));
     }
 
     // --- WriteTx tests ---
@@ -2593,7 +2766,10 @@ mod tests {
         let store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("notes").unwrap().insert("hello".to_string()).unwrap();
+            wtx.open_table::<String>("notes")
+                .unwrap()
+                .insert("hello".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx2 = store.begin_write(None).unwrap();
@@ -2606,9 +2782,15 @@ mod tests {
         let store = Store::default();
         let rtx = store.begin_read(None).unwrap(); // snapshot v0
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<String>("t").unwrap().insert("secret".to_string()).unwrap();
+        wtx.open_table::<String>("t")
+            .unwrap()
+            .insert("secret".to_string())
+            .unwrap();
         // Do NOT commit yet — rtx should still see empty
-        assert!(matches!(rtx.open_table::<String>("t"), Err(Error::KeyNotFound)));
+        assert!(matches!(
+            rtx.open_table::<String>("t"),
+            Err(Error::KeyNotFound)
+        ));
         wtx.rollback();
     }
 
@@ -2617,11 +2799,17 @@ mod tests {
         let store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("msgs").unwrap().insert("hello".to_string()).unwrap();
+            wtx.open_table::<String>("msgs")
+                .unwrap()
+                .insert("hello".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let rtx = store.begin_read(None).unwrap();
-        assert_eq!(rtx.open_table::<String>("msgs").unwrap().get(1), Some(&"hello".to_string()));
+        assert_eq!(
+            rtx.open_table::<String>("msgs").unwrap().get(1),
+            Some(&"hello".to_string())
+        );
     }
 
     #[test]
@@ -2629,7 +2817,10 @@ mod tests {
         let store = Store::default();
         let mut wtx = store.begin_write(None).unwrap();
         wtx.open_table::<String>("t").unwrap();
-        assert!(matches!(wtx.open_table::<u64>("t"), Err(Error::TypeMismatch(_))));
+        assert!(matches!(
+            wtx.open_table::<u64>("t"),
+            Err(Error::TypeMismatch(_))
+        ));
         wtx.rollback();
     }
 
@@ -2663,12 +2854,16 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         // Seed: insert a row id=1.
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("a".to_string()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("a".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
 
@@ -2689,10 +2884,14 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("seed".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx = store.begin_write(None).unwrap();
@@ -2710,11 +2909,13 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
-            t.define_index("by_val", crate::IndexKind::Unique, |s: &String| s.clone()).unwrap();
+            t.define_index("by_val", crate::IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
             t.insert("alpha".to_string()).unwrap();
             wtx.commit().unwrap();
         }
@@ -2724,8 +2925,10 @@ mod tests {
             let _ = t.get_unique("by_val", &"alpha".to_string()).unwrap();
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
-        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false),
-            "get_unique should set table_scan");
+        assert!(
+            rs.get("t").map(|e| e.table_scan).unwrap_or(false),
+            "get_unique should set table_scan"
+        );
     }
 
     #[test]
@@ -2734,11 +2937,13 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
-            t.define_index("by_len", crate::IndexKind::NonUnique, |s: &String| s.len()).unwrap();
+            t.define_index("by_len", crate::IndexKind::NonUnique, |s: &String| s.len())
+                .unwrap();
             t.insert("a".to_string()).unwrap();
             t.insert("ab".to_string()).unwrap();
             t.insert("abc".to_string()).unwrap();
@@ -2750,8 +2955,10 @@ mod tests {
             let _ = t.index_range::<usize>("by_len", 1..3).unwrap();
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
-        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false),
-            "index_range should set table_scan (v1 coarse tracking)");
+        assert!(
+            rs.get("t").map(|e| e.table_scan).unwrap_or(false),
+            "index_range should set table_scan (v1 coarse tracking)"
+        );
     }
 
     #[test]
@@ -2779,7 +2986,8 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -2793,8 +3001,10 @@ mod tests {
             let _ = t.custom_index::<CountIndex>("ct").unwrap();
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
-        assert!(rs.get("t").map(|e| e.table_scan).unwrap_or(false),
-            "custom_index lookup should set table_scan");
+        assert!(
+            rs.get("t").map(|e| e.table_scan).unwrap_or(false),
+            "custom_index lookup should set table_scan"
+        );
     }
 
     #[test]
@@ -2803,10 +3013,14 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::SnapshotIsolation,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("seed".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx = store.begin_write(None).unwrap();
@@ -2823,9 +3037,13 @@ mod tests {
             writer_mode: WriterMode::SingleWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         let wtx = store.begin_write(None).unwrap();
-        assert!(wtx.read_set.is_none(), "SingleWriter+SSI should not allocate a read_set");
+        assert!(
+            wtx.read_set.is_none(),
+            "SingleWriter+SSI should not allocate a read_set"
+        );
     }
 
     #[test]
@@ -2834,7 +3052,8 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -2853,7 +3072,10 @@ mod tests {
         assert!(entry.keys.contains(&1));
         assert!(entry.keys.contains(&2));
         assert!(entry.keys.contains(&3));
-        assert!(!entry.table_scan, "get_many is point-precise, should not promote to scan");
+        assert!(
+            !entry.table_scan,
+            "get_many is point-precise, should not promote to scan"
+        );
     }
 
     #[test]
@@ -2862,10 +3084,14 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("seed".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx = store.begin_write(None).unwrap();
@@ -2875,7 +3101,10 @@ mod tests {
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
         let entry = rs.get("t").expect("table 't' must be in read_set");
-        assert!(entry.keys.contains(&999), "missing-key reads must still record (phantom-write-skew defense)");
+        assert!(
+            entry.keys.contains(&999),
+            "missing-key reads must still record (phantom-write-skew defense)"
+        );
     }
 
     #[test]
@@ -2884,10 +3113,14 @@ mod tests {
             writer_mode: WriterMode::MultiWriter,
             isolation_level: IsolationLevel::Serializable,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("seed".to_string()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("seed".to_string())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx = store.begin_write(None).unwrap();
@@ -2898,8 +3131,14 @@ mod tests {
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
         let entry = rs.get("t").expect("table 't' must be in read_set");
-        assert!(entry.keys.contains(&1), "point read of id=1 must be retained");
-        assert!(entry.table_scan, "subsequent iter() must promote table_scan to true");
+        assert!(
+            entry.keys.contains(&1),
+            "point read of id=1 must be retained"
+        );
+        assert!(
+            entry.table_scan,
+            "subsequent iter() must promote table_scan to true"
+        );
     }
 
     #[test]
@@ -2908,7 +3147,8 @@ mod tests {
             num_snapshots_retained: 1,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         // Commit v1
         store.begin_write(None).unwrap().commit().unwrap();
         // Commit v2
@@ -2941,7 +3181,8 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         // Commit v1, v2, v3
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
@@ -2962,7 +3203,8 @@ mod tests {
             num_snapshots_retained: 1,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         // Commit v1, v2
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
@@ -2983,7 +3225,8 @@ mod tests {
             num_snapshots_retained: 0,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
         // Snapshots: 0, 1, 2
@@ -3001,7 +3244,8 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         // Commit 5 versions
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
@@ -3018,7 +3262,8 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
         }
@@ -3036,7 +3281,10 @@ mod tests {
         let store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("a").unwrap().insert("x".into()).unwrap();
+            wtx.open_table::<String>("a")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
             wtx.open_table::<u32>("b").unwrap().insert(1u32).unwrap();
             wtx.commit().unwrap();
         }
@@ -3054,7 +3302,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         let wtx = store.begin_write(Some(10)).unwrap();
         assert_eq!(wtx.version(), 10);
         wtx.commit().unwrap();
@@ -3070,18 +3319,31 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("hello".into()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("hello".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx_a = store.begin_write(None).unwrap();
         let mut wtx_b = store.begin_write(None).unwrap();
 
         wtx_a.open_table::<String>("t").unwrap().delete(1).unwrap();
-        let err = wtx_b.open_table::<String>("t").unwrap().update(1, "b".into());
-        assert!(matches!(err, Err(Error::WriteConflict { wait_for: Some(_), .. })));
+        let err = wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .update(1, "b".into());
+        assert!(matches!(
+            err,
+            Err(Error::WriteConflict {
+                wait_for: Some(_),
+                ..
+            })
+        ));
         wtx_a.commit().unwrap();
     }
 
@@ -3092,7 +3354,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -3105,10 +3368,16 @@ mod tests {
 
         // wtx_a must use update_batch too — single update would hold an
         // intent that would early-fail B's batch via A's other writes.
-        wtx_a.open_table::<String>("t").unwrap()
-            .update_batch(vec![(1, "a2".into())]).unwrap();
-        wtx_b.open_table::<String>("t").unwrap()
-            .update_batch(vec![(1, "b2".into())]).unwrap();
+        wtx_a
+            .open_table::<String>("t")
+            .unwrap()
+            .update_batch(vec![(1, "a2".into())])
+            .unwrap();
+        wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .update_batch(vec![(1, "b2".into())])
+            .unwrap();
 
         wtx_a.commit().unwrap();
         assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
@@ -3121,7 +3390,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -3132,9 +3402,16 @@ mod tests {
         let mut wtx_a = store.begin_write(None).unwrap();
         let mut wtx_b = store.begin_write(None).unwrap();
 
-        wtx_a.open_table::<String>("t").unwrap()
-            .update_batch(vec![(2, "a2".into())]).unwrap();
-        wtx_b.open_table::<String>("t").unwrap().delete_batch(&[2]).unwrap();
+        wtx_a
+            .open_table::<String>("t")
+            .unwrap()
+            .update_batch(vec![(2, "a2".into())])
+            .unwrap();
+        wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .delete_batch(&[2])
+            .unwrap();
 
         wtx_a.commit().unwrap();
         assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
@@ -3168,12 +3445,15 @@ mod tests {
         let store = Store::default();
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<String>("t").unwrap();
-        t.define_index("by_val", IndexKind::NonUnique, |s: &String| s.clone()).unwrap();
+        t.define_index("by_val", IndexKind::NonUnique, |s: &String| s.clone())
+            .unwrap();
         t.insert("apple".into()).unwrap();
         t.insert("banana".into()).unwrap();
         t.insert("apple".into()).unwrap();
 
-        let results = t.get_by_key::<String>("by_val", &"apple".to_string()).unwrap();
+        let results = t
+            .get_by_key::<String>("by_val", &"apple".to_string())
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -3183,11 +3463,17 @@ mod tests {
         let store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("hi".into()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("hi".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx = store.begin_write(None).unwrap();
-        assert!(matches!(wtx.open_table::<u64>("t"), Err(Error::TypeMismatch(_))));
+        assert!(matches!(
+            wtx.open_table::<u64>("t"),
+            Err(Error::TypeMismatch(_))
+        ));
     }
 
     /// Write sets with `version <= base_version` are skipped during validation —
@@ -3197,11 +3483,15 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         // v1
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("a".into()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("a".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         // Open writer_b based on v1 (so v1's write set is skipped)
@@ -3210,13 +3500,20 @@ mod tests {
         // v3
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("c".into()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("c".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         // writer based on v3 modifies key 4 — should conflict with v3's committed write set
         // but v1's write set (key 1) should be skipped since it's <= base v3
         let mut wtx_d = store.begin_write(None).unwrap();
-        wtx_d.open_table::<String>("t").unwrap().insert("d".into()).unwrap();
+        wtx_d
+            .open_table::<String>("t")
+            .unwrap()
+            .insert("d".into())
+            .unwrap();
         // key 4 doesn't overlap with v3's keys (1..=2), so should succeed
         // Actually v3's committed write set has key 2 (from the second insert).
         // wtx_d will insert key 3 (next_id from base v3 which had 2 records).
@@ -3232,7 +3529,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         // Push next_version to 11 with explicit version 10
         store.begin_write(Some(10)).unwrap().commit().unwrap();
         // Now latest=10, next_version=11. Request version 10+1=11 (auto) or explicit < 11 but > 10... impossible.
@@ -3248,7 +3546,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("t").unwrap();
@@ -3260,8 +3559,16 @@ mod tests {
         let mut wtx_b = store.begin_write(None).unwrap();
 
         // Use delete_batch through TableWriter — tests write_set tracking for delete_batch
-        wtx_a.open_table::<String>("t").unwrap().delete_batch(&[1]).unwrap();
-        wtx_b.open_table::<String>("t").unwrap().delete_batch(&[1]).unwrap();
+        wtx_a
+            .open_table::<String>("t")
+            .unwrap()
+            .delete_batch(&[1])
+            .unwrap();
+        wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .delete_batch(&[1])
+            .unwrap();
 
         wtx_a.commit().unwrap();
         assert!(matches!(wtx_b.commit(), Err(Error::WriteConflict { .. })));
@@ -3273,11 +3580,18 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t1").unwrap().insert("x".into()).unwrap();
-            wtx.open_table::<String>("t2").unwrap().insert("y".into()).unwrap();
+            wtx.open_table::<String>("t1")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.open_table::<String>("t2")
+                .unwrap()
+                .insert("y".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx_a = store.begin_write(None).unwrap();
@@ -3285,7 +3599,11 @@ mod tests {
 
         // A deletes t1, B writes to t2 — no conflict
         wtx_a.delete_table("t1");
-        wtx_b.open_table::<String>("t2").unwrap().update(1, "z".into()).unwrap();
+        wtx_b
+            .open_table::<String>("t2")
+            .unwrap()
+            .update(1, "z".into())
+            .unwrap();
 
         wtx_a.commit().unwrap();
         wtx_b.commit().unwrap(); // should succeed
@@ -3297,10 +3615,14 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx_a = store.begin_write(None).unwrap();
@@ -3308,7 +3630,11 @@ mod tests {
 
         // A deletes table, B writes to it
         wtx_a.delete_table("t");
-        wtx_b.open_table::<String>("t").unwrap().insert("y".into()).unwrap();
+        wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .insert("y".into())
+            .unwrap();
 
         wtx_a.commit().unwrap();
         let err = wtx_b.commit().unwrap_err();
@@ -3321,17 +3647,25 @@ mod tests {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let mut wtx_a = store.begin_write(None).unwrap();
         let mut wtx_b = store.begin_write(None).unwrap();
 
         // A writes, B deletes
-        wtx_a.open_table::<String>("t").unwrap().insert("y".into()).unwrap();
+        wtx_a
+            .open_table::<String>("t")
+            .unwrap()
+            .insert("y".into())
+            .unwrap();
         wtx_b.delete_table("t");
 
         wtx_a.commit().unwrap();
@@ -3344,7 +3678,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             require_explicit_version: true,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         let result = store.begin_write(None);
         assert!(matches!(result, Err(Error::ExplicitVersionRequired)));
     }
@@ -3354,7 +3689,8 @@ mod tests {
         let store = Store::new(StoreConfig {
             require_explicit_version: true,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         let wtx = store.begin_write(Some(1)).unwrap();
         assert_eq!(wtx.version(), 1);
         wtx.commit().unwrap();
@@ -3372,9 +3708,18 @@ mod tests {
         let store = Store::default();
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<String>("zebra").unwrap().insert("z".into()).unwrap();
-            wtx.open_table::<String>("apple").unwrap().insert("a".into()).unwrap();
-            wtx.open_table::<String>("mango").unwrap().insert("m".into()).unwrap();
+            wtx.open_table::<String>("zebra")
+                .unwrap()
+                .insert("z".into())
+                .unwrap();
+            wtx.open_table::<String>("apple")
+                .unwrap()
+                .insert("a".into())
+                .unwrap();
+            wtx.open_table::<String>("mango")
+                .unwrap()
+                .insert("m".into())
+                .unwrap();
             wtx.commit().unwrap();
         }
         let rtx = store.begin_read(None).unwrap();
@@ -3389,7 +3734,8 @@ mod tests {
             num_snapshots_retained: 2,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         for _ in 0..5 {
             store.begin_write(None).unwrap().commit().unwrap();
         }
@@ -3405,7 +3751,9 @@ mod tests {
 
     #[cfg(feature = "persistence")]
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-    struct Item { name: String }
+    struct Item {
+        name: String,
+    }
 
     /// Create a store with a MockWal attached. Returns both so the test
     /// can call `mock.flush()` to simulate WAL fsync.
@@ -3426,8 +3774,10 @@ mod tests {
         let ss = store.clone();
         let t = std::thread::spawn(move || {
             let mut wtx = ss.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .insert(Item { name: "A".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3435,7 +3785,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Snapshot should NOT be visible yet (still waiting for WAL fsync).
-        assert_eq!(store.latest_version(), 0, "snapshot promoted before WAL flush");
+        assert_eq!(
+            store.latest_version(),
+            0,
+            "snapshot promoted before WAL flush"
+        );
 
         // Flush the mock WAL — commit unblocks, snapshot promoted.
         mock.flush();
@@ -3463,16 +3817,20 @@ mod tests {
         let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items_a").unwrap()
-                .insert(Item { name: "A".into() }).unwrap();
+            wtx.open_table::<Item>("items_a")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
         let ss2 = store.clone();
         let t2 = std::thread::spawn(move || {
             let mut wtx = ss2.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items_b").unwrap()
-                .insert(Item { name: "B".into() }).unwrap();
+            wtx.open_table::<Item>("items_b")
+                .unwrap()
+                .insert(Item { name: "B".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3509,8 +3867,12 @@ mod tests {
             // Temporarily remove mock so this commit doesn't block.
             store.inner.write().unwrap().mock_wal = None;
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .insert(Item { name: "original".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item {
+                    name: "original".into(),
+                })
+                .unwrap();
             wtx.commit().unwrap();
             store.inner.write().unwrap().mock_wal = Some(mock.clone());
         }
@@ -3523,8 +3885,15 @@ mod tests {
         let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .update(1, Item { name: "from_t1".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .update(
+                    1,
+                    Item {
+                        name: "from_t1".into(),
+                    },
+                )
+                .unwrap();
             wtx.commit()
         });
 
@@ -3534,11 +3903,21 @@ mod tests {
         // T2: modify same key 1. With early-fail intents, T2's update()
         // surfaces the conflict immediately — T1 still holds the intent
         // even while it's blocked on the mock WAL fsync.
-        let result = wtx2.open_table::<Item>("items").unwrap()
-            .update(1, Item { name: "from_t2".into() });
+        let result = wtx2.open_table::<Item>("items").unwrap().update(
+            1,
+            Item {
+                name: "from_t2".into(),
+            },
+        );
 
         assert!(
-            matches!(result, Err(Error::WriteConflict { wait_for: Some(_), .. })),
+            matches!(
+                result,
+                Err(Error::WriteConflict {
+                    wait_for: Some(_),
+                    ..
+                })
+            ),
             "T2 should early-fail against T1's intent, got: {result:?}"
         );
         drop(wtx2);
@@ -3557,8 +3936,12 @@ mod tests {
         store.inner.write().unwrap().mock_wal = None;
         {
             let mut wtx = store.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .insert(Item { name: "visible".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item {
+                    name: "visible".into(),
+                })
+                .unwrap();
             wtx.commit().unwrap();
         }
         store.inner.write().unwrap().mock_wal = Some(mock.clone());
@@ -3567,8 +3950,12 @@ mod tests {
         let ss = store.clone();
         let t = std::thread::spawn(move || {
             let mut wtx = ss.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .insert(Item { name: "pending".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item {
+                    name: "pending".into(),
+                })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3579,7 +3966,12 @@ mod tests {
         assert_eq!(rtx.version(), 1);
         let table = rtx.open_table::<Item>("items").unwrap();
         assert_eq!(table.len(), 1);
-        assert_eq!(table.get(1).unwrap(), &Item { name: "visible".into() });
+        assert_eq!(
+            table.get(1).unwrap(),
+            &Item {
+                name: "visible".into()
+            }
+        );
 
         mock.flush();
         t.join().unwrap();
@@ -3602,16 +3994,20 @@ mod tests {
         let ss_a = store.clone();
         let t_a = std::thread::spawn(move || {
             let mut wtx = ss_a.begin_write(None).unwrap();
-            wtx.open_table::<Item>("table_a").unwrap()
-                .insert(Item { name: "A".into() }).unwrap();
+            wtx.open_table::<Item>("table_a")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
         let ss_b = store.clone();
         let t_b = std::thread::spawn(move || {
             let mut wtx = ss_b.begin_write(None).unwrap();
-            wtx.open_table::<Item>("table_b").unwrap()
-                .insert(Item { name: "B".into() }).unwrap();
+            wtx.open_table::<Item>("table_b")
+                .unwrap()
+                .insert(Item { name: "B".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3656,8 +4052,10 @@ mod tests {
         let f1 = flag_1.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items_a").unwrap()
-                .insert(Item { name: "A".into() }).unwrap();
+            wtx.open_table::<Item>("items_a")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
             let v = wtx.commit().unwrap();
             f1.store(true, std::sync::atomic::Ordering::Release);
             v
@@ -3667,8 +4065,10 @@ mod tests {
         let f2 = flag_2.clone();
         let t2 = std::thread::spawn(move || {
             let mut wtx = ss2.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items_b").unwrap()
-                .insert(Item { name: "B".into() }).unwrap();
+            wtx.open_table::<Item>("items_b")
+                .unwrap()
+                .insert(Item { name: "B".into() })
+                .unwrap();
             let v = wtx.commit().unwrap();
             f2.store(true, std::sync::atomic::Ordering::Release);
             v
@@ -3715,8 +4115,12 @@ mod tests {
         let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .insert(Item { name: "first".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item {
+                    name: "first".into(),
+                })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3734,8 +4138,12 @@ mod tests {
         let ss2 = store.clone();
         let t2 = std::thread::spawn(move || {
             let mut wtx = ss2.begin_write(None).unwrap();
-            wtx.open_table::<Item>("other").unwrap()
-                .insert(Item { name: "second".into() }).unwrap();
+            wtx.open_table::<Item>("other")
+                .unwrap()
+                .insert(Item {
+                    name: "second".into(),
+                })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3763,8 +4171,12 @@ mod tests {
         let t = std::thread::spawn(move || {
             for i in 0..3u64 {
                 let mut wtx = ss.begin_write(None).unwrap();
-                wtx.open_table::<Item>("items").unwrap()
-                    .insert(Item { name: format!("item_{i}") }).unwrap();
+                wtx.open_table::<Item>("items")
+                    .unwrap()
+                    .insert(Item {
+                        name: format!("item_{i}"),
+                    })
+                    .unwrap();
                 // This will block until the mock is flushed.
                 wtx.commit().unwrap();
             }
@@ -3806,8 +4218,12 @@ mod tests {
         let ss1 = store.clone();
         let t1 = std::thread::spawn(move || {
             let mut wtx = ss1.begin_write(None).unwrap();
-            wtx.open_table::<Item>("items").unwrap()
-                .insert(Item { name: "doomed".into() }).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item {
+                    name: "doomed".into(),
+                })
+                .unwrap();
             // Commit enters phase 2, blocks on mock. We'll never flush for
             // this writer — instead we simulate a panic by dropping the thread.
             // But we can't really panic inside wait(). Instead, just let the
@@ -3833,8 +4249,12 @@ mod tests {
 
         // A fresh writer should succeed without issues.
         let mut wtx = store.begin_write(None).unwrap();
-        wtx.open_table::<Item>("more").unwrap()
-            .insert(Item { name: "alive".into() }).unwrap();
+        wtx.open_table::<Item>("more")
+            .unwrap()
+            .insert(Item {
+                name: "alive".into(),
+            })
+            .unwrap();
         wtx.commit().unwrap();
         assert_eq!(store.latest_version(), 2);
     }
@@ -3862,16 +4282,20 @@ mod tests {
         let ss_a = store.clone();
         let t_a = std::thread::spawn(move || {
             let mut wtx = ss_a.begin_write(None).unwrap();
-            wtx.open_table::<Item>("table_a").unwrap()
-                .insert(Item { name: "A".into() }).unwrap();
+            wtx.open_table::<Item>("table_a")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
         let ss_b = store.clone();
         let t_b = std::thread::spawn(move || {
             let mut wtx = ss_b.begin_write(None).unwrap();
-            wtx.open_table::<Item>("table_b").unwrap()
-                .insert(Item { name: "B".into() }).unwrap();
+            wtx.open_table::<Item>("table_b")
+                .unwrap()
+                .insert(Item { name: "B".into() })
+                .unwrap();
             wtx.commit().unwrap()
         });
 
@@ -3949,7 +4373,8 @@ mod tests {
             num_snapshots_retained: 1,
             auto_snapshot_gc: false,
             ..StoreConfig::default()
-        }).unwrap();
+        })
+        .unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
         store.begin_write(None).unwrap().commit().unwrap();
@@ -3986,8 +4411,10 @@ mod tests {
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("items").unwrap();
-            t.insert_batch(vec!["a".into(), "b".into(), "c".into()]).unwrap();
-            t.update_batch(vec![(1, "aa".into()), (2, "bb".into())]).unwrap();
+            t.insert_batch(vec!["a".into(), "b".into(), "c".into()])
+                .unwrap();
+            t.update_batch(vec![(1, "aa".into()), (2, "bb".into())])
+                .unwrap();
             t.delete_batch(&[1, 2]).unwrap();
             wtx.commit().unwrap();
         }
@@ -4030,7 +4457,8 @@ mod tests {
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("items").unwrap();
-            t.define_index("len", IndexKind::NonUnique, |s: &String| s.len()).unwrap();
+            t.define_index("len", IndexKind::NonUnique, |s: &String| s.len())
+                .unwrap();
             t.insert("hi".to_string()).unwrap();
             t.insert("hello".to_string()).unwrap();
             let _ = t.get_by_index::<usize>("len", &2);
@@ -4042,7 +4470,7 @@ mod tests {
         let _ = reader.get_by_index::<usize>("len", &5);
         let m = store.metrics();
         let idx = &m.tables["items"].indexes["len"];
-        assert_eq!(idx.reads, 2);       // 1 writer (get_by_index) + 1 reader (get_by_index)
+        assert_eq!(idx.reads, 2); // 1 writer (get_by_index) + 1 reader (get_by_index)
         assert_eq!(idx.range_scans, 1); // 1 writer (index_range)
     }
 
@@ -4054,7 +4482,8 @@ mod tests {
         {
             let mut wtx = store.begin_write(None).unwrap();
             let mut t = wtx.open_table::<String>("users").unwrap();
-            t.define_index("value", IndexKind::Unique, |s: &String| s.clone()).unwrap();
+            t.define_index("value", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
             t.insert("alice".to_string()).unwrap();
             t.insert("bob".to_string()).unwrap();
             t.update(1, "ALICE".to_string()).unwrap();
@@ -4120,8 +4549,7 @@ mod tests {
         // Calling install_after_delta_check with the stale base_version (v0)
         // must surface a WriteConflict — the delta was computed against a
         // snapshot that no longer represents the latest state.
-        let res: Result<u64> =
-            store.install_after_delta_check::<String>("t", new_table, v0);
+        let res: Result<u64> = store.install_after_delta_check::<String>("t", new_table, v0);
         assert!(matches!(res, Err(Error::WriteConflict { .. })));
     }
 }

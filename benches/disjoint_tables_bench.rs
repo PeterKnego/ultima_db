@@ -21,8 +21,8 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::{RngExt, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use ultima_db::{Store, StoreConfig, WriterMode};
 
 const WRITER_COUNTS: &[usize] = &[2, 4, 8, 16];
@@ -129,7 +129,9 @@ fn run_burst(store: &Store, table_names: &[String], op_sets: &[Vec<(u64, u64)>])
                         Ok(()) => {}
                         Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
                             drop(wtx);
-                            if let Some(w) = wait_for { w.wait(); }
+                            if let Some(w) = wait_for {
+                                w.wait();
+                            }
                             continue;
                         }
                         Err(e) => panic!("ops error: {e}"),
@@ -137,7 +139,9 @@ fn run_burst(store: &Store, table_names: &[String], op_sets: &[Vec<(u64, u64)>])
                     match wtx.commit() {
                         Ok(_) => return,
                         Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
-                            if let Some(w) = wait_for { w.wait(); }
+                            if let Some(w) = wait_for {
+                                w.wait();
+                            }
                             continue;
                         }
                         Err(e) => panic!("commit error: {e}"),
@@ -146,7 +150,9 @@ fn run_burst(store: &Store, table_names: &[String], op_sets: &[Vec<(u64, u64)>])
             })
         })
         .collect();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 fn bench(c: &mut Criterion) {
@@ -154,7 +160,9 @@ fn bench(c: &mut Criterion) {
     let (store, _tmp) = build_store(max_writers);
 
     let mut group = c.benchmark_group("disjoint_tables");
-    group.sample_size(20).measurement_time(Duration::from_secs(10));
+    group
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(10));
 
     for &n in WRITER_COUNTS {
         let total_ops = (n * OPS_PER_WRITER) as u64;
@@ -169,7 +177,8 @@ fn bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_batched_ref(
                 || {
-                    let idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
+                    let idx =
+                        cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
                     pool[idx].clone()
                 },
                 |op_sets| {

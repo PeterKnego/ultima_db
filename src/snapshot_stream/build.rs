@@ -12,13 +12,13 @@
 use std::io::{self, Read};
 use std::sync::Arc;
 
-use crate::registry::TableRegistry;
-use crate::store::Snapshot;
 use super::SnapshotStreamError;
 use super::codec::{
-    FILE_FORMAT_V, FILE_MAGIC, IndexDef, TableHeader, FileHeader,
-    encode_file_header, encode_table_header,
+    FILE_FORMAT_V, FILE_MAGIC, FileHeader, IndexDef, TableHeader, encode_file_header,
+    encode_table_header,
 };
+use crate::registry::TableRegistry;
+use crate::store::Snapshot;
 
 // ---------------------------------------------------------------------------
 // SnapshotReader — public streaming reader
@@ -120,7 +120,8 @@ impl SnapshotReader {
                 if self.next_table_idx >= self.table_names.len() {
                     // All tables done — emit file trailer.
                     // total_rows (u64 LE) + total_crc (u32 LE) + bookend magic (8 bytes)
-                    self.buffer.extend_from_slice(&self.total_rows.to_le_bytes());
+                    self.buffer
+                        .extend_from_slice(&self.total_rows.to_le_bytes());
                     // total_crc covers everything up to (but not including) the
                     // trailer itself, so we finalize *before* writing the trailer.
                     let crc = self.total_crc.clone().finalize();

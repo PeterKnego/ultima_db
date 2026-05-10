@@ -45,11 +45,7 @@ fn main() {
 
     let rtx = store.begin_read(None).unwrap();
     let users = rtx.open_table::<String>("users").unwrap();
-    println!(
-        "Final: {} rows; user 42 = {:?}",
-        users.len(),
-        users.get(42)
-    );
+    println!("Final: {} rows; user 42 = {:?}", users.len(), users.get(42));
     assert_eq!(users.len(), 10_497);
     assert_eq!(users.get(42).map(String::as_str), Some("user_42_renamed"));
     assert_eq!(users.get(100), None);

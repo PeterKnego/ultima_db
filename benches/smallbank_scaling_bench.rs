@@ -18,8 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use ultima_db::{IndexKind, Store, StoreConfig, WriterMode};
 
 #[path = "smallbank_common.rs"]
@@ -50,25 +50,44 @@ fn build_store() -> (Store, tempfile::TempDir) {
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut accounts = wtx.open_table::<Account>("accounts").unwrap();
-            accounts.define_index("customer_id", IndexKind::Unique, |a: &Account| a.customer_id).unwrap();
+            accounts
+                .define_index("customer_id", IndexKind::Unique, |a: &Account| {
+                    a.customer_id
+                })
+                .unwrap();
             let batch: Vec<Account> = (1..=NUM_ACCOUNTS)
-                .map(|i| Account { customer_id: i, name: format!("C{i}") })
+                .map(|i| Account {
+                    customer_id: i,
+                    name: format!("C{i}"),
+                })
                 .collect();
             accounts.insert_batch(batch).unwrap();
         }
         {
             let mut s = wtx.open_table::<Savings>("savings").unwrap();
-            s.define_index("customer_id", IndexKind::Unique, |s: &Savings| s.customer_id).unwrap();
+            s.define_index("customer_id", IndexKind::Unique, |s: &Savings| {
+                s.customer_id
+            })
+            .unwrap();
             let batch: Vec<Savings> = (1..=NUM_ACCOUNTS)
-                .map(|i| Savings { customer_id: i, balance: INITIAL_SAVINGS })
+                .map(|i| Savings {
+                    customer_id: i,
+                    balance: INITIAL_SAVINGS,
+                })
                 .collect();
             s.insert_batch(batch).unwrap();
         }
         {
             let mut c = wtx.open_table::<Checking>("checking").unwrap();
-            c.define_index("customer_id", IndexKind::Unique, |c: &Checking| c.customer_id).unwrap();
+            c.define_index("customer_id", IndexKind::Unique, |c: &Checking| {
+                c.customer_id
+            })
+            .unwrap();
             let batch: Vec<Checking> = (1..=NUM_ACCOUNTS)
-                .map(|i| Checking { customer_id: i, balance: INITIAL_CHECKING })
+                .map(|i| Checking {
+                    customer_id: i,
+                    balance: INITIAL_CHECKING,
+                })
                 .collect();
             c.insert_batch(batch).unwrap();
         }
@@ -85,56 +104,101 @@ fn gen_hot_ops(num_writers: usize, seed: u64) -> Vec<Vec<SmallBankOp>> {
         .collect()
 }
 
-fn execute_ops_on_tx(wtx: &mut ultima_db::WriteTx, ops: &[SmallBankOp]) -> Result<(), ultima_db::Error> {
+fn execute_ops_on_tx(
+    wtx: &mut ultima_db::WriteTx,
+    ops: &[SmallBankOp],
+) -> Result<(), ultima_db::Error> {
     for op in ops {
         match op {
             SmallBankOp::Balance(_) => {}
             SmallBankOp::DepositChecking(cid, amount) => {
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
                 if let Some((id, rec)) = c.get_unique::<u64>("customer_id", cid).unwrap() {
-                    let new = Checking { balance: rec.balance + amount, ..*rec };
+                    let new = Checking {
+                        balance: rec.balance + amount,
+                        ..*rec
+                    };
                     c.update(id, new)?;
                 }
             }
             SmallBankOp::TransactSavings(cid, amount) => {
                 let mut s = wtx.open_table::<Savings>("savings").unwrap();
                 if let Some((id, rec)) = s.get_unique::<u64>("customer_id", cid).unwrap() {
-                    let new = Savings { balance: rec.balance + amount, ..*rec };
+                    let new = Savings {
+                        balance: rec.balance + amount,
+                        ..*rec
+                    };
                     s.update(id, new)?;
                 }
             }
             SmallBankOp::Amalgamate { source, dest } => {
                 let mut s = wtx.open_table::<Savings>("savings").unwrap();
-                let amt = if let Some((id, rec)) = s.get_unique::<u64>("customer_id", source).unwrap() {
-                    let a = rec.balance;
-                    s.update(id, Savings { balance: 0.0, ..*rec })?;
-                    a
-                } else { 0.0 };
+                let amt =
+                    if let Some((id, rec)) = s.get_unique::<u64>("customer_id", source).unwrap() {
+                        let a = rec.balance;
+                        s.update(
+                            id,
+                            Savings {
+                                balance: 0.0,
+                                ..*rec
+                            },
+                        )?;
+                        a
+                    } else {
+                        0.0
+                    };
                 drop(s);
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
                 if let Some((id, rec)) = c.get_unique::<u64>("customer_id", dest).unwrap() {
-                    c.update(id, Checking { balance: rec.balance + amt, ..*rec })?;
+                    c.update(
+                        id,
+                        Checking {
+                            balance: rec.balance + amt,
+                            ..*rec
+                        },
+                    )?;
                 }
             }
             SmallBankOp::WriteCheck(cid, amount) => {
                 let s = wtx.open_table::<Savings>("savings").unwrap();
-                let sbal = s.get_unique::<u64>("customer_id", cid).unwrap().map(|(_, s)| s.balance).unwrap_or(0.0);
+                let sbal = s
+                    .get_unique::<u64>("customer_id", cid)
+                    .unwrap()
+                    .map(|(_, s)| s.balance)
+                    .unwrap_or(0.0);
                 drop(s);
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
                 if let Some((id, rec)) = c.get_unique::<u64>("customer_id", cid).unwrap() {
                     let tot = sbal + rec.balance;
                     let penalty = if tot < *amount { 1.0 } else { 0.0 };
-                    c.update(id, Checking { balance: rec.balance - amount - penalty, ..*rec })?;
+                    c.update(
+                        id,
+                        Checking {
+                            balance: rec.balance - amount - penalty,
+                            ..*rec
+                        },
+                    )?;
                 }
             }
-            SmallBankOp::SendPayment { source, dest, amount } => {
+            SmallBankOp::SendPayment {
+                source,
+                dest,
+                amount,
+            } => {
                 let mut c = wtx.open_table::<Checking>("checking").unwrap();
                 if let Some((src_id, src_rec)) = c.get_unique::<u64>("customer_id", source).unwrap()
                     && src_rec.balance >= *amount
-                    && let Some((dst_id, dst_rec)) = c.get_unique::<u64>("customer_id", dest).unwrap()
+                    && let Some((dst_id, dst_rec)) =
+                        c.get_unique::<u64>("customer_id", dest).unwrap()
                 {
-                    let src_new = Checking { balance: src_rec.balance - amount, ..*src_rec };
-                    let dst_new = Checking { balance: dst_rec.balance + amount, ..*dst_rec };
+                    let src_new = Checking {
+                        balance: src_rec.balance - amount,
+                        ..*src_rec
+                    };
+                    let dst_new = Checking {
+                        balance: dst_rec.balance + amount,
+                        ..*dst_rec
+                    };
                     c.update(src_id, src_new)?;
                     c.update(dst_id, dst_new)?;
                 }
@@ -160,7 +224,9 @@ fn run_burst(store: &Store, op_sets: &[Vec<SmallBankOp>]) {
                         Ok(()) => {}
                         Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
                             drop(wtx);
-                            if let Some(w) = wait_for { w.wait(); }
+                            if let Some(w) = wait_for {
+                                w.wait();
+                            }
                             continue;
                         }
                         Err(e) => panic!("ops error: {e}"),
@@ -168,7 +234,9 @@ fn run_burst(store: &Store, op_sets: &[Vec<SmallBankOp>]) {
                     match wtx.commit() {
                         Ok(_) => return,
                         Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
-                            if let Some(w) = wait_for { w.wait(); }
+                            if let Some(w) = wait_for {
+                                w.wait();
+                            }
                             continue;
                         }
                         Err(e) => panic!("commit error: {e}"),
@@ -177,12 +245,16 @@ fn run_burst(store: &Store, op_sets: &[Vec<SmallBankOp>]) {
             })
         })
         .collect();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("smallbank_scaling_high");
-    group.sample_size(20).measurement_time(Duration::from_secs(10));
+    group
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(10));
     for &n in WRITER_COUNTS {
         let total_ops = (n * OPS_PER_WRITER_LOCAL) as u64;
         group.throughput(Throughput::Elements(total_ops));
@@ -196,7 +268,8 @@ fn bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_batched_ref(
                 || {
-                    let idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
+                    let idx =
+                        cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
                     pool[idx].clone()
                 },
                 |op_sets| {

@@ -33,10 +33,7 @@ const MAGIC: &[u8; 4] = b"ULDB";
 const FORMAT_VERSION: u32 = 1;
 
 /// Serialize a snapshot to bytes using the type registry.
-fn serialize_snapshot(
-    snapshot: &Snapshot,
-    registry: &TableRegistry,
-) -> Result<Vec<u8>> {
+fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     let mut buf = Vec::new();
 
@@ -48,20 +45,19 @@ fn serialize_snapshot(
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     // Only serialize tables that are registered in the registry.
-    let registered_tables: Vec<(
-        &String,
-        &std::sync::Arc<dyn crate::table::MergeableTable>,
-    )> = snapshot
-        .tables
-        .iter()
-        .filter(|(name, _)| registry.contains(name))
-        .collect();
+    let registered_tables: Vec<(&String, &std::sync::Arc<dyn crate::table::MergeableTable>)> =
+        snapshot
+            .tables
+            .iter()
+            .filter(|(name, _)| registry.contains(name))
+            .collect();
 
     bincode::encode_into_std_write(registered_tables.len() as u32, &mut buf, config)
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     for (name, table_any) in registered_tables {
-        let info = registry.get(name)
+        let info = registry
+            .get(name)
             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
 
         // Table name
@@ -84,10 +80,7 @@ fn serialize_snapshot(
 }
 
 /// Deserialize a snapshot from bytes using the type registry.
-fn deserialize_snapshot(
-    data: &[u8],
-    registry: &TableRegistry,
-) -> Result<Snapshot> {
+fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapshot> {
     // Minimum: 4 (magic) + 1 (format_version varint) + 1 (version varint)
     //        + 1 (num_tables varint) + 4 (crc32) = 11 bytes
     if data.len() < 4 + 1 + 1 + 1 + 4 {
@@ -152,7 +145,8 @@ fn deserialize_snapshot(
         let table_bytes = &payload[offset..end];
         offset = end;
 
-        let info = registry.get(&name)
+        let info = registry
+            .get(&name)
             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
         let table_any = (info.deserialize_table)(table_bytes)?;
         tables.insert(name, std::sync::Arc::from(table_any));
@@ -203,33 +197,26 @@ pub(crate) fn write_checkpoint(
     snapshot: &Snapshot,
     registry: &TableRegistry,
 ) -> Result<u64> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+    std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
 
     let data = serialize_snapshot(snapshot, registry)?;
     let final_path = dir.join(checkpoint_filename(snapshot.version));
     let tmp_path = dir.join(format!("{}.tmp", checkpoint_filename(snapshot.version)));
 
-    let mut file = File::create(&tmp_path)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut file = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
     file.write_all(&data)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     file.sync_all()
         .map_err(|e| Error::Persistence(e.to_string()))?;
     drop(file);
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
 
     Ok(snapshot.version)
 }
 
 /// Load a checkpoint from a file.
-pub(crate) fn load_checkpoint(
-    path: &Path,
-    registry: &TableRegistry,
-) -> Result<Snapshot> {
-    let mut file = File::open(path)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+pub(crate) fn load_checkpoint(path: &Path, registry: &TableRegistry) -> Result<Snapshot> {
+    let mut file = File::open(path).map_err(|e| Error::Persistence(e.to_string()))?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .map_err(|e| Error::Persistence(e.to_string()))?;
@@ -279,13 +266,29 @@ mod tests {
         reg.register::<User>("users").unwrap();
 
         let mut table = Table::<User>::new();
-        table.insert(User { name: "Alice".into(), age: 30 }).unwrap();
-        table.insert(User { name: "Bob".into(), age: 25 }).unwrap();
+        table
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+        table
+            .insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(table) as std::sync::Arc<dyn crate::table::MergeableTable>);
+        tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
 
-        let snapshot = Snapshot { version: 42, tables };
+        let snapshot = Snapshot {
+            version: 42,
+            tables,
+        };
         (snapshot, reg)
     }
 
@@ -295,11 +298,28 @@ mod tests {
         let data = serialize_snapshot(&snapshot, &reg).unwrap();
         let recovered = deserialize_snapshot(&data, &reg).unwrap();
         assert_eq!(recovered.version, 42);
-        let table = recovered.tables.get("users").unwrap()
-            .as_any().downcast_ref::<Table<User>>().unwrap();
+        let table = recovered
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
         assert_eq!(table.len(), 2);
-        assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
-        assert_eq!(table.get(2).unwrap(), &User { name: "Bob".into(), age: 25 });
+        assert_eq!(
+            table.get(1).unwrap(),
+            &User {
+                name: "Alice".into(),
+                age: 30
+            }
+        );
+        assert_eq!(
+            table.get(2).unwrap(),
+            &User {
+                name: "Bob".into(),
+                age: 25
+            }
+        );
     }
 
     #[test]
@@ -307,7 +327,10 @@ mod tests {
         let (snapshot, reg) = make_snapshot_with_users();
         let mut data = serialize_snapshot(&snapshot, &reg).unwrap();
         data[10] ^= 0xFF; // corrupt a byte
-        assert!(matches!(deserialize_snapshot(&data, &reg), Err(Error::CheckpointCorrupted(_))));
+        assert!(matches!(
+            deserialize_snapshot(&data, &reg),
+            Err(Error::CheckpointCorrupted(_))
+        ));
     }
 
     #[test]
@@ -353,7 +376,8 @@ mod tests {
 
         cleanup_old_checkpoints(dir.path(), 42).unwrap();
 
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
@@ -366,7 +390,9 @@ mod tests {
         let reg = TableRegistry::default();
         let data = vec![0u8; 5]; // too short for any valid checkpoint
         let result = deserialize_snapshot(&data, &reg);
-        assert!(matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("too short")));
+        assert!(
+            matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("too short"))
+        );
     }
 
     #[test]
@@ -382,7 +408,9 @@ mod tests {
         let checksum = crc32(&data);
         data.extend_from_slice(&checksum.to_le_bytes());
         let result = deserialize_snapshot(&data, &reg);
-        assert!(matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("bad magic")));
+        assert!(
+            matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("bad magic"))
+        );
     }
 
     #[test]
@@ -423,7 +451,9 @@ mod tests {
         let mut reg = TableRegistry::default();
         reg.register::<User>("users").unwrap();
         let result = deserialize_snapshot(&data, &reg);
-        assert!(matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("truncated")));
+        assert!(
+            matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("truncated"))
+        );
     }
 
     #[test]
@@ -440,7 +470,10 @@ mod tests {
 
     #[test]
     fn find_latest_checkpoint_nonexistent_dir() {
-        let result = find_latest_checkpoint(std::path::Path::new("/nonexistent/path/that/does/not/exist")).unwrap();
+        let result = find_latest_checkpoint(std::path::Path::new(
+            "/nonexistent/path/that/does/not/exist",
+        ))
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -470,7 +503,10 @@ mod tests {
     #[test]
     fn empty_snapshot_roundtrip() {
         let reg = TableRegistry::default();
-        let snapshot = Snapshot { version: 1, tables: std::collections::BTreeMap::new() };
+        let snapshot = Snapshot {
+            version: 1,
+            tables: std::collections::BTreeMap::new(),
+        };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();
         let recovered = deserialize_snapshot(&data, &reg).unwrap();
         assert_eq!(recovered.version, 1);
@@ -480,22 +516,46 @@ mod tests {
     #[test]
     fn multi_table_snapshot_roundtrip() {
         #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-        struct Order { item: String, qty: u32 }
+        struct Order {
+            item: String,
+            qty: u32,
+        }
 
         let mut reg = TableRegistry::default();
         reg.register::<User>("users").unwrap();
         reg.register::<Order>("orders").unwrap();
 
         let mut user_table = Table::<User>::new();
-        user_table.insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        user_table
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
 
         let mut order_table = Table::<Order>::new();
-        order_table.insert(Order { item: "Widget".into(), qty: 5 }).unwrap();
-        order_table.insert(Order { item: "Gadget".into(), qty: 3 }).unwrap();
+        order_table
+            .insert(Order {
+                item: "Widget".into(),
+                qty: 5,
+            })
+            .unwrap();
+        order_table
+            .insert(Order {
+                item: "Gadget".into(),
+                qty: 3,
+            })
+            .unwrap();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
-        tables.insert("orders".to_string(), std::sync::Arc::new(order_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
+        tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(user_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        tables.insert(
+            "orders".to_string(),
+            std::sync::Arc::new(order_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
 
         let snapshot = Snapshot { version: 7, tables };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();
@@ -504,12 +564,22 @@ mod tests {
         assert_eq!(recovered.version, 7);
         assert_eq!(recovered.tables.len(), 2);
 
-        let users = recovered.tables.get("users").unwrap()
-            .as_any().downcast_ref::<Table<User>>().unwrap();
+        let users = recovered
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
         assert_eq!(users.len(), 1);
 
-        let orders = recovered.tables.get("orders").unwrap()
-            .as_any().downcast_ref::<Table<Order>>().unwrap();
+        let orders = recovered
+            .tables
+            .get("orders")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<Order>>()
+            .unwrap();
         assert_eq!(orders.len(), 2);
         assert_eq!(orders.get(1).unwrap().item, "Widget");
         assert_eq!(orders.get(2).unwrap().qty, 3);
@@ -522,13 +592,24 @@ mod tests {
         reg.register::<User>("users").unwrap();
 
         let mut user_table = Table::<User>::new();
-        user_table.insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        user_table
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
 
         let log_table = Table::<String>::new();
 
         let mut tables = std::collections::BTreeMap::new();
-        tables.insert("users".to_string(), std::sync::Arc::new(user_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
-        tables.insert("logs".to_string(), std::sync::Arc::new(log_table) as std::sync::Arc<dyn crate::table::MergeableTable>);
+        tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(user_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        tables.insert(
+            "logs".to_string(),
+            std::sync::Arc::new(log_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
 
         let snapshot = Snapshot { version: 1, tables };
         let data = serialize_snapshot(&snapshot, &reg).unwrap();

@@ -3,7 +3,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
 
@@ -74,8 +74,8 @@ impl YcsbEngine for RocksDbEngine {
                 YcsbOp::Update(key) => {
                     let k = encode_key(*key);
                     let record = YcsbRecord::new(key.wrapping_add(1));
-                    let value =
-                        bincode::serde::encode_to_vec(record, BINCODE_CFG).expect("serialize failed");
+                    let value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
+                        .expect("serialize failed");
                     self.db.put_opt(k, value, &write_opts).expect("put failed");
                 }
                 YcsbOp::Insert => {
@@ -83,8 +83,8 @@ impl YcsbEngine for RocksDbEngine {
                     self.next_id += 1;
                     let k = encode_key(id);
                     let record = YcsbRecord::new(0);
-                    let value =
-                        bincode::serde::encode_to_vec(record, BINCODE_CFG).expect("serialize failed");
+                    let value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
+                        .expect("serialize failed");
                     self.db.put_opt(k, value, &write_opts).expect("put failed");
                 }
                 YcsbOp::Scan(start, count) => {
@@ -107,7 +107,9 @@ impl YcsbEngine for RocksDbEngine {
                         record.field0 = std::iter::repeat_n('X', FIELD_SIZE).collect();
                         let new_value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
                             .expect("serialize failed");
-                        self.db.put_opt(k, new_value, &write_opts).expect("put failed");
+                        self.db
+                            .put_opt(k, new_value, &write_opts)
+                            .expect("put failed");
                     }
                 }
             }

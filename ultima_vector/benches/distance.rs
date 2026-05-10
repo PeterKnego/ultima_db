@@ -47,9 +47,7 @@ fn bench_pairwise(c: &mut Criterion) {
             BenchmarkId::new("cosine_normalized", dim),
             &dim,
             |bencher, _| {
-                bencher.iter(|| {
-                    black_box(CosineNormalized.distance(black_box(&a), black_box(&b)))
-                });
+                bencher.iter(|| black_box(CosineNormalized.distance(black_box(&a), black_box(&b))));
             },
         );
     }
@@ -82,13 +80,8 @@ fn bench_hnsw_search(c: &mut Criterion) {
     let n = 10_000;
 
     let store = Store::new(StoreConfig::default()).unwrap();
-    let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-        store.clone(),
-        "vectors",
-        HnswParams::for_dim(dim),
-        Cosine,
-    )
-    .unwrap();
+    let coll: VectorCollection<u64, Cosine> =
+        VectorCollection::open(store.clone(), "vectors", HnswParams::for_dim(dim), Cosine).unwrap();
 
     let items: Vec<(Vec<f32>, u64)> = (0..n)
         .map(|i| (random_unit_vec(&mut rng, dim), i as u64))
@@ -109,5 +102,10 @@ fn bench_hnsw_search(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_pairwise, bench_distance_many, bench_hnsw_search);
+criterion_group!(
+    benches,
+    bench_pairwise,
+    bench_distance_many,
+    bench_hnsw_search
+);
 criterion_main!(benches);

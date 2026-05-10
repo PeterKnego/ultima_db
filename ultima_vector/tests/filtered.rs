@@ -4,9 +4,9 @@
 //! Filtered ANN search: assert results stay within filter and recall holds
 //! at varying selectivities, including the brute-force fallback regime.
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{Store, StoreConfig};
 use ultima_vector::filter::RoaringTreemap;
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
@@ -55,13 +55,8 @@ struct Setup {
 fn build() -> Setup {
     let mut rng = StdRng::seed_from_u64(0xF11);
     let store = Store::new(StoreConfig::default()).unwrap();
-    let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-        store.clone(),
-        "vec",
-        HnswParams::for_dim(DIM),
-        Cosine,
-    )
-    .unwrap();
+    let coll: VectorCollection<u64, Cosine> =
+        VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
     let mut vectors: Vec<(u64, Vec<f32>)> = Vec::with_capacity(N);
     let mut tx = store.begin_write(None).unwrap();
     for i in 0..N {
@@ -140,7 +135,9 @@ fn recall_holds_at_50pct_selectivity() {
             .map(|(id, _)| id)
             .collect();
         let truth_set: std::collections::HashSet<u64> =
-            brute_force_top_k_in_bitmap(&q, &vectors, &filter, K).into_iter().collect();
+            brute_force_top_k_in_bitmap(&q, &vectors, &filter, K)
+                .into_iter()
+                .collect();
         for id in &hnsw_top {
             if truth_set.contains(id) {
                 hits += 1;

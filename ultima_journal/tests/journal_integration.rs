@@ -14,7 +14,10 @@ fn end_to_end_append_read_truncate_purge_reopen() {
     {
         let j = Journal::open(cfg.clone()).unwrap();
         for i in 1..=20u64 {
-            j.append(i, i * 7, format!("payload-{i}").as_bytes()).unwrap().wait().unwrap();
+            j.append(i, i * 7, format!("payload-{i}").as_bytes())
+                .unwrap()
+                .wait()
+                .unwrap();
         }
         assert_eq!(j.last_seq(), Some(20));
         let v = j.read_range(5..=15).unwrap();

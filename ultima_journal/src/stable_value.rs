@@ -23,7 +23,7 @@ pub struct SvHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SvSlot {
     pub r#gen: u64,
-    pub state: u8,    // 0 = absent, 1 = present
+    pub state: u8, // 0 = absent, 1 = present
     pub bytes: Vec<u8>,
 }
 
@@ -39,19 +39,28 @@ pub fn encode_header(h: &SvHeader) -> [u8; SV_HEADER_SIZE] {
 
 pub fn decode_header(b: &[u8]) -> Result<SvHeader, StableValueError> {
     if b.len() < SV_HEADER_SIZE {
-        return Err(StableValueError::Corrupted { reason: "header too short".into() });
+        return Err(StableValueError::Corrupted {
+            reason: "header too short".into(),
+        });
     }
     if &b[0..8] != SV_MAGIC {
-        return Err(StableValueError::Corrupted { reason: "bad magic".into() });
+        return Err(StableValueError::Corrupted {
+            reason: "bad magic".into(),
+        });
     }
     let format_ver = u16::from_le_bytes(b[8..10].try_into().unwrap());
     let slot_size = u32::from_le_bytes(b[10..14].try_into().unwrap());
     let stored_crc = u32::from_le_bytes(b[14..18].try_into().unwrap());
     let actual = crc32fast::hash(&b[0..14]);
     if stored_crc != actual {
-        return Err(StableValueError::Corrupted { reason: "header crc mismatch".into() });
+        return Err(StableValueError::Corrupted {
+            reason: "header crc mismatch".into(),
+        });
     }
-    Ok(SvHeader { format_ver, slot_size })
+    Ok(SvHeader {
+        format_ver,
+        slot_size,
+    })
 }
 
 pub fn encode_slot(s: &SvSlot, slot_size: u32) -> Result<Vec<u8>, StableValueError> {
@@ -74,11 +83,15 @@ pub fn encode_slot(s: &SvSlot, slot_size: u32) -> Result<Vec<u8>, StableValueErr
 }
 
 pub fn decode_slot(b: &[u8]) -> Result<Option<SvSlot>, StableValueError> {
-    if b.len() < 17 { return Ok(None); }
+    if b.len() < 17 {
+        return Ok(None);
+    }
     let crc_offset = b.len() - 4;
     let stored_crc = u32::from_le_bytes(b[crc_offset..].try_into().unwrap());
     let actual = crc32fast::hash(&b[0..crc_offset]);
-    if stored_crc != actual { return Ok(None); }
+    if stored_crc != actual {
+        return Ok(None);
+    }
     let r#gen = u64::from_le_bytes(b[0..8].try_into().unwrap());
     let state = b[8];
     let len = u32::from_le_bytes(b[9..13].try_into().unwrap()) as usize;
@@ -86,7 +99,11 @@ pub fn decode_slot(b: &[u8]) -> Result<Option<SvSlot>, StableValueError> {
         return Ok(None);
     }
     let bytes = b[13..13 + len].to_vec();
-    Ok(Some(SvSlot { r#gen, state, bytes }))
+    Ok(Some(SvSlot {
+        r#gen,
+        state,
+        bytes,
+    }))
 }
 
 // ── StableValueConfig ──────────────────────────────────────────────────────────
@@ -119,7 +136,7 @@ pub struct StableValue<T> {
 struct Inner<T> {
     file: File,
     next_gen: u64,
-    next_slot: u8,     // 0 or 1 — alternates
+    next_slot: u8, // 0 or 1 — alternates
     cached: Option<T>,
 }
 
@@ -145,9 +162,16 @@ where
 
         if !exists {
             // Initialize: header + two zeroed slots (state=0).
-            let header = encode_header(&SvHeader { format_ver: SV_FORMAT_V, slot_size });
+            let header = encode_header(&SvHeader {
+                format_ver: SV_FORMAT_V,
+                slot_size,
+            });
             file.write_all(&header)?;
-            let empty = SvSlot { r#gen: 0, state: 0, bytes: Vec::new() };
+            let empty = SvSlot {
+                r#gen: 0,
+                state: 0,
+                bytes: Vec::new(),
+            };
             let slot_bytes = encode_slot(&empty, slot_size)?;
             file.write_all(&slot_bytes)?; // slot 0
             file.write_all(&slot_bytes)?; // slot 1
@@ -179,7 +203,12 @@ where
         Ok(Self {
             config,
             slot_size: header.slot_size,
-            inner: Mutex::new(Inner { file, next_gen, next_slot, cached }),
+            inner: Mutex::new(Inner {
+                file,
+                next_gen,
+                next_slot,
+                cached,
+            }),
         })
     }
 
@@ -202,10 +231,13 @@ where
             });
         }
         let mut inner = self.inner.lock().unwrap();
-        let slot = SvSlot { r#gen: inner.next_gen, state: 1, bytes };
+        let slot = SvSlot {
+            r#gen: inner.next_gen,
+            state: 1,
+            bytes,
+        };
         let buf = encode_slot(&slot, self.slot_size)?;
-        let offset =
-            SV_HEADER_SIZE as u64 + (inner.next_slot as u64) * (self.slot_size as u64);
+        let offset = SV_HEADER_SIZE as u64 + (inner.next_slot as u64) * (self.slot_size as u64);
         inner.file.seek(SeekFrom::Start(offset))?;
         inner.file.write_all(&buf)?;
         if matches!(self.config.durability, Durability::Consistent) {
@@ -223,10 +255,13 @@ where
     /// synchronously inside `clear` when `Durability::Consistent`).
     pub fn clear(&self) -> Result<Notifier, StableValueError> {
         let mut inner = self.inner.lock().unwrap();
-        let slot = SvSlot { r#gen: inner.next_gen, state: 0, bytes: Vec::new() };
+        let slot = SvSlot {
+            r#gen: inner.next_gen,
+            state: 0,
+            bytes: Vec::new(),
+        };
         let buf = encode_slot(&slot, self.slot_size)?;
-        let offset =
-            SV_HEADER_SIZE as u64 + (inner.next_slot as u64) * (self.slot_size as u64);
+        let offset = SV_HEADER_SIZE as u64 + (inner.next_slot as u64) * (self.slot_size as u64);
         inner.file.seek(SeekFrom::Start(offset))?;
         inner.file.write_all(&buf)?;
         if matches!(self.config.durability, Durability::Consistent) {
@@ -262,7 +297,7 @@ fn pick_slot<T: DeserializeOwned>(
         (None, None) => {
             return Err(StableValueError::Corrupted {
                 reason: "both slots invalid".into(),
-            })
+            });
         }
         (Some(a), None) => Some((a.clone(), 0u8)),
         (None, Some(b)) => Some((b.clone(), 1u8)),
@@ -280,10 +315,11 @@ fn pick_slot<T: DeserializeOwned>(
     let cached: Option<T> = if winner.state == 0 {
         None
     } else {
-        let v: T =
-            bincode::serde::decode_from_slice(&winner.bytes, bincode::config::standard())
-                .map_err(|e| StableValueError::Corrupted { reason: e.to_string() })?
-                .0;
+        let v: T = bincode::serde::decode_from_slice(&winner.bytes, bincode::config::standard())
+            .map_err(|e| StableValueError::Corrupted {
+                reason: e.to_string(),
+            })?
+            .0;
         Some(v)
     };
     Ok((cached, next_gen, next_slot))
@@ -297,14 +333,21 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = SvHeader { format_ver: 1, slot_size: 4096 };
+        let h = SvHeader {
+            format_ver: 1,
+            slot_size: 4096,
+        };
         let bytes = encode_header(&h);
         assert_eq!(decode_header(&bytes).unwrap(), h);
     }
 
     #[test]
     fn slot_roundtrip() {
-        let s = SvSlot { r#gen: 7, state: 1, bytes: b"hello".to_vec() };
+        let s = SvSlot {
+            r#gen: 7,
+            state: 1,
+            bytes: b"hello".to_vec(),
+        };
         let bytes = encode_slot(&s, 4096).unwrap();
         assert_eq!(bytes.len(), 4096);
         assert_eq!(decode_slot(&bytes).unwrap().unwrap(), s);
@@ -312,7 +355,11 @@ mod tests {
 
     #[test]
     fn slot_with_bad_crc_returns_none() {
-        let s = SvSlot { r#gen: 1, state: 1, bytes: vec![1, 2, 3] };
+        let s = SvSlot {
+            r#gen: 1,
+            state: 1,
+            bytes: vec![1, 2, 3],
+        };
         let mut bytes = encode_slot(&s, 1024).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
@@ -330,7 +377,10 @@ mod tests {
 
     #[test]
     fn decode_header_bad_magic() {
-        let mut bytes = encode_header(&SvHeader { format_ver: 1, slot_size: 1024 });
+        let mut bytes = encode_header(&SvHeader {
+            format_ver: 1,
+            slot_size: 1024,
+        });
         bytes[0] = b'X';
         assert!(matches!(
             decode_header(&bytes),
@@ -340,7 +390,10 @@ mod tests {
 
     #[test]
     fn decode_header_crc_mismatch() {
-        let mut bytes = encode_header(&SvHeader { format_ver: 1, slot_size: 1024 });
+        let mut bytes = encode_header(&SvHeader {
+            format_ver: 1,
+            slot_size: 1024,
+        });
         bytes[10] ^= 0xFF;
         assert!(matches!(
             decode_header(&bytes),
@@ -395,7 +448,10 @@ mod sv_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vote.sv");
         let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
-        let v = Vote { term: 5, voted_for: 42 };
+        let v = Vote {
+            term: 5,
+            voted_for: 42,
+        };
         sv.store(&v).unwrap().wait().unwrap();
         assert_eq!(sv.load().unwrap(), Some(v));
     }
@@ -406,10 +462,22 @@ mod sv_tests {
         let path = dir.path().join("vote.sv");
         {
             let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
-            sv.store(&Vote { term: 3, voted_for: 7 }).unwrap().wait().unwrap();
+            sv.store(&Vote {
+                term: 3,
+                voted_for: 7,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
         }
         let sv2 = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
-        assert_eq!(sv2.load().unwrap(), Some(Vote { term: 3, voted_for: 7 }));
+        assert_eq!(
+            sv2.load().unwrap(),
+            Some(Vote {
+                term: 3,
+                voted_for: 7
+            })
+        );
     }
 
     #[test]
@@ -417,9 +485,27 @@ mod sv_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vote.sv");
         let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
-        sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();
-        sv.store(&Vote { term: 2, voted_for: 2 }).unwrap().wait().unwrap();
-        sv.store(&Vote { term: 3, voted_for: 3 }).unwrap().wait().unwrap();
+        sv.store(&Vote {
+            term: 1,
+            voted_for: 1,
+        })
+        .unwrap()
+        .wait()
+        .unwrap();
+        sv.store(&Vote {
+            term: 2,
+            voted_for: 2,
+        })
+        .unwrap()
+        .wait()
+        .unwrap();
+        sv.store(&Vote {
+            term: 3,
+            voted_for: 3,
+        })
+        .unwrap()
+        .wait()
+        .unwrap();
         assert_eq!(sv.load().unwrap().unwrap().term, 3);
     }
 
@@ -428,7 +514,13 @@ mod sv_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sv");
         let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
-        sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();
+        sv.store(&Vote {
+            term: 1,
+            voted_for: 1,
+        })
+        .unwrap()
+        .wait()
+        .unwrap();
         sv.clear().unwrap().wait().unwrap();
         assert_eq!(sv.load().unwrap(), None);
     }
@@ -439,7 +531,7 @@ mod sv_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sv");
         let mut cfg = StableValueConfig::new(&path);
-        cfg.max_payload_bytes = 16;  // very small
+        cfg.max_payload_bytes = 16; // very small
         let sv = StableValue::<Vec<u8>>::open(cfg).unwrap();
         let big = vec![0xABu8; 1024];
         assert!(matches!(
@@ -462,9 +554,16 @@ mod sv_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sv");
         // Build a valid-CRC header but with format_ver = 99.
-        let bad_header = encode_header(&SvHeader { format_ver: 99, slot_size: 1024 });
+        let bad_header = encode_header(&SvHeader {
+            format_ver: 99,
+            slot_size: 1024,
+        });
         // Two empty-ish slots so file size matches what `open` expects to read.
-        let empty = SvSlot { r#gen: 0, state: 0, bytes: Vec::new() };
+        let empty = SvSlot {
+            r#gen: 0,
+            state: 0,
+            bytes: Vec::new(),
+        };
         let slot_bytes = encode_slot(&empty, 1024).unwrap();
         let mut buf = Vec::new();
         buf.extend_from_slice(&bad_header);
@@ -484,8 +583,20 @@ mod sv_tests {
         let path = dir.path().join("v.sv");
         {
             let sv = StableValue::<Vote>::open(StableValueConfig::new(&path)).unwrap();
-            sv.store(&Vote { term: 1, voted_for: 1 }).unwrap().wait().unwrap();  // slot 0
-            sv.store(&Vote { term: 2, voted_for: 2 }).unwrap().wait().unwrap();  // slot 1
+            sv.store(&Vote {
+                term: 1,
+                voted_for: 1,
+            })
+            .unwrap()
+            .wait()
+            .unwrap(); // slot 0
+            sv.store(&Vote {
+                term: 2,
+                voted_for: 2,
+            })
+            .unwrap()
+            .wait()
+            .unwrap(); // slot 1
         }
         // Reopen and corrupt slot 0 by zeroing its CRC area.
         let header_size = SV_HEADER_SIZE as u64;
@@ -503,7 +614,14 @@ mod sv_tests {
         // surviving value must be one of the two we stored.
         let v = sv.load().unwrap().unwrap();
         assert!(
-            v == Vote { term: 1, voted_for: 1 } || v == Vote { term: 2, voted_for: 2 },
+            v == Vote {
+                term: 1,
+                voted_for: 1
+            } || v
+                == Vote {
+                    term: 2,
+                    voted_for: 2
+                },
             "unexpected surviving value: {v:?}",
         );
     }

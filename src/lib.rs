@@ -3,38 +3,38 @@
 
 pub mod btree;
 pub mod bulk_load;
+#[cfg(feature = "persistence")]
+pub(crate) mod checkpoint;
 pub mod error;
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
 pub mod index;
 pub(crate) mod intents;
+pub mod metrics;
 pub mod persistence;
 #[cfg(feature = "persistence")]
-pub(crate) mod checkpoint;
-#[cfg(feature = "persistence")]
 pub(crate) mod registry;
-pub mod metrics;
 pub mod snapshot_stream;
 pub mod store;
-#[cfg(feature = "persistence")]
-pub mod wal;
 pub mod table;
 pub mod transaction;
+#[cfg(feature = "persistence")]
+pub mod wal;
 
 pub use btree::BTree;
 pub use bulk_load::{
     AddOptions, BulkDelta, BulkLoadBatch, BulkLoadInput, BulkLoadOptions, BulkSource,
 };
 pub use error::{Error, Result};
-pub use intents::CommitWaiter;
 #[cfg(feature = "fulltext")]
 pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
-pub use persistence::{Durability, Persistence, Record};
+pub use intents::CommitWaiter;
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
-pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};
+pub use persistence::{Durability, Persistence, Record};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;
+pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};
 pub use store::{IsolationLevel, Readable, Store, StoreConfig, WriterMode};
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};

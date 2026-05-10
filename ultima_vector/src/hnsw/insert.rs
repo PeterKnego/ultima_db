@@ -40,7 +40,10 @@ where
     R: Rng + ?Sized,
 {
     if embedding.len() != params.dim {
-        return Err(Error::DimMismatch { expected: params.dim, got: embedding.len() });
+        return Err(Error::DimMismatch {
+            expected: params.dim,
+            got: embedding.len(),
+        });
     }
 
     let sampler = LevelSampler::new(params.m, params.max_level);
@@ -57,7 +60,9 @@ where
         };
         let new_id = data.insert(new_row)?;
         if ep.node_id.is_some() {
-            connect_node(&mut data, distance, &embedding, new_id, new_level, &ep, params)?;
+            connect_node(
+                &mut data, distance, &embedding, new_id, new_level, &ep, params,
+            )?;
         }
         new_id
     };
@@ -95,7 +100,10 @@ where
     R: Rng + ?Sized,
 {
     if embedding.len() != params.dim {
-        return Err(Error::DimMismatch { expected: params.dim, got: embedding.len() });
+        return Err(Error::DimMismatch {
+            expected: params.dim,
+            got: embedding.len(),
+        });
     }
 
     let sampler = LevelSampler::new(params.m, params.max_level);
@@ -140,12 +148,7 @@ where
 /// If the tombstoned node is the current entry point, scan the table for
 /// the highest-level non-tombstoned node and promote it. Linear in the
 /// table size; rare in practice (only on entry-point delete).
-pub fn delete<Meta>(
-    tx: &mut WriteTx,
-    data_name: &str,
-    entry_name: &str,
-    id: u64,
-) -> Result<()>
+pub fn delete<Meta>(tx: &mut WriteTx, data_name: &str, entry_name: &str, id: u64) -> Result<()>
 where
     Meta: Record + Clone,
 {
@@ -180,7 +183,10 @@ where
     };
 
     let new_ep = match replacement {
-        Some((rid, l)) => EntryPoint { node_id: Some(rid), max_level: l },
+        Some((rid, l)) => EntryPoint {
+            node_id: Some(rid),
+            max_level: l,
+        },
         None => EntryPoint::default(),
     };
     write_entry_point(tx, entry_name, new_ep)?;
@@ -221,13 +227,18 @@ where
     Meta: Record + Clone,
     D: Distance,
 {
-    let ep_id = ep.node_id.expect("connect_node requires existing entry point");
+    let ep_id = ep
+        .node_id
+        .expect("connect_node requires existing entry point");
 
     let start_dist = {
         let r = data.get(ep_id).ok_or(Error::NodeNotFound(ep_id))?;
         distance.distance(embedding, &r.embedding)
     };
-    let mut current = vec![Candidate { id: ep_id, dist: start_dist }];
+    let mut current = vec![Candidate {
+        id: ep_id,
+        dist: start_dist,
+    }];
 
     // Greedy descent through layers above new_level.
     let mut layer = ep.max_level;
@@ -259,8 +270,12 @@ where
         let selected = select_neighbors_heuristic(&*data, distance, &candidates, m_lim)?;
 
         // Write this node's adjacency at this layer.
-        let mut nrow = data.get(node_id).ok_or(Error::NodeNotFound(node_id))?.clone();
-        nrow.hnsw.set_neighbors(l, selected.iter().map(|c| c.id).collect());
+        let mut nrow = data
+            .get(node_id)
+            .ok_or(Error::NodeNotFound(node_id))?
+            .clone();
+        nrow.hnsw
+            .set_neighbors(l, selected.iter().map(|c| c.id).collect());
         data.update(node_id, nrow)?;
 
         // Add back-reference on each chosen neighbor; M-prune if over capacity.

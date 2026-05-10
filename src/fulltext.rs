@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::Result;
 use crate::btree::BTree;
 use crate::index::CustomIndex;
 use crate::persistence::Record;
-use crate::Result;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -79,8 +79,9 @@ impl<R: Record> FullTextIndex<R> {
             let idf = ((self.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
             let idf = idf.max(0.0);
 
-            for ((_, doc_id), tf) in
-                self.postings.range((token.clone(), 0u64)..=(token.clone(), u64::MAX))
+            for ((_, doc_id), tf) in self
+                .postings
+                .range((token.clone(), 0u64)..=(token.clone(), u64::MAX))
             {
                 let tf = *tf as f64;
                 let dl = self.doc_lengths.get(doc_id).copied().unwrap_or(0) as f64;
@@ -95,7 +96,11 @@ impl<R: Record> FullTextIndex<R> {
             .map(|(id, score)| SearchResult { id, score })
             .collect();
 
-        results.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         results.truncate(limit);
         results
@@ -438,7 +443,8 @@ mod tests {
             ),
         ];
 
-        idx.rebuild(articles.iter().map(|(id, r)| (*id, r))).unwrap();
+        idx.rebuild(articles.iter().map(|(id, r)| (*id, r)))
+            .unwrap();
 
         assert_eq!(idx.search("rust").len(), 1);
         assert_eq!(idx.search("python").len(), 1);
@@ -447,8 +453,7 @@ mod tests {
 
     #[test]
     fn custom_bm25_params() {
-        let idx = FullTextIndex::<Article>::new(|a| a.title.clone())
-            .with_bm25_params(2.0, 0.5);
+        let idx = FullTextIndex::<Article>::new(|a| a.title.clone()).with_bm25_params(2.0, 0.5);
         assert_eq!(idx.k1, 2.0);
         assert_eq!(idx.b, 0.5);
     }

@@ -5,15 +5,15 @@
 
 pub mod durability;
 pub mod error;
-pub mod notifier;
 pub mod journal;
+pub mod notifier;
 #[cfg(feature = "stable_value")]
 pub mod stable_value;
 
 pub use durability::Durability;
+pub use error::JournalError;
 #[cfg(feature = "stable_value")]
 pub use error::StableValueError;
-pub use error::JournalError;
 pub use journal::{Journal, JournalConfig};
 pub use notifier::Notifier;
 #[cfg(feature = "stable_value")]

@@ -85,7 +85,14 @@ impl ZipfianGenerator {
         let zeta_n = Self::zeta(item_count, theta);
         let alpha = 1.0 / (1.0 - theta);
         let eta = (1.0 - (2.0 / item_count as f64).powf(1.0 - theta)) / (1.0 - zeta_2 / zeta_n);
-        Self { item_count, theta, zeta_n, zeta_2, alpha, eta }
+        Self {
+            item_count,
+            theta,
+            zeta_n,
+            zeta_2,
+            alpha,
+            eta,
+        }
     }
 
     fn zeta(n: u64, theta: f64) -> f64 {
@@ -448,7 +455,13 @@ pub fn bench_multiwriter_workloads(c: &mut Criterion, engine: &mut impl MultiWri
             });
         });
         group.finish();
-        report_conflicts(&name, "low_contention", burst_count.get(), burst_conflicts.get(), MW_WRITERS);
+        report_conflicts(
+            &name,
+            "low_contention",
+            burst_count.get(),
+            burst_conflicts.get(),
+            MW_WRITERS,
+        );
     }
 
     // High contention: hot keys 1..=10, 4 writers
@@ -476,7 +489,13 @@ pub fn bench_multiwriter_workloads(c: &mut Criterion, engine: &mut impl MultiWri
             });
         });
         group.finish();
-        report_conflicts(&name, "high_contention", burst_count.get(), burst_conflicts.get(), MW_WRITERS);
+        report_conflicts(
+            &name,
+            "high_contention",
+            burst_count.get(),
+            burst_conflicts.get(),
+            MW_WRITERS,
+        );
     }
 
     // Scaling: vary number of concurrent writers (1, 2, 4, 8)
@@ -509,7 +528,13 @@ pub fn bench_multiwriter_workloads(c: &mut Criterion, engine: &mut impl MultiWri
                     });
                 },
             );
-            report_conflicts(&name, &format!("scaling/{num_writers}w"), burst_count.get(), burst_conflicts.get(), num_writers);
+            report_conflicts(
+                &name,
+                &format!("scaling/{num_writers}w"),
+                burst_count.get(),
+                burst_conflicts.get(),
+                num_writers,
+            );
         }
         group.finish();
     }

@@ -68,7 +68,10 @@ fn bulk_load_replace_preserves_index_definitions() {
     {
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table::<U>("u").unwrap();
-        t.insert(U { email: "a@x".into() }).unwrap();
+        t.insert(U {
+            email: "a@x".into(),
+        })
+        .unwrap();
         t.define_index("by_email", IndexKind::Unique, |u: &U| u.email.clone())
             .unwrap();
         wtx.commit().unwrap();
@@ -157,11 +160,7 @@ fn bulk_load_delta_applies_inserts_updates_deletes() {
         deletes: vec![3, 7],
     };
     store
-        .bulk_load::<String>(
-            "t",
-            BulkLoadInput::Delta(delta),
-            BulkLoadOptions::default(),
-        )
+        .bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default())
         .unwrap();
 
     let rtx = store.begin_read(None).unwrap();
@@ -191,11 +190,7 @@ fn bulk_load_delta_rejects_overlapping_ids_across_buckets() {
         updates: vec![(2, "u".into())],
         deletes: vec![],
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(bad),
-        BulkLoadOptions::default(),
-    );
+    let res = store.bulk_load::<String>("t", BulkLoadInput::Delta(bad), BulkLoadOptions::default());
     assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));
 }
 
@@ -527,11 +522,8 @@ fn bulk_load_delta_duplicate_in_inserts_rejected() {
         inserts: vec![(10, "a".into()), (10, "b".into())],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     match res.unwrap_err() {
         Error::InvalidBulkLoadInput(msg) => assert!(msg.contains("inserts")),
         other => panic!("expected InvalidBulkLoadInput(inserts), got {other:?}"),
@@ -545,11 +537,8 @@ fn bulk_load_delta_duplicate_in_updates_rejected() {
         updates: vec![(2, "x".into()), (2, "y".into())],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     match res.unwrap_err() {
         Error::InvalidBulkLoadInput(msg) => assert!(msg.contains("updates")),
         other => panic!("expected InvalidBulkLoadInput(updates), got {other:?}"),
@@ -563,11 +552,8 @@ fn bulk_load_delta_duplicate_in_deletes_rejected() {
         deletes: vec![1, 1],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     match res.unwrap_err() {
         Error::InvalidBulkLoadInput(msg) => assert!(msg.contains("deletes")),
         other => panic!("expected InvalidBulkLoadInput(deletes), got {other:?}"),
@@ -582,11 +568,8 @@ fn bulk_load_delta_cross_bucket_insert_update_overlap() {
         updates: vec![(2, "upd".into())],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     match res.unwrap_err() {
         Error::InvalidBulkLoadInput(msg) => assert!(msg.contains("multiple buckets")),
         other => panic!("expected InvalidBulkLoadInput(multiple buckets), got {other:?}"),
@@ -601,11 +584,8 @@ fn bulk_load_delta_cross_bucket_update_delete_overlap() {
         deletes: vec![2],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     match res.unwrap_err() {
         Error::InvalidBulkLoadInput(msg) => assert!(msg.contains("multiple buckets")),
         other => panic!("expected InvalidBulkLoadInput(multiple buckets), got {other:?}"),
@@ -620,11 +600,8 @@ fn bulk_load_delta_cross_bucket_insert_delete_overlap() {
         deletes: vec![7],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     match res.unwrap_err() {
         Error::InvalidBulkLoadInput(msg) => assert!(msg.contains("multiple buckets")),
         other => panic!("expected InvalidBulkLoadInput(multiple buckets), got {other:?}"),
@@ -638,11 +615,8 @@ fn bulk_load_delta_update_missing_id_returns_key_not_found() {
         updates: vec![(99, "ghost".into())],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     assert!(matches!(res, Err(Error::KeyNotFound)));
 }
 
@@ -653,11 +627,8 @@ fn bulk_load_delta_delete_missing_id_returns_key_not_found() {
         deletes: vec![99],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     assert!(matches!(res, Err(Error::KeyNotFound)));
 }
 
@@ -668,11 +639,8 @@ fn bulk_load_delta_insert_existing_id_returns_duplicate_key() {
         inserts: vec![(2, "boom".into())],
         ..Default::default()
     };
-    let res = store.bulk_load::<String>(
-        "t",
-        BulkLoadInput::Delta(delta),
-        BulkLoadOptions::default(),
-    );
+    let res =
+        store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
     assert!(matches!(res, Err(Error::DuplicateKey(_))));
 }
 
@@ -687,11 +655,7 @@ fn bulk_load_delta_merges_inserts_into_base_in_id_order() {
         deletes: vec![5],
     };
     store
-        .bulk_load::<String>(
-            "t",
-            BulkLoadInput::Delta(delta),
-            BulkLoadOptions::default(),
-        )
+        .bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default())
         .unwrap();
     let rtx = store.begin_read(None).unwrap();
     let t = rtx.open_table::<String>("t").unwrap();
@@ -818,12 +782,22 @@ fn bulk_load_replace_preserves_unique_index_definition() {
         let mut t = wtx.open_table::<U>("u").unwrap();
         t.define_index("by_email", IndexKind::Unique, |u: &U| u.email.clone())
             .unwrap();
-        t.insert(U { email: "old@x.com".into() }).unwrap();
+        t.insert(U {
+            email: "old@x.com".into(),
+        })
+        .unwrap();
         wtx.commit().unwrap();
     }
 
     let rows: Vec<(u64, U)> = (1u64..=10)
-        .map(|i| (i, U { email: format!("user{i}@x.com") }))
+        .map(|i| {
+            (
+                i,
+                U {
+                    email: format!("user{i}@x.com"),
+                },
+            )
+        })
         .collect();
     store
         .bulk_load::<U>(

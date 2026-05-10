@@ -10,15 +10,15 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rocksdb::{OptimisticTransactionDB, Options};
 use tempfile::TempDir;
 
 #[path = "ycsb_common.rs"]
 mod ycsb_common;
 use ycsb_common::{
-    bench_multiwriter_workloads, ycsb_criterion, BurstResult, MultiWriterEngine, YcsbRecord,
-    NUM_RECORDS,
+    BurstResult, MultiWriterEngine, NUM_RECORDS, YcsbRecord, bench_multiwriter_workloads,
+    ycsb_criterion,
 };
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
@@ -43,8 +43,8 @@ impl RocksDbMultiWriterEngine {
         opts.create_if_missing(true);
         opts.set_write_buffer_size(256 * 1024 * 1024);
         opts.set_disable_auto_compactions(true);
-        let db = OptimisticTransactionDB::open(&opts, tmpdir.path())
-            .expect("failed to open rocksdb");
+        let db =
+            OptimisticTransactionDB::open(&opts, tmpdir.path()).expect("failed to open rocksdb");
 
         {
             let mut write_opts = rocksdb::WriteOptions::default();
@@ -57,7 +57,10 @@ impl RocksDbMultiWriterEngine {
             }
         }
 
-        RocksDbMultiWriterEngine { db: Arc::new(db), _tmpdir: tmpdir }
+        RocksDbMultiWriterEngine {
+            db: Arc::new(db),
+            _tmpdir: tmpdir,
+        }
     }
 }
 
@@ -107,7 +110,10 @@ impl MultiWriterEngine for RocksDbMultiWriterEngine {
             committed += c;
             conflicts += x;
         }
-        BurstResult { committed, conflicts }
+        BurstResult {
+            committed,
+            conflicts,
+        }
     }
 
     fn verify_key(&self, key: u64) -> bool {

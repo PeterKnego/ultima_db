@@ -89,7 +89,11 @@ mod tests {
         // Magic + format_ver(2) + store_ver(8) + table_count(4) = 22 bytes header
         // + total_rows(8) + total_crc(4) + bookend(8) = 20 bytes trailer
         // = 42 bytes total.
-        assert!(buf.len() >= 42, "stream too short for empty snapshot: {} bytes", buf.len());
+        assert!(
+            buf.len() >= 42,
+            "stream too short for empty snapshot: {} bytes",
+            buf.len()
+        );
         assert_eq!(&buf[0..8], FILE_MAGIC);
         let table_count = u32::from_le_bytes(buf[18..22].try_into().unwrap());
         assert_eq!(table_count, 0, "no tables should be in the empty snapshot");
@@ -127,7 +131,11 @@ mod tests {
         let p = 22usize; // after file header
         let name_len = u16::from_le_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
         let row_count_offset = p + 2 + name_len + 8; // skip name_len + name + type_id
-        let row_count = u64::from_le_bytes(buf[row_count_offset..row_count_offset + 8].try_into().unwrap());
+        let row_count = u64::from_le_bytes(
+            buf[row_count_offset..row_count_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(row_count, 42, "table header row_count mismatch");
     }
 
@@ -160,10 +168,7 @@ mod tests {
         let dst = Store::new(StoreConfig::default()).unwrap();
         dst.register_table::<Row>("rows").unwrap();
         let new_ver = dst
-            .install_snapshot_stream(
-                std::io::Cursor::new(&bytes),
-                Default::default(),
-            )
+            .install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
             .unwrap();
         assert!(new_ver > 0, "install must produce a positive version");
 
@@ -201,10 +206,8 @@ mod tests {
 
         // Truncate to half — must error.
         let half = bytes.len() / 2;
-        let res = dst.install_snapshot_stream(
-            std::io::Cursor::new(&bytes[..half]),
-            Default::default(),
-        );
+        let res =
+            dst.install_snapshot_stream(std::io::Cursor::new(&bytes[..half]), Default::default());
         assert!(res.is_err(), "truncated stream must fail");
 
         // Destination must remain empty — the table should not exist in the
@@ -243,10 +246,7 @@ mod tests {
 
         let dst = Store::new(StoreConfig::default()).unwrap();
         dst.register_table::<Row>("rows").unwrap();
-        let res = dst.install_snapshot_stream(
-            std::io::Cursor::new(&bytes),
-            Default::default(),
-        );
+        let res = dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default());
         assert!(
             matches!(res, Err(ultima_db::SnapshotStreamError::BadCrc { .. })),
             "corrupted bytes must produce BadCrc error, got: {res:?}"
@@ -282,14 +282,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(res.is_ok(), "Drop policy must succeed even with unknown table");
+        assert!(
+            res.is_ok(),
+            "Drop policy must succeed even with unknown table"
+        );
     }
 
     /// Unknown table with OnUnknown::Error must fail.
     #[test]
     fn unknown_table_error_fails() {
-        use ultima_db::snapshot_stream::install::{InstallOptions, OnUnknown};
         use ultima_db::SnapshotStreamError;
+        use ultima_db::snapshot_stream::install::{InstallOptions, OnUnknown};
 
         let src = Store::new(StoreConfig::default()).unwrap();
         src.register_table::<Row>("rows").unwrap();
@@ -356,7 +359,11 @@ mod tests {
         let p = 22usize;
         let name_len = u16::from_le_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
         let row_count_offset = p + 2 + name_len + 8;
-        let row_count = u64::from_le_bytes(buf[row_count_offset..row_count_offset + 8].try_into().unwrap());
+        let row_count = u64::from_le_bytes(
+            buf[row_count_offset..row_count_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(row_count, 5, "streaming v1 should have 5 rows");
     }
 
@@ -370,7 +377,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig {
-            persistence: Persistence::Smr { dir: dir.path().to_path_buf() },
+            persistence: Persistence::Smr {
+                dir: dir.path().to_path_buf(),
+            },
             ..StoreConfig::default()
         };
         let store = Store::new(cfg).unwrap();
@@ -399,7 +408,10 @@ mod tests {
         // Note: checkpoint() prunes old checkpoints (keeps only the latest),
         // so we only expect v2 to be present on disk.
         let cps = store.list_checkpoints().unwrap();
-        assert!(cps.contains(&v2), "v2={v2} must be in checkpoint list: {cps:?}");
+        assert!(
+            cps.contains(&v2),
+            "v2={v2} must be in checkpoint list: {cps:?}"
+        );
         // v1 has been pruned by the second checkpoint().
         // v1 < v2 always holds.
         assert!(v1 < v2, "v1={v1} must be < v2={v2}");
@@ -415,7 +427,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig {
-            persistence: Persistence::Smr { dir: dir.path().to_path_buf() },
+            persistence: Persistence::Smr {
+                dir: dir.path().to_path_buf(),
+            },
             ..StoreConfig::default()
         };
         let store = Store::new(cfg).unwrap();
@@ -604,9 +618,18 @@ mod tests {
             }
             {
                 let mut t = wtx.open_table::<Tx>("txs").unwrap();
-                t.insert(Tx { note: "deposit".into() }).unwrap();
-                t.insert(Tx { note: "withdraw".into() }).unwrap();
-                t.insert(Tx { note: "transfer".into() }).unwrap();
+                t.insert(Tx {
+                    note: "deposit".into(),
+                })
+                .unwrap();
+                t.insert(Tx {
+                    note: "withdraw".into(),
+                })
+                .unwrap();
+                t.insert(Tx {
+                    note: "transfer".into(),
+                })
+                .unwrap();
             }
             wtx.commit().unwrap();
         }
@@ -688,12 +711,7 @@ mod tests {
                 self.count += 1;
                 Ok(())
             }
-            fn on_update(
-                &mut self,
-                _id: u64,
-                _old: &Row,
-                _new: &Row,
-            ) -> ultima_db::Result<()> {
+            fn on_update(&mut self, _id: u64, _old: &Row, _new: &Row) -> ultima_db::Result<()> {
                 Ok(())
             }
             fn on_delete(&mut self, _id: u64, _record: &Row) {
@@ -725,10 +743,8 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        let res = dst.install_snapshot_stream(
-            std::io::Cursor::new(&bytes),
-            InstallOptions::default(),
-        );
+        let res =
+            dst.install_snapshot_stream(std::io::Cursor::new(&bytes), InstallOptions::default());
         assert!(
             matches!(res, Err(SnapshotStreamError::CustomIndexUnsupported { .. })),
             "expected CustomIndexUnsupported, got: {res:?}"

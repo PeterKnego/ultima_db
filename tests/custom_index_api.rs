@@ -3,7 +3,7 @@
 
 //! Integration test verifying the custom index public API.
 
-use ultima_db::{BTree, CustomIndex, Table, Result, Store};
+use ultima_db::{BTree, CustomIndex, Result, Store, Table};
 
 /// A simple ID-set index backed by the public BTree.
 #[derive(Clone)]
@@ -45,7 +45,9 @@ impl CustomIndex<String> for IdSetIndex {
 #[test]
 fn custom_index_public_api_with_btree() {
     let mut table = Table::<String>::new();
-    table.define_custom_index("id_set", IdSetIndex::new()).unwrap();
+    table
+        .define_custom_index("id_set", IdSetIndex::new())
+        .unwrap();
 
     let id1 = table.insert("hello".to_string()).unwrap();
     let id2 = table.insert("world".to_string()).unwrap();
@@ -69,7 +71,9 @@ fn custom_index_through_write_tx() {
     let mut wtx = store.begin_write(None).unwrap();
     {
         let mut table = wtx.open_table::<String>("docs").unwrap();
-        table.define_custom_index("id_set", IdSetIndex::new()).unwrap();
+        table
+            .define_custom_index("id_set", IdSetIndex::new())
+            .unwrap();
         table.insert("hello".to_string()).unwrap();
         table.insert("world".to_string()).unwrap();
     }
@@ -92,7 +96,9 @@ fn custom_index_snapshot_isolation() {
     let mut wtx = store.begin_write(None).unwrap();
     {
         let mut table = wtx.open_table::<String>("docs").unwrap();
-        table.define_custom_index("id_set", IdSetIndex::new()).unwrap();
+        table
+            .define_custom_index("id_set", IdSetIndex::new())
+            .unwrap();
         table.insert("v1".to_string()).unwrap();
     }
     wtx.commit().unwrap();

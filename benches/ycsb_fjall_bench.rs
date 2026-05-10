@@ -3,7 +3,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use tempfile::TempDir;
 
@@ -40,8 +40,8 @@ impl FjallEngine {
 
         for i in 1..=NUM_RECORDS {
             let key = encode_key(i);
-            let value =
-                bincode::serde::encode_to_vec(YcsbRecord::new(i), BINCODE_CFG).expect("serialize failed");
+            let value = bincode::serde::encode_to_vec(YcsbRecord::new(i), BINCODE_CFG)
+                .expect("serialize failed");
             keyspace.insert(key, value).expect("insert failed");
         }
 
@@ -69,8 +69,8 @@ impl YcsbEngine for FjallEngine {
                 YcsbOp::Update(key) => {
                     let k = encode_key(*key);
                     let record = YcsbRecord::new(key.wrapping_add(1));
-                    let value =
-                        bincode::serde::encode_to_vec(record, BINCODE_CFG).expect("serialize failed");
+                    let value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
+                        .expect("serialize failed");
                     self.keyspace.insert(k, value).expect("insert failed");
                 }
                 YcsbOp::Insert => {
@@ -78,8 +78,8 @@ impl YcsbEngine for FjallEngine {
                     self.next_id += 1;
                     let k = encode_key(id);
                     let record = YcsbRecord::new(0);
-                    let value =
-                        bincode::serde::encode_to_vec(record, BINCODE_CFG).expect("serialize failed");
+                    let value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
+                        .expect("serialize failed");
                     self.keyspace.insert(k, value).expect("insert failed");
                 }
                 YcsbOp::Scan(start, count) => {

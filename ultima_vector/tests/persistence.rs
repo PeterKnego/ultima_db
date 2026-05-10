@@ -6,9 +6,9 @@
 
 #![cfg(feature = "persistence")]
 
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::RngExt;
 use ultima_db::{Durability, Persistence, Store, StoreConfig};
 use ultima_vector::row::{EntryPoint, HnswState};
 use ultima_vector::{Cosine, HnswParams, VectorCollection, VectorRow};
@@ -48,13 +48,8 @@ fn round_trip_after_wal_replay_matches_pre_close_results() {
     // Build phase.
     let pre_top_ids: Vec<u64> = {
         let store = Store::new(config.clone()).unwrap();
-        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-            store.clone(),
-            "vec",
-            HnswParams::for_dim(DIM),
-            Cosine,
-        )
-        .unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
         // Nothing to recover on a fresh store, but call it to exercise the path.
         store.recover().unwrap();
 
@@ -78,13 +73,8 @@ fn round_trip_after_wal_replay_matches_pre_close_results() {
     // Recovery phase.
     let post_top_ids: Vec<u64> = {
         let store = Store::new(config).unwrap();
-        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-            store.clone(),
-            "vec",
-            HnswParams::for_dim(DIM),
-            Cosine,
-        )
-        .unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
         store.recover().unwrap();
 
         coll.search(&query, 10, None, Some(64))
@@ -94,7 +84,10 @@ fn round_trip_after_wal_replay_matches_pre_close_results() {
             .collect()
     };
 
-    assert_eq!(pre_top_ids, post_top_ids, "post-recovery top-K must match pre-close");
+    assert_eq!(
+        pre_top_ids, post_top_ids,
+        "post-recovery top-K must match pre-close"
+    );
 }
 
 #[test]
@@ -109,13 +102,8 @@ fn wal_only_recovery_works_without_checkpoint() {
 
     let pre_top: Vec<u64> = {
         let store = Store::new(config.clone()).unwrap();
-        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-            store.clone(),
-            "vec",
-            HnswParams::for_dim(DIM),
-            Cosine,
-        )
-        .unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
         store.recover().unwrap();
         let items: Vec<(Vec<f32>, u64)> = vectors
             .iter()
@@ -133,13 +121,8 @@ fn wal_only_recovery_works_without_checkpoint() {
 
     let post_top: Vec<u64> = {
         let store = Store::new(config).unwrap();
-        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-            store.clone(),
-            "vec",
-            HnswParams::for_dim(DIM),
-            Cosine,
-        )
-        .unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(DIM), Cosine).unwrap();
         store.recover().unwrap();
         coll.search(&query, 5, None, None)
             .unwrap()
@@ -162,13 +145,8 @@ fn restore_through_bulk_load_persists() {
     // Build phase: restore one row at id=42, checkpoint via bulk-load default.
     {
         let store = Store::new(config.clone()).unwrap();
-        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-            store.clone(),
-            "vec",
-            HnswParams::for_dim(4),
-            Cosine,
-        )
-        .unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(4), Cosine).unwrap();
         store.recover().unwrap();
 
         let row = VectorRow {
@@ -176,26 +154,25 @@ fn restore_through_bulk_load_persists() {
             meta: 42u64,
             hnsw: HnswState::empty(0),
         };
-        let entry = EntryPoint { node_id: Some(42), max_level: 0 };
+        let entry = EntryPoint {
+            node_id: Some(42),
+            max_level: 0,
+        };
         coll.restore_vec(vec![(42, row)], entry).unwrap();
     } // store dropped here; restore_vec's checkpoint should have flushed state.
 
     // Recovery phase: reopen the same dir and verify the restored row is searchable.
     {
         let store = Store::new(config).unwrap();
-        let coll: VectorCollection<u64, Cosine> = VectorCollection::open(
-            store.clone(),
-            "vec",
-            HnswParams::for_dim(4),
-            Cosine,
-        )
-        .unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(4), Cosine).unwrap();
         store.recover().unwrap();
 
-        let results = coll
-            .search(&[1.0, 0.0, 0.0, 0.0], 1, None, None)
-            .unwrap();
+        let results = coll.search(&[1.0, 0.0, 0.0, 0.0], 1, None, None).unwrap();
         assert_eq!(results.len(), 1, "expected exactly one result after reopen");
-        assert_eq!(results[0].0, 42, "expected restored id=42 to be the top hit");
+        assert_eq!(
+            results[0].0, 42,
+            "expected restored id=42 to be the top hit"
+        );
     }
 }

@@ -155,16 +155,13 @@ impl crate::store::Store {
             total_crc.update(&bytes[p..p + n]);
             p += n;
             stream_table_names.insert(table_header.name.clone());
-            declared_rows_total =
-                declared_rows_total.saturating_add(table_header.row_count);
+            declared_rows_total = declared_rows_total.saturating_add(table_header.row_count);
 
             // 3b. Rows: key(u64 LE) | val_len(u32 LE) | val(bytes).
             let mut table_crc = crc32fast::Hasher::new();
             let remaining = bytes.len().saturating_sub(p);
-            let cap_hint = std::cmp::min(
-                table_header.row_count as usize,
-                remaining / MIN_ROW_BYTES,
-            );
+            let cap_hint =
+                std::cmp::min(table_header.row_count as usize, remaining / MIN_ROW_BYTES);
             let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(cap_hint);
 
             for _ in 0..table_header.row_count {
@@ -172,8 +169,7 @@ impl crate::store::Store {
                     return Err(SnapshotStreamError::Truncated);
                 }
                 let key = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
-                let val_len =
-                    u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as usize;
+                let val_len = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as usize;
                 if bytes.len() < p + 12 + val_len {
                     return Err(SnapshotStreamError::Truncated);
                 }

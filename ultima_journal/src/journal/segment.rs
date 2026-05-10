@@ -73,7 +73,11 @@ pub fn decode_header(bytes: &[u8]) -> Result<SegmentHeader, JournalError> {
             reason: "header crc mismatch".into(),
         });
     }
-    Ok(SegmentHeader { format_ver, base_seq, created_at })
+    Ok(SegmentHeader {
+        format_ver,
+        base_seq,
+        created_at,
+    })
 }
 
 /// Returns the encoded record bytes (length-prefix + body + CRC).
@@ -106,7 +110,7 @@ pub fn decode_record(
     offset: u64,
 ) -> Result<Option<(DecodedRecord, usize)>, JournalError> {
     if bytes.len() < 4 {
-        return Ok(None);  // torn tail (length prefix incomplete)
+        return Ok(None); // torn tail (length prefix incomplete)
     }
     let body_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let total = 4 + body_len + 4;
@@ -115,7 +119,7 @@ pub fn decode_record(
     // treat it as a torn tail (incomplete/garbage record).
     if body_len < 16 {
         if bytes.len() < total {
-            return Ok(None);  // torn tail (could be incomplete record with bad length)
+            return Ok(None); // torn tail (could be incomplete record with bad length)
         }
         return Err(JournalError::Corrupted {
             segment: segment_name.into(),
@@ -124,7 +128,7 @@ pub fn decode_record(
         });
     }
     if bytes.len() < total {
-        return Ok(None);  // torn tail (record incomplete)
+        return Ok(None); // torn tail (record incomplete)
     }
     let body = &bytes[4..4 + body_len];
     let stored_crc = u32::from_le_bytes(bytes[4 + body_len..total].try_into().unwrap());
@@ -181,7 +185,10 @@ pub struct SegmentFile {
 impl SegmentFile {
     pub fn create(path: &Path, base_seq: u64) -> Result<Self, JournalError> {
         let mut file = OpenOptions::new()
-            .read(true).write(true).create_new(true).open(path)?;
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
         let header = SegmentHeader {
             format_ver: SEGMENT_FORMAT_V,
             base_seq,
@@ -202,11 +209,12 @@ impl SegmentFile {
     pub fn open_for_read(path: &Path) -> Result<Self, JournalError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut hdr_bytes = [0u8; SEGMENT_HEADER_SIZE];
-        file.read_exact(&mut hdr_bytes).map_err(|e| JournalError::Corrupted {
-            segment: path.display().to_string(),
-            offset: 0,
-            reason: format!("header read failed: {e}"),
-        })?;
+        file.read_exact(&mut hdr_bytes)
+            .map_err(|e| JournalError::Corrupted {
+                segment: path.display().to_string(),
+                offset: 0,
+                reason: format!("header read failed: {e}"),
+            })?;
         let header = decode_header(&hdr_bytes)?;
         if header.format_ver != SEGMENT_FORMAT_V {
             return Err(JournalError::Corrupted {
@@ -228,11 +236,19 @@ impl SegmentFile {
         })
     }
 
-    pub fn base_seq(&self) -> u64 { self.base_seq }
-    pub fn size(&self) -> Result<u64, JournalError> { Ok(self.size) }
-    pub fn path(&self) -> &Path { &self.path }
-    #[allow(dead_code)]  // Used by future sparse-index-seek read path.
-    pub fn index_snapshot(&self) -> &[(u64, u64)] { &self.index }
+    pub fn base_seq(&self) -> u64 {
+        self.base_seq
+    }
+    pub fn size(&self) -> Result<u64, JournalError> {
+        Ok(self.size)
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    #[allow(dead_code)] // Used by future sparse-index-seek read path.
+    pub fn index_snapshot(&self) -> &[(u64, u64)] {
+        &self.index
+    }
 
     /// Append a record at end-of-file. Caller must enforce monotonic seq.
     /// Updates the sparse index when the gap since the previous indexed
@@ -248,9 +264,10 @@ impl SegmentFile {
         self.file.write_all(&bytes)?;
         let written_offset = self.size;
         self.size += bytes.len() as u64;
-        let want_index = self.index.last().is_none_or(|(_, off)| {
-            written_offset.saturating_sub(*off) >= SPARSE_INDEX_GAP
-        });
+        let want_index = self
+            .index
+            .last()
+            .is_none_or(|(_, off)| written_offset.saturating_sub(*off) >= SPARSE_INDEX_GAP);
         if want_index {
             self.index.push((seq, written_offset));
         }
@@ -324,7 +341,11 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = SegmentHeader { format_ver: 1, base_seq: 42, created_at: 100 };
+        let h = SegmentHeader {
+            format_ver: 1,
+            base_seq: 42,
+            created_at: 100,
+        };
         let bytes = encode_header(&h);
         assert_eq!(bytes.len(), SEGMENT_HEADER_SIZE);
         let decoded = decode_header(&bytes).unwrap();
@@ -333,9 +354,16 @@ mod tests {
 
     #[test]
     fn header_rejects_bad_magic() {
-        let mut bytes = encode_header(&SegmentHeader { format_ver: 1, base_seq: 0, created_at: 0 });
+        let mut bytes = encode_header(&SegmentHeader {
+            format_ver: 1,
+            base_seq: 0,
+            created_at: 0,
+        });
         bytes[0] = b'X';
-        assert!(matches!(decode_header(&bytes), Err(JournalError::Corrupted { .. })));
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(JournalError::Corrupted { .. })
+        ));
     }
 
     #[test]
@@ -361,7 +389,10 @@ mod tests {
         let mut bytes = encode_record(1, 0, b"abc");
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
-        assert!(matches!(decode_record(&bytes, "seg", 0), Err(JournalError::Corrupted { .. })));
+        assert!(matches!(
+            decode_record(&bytes, "seg", 0),
+            Err(JournalError::Corrupted { .. })
+        ));
     }
 
     #[test]
@@ -407,7 +438,10 @@ mod tests {
         // Append garbage (simulated torn write).
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(&[0u8; 5]).unwrap();
         }
         let opened = SegmentFile::open_for_read(&path).unwrap();
@@ -445,9 +479,9 @@ mod tests {
         // Length prefix says 5 bytes (< minimum 16). Pad with garbage so the
         // record looks "complete" — body_len < 16 must hit Err, not Ok(None).
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&5u32.to_le_bytes());     // body_len = 5
-        bytes.extend_from_slice(&[0u8; 5]);                // body
-        bytes.extend_from_slice(&[0u8; 4]);                // crc placeholder
+        bytes.extend_from_slice(&5u32.to_le_bytes()); // body_len = 5
+        bytes.extend_from_slice(&[0u8; 5]); // body
+        bytes.extend_from_slice(&[0u8; 4]); // crc placeholder
         assert!(matches!(
             decode_record(&bytes, "seg", 0),
             Err(JournalError::Corrupted { .. })
