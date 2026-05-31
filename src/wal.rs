@@ -909,10 +909,11 @@ pub struct BenchWal {
 #[doc(hidden)]
 #[cfg(feature = "bench-internals")]
 impl BenchWal {
-    /// Open a WAL in `dir`. `consistent` selects Consistent vs Eventual mode.
-    pub fn new(dir: &Path, consistent: bool) -> Result<Self> {
+    /// Open a WAL in `dir`. `consistent` selects Consistent vs Eventual mode;
+    /// `kind` selects the sink implementation under test.
+    pub fn new(dir: &Path, consistent: bool, kind: WalSinkKind) -> Result<Self> {
         Ok(Self {
-            inner: WalHandle::new(dir, consistent, Arc::new(WalPoison::new()))?,
+            inner: WalHandle::with_sink_kind(dir, consistent, Arc::new(WalPoison::new()), kind)?,
         })
     }
 

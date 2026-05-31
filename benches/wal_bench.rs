@@ -1,32 +1,20 @@
 // WAL-only microbenchmark — isolates the write-ahead-log I/O path from the rest
-// of the store so we can measure the cost of a durable commit and track it
-// across WAL implementation changes.
+// of the store so we can measure the cost of a durable commit and compare write
+// backends (sinks) across record sizes.
 //
-// Covers both durability modes (Consistent / Eventual) across record sizes
-// 1/2/4/8/16 KiB. Three views:
-//   * wal_commit_consistent — one durable commit (write + fsync wait) per iter
-//   * wal_commit_eventual   — one fire-and-forget commit (enqueue only, no wait):
-//                             the caller-visible latency of an Eventual commit,
-//                             which returns before fsync. The fsync still runs on
-//                             the background thread and is forced (off the timed
-//                             clock) when the WAL is dropped in teardown.
-//   * wal_eventual_batch    — fire-and-forget batch + single drain (group commit):
-//                             sustained *durable* throughput under Eventual.
-//
-// Each iteration gets a fresh WAL via iter_batched: setup (thread spawn + file
-// open) and teardown (thread join + dir removal) are excluded from the timed
-// section, and the on-disk file never grows beyond one batch.
+// Dimensions: sink {fswrite[,buffered,mmap,iouring]} x size {1,2,4,8,16 KiB} x
+// view {consistent single, eventual single, eventual batch}.
 //
 // IMPORTANT: fsync on tmpfs is a no-op, which would make every number here
-// meaningless. The WAL dir is pinned to `target/wal-bench` (real disk in this
-// repo); the harness prints the backing filesystem at startup and panics if it
-// resolves to tmpfs/ramfs.
+// meaningless. The WAL dir is pinned to `target/wal-bench` (real disk); the
+// harness prints the backing filesystem at startup and panics if it resolves to
+// tmpfs/ramfs.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use ultima_db::wal::{BenchWal, WalEntry, WalOp};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use ultima_db::wal::{BenchWal, WalEntry, WalOp, WalSinkKind};
 
 /// Record payload sizes to sweep (bytes).
 const SIZES: &[usize] = &[1024, 2048, 4096, 8192, 16384];
@@ -34,21 +22,18 @@ const SIZES: &[usize] = &[1024, 2048, 4096, 8192, 16384];
 /// Number of entries per Eventual fire-and-forget batch.
 const EVENTUAL_BATCH: u64 = 256;
 
+/// Sinks under test. Entries are added as each sink lands (Tasks 4/6/7).
+const KINDS: &[(&str, WalSinkKind)] = &[("fswrite", WalSinkKind::FsWrite)];
+
 /// Build a single-op WAL entry whose payload is `payload` bytes.
 fn make_entry(version: u64, payload: usize) -> WalEntry {
     WalEntry {
         version,
-        ops: vec![WalOp::Insert {
-            table: "bench".to_string(),
-            id: version,
-            data: vec![0u8; payload],
-        }],
+        ops: vec![WalOp::Insert { table: "bench".to_string(), id: version, data: vec![0u8; payload] }],
     }
 }
 
-/// Resolve the (mount point, fstype) backing `path` by scanning /proc/mounts and
-/// picking the longest mount-point prefix. Best-effort; returns "unknown" if it
-/// can't be determined.
+/// Resolve the (mount point, fstype) backing `path` by scanning /proc/mounts.
 fn backing_fs(path: &Path) -> (String, String) {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
@@ -68,20 +53,12 @@ fn backing_fs(path: &Path) -> (String, String) {
     (best.1, best.2)
 }
 
-/// Create (if needed) and return the on-disk benchmark root, asserting it is not
-/// tmpfs/ramfs (where fsync would be a no-op).
+/// Create and return the on-disk benchmark root, asserting it is not tmpfs/ramfs.
 fn bench_root() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("wal-bench");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("wal-bench");
     std::fs::create_dir_all(&root).expect("create bench root");
     let (mount, fs) = backing_fs(&root);
-    eprintln!(
-        "[wal_bench] WAL dir = {} | mount = {} | fs = {}",
-        root.display(),
-        mount,
-        fs
-    );
+    eprintln!("[wal_bench] WAL dir = {} | mount = {} | fs = {}", root.display(), mount, fs);
     assert!(
         fs != "tmpfs" && fs != "ramfs",
         "WAL benchmark dir is on {fs} (mount {mount}); fsync is a no-op there, so \
@@ -90,14 +67,11 @@ fn bench_root() -> PathBuf {
     root
 }
 
-/// Open a fresh WAL under `root`. The TempDir is returned alongside so the caller
-/// controls when it (and the background writer thread) is dropped.
-fn new_wal(root: &Path, consistent: bool) -> (tempfile::TempDir, BenchWal) {
-    let dir = tempfile::Builder::new()
-        .prefix("wal")
-        .tempdir_in(root)
-        .expect("tempdir on bench root");
-    let wal = BenchWal::new(dir.path(), consistent).expect("open BenchWal");
+/// Open a fresh WAL under `root` with the given sink. The TempDir is returned so
+/// the caller controls when it (and the background writer thread) is dropped.
+fn new_wal(root: &Path, consistent: bool, kind: WalSinkKind) -> (tempfile::TempDir, BenchWal) {
+    let dir = tempfile::Builder::new().prefix("wal").tempdir_in(root).expect("tempdir on bench root");
+    let wal = BenchWal::new(dir.path(), consistent, kind).expect("open BenchWal");
     (dir, wal)
 }
 
@@ -108,66 +82,70 @@ fn label(size: usize) -> String {
 fn wal_benches(c: &mut Criterion) {
     let root = bench_root();
 
-    // --- Consistent: one durable commit (write + fsync wait) per iteration --
+    // --- Consistent: one durable commit (write + fsync wait) per iteration. ---
     {
         let mut g = c.benchmark_group("wal_commit_consistent");
-        for &size in SIZES {
-            g.throughput(Throughput::Bytes(size as u64));
-            g.bench_function(label(size), |b| {
-                b.iter_batched(
-                    || new_wal(&root, true),
-                    |(dir, wal)| {
-                        wal.commit_consistent(make_entry(1, size)).unwrap();
-                        (dir, wal) // returned → dropped outside the timed section
-                    },
-                    BatchSize::PerIteration,
-                );
-            });
+        for &(kind_name, kind) in KINDS {
+            for &size in SIZES {
+                g.throughput(Throughput::Bytes(size as u64));
+                g.bench_function(BenchmarkId::new(kind_name, label(size)), |b| {
+                    b.iter_batched(
+                        || new_wal(&root, true, kind),
+                        |(dir, wal)| {
+                            wal.commit_consistent(make_entry(1, size)).unwrap();
+                            (dir, wal)
+                        },
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
         }
         g.finish();
     }
 
-    // --- Eventual: caller-visible latency of one fire-and-forget commit. No
-    // drain — commit_eventual returns as soon as the entry is enqueued; the
-    // fsync happens on the background thread and is forced off-clock when the
-    // WAL is dropped in teardown. This is what an Eventual writer actually pays.
+    // --- Eventual: caller-visible latency of one fire-and-forget commit (no
+    // drain). The fsync runs on the bg thread and is forced off-clock at teardown.
     {
         let mut g = c.benchmark_group("wal_commit_eventual");
-        for &size in SIZES {
-            g.throughput(Throughput::Bytes(size as u64));
-            g.bench_function(label(size), |b| {
-                b.iter_batched(
-                    || new_wal(&root, false),
-                    |(dir, wal)| {
-                        wal.commit_eventual(make_entry(1, size)).unwrap();
-                        (dir, wal)
-                    },
-                    BatchSize::PerIteration,
-                );
-            });
+        for &(kind_name, kind) in KINDS {
+            for &size in SIZES {
+                g.throughput(Throughput::Bytes(size as u64));
+                g.bench_function(BenchmarkId::new(kind_name, label(size)), |b| {
+                    b.iter_batched(
+                        || new_wal(&root, false, kind),
+                        |(dir, wal)| {
+                            wal.commit_eventual(make_entry(1, size)).unwrap();
+                            (dir, wal)
+                        },
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
         }
         g.finish();
     }
 
-    // --- Eventual batched throughput: fire-and-forget batch + single drain ---
+    // --- Eventual batched: fire-and-forget batch + single drain (group commit). -
     {
         let mut g = c.benchmark_group("wal_eventual_batch");
         g.sample_size(20);
-        for &size in SIZES {
-            g.throughput(Throughput::Bytes(size as u64 * EVENTUAL_BATCH));
-            g.bench_function(label(size), |b| {
-                b.iter_batched(
-                    || new_wal(&root, false),
-                    |(dir, wal)| {
-                        for v in 1..=EVENTUAL_BATCH {
-                            wal.commit_eventual(make_entry(v, size)).unwrap();
-                        }
-                        wal.wait_durable(EVENTUAL_BATCH).unwrap();
-                        (dir, wal)
-                    },
-                    BatchSize::PerIteration,
-                );
-            });
+        for &(kind_name, kind) in KINDS {
+            for &size in SIZES {
+                g.throughput(Throughput::Bytes(size as u64 * EVENTUAL_BATCH));
+                g.bench_function(BenchmarkId::new(kind_name, label(size)), |b| {
+                    b.iter_batched(
+                        || new_wal(&root, false, kind),
+                        |(dir, wal)| {
+                            for v in 1..=EVENTUAL_BATCH {
+                                wal.commit_eventual(make_entry(v, size)).unwrap();
+                            }
+                            wal.wait_durable(EVENTUAL_BATCH).unwrap();
+                            (dir, wal)
+                        },
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
         }
         g.finish();
     }
