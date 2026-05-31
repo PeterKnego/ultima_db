@@ -14,10 +14,62 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 
 use crate::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Poison latch
+// ---------------------------------------------------------------------------
+
+/// Poison latch shared between the WAL background thread and the store.
+///
+/// The background thread calls [`WalPoison::poison`] on any append/fsync
+/// failure; the store checks it at `begin_write`/`commit`. Once poisoned the
+/// store refuses further writes until it is dropped and re-created.
+pub(crate) struct WalPoison {
+    poisoned: AtomicBool,
+    cause: Mutex<Option<String>>,
+}
+
+impl WalPoison {
+    pub(crate) fn new() -> Self {
+        Self {
+            poisoned: AtomicBool::new(false),
+            cause: Mutex::new(None),
+        }
+    }
+
+    /// Record the failure cause (first cause wins) and set the latch.
+    pub(crate) fn poison(&self, msg: String) {
+        let mut c = self.cause.lock().unwrap();
+        if c.is_none() {
+            *c = Some(msg);
+        }
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// `Ok(())` when clear, else `Err(Error::Poisoned(cause))`.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_poisoned() {
+            Err(self.error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn error(&self) -> Error {
+        let c = self.cause.lock().unwrap();
+        Error::Poisoned(c.clone().unwrap_or_else(|| "WAL poisoned".into()))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WAL data types
@@ -316,6 +368,9 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
         .map_err(|e| Error::Persistence(e.to_string()))?;
     file.sync_all()
         .map_err(|e| Error::Persistence(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
     Ok(())
 }
 
@@ -337,25 +392,71 @@ pub(crate) struct WalSyncState {
 pub(crate) enum SyncWaiter {
     /// Already durable or fire-and-forget (Eventual).
     Done,
-    /// Block until the background thread fsyncs past this epoch.
+    /// Block until the background thread fsyncs past this epoch, or the WAL
+    /// is poisoned.
     WaitForEpoch {
         epoch: u64,
         state: Arc<WalSyncState>,
+        poison: Arc<WalPoison>,
     },
 }
 
 impl SyncWaiter {
-    pub fn wait(self) {
-        if let SyncWaiter::WaitForEpoch { epoch, state } = self {
+    /// Block until this entry's batch is durably fsynced.
+    ///
+    /// Returns `Err(Error::Poisoned)` if the WAL was poisoned before this
+    /// entry's batch reached disk. An entry whose batch fsynced *before* a
+    /// later failure still returns `Ok`.
+    pub fn wait(self) -> Result<()> {
+        if let SyncWaiter::WaitForEpoch {
+            epoch,
+            state,
+            poison,
+        } = self
+        {
             let mut guard = state.mu.lock().unwrap();
-            while state
-                .fsynced_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                < epoch
-            {
+            loop {
+                if state
+                    .fsynced_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    >= epoch
+                {
+                    return Ok(());
+                }
+                if poison.is_poisoned() {
+                    return Err(poison.error());
+                }
                 guard = state.condvar.wait(guard).unwrap();
             }
         }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WalSink — abstraction over the WAL's durable backing store
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the WAL's durable backing store, so failures can be
+/// injected in tests. `append` writes one entry; `sync` fsyncs.
+pub(crate) trait WalSink: Send {
+    fn append(&mut self, entry: &WalEntry) -> Result<()>;
+    fn sync(&mut self) -> Result<()>;
+}
+
+/// Production sink: appends framed entries to a file and fsyncs it.
+struct FileSink {
+    file: File,
+}
+
+impl WalSink for FileSink {
+    fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        write_entry_to_file(&mut self.file, entry)
+    }
+    fn sync(&mut self) -> Result<()> {
+        self.file
+            .sync_all()
+            .map_err(|e| Error::Persistence(e.to_string()))
     }
 }
 
@@ -377,19 +478,35 @@ pub(crate) struct WalHandle {
     bg_thread: Option<thread::JoinHandle<()>>,
     consistent: bool,
     sync_state: Option<Arc<WalSyncState>>,
+    poison: Arc<WalPoison>,
     /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WalHandle {
-    /// Create a new WAL handle. Opens (or creates) the WAL file.
-    /// Both modes use a background thread for batched writes.
-    pub fn new(dir: &Path, consistent: bool) -> Result<Self> {
+    /// Create a new WAL handle. Opens (or creates) the WAL file and fsyncs the
+    /// directory so the file's creation is durable. Both modes use a background
+    /// thread for batched writes.
+    pub fn new(dir: &Path, consistent: bool, poison: Arc<WalPoison>) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        Ok(Self::with_sink(FileSink { file }, consistent, poison))
+    }
 
+    /// Build a handle around an arbitrary sink. Used by `new` (FileSink) and by
+    /// tests (fault-injecting sinks).
+    pub(crate) fn with_sink<S: WalSink + 'static>(
+        sink: S,
+        consistent: bool,
+        poison: Arc<WalPoison>,
+    ) -> Self {
         let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
         let sync_state = if consistent {
             Some(Arc::new(WalSyncState {
                 next_epoch: std::sync::atomic::AtomicU64::new(1),
@@ -404,50 +521,18 @@ impl WalHandle {
         let (tx, rx) = mpsc::channel::<WalEntry>();
         let bg_in_flight = in_flight.clone();
         let bg_sync_state = sync_state.clone();
+        let bg_poison = poison.clone();
 
-        let handle = thread::spawn(move || {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&wal_path)
-                .expect("failed to open WAL file in background thread");
-            // Block on the first entry, then drain all queued entries
-            // so they share a single fsync.
-            while let Ok(first) = rx.recv() {
-                let mut count = 1u64;
-                if write_entry_to_file(&mut file, &first).is_err() {
-                    count = 0;
-                }
-                while let Ok(entry) = rx.try_recv() {
-                    count += 1;
-                    if write_entry_to_file(&mut file, &entry).is_err() {
-                        count -= 1;
-                    }
-                }
-                let _ = file.sync_all();
-                bg_in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
-                // Notify Consistent waiters that this batch is durable.
-                // The epoch update MUST happen inside the mutex to prevent
-                // lost wakeups: without it, a waiter could check fsynced_epoch
-                // (seeing the old value), then we update + notify before the
-                // waiter enters condvar.wait(), causing it to block forever.
-                if let Some(state) = &bg_sync_state {
-                    let _guard = state.mu.lock().unwrap();
-                    state
-                        .fsynced_epoch
-                        .fetch_add(count, std::sync::atomic::Ordering::Release);
-                    state.condvar.notify_all();
-                }
-            }
-        });
+        let handle = spawn_wal_thread(sink, rx, bg_in_flight, bg_sync_state, bg_poison);
 
-        Ok(Self {
+        Self {
             sender: Some(tx),
             bg_thread: Some(handle),
             consistent,
             sync_state,
+            poison,
             in_flight,
-        })
+        }
     }
 
     /// Submit a WAL entry to the background thread.
@@ -471,6 +556,7 @@ impl WalHandle {
             Ok(SyncWaiter::WaitForEpoch {
                 epoch,
                 state: Arc::clone(state),
+                poison: Arc::clone(&self.poison),
             })
         } else {
             Ok(SyncWaiter::Done)
@@ -481,6 +567,61 @@ impl WalHandle {
     pub fn pending_writes(&self) -> u64 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Background WAL writer loop. Drains a batch, writes it, fsyncs once, and
+/// advances the synced epoch. On any append/fsync failure, poisons the latch,
+/// wakes all waiters, and stops.
+fn spawn_wal_thread<S: WalSink + 'static>(
+    mut sink: S,
+    rx: mpsc::Receiver<WalEntry>,
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
+    sync_state: Option<Arc<WalSyncState>>,
+    poison: Arc<WalPoison>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            while let Ok(entry) = rx.try_recv() {
+                batch.push(entry);
+            }
+            let count = batch.len() as u64;
+
+            // Write every entry, then fsync once. Any error means this batch
+            // is NOT durable.
+            let result: Result<()> = (|| {
+                for entry in &batch {
+                    sink.append(entry)?;
+                }
+                sink.sync()
+            })();
+
+            in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+
+            match result {
+                Ok(()) => {
+                    // Batch is durable — release its waiters.
+                    if let Some(state) = &sync_state {
+                        let _guard = state.mu.lock().unwrap();
+                        state
+                            .fsynced_epoch
+                            .fetch_add(count, std::sync::atomic::Ordering::Release);
+                        state.condvar.notify_all();
+                    }
+                }
+                Err(e) => {
+                    // Poison, wake any waiters so they observe it, and stop.
+                    // The epoch is NOT advanced: this batch never reached disk.
+                    poison.poison(format!("WAL durability failure: {e}"));
+                    if let Some(state) = &sync_state {
+                        let _guard = state.mu.lock().unwrap();
+                        state.condvar.notify_all();
+                    }
+                    return;
+                }
+            }
+        }
+    })
 }
 
 impl Drop for WalHandle {
@@ -503,6 +644,7 @@ impl Drop for WalHandle {
 pub(crate) struct MockWal {
     pub(crate) entries: std::sync::Mutex<Vec<WalEntry>>,
     sync_state: Arc<WalSyncState>,
+    poison: Arc<WalPoison>,
 }
 
 #[cfg(test)]
@@ -516,10 +658,25 @@ impl MockWal {
                 condvar: std::sync::Condvar::new(),
                 mu: std::sync::Mutex::new(()),
             }),
+            poison: Arc::new(WalPoison::new()),
         }
     }
 
-    /// Submit a WAL entry. Returns a SyncWaiter that blocks until `flush()`.
+    /// The poison latch backing this mock, so a test can install it as the
+    /// store's `wal_poison` and observe `begin_write` failing after `fail()`.
+    pub fn poison(&self) -> Arc<WalPoison> {
+        Arc::clone(&self.poison)
+    }
+
+    /// Simulate a WAL fsync failure: poison and wake all blocked waiters.
+    pub fn fail(&self) {
+        self.poison.poison("mock WAL failure".into());
+        let _guard = self.sync_state.mu.lock().unwrap();
+        self.sync_state.condvar.notify_all();
+    }
+
+    /// Submit a WAL entry. Returns a SyncWaiter that blocks until `flush()` or
+    /// `fail()`.
     pub fn write(&self, entry: WalEntry) -> SyncWaiter {
         self.entries.lock().unwrap().push(entry);
         let epoch = self
@@ -529,6 +686,7 @@ impl MockWal {
         SyncWaiter::WaitForEpoch {
             epoch,
             state: Arc::clone(&self.sync_state),
+            poison: Arc::clone(&self.poison),
         }
     }
 
@@ -572,6 +730,23 @@ impl MockWal {
 /// Return the WAL file path for a given directory.
 pub(crate) fn wal_path(dir: &Path) -> PathBuf {
     dir.join(WAL_FILENAME)
+}
+
+/// Fsync a directory so that file creations/renames within it are durable.
+///
+/// On Unix this opens the directory and calls `sync_all`. On platforms that
+/// do not support directory fsync (e.g. Windows) this is a no-op.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let f = File::open(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        f.sync_all().map_err(|e| Error::Persistence(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +977,7 @@ mod tests {
     #[test]
     fn wal_handle_consistent_write() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), true).unwrap();
+        let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         let w1 = handle
             .write(WalEntry {
                 version: 1,
@@ -816,8 +991,8 @@ mod tests {
             })
             .unwrap();
         // Wait for both fsyncs to complete.
-        w1.wait();
-        w2.wait();
+        w1.wait().unwrap();
+        w2.wait().unwrap();
 
         let entries = read_wal(&wal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 2);
@@ -826,7 +1001,7 @@ mod tests {
     #[test]
     fn wal_handle_eventual_write() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), false).unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         handle
             .write(WalEntry {
                 version: 1,
@@ -843,7 +1018,7 @@ mod tests {
     #[test]
     fn wal_handle_pending_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), false).unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         assert_eq!(handle.pending_writes(), 0);
         handle
             .write(WalEntry {
@@ -860,7 +1035,7 @@ mod tests {
     #[test]
     fn wal_handle_consistent_pending_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), true).unwrap();
+        let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         assert_eq!(handle.pending_writes(), 0);
         let w = handle
             .write(WalEntry {
@@ -869,7 +1044,7 @@ mod tests {
             })
             .unwrap();
         // Before wait, in_flight should be >= 1.
-        w.wait();
+        w.wait().unwrap();
         // After wait + bg thread sync, pending should be 0 (eventually).
         drop(handle);
     }
@@ -996,5 +1171,127 @@ mod tests {
         let path = dir.path().join("does_not_exist.bin");
         let entries = read_wal(&path).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn wal_poison_latches_first_cause() {
+        let p = WalPoison::new();
+        assert!(!p.is_poisoned());
+        assert!(p.check().is_ok());
+
+        p.poison("first".into());
+        p.poison("second".into()); // first cause wins
+
+        assert!(p.is_poisoned());
+        match p.check() {
+            Err(Error::Poisoned(msg)) => assert_eq!(msg, "first"),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_dir_on_normal_directory_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file so the directory is non-trivial.
+        std::fs::write(dir.path().join("x"), b"hello").unwrap();
+        assert!(sync_dir(dir.path()).is_ok());
+    }
+
+    /// Test sink that fails the first `sync` and records appends.
+    struct FaultySink {
+        fail_sync_after: usize, // succeed this many syncs, then fail
+        sync_count: usize,
+    }
+    impl WalSink for FaultySink {
+        fn append(&mut self, _entry: &WalEntry) -> Result<()> {
+            Ok(())
+        }
+        fn sync(&mut self) -> Result<()> {
+            self.sync_count += 1;
+            if self.sync_count > self.fail_sync_after {
+                Err(Error::Persistence("injected sync failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn wal_sync_failure_poisons_and_waiter_errors() {
+        let poison = Arc::new(WalPoison::new());
+        let handle = WalHandle::with_sink(
+            FaultySink {
+                fail_sync_after: 0, // fail immediately
+                sync_count: 0,
+            },
+            true,
+            poison.clone(),
+        );
+        let w = handle
+            .write(WalEntry {
+                version: 1,
+                ops: vec![WalOp::CreateTable { name: "t".into() }],
+            })
+            .unwrap();
+
+        // The waiter must observe the failure as an error, not a fake success.
+        match w.wait() {
+            Err(Error::Poisoned(_)) => {}
+            other => panic!("expected Err(Poisoned), got {other:?}"),
+        }
+        assert!(poison.is_poisoned());
+    }
+
+    #[test]
+    fn wal_durable_batch_before_failure_returns_ok() {
+        let poison = Arc::new(WalPoison::new());
+        let handle = WalHandle::with_sink(
+            FaultySink {
+                fail_sync_after: 1, // first sync ok, second fails
+                sync_count: 0,
+            },
+            true,
+            poison.clone(),
+        );
+
+        // First entry: its own batch fsyncs successfully.
+        let w1 = handle
+            .write(WalEntry { version: 1, ops: vec![] })
+            .unwrap();
+        w1.wait().expect("first batch should be durable");
+
+        // Second entry: its batch's sync fails -> poisoned, waiter errors.
+        let w2 = handle
+            .write(WalEntry { version: 2, ops: vec![] })
+            .unwrap();
+        match w2.wait() {
+            Err(Error::Poisoned(_)) => {}
+            other => panic!("expected Err(Poisoned), got {other:?}"),
+        }
+    }
+
+    /// Eventual mode has no waiter, but an fsync failure must still poison the
+    /// shared latch so the store's next begin_write/commit is refused.
+    #[test]
+    fn wal_eventual_sync_failure_poisons() {
+        let poison = Arc::new(WalPoison::new());
+        let handle = WalHandle::with_sink(
+            FaultySink {
+                fail_sync_after: 0, // fail immediately
+                sync_count: 0,
+            },
+            false, // Eventual: write() returns SyncWaiter::Done
+            poison.clone(),
+        );
+        handle
+            .write(WalEntry { version: 1, ops: vec![] })
+            .unwrap();
+        // Dropping the handle joins the background thread, which by then has
+        // processed the entry, failed the fsync, and poisoned the latch.
+        drop(handle);
+        assert!(
+            poison.is_poisoned(),
+            "Eventual-mode fsync failure must poison the latch"
+        );
     }
 }

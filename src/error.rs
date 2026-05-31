@@ -61,6 +61,11 @@ pub enum Error {
     /// An I/O or format error during persistence operations (WAL or checkpoint).
     #[error("persistence error: {0}")]
     Persistence(String),
+    /// The store has been poisoned by a durability failure (a WAL write or
+    /// fsync failed). All subsequent writes are refused; recover by dropping
+    /// the `Store` and re-creating it via `Store::recover`.
+    #[error("store poisoned by a durability failure: {0}")]
+    Poisoned(String),
     /// Table not registered in the type registry (required for persistence).
     #[error("table '{0}' not registered in type registry")]
     TableNotRegistered(String),
@@ -175,6 +180,15 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "serialization failure on table 'accounts' (conflicting version 5)"
+        );
+    }
+
+    #[test]
+    fn error_poisoned_displays() {
+        let e = Error::Poisoned("WAL fsync failed: disk error".to_string());
+        assert_eq!(
+            e.to_string(),
+            "store poisoned by a durability failure: WAL fsync failed: disk error"
         );
     }
 }
