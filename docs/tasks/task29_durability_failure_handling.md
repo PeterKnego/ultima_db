@@ -1,4 +1,8 @@
-# Task 28: Durability Failure Handling
+# Task 29: Durability Failure Handling
+
+> Composes with [task28_eventual_durability_watermark.md](task28_eventual_durability_watermark.md),
+> which landed in parallel and also rewrites the WAL background thread. See
+> "Composition with the durable-version watermark" below for how the two unify.
 
 ## Summary
 
@@ -89,6 +93,27 @@ the file contents.
   redb's `needs_recovery` model rather than sled's `process::abort()`.
 - **No fsyncgate EIO-retry.** The first fsync failure is treated as fatal, matching every
   database surveyed.
+
+## Composition with the durable-version watermark (task28)
+
+task28 added `WalDurability`, a version-keyed durability **watermark**
+(`publish`/`publish_error`/`wait`/`on_complete`, plus `Store::durable_version`/
+`wait_durable`/`on_durable`) running alongside the Consistent epoch path. Both features
+modify the WAL background thread, so they are unified in `spawn_wal_thread`:
+
+- **Successful batch:** advance the Consistent epoch (this task) **and**
+  `durability.publish(hwm)` (task28), where `hwm` is the batch's high-water version.
+- **Failed append/fsync:** **poison is authoritative** (this task) — `poison.poison(..)`
+  latches the store, then `durability.publish_error(hwm, ..)` surfaces the error to
+  watermark waiters at/below `hwm`, the thread stops, and `durability.close()` (after the
+  loop / in `WalHandle::drop`) releases any watermark waiter parked above `hwm`.
+
+This supersedes task28's original "transient" failure policy (its open item: "a failed
+fsync poisons waiters only transiently … if a terminal-on-failure policy is preferred,
+it's a small change to `publish_error`"). With this task that policy is now terminal: any
+fsync failure poisons the store, so `durable_version()` simply stops advancing and every
+durability waiter resolves `Err`. The watermark remains fully additive for the
+success-path Eventual/Consistent use cases task28 targets.
 
 ## Known limitations
 

@@ -461,6 +461,174 @@ impl WalSink for FileSink {
 }
 
 // ---------------------------------------------------------------------------
+// WalDurability — version-keyed durability watermark (task28)
+// ---------------------------------------------------------------------------
+
+/// A one-shot durability callback, fired with `Ok(())` once the target version
+/// is fsynced or `Err(_)` if the fsync failed / the WAL closed first.
+type DurabilityCallback = Box<dyn FnOnce(Result<()>) + Send>;
+
+/// Tracks the highest commit version whose WAL bytes are fsync-durable, and
+/// lets callers wait on (or be notified of) an arbitrary target version.
+///
+/// Unlike [`WalSyncState`] (which counts entries via opaque epochs for the
+/// Consistent-mode `commit()` wait), this is keyed by the same `version` that
+/// `commit()` returns, so an Eventual-mode caller can learn after the fact
+/// when a version it already committed became durable. Strictly additive: it
+/// runs in both durability modes and changes no existing behavior.
+pub(crate) struct WalDurability {
+    /// Highest version known fsync-durable. Monotonic; only ever advances.
+    durable_version: std::sync::atomic::AtomicU64,
+    /// Set when the background thread is gone; releases parked waiters so they
+    /// cannot block forever on a version that will never be reached.
+    closed: std::sync::atomic::AtomicBool,
+    inner: std::sync::Mutex<DurabilityWaiters>,
+    condvar: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct DurabilityWaiters {
+    /// Parked callbacks: `(target_version, callback)`. Fired once the watermark
+    /// reaches `target_version` (or an error/close covers it).
+    callbacks: Vec<(u64, DurabilityCallback)>,
+    /// Sticky fsync error, recorded for the highest version that failed.
+    /// Waiters at/below this version resolve to `Err`.
+    last_error: Option<(u64, String)>,
+}
+
+impl WalDurability {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            durable_version: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            inner: std::sync::Mutex::new(DurabilityWaiters::default()),
+            condvar: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Highest version known to be fsync-durable.
+    pub(crate) fn current(&self) -> u64 {
+        self.durable_version
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Called by the background writer after a successful batch fsync. `version`
+    /// is the high-water mark of the batch (max successfully-written version).
+    fn publish(&self, version: u64) {
+        use std::sync::atomic::Ordering;
+        let ready = {
+            let mut w = self.inner.lock().unwrap();
+            let new = self.durable_version.load(Ordering::Acquire).max(version);
+            // Store under the mutex so a concurrent `wait`/`on_complete` cannot
+            // observe the old watermark and then miss the notify (lost wakeup).
+            self.durable_version.store(new, Ordering::Release);
+            self.condvar.notify_all();
+            drain_le(&mut w.callbacks, new)
+        };
+        for cb in ready {
+            cb(Ok(()));
+        }
+    }
+
+    /// Called by the background writer when a batch fsync fails. Waiters at or
+    /// below `version` resolve to `Err`; the watermark is NOT advanced.
+    fn publish_error(&self, version: u64, msg: String) {
+        let ready = {
+            let mut w = self.inner.lock().unwrap();
+            match &w.last_error {
+                Some((ev, _)) if *ev >= version => {}
+                _ => w.last_error = Some((version, msg.clone())),
+            }
+            self.condvar.notify_all();
+            drain_le(&mut w.callbacks, version)
+        };
+        for cb in ready {
+            cb(Err(Error::Persistence(msg.clone())));
+        }
+    }
+
+    /// Release all parked waiters (the background thread is gone).
+    fn close(&self) {
+        use std::sync::atomic::Ordering;
+        let ready = {
+            let mut w = self.inner.lock().unwrap();
+            self.closed.store(true, Ordering::Release);
+            self.condvar.notify_all();
+            std::mem::take(&mut w.callbacks)
+        };
+        for (_, cb) in ready {
+            cb(Err(Error::Persistence(
+                "WAL closed before version became durable".into(),
+            )));
+        }
+    }
+
+    /// Block until `version` is durable. Returns `Err` if a covering fsync
+    /// failed or the WAL closed first.
+    pub(crate) fn wait(&self, version: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut guard = self.inner.lock().unwrap();
+        loop {
+            if self.durable_version.load(Ordering::Acquire) >= version {
+                return Ok(());
+            }
+            if let Some((ev, msg)) = &guard.last_error
+                && *ev >= version
+            {
+                return Err(Error::Persistence(msg.clone()));
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Persistence(
+                    "WAL closed before version became durable".into(),
+                ));
+            }
+            guard = self.condvar.wait(guard).unwrap();
+        }
+    }
+
+    /// Register `cb` to fire once `version` is durable. Fires inline (on the
+    /// calling thread) if already durable, already errored, or already closed.
+    pub(crate) fn on_complete(&self, version: u64, cb: DurabilityCallback) {
+        use std::sync::atomic::Ordering;
+        let mut w = self.inner.lock().unwrap();
+        if self.durable_version.load(Ordering::Acquire) >= version {
+            drop(w);
+            cb(Ok(()));
+            return;
+        }
+        if let Some((ev, msg)) = &w.last_error
+            && *ev >= version
+        {
+            let msg = msg.clone();
+            drop(w);
+            cb(Err(Error::Persistence(msg)));
+            return;
+        }
+        if self.closed.load(Ordering::Acquire) {
+            drop(w);
+            cb(Err(Error::Persistence("WAL closed".into())));
+            return;
+        }
+        w.callbacks.push((version, cb));
+    }
+}
+
+/// Remove and return every callback whose target version is `<= version`.
+/// Order is irrelevant (each callback is independent), so `swap_remove` is fine.
+fn drain_le(callbacks: &mut Vec<(u64, DurabilityCallback)>, version: u64) -> Vec<DurabilityCallback> {
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < callbacks.len() {
+        if callbacks[i].0 <= version {
+            ready.push(callbacks.swap_remove(i).1);
+        } else {
+            i += 1;
+        }
+    }
+    ready
+}
+
+// ---------------------------------------------------------------------------
 // WalHandle — background-thread WAL writer for both modes
 // ---------------------------------------------------------------------------
 
@@ -478,7 +646,11 @@ pub(crate) struct WalHandle {
     bg_thread: Option<thread::JoinHandle<()>>,
     consistent: bool,
     sync_state: Option<Arc<WalSyncState>>,
+    /// Poison latch (task29): any append/fsync failure latches this and the
+    /// store refuses further writes. Authoritative on failure.
     poison: Arc<WalPoison>,
+    /// Version-keyed durability watermark (task28). Present in both modes.
+    durability: Arc<WalDurability>,
     /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -518,12 +690,22 @@ impl WalHandle {
             None
         };
 
+        let durability = WalDurability::new();
+
         let (tx, rx) = mpsc::channel::<WalEntry>();
         let bg_in_flight = in_flight.clone();
         let bg_sync_state = sync_state.clone();
         let bg_poison = poison.clone();
+        let bg_durability = durability.clone();
 
-        let handle = spawn_wal_thread(sink, rx, bg_in_flight, bg_sync_state, bg_poison);
+        let handle = spawn_wal_thread(
+            sink,
+            rx,
+            bg_in_flight,
+            bg_sync_state,
+            bg_poison,
+            bg_durability,
+        );
 
         Self {
             sender: Some(tx),
@@ -531,6 +713,7 @@ impl WalHandle {
             consistent,
             sync_state,
             poison,
+            durability,
             in_flight,
         }
     }
@@ -567,6 +750,17 @@ impl WalHandle {
     pub fn pending_writes(&self) -> u64 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Highest commit version known to be fsync-durable (task28).
+    pub fn durable_version(&self) -> u64 {
+        self.durability.current()
+    }
+
+    /// Shared handle to the durability watermark, so callers can wait/register
+    /// without holding any store lock during the (potentially blocking) wait.
+    pub fn durability(&self) -> Arc<WalDurability> {
+        Arc::clone(&self.durability)
+    }
 }
 
 /// Background WAL writer loop. Drains a batch, writes it, fsyncs once, and
@@ -578,6 +772,7 @@ fn spawn_wal_thread<S: WalSink + 'static>(
     in_flight: Arc<std::sync::atomic::AtomicU64>,
     sync_state: Option<Arc<WalSyncState>>,
     poison: Arc<WalPoison>,
+    durability: Arc<WalDurability>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(first) = rx.recv() {
@@ -586,6 +781,10 @@ fn spawn_wal_thread<S: WalSink + 'static>(
                 batch.push(entry);
             }
             let count = batch.len() as u64;
+            // Batch high-water mark: the max version in the batch. Entries
+            // arrive in commit order, so this is the last one, but `max` is
+            // robust regardless. Used to advance / error the watermark.
+            let hwm = batch.iter().map(|e| e.version).max().unwrap_or(0);
 
             // Write every entry, then fsync once. Any error means this batch
             // is NOT durable.
@@ -600,7 +799,7 @@ fn spawn_wal_thread<S: WalSink + 'static>(
 
             match result {
                 Ok(()) => {
-                    // Batch is durable — release its waiters.
+                    // Batch is durable — release Consistent epoch waiters...
                     if let Some(state) = &sync_state {
                         let _guard = state.mu.lock().unwrap();
                         state
@@ -608,19 +807,31 @@ fn spawn_wal_thread<S: WalSink + 'static>(
                             .fetch_add(count, std::sync::atomic::Ordering::Release);
                         state.condvar.notify_all();
                     }
+                    // ...and advance the version-keyed watermark (task28).
+                    durability.publish(hwm);
                 }
                 Err(e) => {
-                    // Poison, wake any waiters so they observe it, and stop.
-                    // The epoch is NOT advanced: this batch never reached disk.
-                    poison.poison(format!("WAL durability failure: {e}"));
+                    // Poison is authoritative (task29): latch the store, wake
+                    // epoch waiters so they observe it, surface the error to
+                    // watermark waiters at/below hwm, and stop the thread. The
+                    // epoch/watermark are NOT advanced: this batch never reached
+                    // disk. `durability.close()` after the loop releases any
+                    // watermark waiter parked above hwm.
+                    let msg = format!("WAL durability failure: {e}");
+                    poison.poison(msg.clone());
                     if let Some(state) = &sync_state {
                         let _guard = state.mu.lock().unwrap();
                         state.condvar.notify_all();
                     }
-                    return;
+                    durability.publish_error(hwm, msg);
+                    break;
                 }
             }
         }
+        // Normal shutdown or post-failure stop: release any watermark waiter
+        // parked on a version that will never be reached. Idempotent with the
+        // `close()` in `WalHandle::drop`.
+        durability.close();
     })
 }
 
@@ -629,10 +840,15 @@ impl Drop for WalHandle {
         // Drop the sender first so the background thread's recv() loop exits
         // after draining pending entries.
         self.sender.take();
-        // Join the background thread to ensure all entries are fsynced.
+        // Join the background thread to ensure all entries are fsynced. By the
+        // time this returns, every queued entry has been published to the
+        // watermark.
         if let Some(handle) = self.bg_thread.take() {
             let _ = handle.join();
         }
+        // Release any waiter parked on a version that was never committed, so
+        // it cannot block forever now that the writer is gone.
+        self.durability.close();
     }
 }
 
@@ -1047,6 +1263,176 @@ mod tests {
         w.wait().unwrap();
         // After wait + bg thread sync, pending should be 0 (eventually).
         drop(handle);
+    }
+
+    // --- task28: version-keyed durability watermark ---------------------------
+
+    /// In Eventual mode there is no `SyncWaiter`, but the watermark still lets a
+    /// caller observe when a committed version became fsync-durable.
+    #[test]
+    fn durability_watermark_advances_in_eventual_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        for v in 1..=3u64 {
+            handle.write(WalEntry { version: v, ops: vec![] }).unwrap();
+        }
+        // Deterministic: block until the bg thread publishes v3.
+        handle.durability().wait(3).unwrap();
+        assert!(handle.durable_version() >= 3);
+    }
+
+    /// The watermark tracks the high-water version of each fsynced batch in
+    /// Consistent mode too (additive — does not disturb the SyncWaiter path).
+    #[test]
+    fn durability_watermark_advances_in_consistent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
+        let w = handle.write(WalEntry { version: 7, ops: vec![] }).unwrap();
+        w.wait().unwrap();
+        handle.durability().wait(7).unwrap();
+        assert!(handle.durable_version() >= 7);
+    }
+
+    /// Waiting on an already-durable version returns immediately (no block).
+    #[test]
+    fn wait_durable_on_already_durable_is_immediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        let dur = handle.durability();
+        dur.wait(1).unwrap();
+        // Second wait on the same (already-durable) version must not block.
+        dur.wait(1).unwrap();
+    }
+
+    /// `on_complete` fires exactly once, with `Ok`, after the version is durable.
+    #[test]
+    fn on_complete_fires_once_after_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        let (tx, rx) = mpsc::channel();
+        handle
+            .durability()
+            .on_complete(1, Box::new(move |res| tx.send(res).unwrap()));
+        handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        // Ensure the publish has happened, then the callback must have fired Ok.
+        handle.durability().wait(1).unwrap();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("callback did not fire");
+        assert!(got.is_ok());
+        // Exactly once: no second delivery.
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+    }
+
+    /// `on_complete` fires inline (on the calling thread) when already durable.
+    #[test]
+    fn on_complete_fires_inline_when_already_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
+        handle.durability().wait(1).unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = Arc::clone(&fired);
+        handle.durability().on_complete(1, Box::new(move |res| {
+            assert!(res.is_ok());
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        // Inline: already set before on_complete returned.
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A waiter parked on a version that is never written is released with an
+    /// error when the WAL closes (handle dropped), rather than blocking forever.
+    #[test]
+    fn close_releases_parked_waiter_with_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        let (tx, rx) = mpsc::channel();
+        handle
+            .durability()
+            .on_complete(999, Box::new(move |res| tx.send(res).unwrap()));
+        drop(handle); // joins bg thread, then close() drains parked waiters.
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("callback did not fire on close");
+        assert!(got.is_err());
+    }
+
+    /// A thread blocked in `wait()` on an unreachable version unblocks with an
+    /// error when the handle is dropped.
+    #[test]
+    fn wait_unblocks_with_err_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        let dur = handle.durability();
+        let waiter = thread::spawn(move || dur.wait(999));
+        // Give the waiter time to park on the condvar, then close.
+        thread::sleep(std::time::Duration::from_millis(50));
+        drop(handle);
+        let res = waiter.join().unwrap();
+        assert!(res.is_err());
+    }
+
+    /// A failed fsync poisons waiters at/below the attempted high-water version
+    /// without advancing the watermark.
+    #[test]
+    fn publish_error_poisons_waiters_without_advancing() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
+        let dur = handle.durability();
+        // Drive the watermark primitive directly: simulate a failed batch fsync.
+        dur.publish_error(5, "disk full".into());
+        assert_eq!(dur.current(), 0, "watermark must not advance on error");
+        let err = dur.wait(3).unwrap_err();
+        assert!(matches!(err, Error::Persistence(_)));
+        // A later successful fsync still advances and resolves higher versions.
+        dur.publish(6);
+        assert_eq!(dur.current(), 6);
+        dur.wait(6).unwrap();
+    }
+
+    /// End-to-end through the public `Store` API in Eventual mode: a committed
+    /// version becomes observably durable via `wait_durable`/`durable_version`.
+    #[test]
+    fn store_wait_durable_eventual_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(crate::StoreConfig {
+            persistence: crate::Persistence::Standalone {
+                dir: dir.path().to_path_buf(),
+                durability: crate::Durability::Eventual,
+            },
+            ..crate::StoreConfig::default()
+        })
+        .unwrap();
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User { name: "Alice".into(), age: 30 })
+            .unwrap();
+        let v = wtx.commit().unwrap();
+
+        // Eventual commit returned without blocking on fsync; now await durability.
+        store.wait_durable(v).unwrap();
+        assert!(store.durable_version() >= v);
+
+        // on_durable fires inline now that v is durable.
+        let (tx, rx) = mpsc::channel();
+        store.on_durable(v, move |res| tx.send(res).unwrap());
+        assert!(rx.recv().unwrap().is_ok());
+    }
+
+    /// Without a Standalone WAL the durability accessors are no-ops: there is no
+    /// WAL-level durability to await.
+    #[test]
+    fn store_durability_accessors_noop_without_wal() {
+        let store = Store::new(crate::StoreConfig::default()).unwrap(); // Persistence::None
+        assert_eq!(store.durable_version(), 0);
+        store.wait_durable(5).unwrap();
+        let (tx, rx) = mpsc::channel();
+        store.on_durable(5, move |res| tx.send(res).unwrap());
+        assert!(rx.recv().unwrap().is_ok());
     }
 
     /// Truncated entry at end of WAL file (simulates crash during write).

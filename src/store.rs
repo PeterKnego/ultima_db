@@ -430,6 +430,61 @@ impl Store {
         inner.wal_handle.as_ref().map_or(0, |h| h.pending_writes())
     }
 
+    /// Highest committed version known to be fsync-durable (task28).
+    ///
+    /// In `Durability::Eventual` this trails [`Store::latest_version`] by up to
+    /// the background batch window; in `Consistent` it trails by ~one in-flight
+    /// batch. Without a `Standalone` WAL (i.e. `Persistence::None` / `Smr`, where
+    /// durability is provided elsewhere) this returns 0.
+    #[cfg(feature = "persistence")]
+    pub fn durable_version(&self) -> u64 {
+        let inner = self.inner.read().unwrap();
+        inner.wal_handle.as_ref().map_or(0, |h| h.durable_version())
+    }
+
+    /// Block until `version` is fsync-durable.
+    ///
+    /// Returns immediately for an already-durable version. Returns
+    /// `Err(Error::Persistence)` if a covering fsync failed or the WAL closed
+    /// before reaching `version`. Without a `Standalone` WAL this is a no-op
+    /// (`Ok(())`) — there is no WAL-level durability to await.
+    ///
+    /// Does not hold any store lock while blocking: reads and writes proceed.
+    #[cfg(feature = "persistence")]
+    pub fn wait_durable(&self, version: u64) -> Result<()> {
+        let durability = {
+            let inner = self.inner.read().unwrap();
+            inner.wal_handle.as_ref().map(|h| h.durability())
+        };
+        match durability {
+            Some(d) => d.wait(version),
+            None => Ok(()),
+        }
+    }
+
+    /// Register `cb` to fire once `version` is fsync-durable.
+    ///
+    /// Fires inline on the calling thread if `version` is already durable (or
+    /// already failed / WAL closed). Otherwise fires later on the background
+    /// WAL thread. Without a `Standalone` WAL it fires inline with `Ok(())`.
+    ///
+    /// Intended for the Eventual hot path: `commit()` returns a version without
+    /// blocking, and a durability ack is delivered out-of-band via this hook.
+    #[cfg(feature = "persistence")]
+    pub fn on_durable<F>(&self, version: u64, cb: F)
+    where
+        F: FnOnce(Result<()>) + Send + 'static,
+    {
+        let durability = {
+            let inner = self.inner.read().unwrap();
+            inner.wal_handle.as_ref().map(|h| h.durability())
+        };
+        match durability {
+            Some(d) => d.on_complete(version, Box::new(cb)),
+            None => cb(Ok(())),
+        }
+    }
+
     /// Register a table type for persistence. Must be called before any
     /// transactions that touch this table, and before [`Store::open`] or
     /// [`Store::checkpoint`].
