@@ -8,7 +8,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
 use crate::{JournalError, Notifier};
-use writer::{AppendRequest, Writer, WriterState};
+use writer::{AppendRequest, SeqWatermark, Writer, WriterState};
 
 #[derive(Debug, Clone)]
 pub struct JournalConfig {
@@ -30,6 +30,8 @@ impl JournalConfig {
 pub struct Journal {
     pub(crate) state: Arc<Mutex<WriterState>>,
     writer: Mutex<Option<Writer>>,
+    /// Fsync-durable sequence watermark (task28).
+    durability: Arc<SeqWatermark>,
 }
 
 impl Journal {
@@ -119,10 +121,12 @@ impl Journal {
             last_seq,
             first_seq,
         }));
-        let writer = Writer::spawn(Arc::clone(&state));
+        let durability = SeqWatermark::new();
+        let writer = Writer::spawn(Arc::clone(&state), Arc::clone(&durability));
         Ok(Self {
             state,
             writer: Mutex::new(Some(writer)),
+            durability,
         })
     }
 
@@ -132,6 +136,37 @@ impl Journal {
 
     pub fn last_seq(&self) -> Option<u64> {
         self.state.lock().unwrap().last_seq
+    }
+
+    /// Highest seq known to be fsync-durable (task28).
+    ///
+    /// In `Durability::Eventual` this trails [`Journal::last_seq`] by up to the
+    /// idle-fsync interval; in `Consistent` it trails by ~one in-flight batch.
+    /// Returns 0 before anything is durable.
+    pub fn durable_seq(&self) -> u64 {
+        self.durability.current()
+    }
+
+    /// Block until `seq` is fsync-durable.
+    ///
+    /// Returns immediately for an already-durable seq. Returns `Err` if a
+    /// covering fsync failed or the journal closed before reaching `seq`.
+    /// Holds no journal lock while blocking.
+    pub fn wait_durable(&self, seq: u64) -> Result<(), JournalError> {
+        self.durability.wait(seq)
+    }
+
+    /// Register `cb` to fire once `seq` is fsync-durable.
+    ///
+    /// Fires inline on the calling thread if `seq` is already durable (or
+    /// already failed / journal closed). Otherwise fires later on the writer
+    /// thread. This is the durability hook for `Durability::Eventual`, where
+    /// `append`'s own [`Notifier`] resolves at the buffered write, not fsync.
+    pub fn on_durable<F>(&self, seq: u64, cb: F)
+    where
+        F: FnOnce(Result<(), JournalError>) + Send + 'static,
+    {
+        self.durability.on_complete(seq, Box::new(cb));
     }
 
     /// Append a record.  Monotonicity is validated here under the state lock so
@@ -395,6 +430,11 @@ impl Drop for Journal {
                 let _ = h.join();
             }
         }
+        drop(g);
+        // The writer thread is gone and every queued batch has been published.
+        // Release any waiter parked on a seq that was never written so it cannot
+        // block forever (task28). Idempotent if close() already ran.
+        self.durability.close();
     }
 }
 
@@ -896,5 +936,100 @@ mod tests {
         let read_count = reader.join().unwrap();
         assert!(read_count > 0);
         assert_eq!(j.last_seq(), Some(200));
+    }
+
+    // --- task28: durable_seq watermark ---------------------------------------
+
+    /// In Consistent mode every append is fsynced, so the watermark reaches the
+    /// last appended seq once its Notifier resolves.
+    #[test]
+    fn durable_seq_advances_in_consistent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=5u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        assert!(j.durable_seq() >= 5);
+        j.wait_durable(5).unwrap();
+    }
+
+    /// In Eventual mode the append Notifier resolves before fsync, but the
+    /// watermark still lets a caller observe durability — advanced by the
+    /// idle-timer fsync. `wait_durable` blocks until that fsync lands.
+    #[test]
+    fn durable_seq_advances_in_eventual_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Eventual;
+        let j = Journal::open(cfg).unwrap();
+        for i in 1..=3u64 {
+            j.append(i, 0, b"x").unwrap();
+        }
+        // Deterministic: block until the idle-timer fsync publishes seq 3.
+        j.wait_durable(3).unwrap();
+        assert!(j.durable_seq() >= 3);
+    }
+
+    /// `wait_durable` on an already-durable seq returns immediately.
+    #[test]
+    fn wait_durable_already_durable_is_immediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 0, b"x").unwrap().wait().unwrap();
+        j.wait_durable(1).unwrap();
+        j.wait_durable(1).unwrap(); // second call must not block
+    }
+
+    /// `on_durable` fires exactly once with `Ok` after the seq becomes durable.
+    #[test]
+    fn on_durable_fires_once_after_fsync() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Eventual;
+        let j = Journal::open(cfg).unwrap();
+        let (tx, rx) = mpsc::channel();
+        j.on_durable(1, move |res| tx.send(res).unwrap());
+        j.append(1, 0, b"x").unwrap();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("callback did not fire");
+        assert!(got.is_ok());
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+    }
+
+    /// `on_durable` fires inline when the seq is already durable.
+    #[test]
+    fn on_durable_fires_inline_when_already_durable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 0, b"x").unwrap().wait().unwrap();
+        j.wait_durable(1).unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&fired);
+        j.on_durable(1, move |res| {
+            assert!(res.is_ok());
+            f2.store(true, Ordering::SeqCst);
+        });
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    /// A waiter parked on a seq that is never written is released with `Err`
+    /// when the journal is dropped, rather than blocking forever.
+    #[test]
+    fn close_releases_parked_waiter_with_err() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Eventual;
+        let j = Journal::open(cfg).unwrap();
+        let (tx, rx) = mpsc::channel();
+        j.on_durable(999, move |res| tx.send(res).unwrap());
+        drop(j); // joins writer, then close() drains parked waiters.
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("callback did not fire on close");
+        assert!(matches!(got, Err(JournalError::Closed)));
     }
 }
