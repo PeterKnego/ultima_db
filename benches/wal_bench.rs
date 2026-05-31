@@ -23,8 +23,11 @@ const SIZES: &[usize] = &[1024, 2048, 4096, 8192, 16384];
 const EVENTUAL_BATCH: u64 = 256;
 
 /// Sinks under test. Entries are added as each sink lands (Tasks 4/6/7).
-const KINDS: &[(&str, WalSinkKind)] =
-    &[("fswrite", WalSinkKind::FsWrite), ("buffered", WalSinkKind::BufferedFile)];
+const KINDS: &[(&str, WalSinkKind)] = &[
+    ("fswrite", WalSinkKind::FsWrite),
+    ("buffered", WalSinkKind::BufferedFile),
+    ("mmap", WalSinkKind::Mmap),
+];
 
 /// Build a single-op WAL entry whose payload is `payload` bytes.
 fn make_entry(version: u64, payload: usize) -> WalEntry {

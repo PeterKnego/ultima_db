@@ -463,6 +463,10 @@ pub enum WalSinkKind {
     FsWrite,
     /// Coalesced single `write` per batch + `fdatasync`.
     BufferedFile,
+    /// Pre-sized mmap sink (experimental, bench-only). memcpy into the mapped
+    /// region; msync on flush; truncate to logical length on Drop.
+    #[cfg(feature = "bench-internals")]
+    Mmap,
 }
 
 /// Production sink: appends framed entries to a file and fsyncs it.
@@ -529,6 +533,97 @@ impl WalSink for BufferedFileSink {
             self.buf.clear(); // retains capacity for the next batch
         }
         self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MmapSink — experimental mmap-based WAL sink (bench-only, feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Pre-sized mmap sink (experimental, bench-only). `append` memcpys framed bytes
+/// into the mapped region at a tracked write head; `sync` `msync`s the map.
+///
+/// NOT safe with `prune_wal`/checkpoint (truncating the file under the mapping
+/// risks SIGBUS). Assumes it opens an empty/clean file (the bench uses a fresh
+/// dir per iteration). On clean `Drop` the file is truncated to the logical
+/// write head; a crash leaves a zero tail that `read_wal` treats as end-of-log.
+#[cfg(feature = "bench-internals")]
+struct MmapSink {
+    file: File,
+    map: memmap2::MmapMut,
+    write_head: usize,
+    capacity: usize,
+}
+
+#[cfg(feature = "bench-internals")]
+const MMAP_GROW_QUANTUM: u64 = 8 * 1024 * 1024;
+
+#[cfg(feature = "bench-internals")]
+impl MmapSink {
+    fn open(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        let wal_path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&wal_path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        let existing = file.metadata().map_err(|e| Error::Persistence(e.to_string()))?.len();
+        let capacity = ((existing / MMAP_GROW_QUANTUM) + 1) * MMAP_GROW_QUANTUM;
+        file.set_len(capacity).map_err(|e| Error::Persistence(e.to_string()))?;
+        // SAFETY: MmapSink owns `file` exclusively; no other handle aliases this
+        // mapping, and (per this sink's bench-only contract) there are no concurrent
+        // writers to the backing file.
+        let map = unsafe { memmap2::MmapMut::map_mut(&file).map_err(|e| Error::Persistence(e.to_string()))? };
+        Ok(MmapSink { file, map, write_head: existing as usize, capacity: capacity as usize })
+    }
+
+    /// Grow the file + remap if `extra` more bytes would not fit.
+    fn ensure_capacity(&mut self, extra: usize) -> Result<()> {
+        if self.write_head + extra <= self.capacity {
+            return Ok(());
+        }
+        let needed = (self.write_head + extra) as u64;
+        let new_cap = ((needed / MMAP_GROW_QUANTUM) + 1) * MMAP_GROW_QUANTUM;
+        self.file.set_len(new_cap).map_err(|e| Error::Persistence(e.to_string()))?;
+        // Persist the new size before remapping so a crash can't expose a hole.
+        self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))?;
+        // SAFETY: the old mapping is replaced atomically (the assignment drops
+        // the previous MmapMut before the new one is established); `self.file`
+        // is the sole owner of the backing fd, and no concurrent accessor holds
+        // a reference into the old map at this point.
+        self.map = unsafe { memmap2::MmapMut::map_mut(&self.file).map_err(|e| Error::Persistence(e.to_string()))? };
+        self.capacity = new_cap as usize;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl WalSink for MmapSink {
+    fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        let framed = frame_entry(entry)?;
+        self.ensure_capacity(framed.len())?;
+        self.map[self.write_head..self.write_head + framed.len()].copy_from_slice(&framed);
+        self.write_head += framed.len();
+        Ok(())
+    }
+    fn sync(&mut self) -> Result<()> {
+        // MS_SYNC only the bytes actually written, not the whole pre-sized map.
+        self.map
+            .flush_range(0, self.write_head)
+            .map_err(|e| Error::Persistence(e.to_string()))
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for MmapSink {
+    fn drop(&mut self) {
+        let _ = self.map.flush();
+        let _ = self.file.set_len(self.write_head as u64);
+        let _ = self.file.sync_all();
     }
 }
 
@@ -748,6 +843,8 @@ impl WalHandle {
             WalSinkKind::BufferedFile => {
                 Ok(Self::with_sink(BufferedFileSink::open(dir)?, consistent, poison))
             }
+            #[cfg(feature = "bench-internals")]
+            WalSinkKind::Mmap => Ok(Self::with_sink(MmapSink::open(dir)?, consistent, poison)),
         }
     }
 
@@ -1850,6 +1947,40 @@ mod tests {
         let read = read_wal(&path).unwrap(); // must NOT return Err(WalCorrupted)
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].version, 7);
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn mmap_sink_roundtrips_via_read_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut sink = MmapSink::open(dir.path()).unwrap();
+            for v in 1..=5u64 {
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
+            }
+            sink.sync().unwrap();
+        } // Drop truncates to logical length + syncs
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len(), 5);
+        assert_eq!(read[4].version, 5);
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn mmap_sink_recovers_after_growing_past_quantum() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~9.6 MiB of records forces at least one grow past the 8 MiB quantum.
+        let n = 600u64;
+        {
+            let mut sink = MmapSink::open(dir.path()).unwrap();
+            for v in 1..=n {
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![0u8; 16 * 1024] }] }).unwrap();
+            }
+            sink.sync().unwrap();
+        }
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len() as u64, n);
+        assert_eq!(read[(n - 1) as usize].version, n);
     }
 
     /// Eventual mode has no waiter, but an fsync failure must still poison the

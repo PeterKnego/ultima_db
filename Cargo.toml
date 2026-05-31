@@ -15,13 +15,14 @@ fulltext = []
 metrics = ["dep:metrics"]
 persistence = ["dep:serde", "dep:bincode"]
 # Exposes internal handles (e.g. BenchWal) for the benches/ crate. Not a public API.
-bench-internals = ["persistence"]
+bench-internals = ["persistence", "dep:memmap2"]
 
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
 metrics = { version = "0.24", optional = true }
+memmap2 = { version = "0.9", optional = true }
 dashmap = "6"
 crc32fast = "1"
 
