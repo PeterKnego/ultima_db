@@ -16,6 +16,7 @@ metrics = ["dep:metrics"]
 persistence = ["dep:serde", "dep:bincode"]
 # Exposes internal handles (e.g. BenchWal) for the benches/ crate. Not a public API.
 bench-internals = ["persistence", "dep:memmap2"]
+wal-iouring = ["persistence", "dep:io-uring"]
 
 [dependencies]
 thiserror = "2"
@@ -25,6 +26,7 @@ metrics = { version = "0.24", optional = true }
 memmap2 = { version = "0.9", optional = true }
 dashmap = "6"
 crc32fast = "1"
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

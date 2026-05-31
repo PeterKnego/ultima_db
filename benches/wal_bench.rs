@@ -23,6 +23,16 @@ const SIZES: &[usize] = &[1024, 2048, 4096, 8192, 16384];
 const EVENTUAL_BATCH: u64 = 256;
 
 /// Sinks under test. Entries are added as each sink lands (Tasks 4/6/7).
+/// Array elements cannot carry cfg attributes, so we split into two const
+/// definitions selected by target and feature flags at compile time.
+#[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+const KINDS: &[(&str, WalSinkKind)] = &[
+    ("fswrite", WalSinkKind::FsWrite),
+    ("buffered", WalSinkKind::BufferedFile),
+    ("mmap", WalSinkKind::Mmap),
+    ("iouring", WalSinkKind::IoUring),
+];
+#[cfg(not(all(target_os = "linux", feature = "wal-iouring")))]
 const KINDS: &[(&str, WalSinkKind)] = &[
     ("fswrite", WalSinkKind::FsWrite),
     ("buffered", WalSinkKind::BufferedFile),

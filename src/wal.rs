@@ -467,6 +467,10 @@ pub enum WalSinkKind {
     /// region; msync on flush; truncate to logical length on Drop.
     #[cfg(feature = "bench-internals")]
     Mmap,
+    /// io_uring sink (experimental, bench-only, Linux). One `Write` + `Fsync(DATASYNC)`
+    /// chained with `IO_LINK` per `sync` call; submitted in a single `io_uring_enter`.
+    #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+    IoUring,
 }
 
 /// Production sink: appends framed entries to a file and fsyncs it.
@@ -624,6 +628,138 @@ impl Drop for MmapSink {
         let _ = self.map.flush();
         let _ = self.file.set_len(self.write_head as u64);
         let _ = self.file.sync_all();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IoUringSink — experimental io_uring-based WAL sink (Linux, wal-iouring feature)
+// ---------------------------------------------------------------------------
+
+/// io_uring sink (experimental, bench-only, Linux). `append` accumulates framed
+/// bytes; `sync` submits one `Write` + `Fsync(DATASYNC)` chained with `IO_LINK`
+/// in a single `io_uring_enter`, then waits on completion. Queue depth 8.
+///
+/// NOT safe with `prune_wal`/checkpoint. Writes at an explicit offset (not append
+/// mode). Same on-disk format as the file sinks.
+#[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+struct IoUringSink {
+    ring: io_uring::IoUring,
+    file: File,
+    offset: u64,
+    buf: Vec<u8>,
+}
+
+#[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+impl IoUringSink {
+    fn open(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        let wal_path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&wal_path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        let offset = file.metadata().map_err(|e| Error::Persistence(e.to_string()))?.len();
+        let ring = io_uring::IoUring::new(8).map_err(|e| Error::Persistence(e.to_string()))?;
+        Ok(IoUringSink { ring, file, offset, buf: Vec::new() })
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+impl WalSink for IoUringSink {
+    fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        self.buf.extend_from_slice(&frame_entry(entry)?);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(
+            self.buf.len() <= u32::MAX as usize,
+            "WAL batch exceeds io_uring single-write limit"
+        );
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let write_e = io_uring::opcode::Write::new(fd, self.buf.as_ptr(), self.buf.len() as u32)
+            .offset(self.offset)
+            .build()
+            .flags(io_uring::squeue::Flags::IO_LINK)
+            .user_data(1);
+        let fsync_e = io_uring::opcode::Fsync::new(fd)
+            .flags(io_uring::types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(2);
+        {
+            let mut sq = self.ring.submission();
+            // Ring depth is 8 and we push exactly 2 entries per call, draining
+            // the completion queue before returning, so the SQ is never full
+            // here. Assert to catch any regression to that invariant.
+            debug_assert!(!sq.is_full(), "io_uring submission queue unexpectedly full");
+            // SAFETY: `self.buf` outlives the submission — `submit_and_wait`
+            // below blocks until both ops complete, and we neither mutate nor
+            // free `buf` until after the completions are reaped. `fd` is valid
+            // for the lifetime of `self.file`.
+            unsafe {
+                sq.push(&write_e).map_err(|e| Error::Persistence(e.to_string()))?;
+                sq.push(&fsync_e).map_err(|e| Error::Persistence(e.to_string()))?;
+            }
+        }
+        // On a submit error the kernel may already have queued CQEs; drain them
+        // so the ring is clean for the next call.
+        self.ring.submit_and_wait(2).map_err(|e| {
+            let _ = self.ring.completion().collect::<Vec<_>>();
+            Error::Persistence(e.to_string())
+        })?;
+
+        // Reap both completions keyed by user_data (CQE order is not guaranteed
+        // to match submission order, even with IO_LINK).
+        let mut write_res: Option<i32> = None;
+        let mut fsync_res: Option<i32> = None;
+        for cqe in self.ring.completion() {
+            match cqe.user_data() {
+                1 => write_res = Some(cqe.result()),
+                2 => fsync_res = Some(cqe.result()),
+                other => {
+                    return Err(Error::Persistence(format!(
+                        "io_uring unexpected completion user_data={other}"
+                    )));
+                }
+            }
+        }
+
+        let write_res =
+            write_res.ok_or_else(|| Error::Persistence("io_uring missing write completion".into()))?;
+        if write_res < 0 {
+            return Err(Error::Persistence(format!(
+                "io_uring write failed: {}",
+                std::io::Error::from_raw_os_error(-write_res)
+            )));
+        }
+        match fsync_res {
+            None => return Err(Error::Persistence("io_uring missing fsync completion".into())),
+            Some(r) if r < 0 => {
+                return Err(Error::Persistence(format!(
+                    "io_uring fsync failed: {}",
+                    std::io::Error::from_raw_os_error(-r)
+                )));
+            }
+            Some(_) => {}
+        }
+        if write_res as usize != self.buf.len() {
+            return Err(Error::Persistence(format!(
+                "io_uring short write: {} of {}",
+                write_res,
+                self.buf.len()
+            )));
+        }
+        self.offset += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
     }
 }
 
@@ -845,6 +981,8 @@ impl WalHandle {
             }
             #[cfg(feature = "bench-internals")]
             WalSinkKind::Mmap => Ok(Self::with_sink(MmapSink::open(dir)?, consistent, poison)),
+            #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+            WalSinkKind::IoUring => Ok(Self::with_sink(IoUringSink::open(dir)?, consistent, poison)),
         }
     }
 
@@ -1981,6 +2119,30 @@ mod tests {
         let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
         assert_eq!(read.len() as u64, n);
         assert_eq!(read[(n - 1) as usize].version, n);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+    #[test]
+    fn iouring_sink_roundtrips_via_read_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut sink = IoUringSink::open(dir.path()).unwrap();
+            for v in 1..=5u64 {
+                sink.append(&WalEntry {
+                    version: v,
+                    ops: vec![WalOp::Insert {
+                        table: "t".into(),
+                        id: v,
+                        data: vec![v as u8; 32],
+                    }],
+                })
+                .unwrap();
+            }
+            sink.sync().unwrap();
+        }
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len(), 5);
+        assert_eq!(read[4].version, 5);
     }
 
     /// Eventual mode has no waiter, but an fsync failure must still poison the
