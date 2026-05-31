@@ -626,6 +626,23 @@ pub(crate) fn wal_path(dir: &Path) -> PathBuf {
     dir.join(WAL_FILENAME)
 }
 
+/// Fsync a directory so that file creations/renames within it are durable.
+///
+/// On Unix this opens the directory and calls `sync_all`. On platforms that
+/// do not support directory fsync (e.g. Windows) this is a no-op.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let f = File::open(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        f.sync_all().map_err(|e| Error::Persistence(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1064,5 +1081,13 @@ mod tests {
             Err(Error::Poisoned(msg)) => assert_eq!(msg, "first"),
             other => panic!("expected Poisoned, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_dir_on_normal_directory_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file so the directory is non-trivial.
+        std::fs::write(dir.path().join("x"), b"hello").unwrap();
+        assert!(sync_dir(dir.path()).is_ok());
     }
 }
