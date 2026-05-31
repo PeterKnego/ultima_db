@@ -1269,4 +1269,29 @@ mod tests {
             other => panic!("expected Err(Poisoned), got {other:?}"),
         }
     }
+
+    /// Eventual mode has no waiter, but an fsync failure must still poison the
+    /// shared latch so the store's next begin_write/commit is refused.
+    #[test]
+    fn wal_eventual_sync_failure_poisons() {
+        let poison = Arc::new(WalPoison::new());
+        let handle = WalHandle::with_sink(
+            FaultySink {
+                fail_sync_after: 0, // fail immediately
+                sync_count: 0,
+            },
+            false, // Eventual: write() returns SyncWaiter::Done
+            poison.clone(),
+        );
+        handle
+            .write(WalEntry { version: 1, ops: vec![] })
+            .unwrap();
+        // Dropping the handle joins the background thread, which by then has
+        // processed the entry, failed the fsync, and poisoned the latch.
+        drop(handle);
+        assert!(
+            poison.is_poisoned(),
+            "Eventual-mode fsync failure must poison the latch"
+        );
+    }
 }
