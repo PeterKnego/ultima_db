@@ -489,6 +489,42 @@ impl WalSink for FileSink {
     }
 }
 
+/// Coalescing sink: `append` frames into an in-memory buffer (no syscall);
+/// `sync` writes the whole batch in one `write` then `fdatasync`s. `fdatasync`
+/// persists the data and the file-size change but skips timestamp metadata.
+struct BufferedFileSink {
+    file: File,
+    buf: Vec<u8>,
+}
+
+impl BufferedFileSink {
+    fn open(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        let wal_path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        Ok(BufferedFileSink { file, buf: Vec::new() })
+    }
+}
+
+impl WalSink for BufferedFileSink {
+    fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        self.buf.extend_from_slice(&frame_entry(entry)?);
+        Ok(())
+    }
+    fn sync(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.file.write_all(&self.buf).map_err(|e| Error::Persistence(e.to_string()))?;
+            self.buf.clear(); // retains capacity for the next batch
+        }
+        self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WalDurability — version-keyed durability watermark (task28)
 // ---------------------------------------------------------------------------
@@ -703,7 +739,7 @@ impl WalHandle {
         match kind {
             WalSinkKind::FsWrite => Ok(Self::with_sink(FileSink::open(dir)?, consistent, poison)),
             WalSinkKind::BufferedFile => {
-                Err(Error::Persistence("BufferedFileSink not yet implemented".into()))
+                Ok(Self::with_sink(BufferedFileSink::open(dir)?, consistent, poison))
             }
         }
     }
@@ -1778,6 +1814,21 @@ mod tests {
         let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].version, 1);
+    }
+
+    #[test]
+    fn buffered_file_sink_roundtrips_via_read_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut sink = BufferedFileSink::open(dir.path()).unwrap();
+            for v in 1..=5u64 {
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
+            }
+            sink.sync().unwrap();
+        }
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len(), 5);
+        assert_eq!(read[4].version, 5);
     }
 
     /// Eventual mode has no waiter, but an fsync failure must still poison the
