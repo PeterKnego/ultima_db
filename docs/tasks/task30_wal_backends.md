@@ -42,7 +42,8 @@ end-of-log, which is necessary for `MmapSink`'s pre-sized zero tail.
   and `sync_all` is replaced by `fdatasync` (skips file-metadata sync). No unsafe.
 - **`MmapSink`** (`mmap`, bench-only/experimental): Pre-sizes the WAL file to a fixed capacity
   and memory-maps it. `append` copies bytes in via `memcpy` (safe slice assignment) and
-  advances a write cursor; `sync` calls `flush_range`/`msync(MS_SYNC)` over the dirty region.
+  advances a write cursor; `sync` calls `flush_range(0, write_head)`/`msync(MS_SYNC)` over
+  the entire written prefix `[0, write_head)`.
   Requires `unsafe`. Not safe with `prune_wal`/checkpoint (truncation under a live mapping
   causes SIGBUS).
 - **`IoUringSink`** (`iouring`, bench-only/experimental, Linux + `wal-iouring` feature):

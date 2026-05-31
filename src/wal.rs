@@ -365,12 +365,7 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
     // single truncate + write + sync to minimize the window of corruption.
     let mut buf = Vec::new();
     for entry in &remaining {
-        let data = serialize_entry(entry)?;
-        let len = data.len() as u32;
-        let checksum = crc32(&data);
-        buf.extend_from_slice(&len.to_le_bytes());
-        buf.extend_from_slice(&data);
-        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf.extend_from_slice(&frame_entry(entry)?);
     }
 
     let mut file = File::create(path).map_err(|e| Error::Persistence(e.to_string()))?;

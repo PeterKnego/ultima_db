@@ -22,7 +22,7 @@ const SIZES: &[usize] = &[1024, 2048, 4096, 8192, 16384];
 /// Number of entries per Eventual fire-and-forget batch.
 const EVENTUAL_BATCH: u64 = 256;
 
-/// Sinks under test. Entries are added as each sink lands (Tasks 4/6/7).
+/// Sinks under test (fs-write baseline, buffered, mmap, and io_uring when enabled).
 /// Array elements cannot carry cfg attributes, so we split into two const
 /// definitions selected by target and feature flags at compile time.
 #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
