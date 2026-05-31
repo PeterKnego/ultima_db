@@ -210,6 +210,7 @@ pub(crate) fn write_checkpoint(
         .map_err(|e| Error::Persistence(e.to_string()))?;
     drop(file);
     std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    crate::wal::sync_dir(dir)?;
 
     Ok(snapshot.version)
 }
@@ -632,5 +633,25 @@ mod tests {
         let tmp_path = dir.path().join("checkpoint_42.bin.tmp");
         assert!(final_path.exists());
         assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn write_checkpoint_dir_fsync_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::new(crate::StoreConfig {
+            persistence: crate::Persistence::Smr {
+                dir: dir.path().to_path_buf(),
+            },
+            ..crate::StoreConfig::default()
+        })
+        .unwrap();
+        store.register_table::<String>("t").unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t").unwrap().insert("x".into()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let v = store.checkpoint().unwrap();
+        assert!(dir.path().join(format!("checkpoint_{v}.bin")).exists());
     }
 }

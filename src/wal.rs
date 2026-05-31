@@ -368,6 +368,9 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
         .map_err(|e| Error::Persistence(e.to_string()))?;
     file.sync_all()
         .map_err(|e| Error::Persistence(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
     Ok(())
 }
 
