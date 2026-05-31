@@ -412,6 +412,33 @@ impl SyncWaiter {
 }
 
 // ---------------------------------------------------------------------------
+// WalSink — abstraction over the WAL's durable backing store
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the WAL's durable backing store, so failures can be
+/// injected in tests. `append` writes one entry; `sync` fsyncs.
+pub(crate) trait WalSink: Send {
+    fn append(&mut self, entry: &WalEntry) -> Result<()>;
+    fn sync(&mut self) -> Result<()>;
+}
+
+/// Production sink: appends framed entries to a file and fsyncs it.
+struct FileSink {
+    file: File,
+}
+
+impl WalSink for FileSink {
+    fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        write_entry_to_file(&mut self.file, entry)
+    }
+    fn sync(&mut self) -> Result<()> {
+        self.file
+            .sync_all()
+            .map_err(|e| Error::Persistence(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WalHandle — background-thread WAL writer for both modes
 // ---------------------------------------------------------------------------
 
@@ -429,19 +456,35 @@ pub(crate) struct WalHandle {
     bg_thread: Option<thread::JoinHandle<()>>,
     consistent: bool,
     sync_state: Option<Arc<WalSyncState>>,
+    poison: Arc<WalPoison>,
     /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WalHandle {
-    /// Create a new WAL handle. Opens (or creates) the WAL file.
-    /// Both modes use a background thread for batched writes.
-    pub fn new(dir: &Path, consistent: bool) -> Result<Self> {
+    /// Create a new WAL handle. Opens (or creates) the WAL file and fsyncs the
+    /// directory so the file's creation is durable. Both modes use a background
+    /// thread for batched writes.
+    pub fn new(dir: &Path, consistent: bool, poison: Arc<WalPoison>) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        Ok(Self::with_sink(FileSink { file }, consistent, poison))
+    }
 
+    /// Build a handle around an arbitrary sink. Used by `new` (FileSink) and by
+    /// tests (fault-injecting sinks).
+    pub(crate) fn with_sink<S: WalSink + 'static>(
+        sink: S,
+        consistent: bool,
+        poison: Arc<WalPoison>,
+    ) -> Self {
         let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
         let sync_state = if consistent {
             Some(Arc::new(WalSyncState {
                 next_epoch: std::sync::atomic::AtomicU64::new(1),
@@ -456,50 +499,18 @@ impl WalHandle {
         let (tx, rx) = mpsc::channel::<WalEntry>();
         let bg_in_flight = in_flight.clone();
         let bg_sync_state = sync_state.clone();
+        let bg_poison = poison.clone();
 
-        let handle = thread::spawn(move || {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&wal_path)
-                .expect("failed to open WAL file in background thread");
-            // Block on the first entry, then drain all queued entries
-            // so they share a single fsync.
-            while let Ok(first) = rx.recv() {
-                let mut count = 1u64;
-                if write_entry_to_file(&mut file, &first).is_err() {
-                    count = 0;
-                }
-                while let Ok(entry) = rx.try_recv() {
-                    count += 1;
-                    if write_entry_to_file(&mut file, &entry).is_err() {
-                        count -= 1;
-                    }
-                }
-                let _ = file.sync_all();
-                bg_in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
-                // Notify Consistent waiters that this batch is durable.
-                // The epoch update MUST happen inside the mutex to prevent
-                // lost wakeups: without it, a waiter could check fsynced_epoch
-                // (seeing the old value), then we update + notify before the
-                // waiter enters condvar.wait(), causing it to block forever.
-                if let Some(state) = &bg_sync_state {
-                    let _guard = state.mu.lock().unwrap();
-                    state
-                        .fsynced_epoch
-                        .fetch_add(count, std::sync::atomic::Ordering::Release);
-                    state.condvar.notify_all();
-                }
-            }
-        });
+        let handle = spawn_wal_thread(sink, rx, bg_in_flight, bg_sync_state, bg_poison);
 
-        Ok(Self {
+        Self {
             sender: Some(tx),
             bg_thread: Some(handle),
             consistent,
             sync_state,
+            poison,
             in_flight,
-        })
+        }
     }
 
     /// Submit a WAL entry to the background thread.
@@ -533,6 +544,38 @@ impl WalHandle {
     pub fn pending_writes(&self) -> u64 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Background WAL writer loop. Drains a batch, writes it, fsyncs once, and
+/// advances the synced epoch. (Failure handling is added in Task 5.)
+fn spawn_wal_thread<S: WalSink + 'static>(
+    mut sink: S,
+    rx: mpsc::Receiver<WalEntry>,
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
+    sync_state: Option<Arc<WalSyncState>>,
+    _poison: Arc<WalPoison>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            while let Ok(entry) = rx.try_recv() {
+                batch.push(entry);
+            }
+            let count = batch.len() as u64;
+            for entry in &batch {
+                let _ = sink.append(entry);
+            }
+            let _ = sink.sync();
+            in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+            if let Some(state) = &sync_state {
+                let _guard = state.mu.lock().unwrap();
+                state
+                    .fsynced_epoch
+                    .fetch_add(count, std::sync::atomic::Ordering::Release);
+                state.condvar.notify_all();
+            }
+        }
+    })
 }
 
 impl Drop for WalHandle {
@@ -871,7 +914,7 @@ mod tests {
     #[test]
     fn wal_handle_consistent_write() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), true).unwrap();
+        let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         let w1 = handle
             .write(WalEntry {
                 version: 1,
@@ -895,7 +938,7 @@ mod tests {
     #[test]
     fn wal_handle_eventual_write() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), false).unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         handle
             .write(WalEntry {
                 version: 1,
@@ -912,7 +955,7 @@ mod tests {
     #[test]
     fn wal_handle_pending_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), false).unwrap();
+        let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         assert_eq!(handle.pending_writes(), 0);
         handle
             .write(WalEntry {
@@ -929,7 +972,7 @@ mod tests {
     #[test]
     fn wal_handle_consistent_pending_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = WalHandle::new(dir.path(), true).unwrap();
+        let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         assert_eq!(handle.pending_writes(), 0);
         let w = handle
             .write(WalEntry {

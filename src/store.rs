@@ -237,7 +237,11 @@ impl Store {
         let wal_handle = match &config.persistence {
             crate::persistence::Persistence::Standalone { dir, durability } => {
                 let consistent = matches!(durability, crate::persistence::Durability::Consistent);
-                Some(crate::wal::WalHandle::new(dir, consistent)?)
+                Some(crate::wal::WalHandle::new(
+                    dir,
+                    consistent,
+                    std::sync::Arc::new(crate::wal::WalPoison::new()),
+                )?)
             }
             _ => None,
         };
