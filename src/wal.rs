@@ -308,6 +308,13 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
         let len = u32::from_le_bytes(all_bytes[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
+        if len == 0 {
+            // Clean end-of-log: a pre-sized (mmap) file leaves a zero tail after
+            // a crash, and a torn zero-length write is not a real record (every
+            // valid record frames a non-empty payload). Stop, do not error.
+            break;
+        }
+
         if offset + len + 4 > all_bytes.len() {
             // Truncated entry at end of file — stop (crash during write).
             break;
@@ -1829,6 +1836,20 @@ mod tests {
         let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
         assert_eq!(read.len(), 5);
         assert_eq!(read[4].version, 5);
+    }
+
+    #[test]
+    fn read_wal_stops_at_zero_length_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        // One valid record followed by a zero tail (as a pre-sized mmap crash leaves).
+        let mut bytes = frame_entry(&WalEntry { version: 7, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let read = read_wal(&path).unwrap(); // must NOT return Err(WalCorrupted)
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].version, 7);
     }
 
     /// Eventual mode has no waiter, but an fsync failure must still poison the
