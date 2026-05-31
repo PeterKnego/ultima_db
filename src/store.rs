@@ -186,6 +186,10 @@ pub(crate) struct StoreInner {
     /// WAL writer handle (persistence feature, Standalone mode only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_handle: Option<crate::wal::WalHandle>,
+    /// Poison latch set by the WAL background thread on a durability failure.
+    /// Shared with the WAL handle. Checked at begin_write/commit/checkpoint.
+    #[cfg(feature = "persistence")]
+    pub(crate) wal_poison: Arc<crate::wal::WalPoison>,
     /// Type registry for serialization (persistence feature only).
     #[cfg(feature = "persistence")]
     pub(crate) registry: Arc<crate::registry::TableRegistry>,
@@ -234,13 +238,15 @@ impl Store {
     /// or permission denied).
     pub fn new(config: StoreConfig) -> Result<Self> {
         #[cfg(feature = "persistence")]
+        let wal_poison = Arc::new(crate::wal::WalPoison::new());
+        #[cfg(feature = "persistence")]
         let wal_handle = match &config.persistence {
             crate::persistence::Persistence::Standalone { dir, durability } => {
                 let consistent = matches!(durability, crate::persistence::Durability::Consistent);
                 Some(crate::wal::WalHandle::new(
                     dir,
                     consistent,
-                    std::sync::Arc::new(crate::wal::WalPoison::new()),
+                    Arc::clone(&wal_poison),
                 )?)
             }
             _ => None,
@@ -264,6 +270,8 @@ impl Store {
                 committed_write_sets: Vec::new(),
                 #[cfg(feature = "persistence")]
                 wal_handle,
+                #[cfg(feature = "persistence")]
+                wal_poison,
                 #[cfg(feature = "persistence")]
                 registry: Arc::new(crate::registry::TableRegistry::default()),
                 #[cfg(all(test, feature = "persistence"))]
@@ -311,6 +319,9 @@ impl Store {
     /// snapshot, regardless of the assigned commit version.
     pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
         let mut inner = self.inner.write().unwrap();
+
+        #[cfg(feature = "persistence")]
+        inner.wal_poison.check()?;
 
         if inner.config.require_explicit_version && version.is_none() {
             return Err(Error::ExplicitVersionRequired);
@@ -446,6 +457,8 @@ impl Store {
     pub fn checkpoint(&self) -> Result<u64> {
         let (dir, snap, registry) = {
             let inner = self.inner.read().unwrap();
+            #[cfg(feature = "persistence")]
+            inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
                 crate::persistence::Persistence::Standalone { dir, .. }
                 | crate::persistence::Persistence::Smr { dir } => dir.clone(),
@@ -4325,6 +4338,41 @@ mod tests {
         // initial empty v0 snapshot). The key invariant: no panic or deadlock.
         let rtx = store.begin_read(None).unwrap();
         assert_eq!(rtx.version(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn poisoned_commit_returns_err_and_is_not_visible() {
+        let (store, mock) = store_with_mock_wal();
+        // Share the mock's poison with the store so begin_write sees it too.
+        store.inner.write().unwrap().wal_poison = mock.poison();
+
+        let ss = store.clone();
+        let t = std::thread::spawn(move || {
+            let mut wtx = ss.begin_write(None).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
+            wtx.commit() // blocks until fail()
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mock.fail();
+
+        let res = t.join().unwrap();
+        assert!(matches!(res, Err(Error::Poisoned(_))), "commit must fail");
+        // Snapshot must NOT be visible.
+        assert_eq!(store.latest_version(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn begin_write_fails_after_poison() {
+        let (store, mock) = store_with_mock_wal();
+        store.inner.write().unwrap().wal_poison = mock.poison();
+        mock.fail();
+        assert!(matches!(store.begin_write(None), Err(Error::Poisoned(_))));
     }
 
     #[test]
