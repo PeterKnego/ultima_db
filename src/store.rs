@@ -2145,11 +2145,11 @@ impl WriteTx {
             #[cfg(feature = "persistence")]
             {
                 if let Some(w) = waiter {
-                    w.wait();
+                    w.wait()?;
                 }
                 #[cfg(test)]
                 if let Some(w) = mock_waiter {
-                    w.wait();
+                    w.wait()?;
                 }
             }
             let mut inner = self.store_inner.write().unwrap();
@@ -2370,11 +2370,11 @@ impl WriteTx {
             #[cfg(feature = "persistence")]
             {
                 if let Some(w) = waiter {
-                    w.wait();
+                    w.wait()?;
                 }
                 #[cfg(test)]
                 if let Some(w) = mock_waiter {
-                    w.wait();
+                    w.wait()?;
                 }
             }
 
