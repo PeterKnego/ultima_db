@@ -447,9 +447,35 @@ pub(crate) trait WalSink: Send {
     fn sync(&mut self) -> Result<()>;
 }
 
+/// Selects which `WalSink` implementation a `WalHandle` uses. `FsWrite` is the
+/// production default; the others are experimental and bench-only.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalSinkKind {
+    /// Current behavior: 3 `write_all` per entry + `fsync` per batch.
+    FsWrite,
+    /// Coalesced single `write` per batch + `fdatasync`.
+    BufferedFile,
+}
+
 /// Production sink: appends framed entries to a file and fsyncs it.
 struct FileSink {
     file: File,
+}
+
+impl FileSink {
+    /// Open (creating if needed) the WAL file in `dir` for appending.
+    fn open(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        let wal_path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        Ok(FileSink { file })
+    }
 }
 
 impl WalSink for FileSink {
@@ -659,19 +685,27 @@ pub(crate) struct WalHandle {
 }
 
 impl WalHandle {
-    /// Create a new WAL handle. Opens (or creates) the WAL file and fsyncs the
-    /// directory so the file's creation is durable. Both modes use a background
+    /// Create a new WAL handle, using the production `FsWrite` sink. Delegates
+    /// to [`with_sink_kind`][Self::with_sink_kind]. Both modes use a background
     /// thread for batched writes.
     pub fn new(dir: &Path, consistent: bool, poison: Arc<WalPoison>) -> Result<Self> {
-        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
-        let wal_path = dir.join(WAL_FILENAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
-        sync_dir(dir)?;
-        Ok(Self::with_sink(FileSink { file }, consistent, poison))
+        Self::with_sink_kind(dir, consistent, poison, WalSinkKind::FsWrite)
+    }
+
+    /// Build a handle whose sink is chosen at runtime by `kind`. Each match arm
+    /// monomorphizes the generic `with_sink` with a concrete sink type.
+    pub(crate) fn with_sink_kind(
+        dir: &Path,
+        consistent: bool,
+        poison: Arc<WalPoison>,
+        kind: WalSinkKind,
+    ) -> Result<Self> {
+        match kind {
+            WalSinkKind::FsWrite => Ok(Self::with_sink(FileSink::open(dir)?, consistent, poison)),
+            WalSinkKind::BufferedFile => {
+                Err(Error::Persistence("BufferedFileSink not yet implemented".into()))
+            }
+        }
     }
 
     /// Build a handle around an arbitrary sink. Used by `new` (FileSink) and by
@@ -1727,6 +1761,22 @@ mod tests {
             Err(Error::Poisoned(_)) => {}
             other => panic!("expected Err(Poisoned), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn with_sink_kind_fswrite_writes_recoverable_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let poison = Arc::new(WalPoison::new());
+        {
+            let h = WalHandle::with_sink_kind(dir.path(), true, poison, WalSinkKind::FsWrite).unwrap();
+            h.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] })
+                .unwrap()
+                .wait()
+                .unwrap();
+        } // drop joins bg thread, fsyncs
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].version, 1);
     }
 
     /// Eventual mode has no waiter, but an fsync failure must still poison the
