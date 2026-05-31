@@ -14,10 +14,62 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 
 use crate::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Poison latch
+// ---------------------------------------------------------------------------
+
+/// Poison latch shared between the WAL background thread and the store.
+///
+/// The background thread calls [`WalPoison::poison`] on any append/fsync
+/// failure; the store checks it at `begin_write`/`commit`. Once poisoned the
+/// store refuses further writes until it is dropped and re-created.
+pub(crate) struct WalPoison {
+    poisoned: AtomicBool,
+    cause: Mutex<Option<String>>,
+}
+
+impl WalPoison {
+    pub(crate) fn new() -> Self {
+        Self {
+            poisoned: AtomicBool::new(false),
+            cause: Mutex::new(None),
+        }
+    }
+
+    /// Record the failure cause (first cause wins) and set the latch.
+    pub(crate) fn poison(&self, msg: String) {
+        let mut c = self.cause.lock().unwrap();
+        if c.is_none() {
+            *c = Some(msg);
+        }
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// `Ok(())` when clear, else `Err(Error::Poisoned(cause))`.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_poisoned() {
+            Err(self.error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn error(&self) -> Error {
+        let c = self.cause.lock().unwrap();
+        Error::Poisoned(c.clone().unwrap_or_else(|| "WAL poisoned".into()))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WAL data types
@@ -996,5 +1048,21 @@ mod tests {
         let path = dir.path().join("does_not_exist.bin");
         let entries = read_wal(&path).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn wal_poison_latches_first_cause() {
+        let p = WalPoison::new();
+        assert!(!p.is_poisoned());
+        assert!(p.check().is_ok());
+
+        p.poison("first".into());
+        p.poison("second".into()); // first cause wins
+
+        assert!(p.is_poisoned());
+        match p.check() {
+            Err(Error::Poisoned(msg)) => assert_eq!(msg, "first"),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
     }
 }
