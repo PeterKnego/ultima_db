@@ -853,6 +853,59 @@ impl Drop for WalHandle {
 }
 
 // ---------------------------------------------------------------------------
+// BenchWal — benchmark-only handle (feature `bench-internals`)
+// ---------------------------------------------------------------------------
+
+/// Minimal, primitive-typed wrapper around [`WalHandle`] so an external
+/// `benches/` crate can drive the WAL directly, in isolation from the rest of
+/// the store. Exposes only `WalEntry`/`Path`/`u64`/`Result` in its signatures,
+/// so no internal types (`SyncWaiter`, `WalDurability`, …) leak.
+///
+/// Hidden from docs and gated behind the `bench-internals` feature — it is not
+/// part of the stable public API and must not be relied on.
+#[doc(hidden)]
+#[cfg(feature = "bench-internals")]
+pub struct BenchWal {
+    inner: WalHandle,
+}
+
+#[doc(hidden)]
+#[cfg(feature = "bench-internals")]
+impl BenchWal {
+    /// Open a WAL in `dir`. `consistent` selects Consistent vs Eventual mode.
+    pub fn new(dir: &Path, consistent: bool) -> Result<Self> {
+        Ok(Self {
+            inner: WalHandle::new(dir, consistent, Arc::new(WalPoison::new()))?,
+        })
+    }
+
+    /// Consistent-mode commit: enqueue the entry and block until the batch it
+    /// lands in has been fsynced.
+    pub fn commit_consistent(&self, entry: WalEntry) -> Result<()> {
+        self.inner.write(entry)?.wait()?;
+        Ok(())
+    }
+
+    /// Eventual-mode commit: enqueue the entry and return immediately
+    /// (fire-and-forget — no fsync wait).
+    pub fn commit_eventual(&self, entry: WalEntry) -> Result<()> {
+        self.inner.write(entry)?;
+        Ok(())
+    }
+
+    /// Block until `version` is fsync-durable. Used to drain a fire-and-forget
+    /// batch so Eventual throughput includes the real disk cost.
+    pub fn wait_durable(&self, version: u64) -> Result<()> {
+        self.inner.durability().wait(version)
+    }
+
+    /// Highest commit version currently known fsync-durable.
+    pub fn durable_version(&self) -> u64 {
+        self.inner.durable_version()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MockWal — test-only WAL with manual flush control
 // ---------------------------------------------------------------------------
 

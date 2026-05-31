@@ -14,6 +14,8 @@ default = []
 fulltext = []
 metrics = ["dep:metrics"]
 persistence = ["dep:serde", "dep:bincode"]
+# Exposes internal handles (e.g. BenchWal) for the benches/ crate. Not a public API.
+bench-internals = ["persistence"]
 
 [dependencies]
 thiserror = "2"
@@ -99,6 +101,11 @@ harness = false
 name = "snapshot_throughput"
 harness = false
 required-features = ["persistence"]
+
+[[bench]]
+name = "wal_bench"
+harness = false
+required-features = ["bench-internals"]
 
 [[example]]
 name = "profile_commit"
