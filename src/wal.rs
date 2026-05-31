@@ -459,7 +459,7 @@ pub(crate) trait WalSink: Send {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalSinkKind {
-    /// Current behavior: 3 `write_all` per entry + `fsync` per batch.
+    /// Baseline: one `write_all` per entry (the framed record) + `sync_all` per batch.
     FsWrite,
     /// Coalesced single `write` per batch + `fdatasync`.
     BufferedFile,
