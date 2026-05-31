@@ -271,19 +271,22 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 
 const WAL_FILENAME: &str = "wal.bin";
 
-/// Write a single WAL entry to a file. Format: `[len: u32][data][crc32: u32]`.
-fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
+/// Frame one entry as the on-disk WAL record: `[len: u32 LE][bincode][crc32: u32 LE]`.
+/// Shared by every `WalSink` so all backends produce a byte-identical format.
+fn frame_entry(entry: &WalEntry) -> Result<Vec<u8>> {
     let data = serialize_entry(entry)?;
     let len = data.len() as u32;
     let checksum = crc32(&data);
+    let mut buf = Vec::with_capacity(4 + data.len() + 4);
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&data);
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    Ok(buf)
+}
 
-    file.write_all(&len.to_le_bytes())
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    file.write_all(&data)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    file.write_all(&checksum.to_le_bytes())
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    Ok(())
+fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
+    file.write_all(&frame_entry(entry)?)
+        .map_err(|e| Error::Persistence(e.to_string()))
 }
 
 /// Read all WAL entries from a file. Stops at EOF or first corrupted entry.
@@ -1026,6 +1029,23 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::Store;
+
+    #[test]
+    fn frame_entry_concatenation_reads_back_via_read_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), id: 1, data: vec![1, 2, 3] }] };
+        let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), id: 1 }] };
+
+        let mut bytes = frame_entry(&e1).unwrap();
+        bytes.extend_from_slice(&frame_entry(&e2).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let read = read_wal(&path).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].version, 1);
+        assert_eq!(read[1].version, 2);
+    }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     struct User {
