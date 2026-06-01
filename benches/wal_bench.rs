@@ -28,6 +28,7 @@ const EVENTUAL_BATCH: u64 = 256;
 #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
 const KINDS: &[(&str, WalSinkKind)] = &[
     ("fswrite", WalSinkKind::FsWrite),
+    ("coalesced", WalSinkKind::Coalesced),
     ("buffered", WalSinkKind::BufferedFile),
     ("mmap", WalSinkKind::Mmap),
     ("iouring", WalSinkKind::IoUring),
@@ -35,6 +36,7 @@ const KINDS: &[(&str, WalSinkKind)] = &[
 #[cfg(not(all(target_os = "linux", feature = "wal-iouring")))]
 const KINDS: &[(&str, WalSinkKind)] = &[
     ("fswrite", WalSinkKind::FsWrite),
+    ("coalesced", WalSinkKind::Coalesced),
     ("buffered", WalSinkKind::BufferedFile),
     ("mmap", WalSinkKind::Mmap),
 ];

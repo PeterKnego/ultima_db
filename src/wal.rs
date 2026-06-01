@@ -449,14 +449,17 @@ pub(crate) trait WalSink: Send {
     fn sync(&mut self) -> Result<()>;
 }
 
-/// Selects which `WalSink` implementation a `WalHandle` uses. `FsWrite` is the
-/// production default; the others are experimental and bench-only.
+/// Selects which `WalSink` implementation a `WalHandle` uses. `FsWrite` (the
+/// default) and `Coalesced` are production-safe; the remaining variants are
+/// experimental and bench-only.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalSinkKind {
     /// Baseline: one `write_all` per entry (the framed record) + `sync_all` per batch.
     FsWrite,
-    /// Coalesced single `write` per batch + `fdatasync`.
+    /// Coalesced single `write` per batch + `sync_all` (fsync). Production-safe.
+    Coalesced,
+    /// Coalesced single `write` per batch + `sync_data` (fdatasync). Bench comparison only.
     BufferedFile,
     /// Pre-sized mmap sink (experimental, bench-only). memcpy into the mapped
     /// region; msync on flush; truncate to logical length on Drop.
@@ -978,6 +981,9 @@ impl WalHandle {
     ) -> Result<Self> {
         match kind {
             WalSinkKind::FsWrite => Ok(Self::with_sink(FileSink::open(dir)?, consistent, poison)),
+            WalSinkKind::Coalesced => {
+                Ok(Self::with_sink(BufferedFileSink::open(dir, false)?, consistent, poison))
+            }
             WalSinkKind::BufferedFile => {
                 Ok(Self::with_sink(BufferedFileSink::open(dir, true)?, consistent, poison))
             }
@@ -2042,6 +2048,22 @@ mod tests {
             Err(Error::Poisoned(_)) => {}
             other => panic!("expected Err(Poisoned), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn with_sink_kind_coalesced_writes_recoverable_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let poison = Arc::new(WalPoison::new());
+        {
+            let h = WalHandle::with_sink_kind(dir.path(), true, poison, WalSinkKind::Coalesced).unwrap();
+            h.write(WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] })
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].version, 1);
     }
 
     #[test]
