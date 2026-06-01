@@ -1015,6 +1015,32 @@ mod tests {
         assert!(fired.load(Ordering::SeqCst));
     }
 
+    #[test]
+    fn coalesced_batch_spans_segments() {
+        // Submit a burst WITHOUT waiting each append — this lets the bg writer
+        // drain multiple records into one batch, exercising the coalesced write
+        // path including rotation across the 256-byte segment boundary. Whatever
+        // the batch grouping, the result must be correct.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 256;
+        let j = Journal::open(cfg).unwrap();
+        let payload = [0xCDu8; 100];
+        let mut last = None;
+        for i in 1..=12u64 {
+            last = Some(j.append(i, i * 7, &payload).unwrap());
+        }
+        last.unwrap().wait().unwrap();
+
+        assert_eq!(j.last_seq(), Some(12));
+        let v = j.read_range(1..=12).unwrap();
+        assert_eq!(v.len(), 12);
+        assert_eq!(v[0], (1, 7, payload.to_vec()));
+        assert_eq!(v[11], (12, 84, payload.to_vec()));
+        let segs = j.state.lock().unwrap().segments.len();
+        assert!(segs >= 2, "expected rotation across segments, got {segs}");
+    }
+
     /// A waiter parked on a seq that is never written is released with `Err`
     /// when the journal is dropped, rather than blocking forever.
     #[test]

@@ -48,6 +48,37 @@ fn bench_append_eventual(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_append_batched(c: &mut Criterion) {
+    // Eventual mode: the Notifier resolves on the buffered write (fsync is
+    // off-clock), so this measures the write path — exactly where coalescing
+    // helps. Each iter submits a burst, then waits the final notifier; the
+    // writer drains the burst into batches and (after this feature) coalesces
+    // each batch into one write_all.
+    let mut group = c.benchmark_group("append_batched_eventual");
+    const BURST: u64 = 256;
+    for &payload_size in &[64usize, 256, 1024, 4096] {
+        group.throughput(Throughput::Bytes(payload_size as u64 * BURST));
+        group.bench_function(format!("p{payload_size}"), |b| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = JournalConfig::new(dir.path());
+            cfg.durability = Durability::Eventual;
+            let j = Journal::open(cfg).unwrap();
+            let payload = vec![0xABu8; payload_size];
+            let mut next_seq = 1u64;
+            b.iter(|| {
+                let mut last = None;
+                for _ in 0..BURST {
+                    last = Some(j.append(next_seq, 0, &payload).unwrap());
+                    next_seq += 1;
+                }
+                last.unwrap().wait().unwrap();
+                black_box(next_seq);
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_iter_range(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
@@ -66,6 +97,7 @@ criterion_group!(
     benches,
     bench_append_consistent,
     bench_append_eventual,
+    bench_append_batched,
     bench_iter_range
 );
 criterion_main!(benches);
