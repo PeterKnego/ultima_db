@@ -500,15 +500,18 @@ impl WalSink for FileSink {
 }
 
 /// Coalescing sink: `append` frames into an in-memory buffer (no syscall);
-/// `sync` writes the whole batch in one `write` then `fdatasync`s. `fdatasync`
-/// persists the data and the file-size change but skips timestamp metadata.
+/// `sync` writes the whole batch in one `write` then fsyncs. Coalescing
+/// (one `write` per batch) is identical regardless of the sync mode.
 struct BufferedFileSink {
     file: File,
     buf: Vec<u8>,
+    /// When true, `sync` uses `sync_data` (fdatasync); when false, `sync_all`
+    /// (full fsync). Coalescing (one `write` per batch) is identical either way.
+    datasync: bool,
 }
 
 impl BufferedFileSink {
-    fn open(dir: &Path) -> Result<Self> {
+    fn open(dir: &Path, datasync: bool) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
         let file = OpenOptions::new()
@@ -517,7 +520,7 @@ impl BufferedFileSink {
             .open(&wal_path)
             .map_err(|e| Error::Persistence(e.to_string()))?;
         sync_dir(dir)?;
-        Ok(BufferedFileSink { file, buf: Vec::new() })
+        Ok(BufferedFileSink { file, buf: Vec::new(), datasync })
     }
 }
 
@@ -531,7 +534,11 @@ impl WalSink for BufferedFileSink {
             self.file.write_all(&self.buf).map_err(|e| Error::Persistence(e.to_string()))?;
             self.buf.clear(); // retains capacity for the next batch
         }
-        self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))
+        if self.datasync {
+            self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))
+        } else {
+            self.file.sync_all().map_err(|e| Error::Persistence(e.to_string()))
+        }
     }
 }
 
@@ -972,7 +979,7 @@ impl WalHandle {
         match kind {
             WalSinkKind::FsWrite => Ok(Self::with_sink(FileSink::open(dir)?, consistent, poison)),
             WalSinkKind::BufferedFile => {
-                Ok(Self::with_sink(BufferedFileSink::open(dir)?, consistent, poison))
+                Ok(Self::with_sink(BufferedFileSink::open(dir, true)?, consistent, poison))
             }
             #[cfg(feature = "bench-internals")]
             WalSinkKind::Mmap => Ok(Self::with_sink(MmapSink::open(dir)?, consistent, poison)),
@@ -2057,7 +2064,22 @@ mod tests {
     fn buffered_file_sink_roundtrips_via_read_wal() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut sink = BufferedFileSink::open(dir.path()).unwrap();
+            let mut sink = BufferedFileSink::open(dir.path(), true).unwrap();
+            for v in 1..=5u64 {
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
+            }
+            sink.sync().unwrap();
+        }
+        let read = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(read.len(), 5);
+        assert_eq!(read[4].version, 5);
+    }
+
+    #[test]
+    fn buffered_file_sink_sync_all_roundtrips_via_read_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut sink = BufferedFileSink::open(dir.path(), false).unwrap(); // sync_all
             for v in 1..=5u64 {
                 sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
             }
