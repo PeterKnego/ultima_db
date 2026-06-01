@@ -250,28 +250,58 @@ impl SegmentFile {
         &self.index
     }
 
-    /// Append a record at end-of-file. Caller must enforce monotonic seq.
-    /// Updates the sparse index when the gap since the previous indexed
-    /// record exceeds `SPARSE_INDEX_GAP`.
+    /// Append one record at end-of-file. Thin wrapper over [`append_records`].
+    /// Returns the byte offset at which the record was written.
     pub fn append_record(
         &mut self,
         seq: u64,
         meta: u64,
         payload: &[u8],
     ) -> Result<u64, JournalError> {
-        let bytes = encode_record(seq, meta, payload);
-        self.file.seek(SeekFrom::Start(self.size))?;
-        self.file.write_all(&bytes)?;
-        let written_offset = self.size;
-        self.size += bytes.len() as u64;
-        let want_index = self
-            .index
-            .last()
-            .is_none_or(|(_, off)| written_offset.saturating_sub(*off) >= SPARSE_INDEX_GAP);
-        if want_index {
-            self.index.push((seq, written_offset));
+        let offset = self.size;
+        self.append_records(&[(seq, meta, payload)])?;
+        Ok(offset)
+    }
+
+    /// Append many records with a single `seek` + `write_all`. Caller must
+    /// enforce monotonic seq. Coalesces all records into one buffer, writes
+    /// once, then advances `size` and maintains the sparse index per record
+    /// using the same `SPARSE_INDEX_GAP` rule as a per-record append. Returns
+    /// the byte offset of the first record written.
+    pub fn append_records(
+        &mut self,
+        records: &[(u64, u64, &[u8])],
+    ) -> Result<u64, JournalError> {
+        let start_offset = self.size;
+        if records.is_empty() {
+            return Ok(start_offset);
         }
-        Ok(written_offset)
+        // Coalesce: encode every record into one buffer, tracking each
+        // record's absolute byte offset for the sparse index.
+        let mut buf = Vec::new();
+        let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(records.len());
+        let mut running = self.size;
+        for (seq, meta, payload) in records {
+            let rec = encode_record(*seq, *meta, payload);
+            offsets.push((*seq, running));
+            running += rec.len() as u64;
+            buf.extend_from_slice(&rec);
+        }
+        // Single seek + single write_all for the whole run.
+        self.file.seek(SeekFrom::Start(self.size))?;
+        self.file.write_all(&buf)?;
+        self.size += buf.len() as u64;
+        // Maintain the sparse index per record, identical gap rule.
+        for (seq, off) in offsets {
+            let want_index = self
+                .index
+                .last()
+                .is_none_or(|(_, prev)| off.saturating_sub(*prev) >= SPARSE_INDEX_GAP);
+            if want_index {
+                self.index.push((seq, off));
+            }
+        }
+        Ok(start_offset)
     }
 
     pub fn fsync(&mut self) -> Result<(), JournalError> {
@@ -504,5 +534,47 @@ mod tests {
         seg.append_record(1, 0, b"a").unwrap();
         // First record always indexed.
         assert!(!seg.index_snapshot().is_empty());
+    }
+
+    #[test]
+    fn append_records_coalesced_matches_per_record() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Reference segment built one record at a time.
+        let p1 = dir.path().join("seg-00000000000000000001.log");
+        let mut a = SegmentFile::create(&p1, 1).unwrap();
+        a.append_record(1, 10, b"alpha").unwrap();
+        a.append_record(2, 20, b"beta").unwrap();
+        a.append_record(3, 30, b"gamma").unwrap();
+        a.fsync().unwrap();
+
+        // Segment built with a single coalesced call.
+        let p2 = dir.path().join("seg-00000000000000000010.log");
+        let mut b = SegmentFile::create(&p2, 1).unwrap();
+        b.append_records(&[(1, 10, b"alpha"), (2, 20, b"beta"), (3, 30, b"gamma")])
+            .unwrap();
+        b.fsync().unwrap();
+
+        // Identical post-header bytes (headers differ only by created_at).
+        let ba = std::fs::read(&p1).unwrap();
+        let bb = std::fs::read(&p2).unwrap();
+        assert_eq!(a.size().unwrap(), b.size().unwrap());
+        assert_eq!(&ba[SEGMENT_HEADER_SIZE..], &bb[SEGMENT_HEADER_SIZE..]);
+
+        // Identical decoded records.
+        let sa = SegmentFile::open_for_read(&p1).unwrap().scan().unwrap();
+        let sb = SegmentFile::open_for_read(&p2).unwrap().scan().unwrap();
+        assert_eq!(sa.records, sb.records);
+        assert_eq!(sb.records.len(), 3);
+    }
+
+    #[test]
+    fn append_records_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        let before = seg.size().unwrap();
+        seg.append_records(&[]).unwrap();
+        assert_eq!(seg.size().unwrap(), before);
     }
 }
