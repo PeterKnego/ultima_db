@@ -42,7 +42,7 @@ Burst = 256 records/iter, Eventual durability. Medians:
 
 ### Eventual batch throughput (MiB/s, median) — before vs after
 
-| Payload | before (PerEntry) | after (Coalesced) | change |
+| Payload | before (per-record) | after (coalesced) | change |
 |---------|-------------------|-------------------|--------|
 | 64 B    | 29.4 MiB/s        | 57.8 MiB/s        | +97%   |
 | 256 B   | 102.1 MiB/s       | 169.7 MiB/s       | +66%   |
