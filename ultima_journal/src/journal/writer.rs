@@ -317,15 +317,15 @@ fn write_batch(
         Some(seg) => seg.size()?,
         None => 0,
     };
-    // Running last seq for monotonic validation across the batch — covers
-    // records buffered in `run` that have not yet updated `st.last_seq`.
-    let mut prev = st.last_seq;
-
     for req in batch {
         // Monotonic-seq guard (redundant with append()'s enqueue check, kept
-        // as defense). On failure flush the good prefix so earlier records are
-        // persisted, matching the old per-record write-then-error behavior.
-        if let Some(last) = prev
+        // as defense). `st.last_seq` is updated per record below and the state
+        // lock is held for the whole batch, so it already reflects records
+        // buffered in `run`. On failure flush the good prefix first so earlier
+        // records are persisted, matching the old per-record write-then-error
+        // behavior. A flush error here supersedes the guard error — acceptable,
+        // as the segment I/O failure is the more fundamental problem.
+        if let Some(last) = st.last_seq
             && req.seq <= last
         {
             flush_run(&mut st, &mut run)?;
@@ -360,7 +360,6 @@ fn write_batch(
             st.first_seq = Some(req.seq);
         }
         st.last_seq = Some(req.seq);
-        prev = Some(req.seq);
     }
 
     // Flush the final run for the active segment.
