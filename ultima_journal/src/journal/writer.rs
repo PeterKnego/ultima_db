@@ -308,10 +308,27 @@ fn write_batch(
     batch: &[AppendRequest],
 ) -> Result<Option<u64>, JournalError> {
     let mut st = state.lock().unwrap();
+
+    // Records accumulated for the current (last) segment, not yet written.
+    let mut run: Vec<(u64, u64, &[u8])> = Vec::new();
+    // Projected size of the current segment = on-disk size + bytes buffered in
+    // `run`. Drives rotation exactly like the old per-record `seg.size()` check.
+    let mut projected: u64 = match st.segments.last() {
+        Some(seg) => seg.size()?,
+        None => 0,
+    };
+    // Running last seq for monotonic validation across the batch — covers
+    // records buffered in `run` that have not yet updated `st.last_seq`.
+    let mut prev = st.last_seq;
+
     for req in batch {
-        if let Some(last) = st.last_seq
+        // Monotonic-seq guard (redundant with append()'s enqueue check, kept
+        // as defense). On failure flush the good prefix so earlier records are
+        // persisted, matching the old per-record write-then-error behavior.
+        if let Some(last) = prev
             && req.seq <= last
         {
+            flush_run(&mut st, &mut run)?;
             return Err(JournalError::NonMonotonicSeq {
                 expected_gt: last,
                 got: req.seq,
@@ -320,30 +337,56 @@ fn write_batch(
         let body_len = 16 + req.payload.len();
         let total = (4 + body_len + 4) as u64;
         if total > st.segment_size {
+            flush_run(&mut st, &mut run)?;
             return Err(JournalError::PayloadTooLargeForSegment {
                 segment_size: st.segment_size,
                 record_size: total,
             });
         }
-        let need_new = match st.segments.last() {
-            None => true,
-            Some(seg) => seg.size()? >= st.segment_size,
-        };
+
+        // Rotate when there is no segment yet, or the current one is full.
+        let need_new = st.segments.is_empty() || projected >= st.segment_size;
         if need_new {
+            // Flush whatever was accumulated for the now-full segment first.
+            flush_run(&mut st, &mut run)?;
             let path = st.dir.join(format!("seg-{:020}.log", req.seq));
             st.segments.push(SegmentFile::create(&path, req.seq)?);
+            projected = st.segments.last().unwrap().size()?;
         }
-        let seg = st.segments.last_mut().unwrap();
-        seg.append_record(req.seq, req.meta, &req.payload)?;
+
+        run.push((req.seq, req.meta, &req.payload));
+        projected += total;
         if st.first_seq.is_none() {
             st.first_seq = Some(req.seq);
         }
         st.last_seq = Some(req.seq);
+        prev = Some(req.seq);
     }
+
+    // Flush the final run for the active segment.
+    flush_run(&mut st, &mut run)?;
     // The fsync (Consistent) is issued by the caller so the durable_seq
     // watermark can be published after it, outside this lock. Return the
     // high-water seq written this batch (max == last, monotonic).
     Ok(st.last_seq)
+}
+
+/// Write all accumulated records to the active segment with a single
+/// coalesced `write_all`, then clear the run. No-op on an empty run.
+fn flush_run(
+    st: &mut WriterState,
+    run: &mut Vec<(u64, u64, &[u8])>,
+) -> Result<(), JournalError> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    let seg = st
+        .segments
+        .last_mut()
+        .expect("flush_run called with a non-empty run but no active segment");
+    seg.append_records(run.as_slice())?;
+    run.clear();
+    Ok(())
 }
 
 fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalError> {
