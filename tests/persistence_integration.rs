@@ -904,3 +904,64 @@ fn standalone_wal_recovery_consistent_coalesced() {
     assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
     assert_eq!(table.get(2).unwrap(), &User { name: "Bob".into(), age: 25 });
 }
+
+// ---------------------------------------------------------------------------
+// Eventual × Coalesced: write→drop→reopen→recover round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn standalone_wal_recovery_eventual_coalesced() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        persistence: Persistence::Standalone {
+            dir: dir.path().to_path_buf(),
+            durability: Durability::Eventual,
+            wal_write: WalWrite::Coalesced,
+        },
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = open_store(config.clone());
+        for (name, age) in [("Alice", 30u32), ("Bob", 25), ("Carol", 41)] {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User { name: name.into(), age })
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        // Eventual: dropping the store at the end of this scope joins the WAL
+        // background thread, which fsyncs all pending writes before we reopen.
+        // (Same guarantee exercised by `eventual_drop_flushes_all_pending_wal_writes`.)
+    }
+
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 3);
+    assert_eq!(table.get(3).unwrap(), &User { name: "Carol".into(), age: 41 });
+}
+
+// ---------------------------------------------------------------------------
+// PerEntry default: sanity round-trip (WalWrite::PerEntry is unchanged)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn standalone_perentry_default_still_recovers() {
+    // Sanity: the default WalWrite::PerEntry path behaves as before.
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Consistent); // sets PerEntry
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User { name: "Alice".into(), age: 30 })
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(rtx.open_table::<User>("users").unwrap().len(), 1);
+}
