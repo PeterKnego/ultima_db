@@ -4,7 +4,7 @@
 #![cfg(feature = "persistence")]
 
 use std::path::Path;
-use ultima_db::{Durability, Persistence, Store, StoreConfig};
+use ultima_db::{Durability, Persistence, Store, StoreConfig, WalWrite};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct User {
@@ -17,6 +17,7 @@ fn standalone_config(dir: &Path, durability: Durability) -> StoreConfig {
         persistence: Persistence::Standalone {
             dir: dir.to_path_buf(),
             durability,
+            wal_write: WalWrite::PerEntry,
         },
         ..StoreConfig::default()
     }
@@ -871,4 +872,35 @@ fn read_only_write_tx_commit_with_persistence_no_wal_entry() {
     let rtx = store.begin_read(None).unwrap();
     let t = rtx.open_table::<User>("users").unwrap();
     assert_eq!(t.get(1).unwrap().name, "Alice");
+}
+
+#[test]
+fn standalone_wal_recovery_consistent_coalesced() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        persistence: Persistence::Standalone {
+            dir: dir.path().to_path_buf(),
+            durability: Durability::Consistent,
+            wal_write: WalWrite::Coalesced,
+        },
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users").unwrap().insert(User { name: "Alice".into(), age: 30 }).unwrap();
+        wtx.commit().unwrap();
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users").unwrap().insert(User { name: "Bob".into(), age: 25 }).unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(rtx.version(), 2);
+    let table = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(table.len(), 2);
+    assert_eq!(table.get(1).unwrap(), &User { name: "Alice".into(), age: 30 });
+    assert_eq!(table.get(2).unwrap(), &User { name: "Bob".into(), age: 25 });
 }

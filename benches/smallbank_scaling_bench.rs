@@ -39,6 +39,7 @@ fn build_store() -> (Store, tempfile::TempDir) {
         persistence: ultima_db::Persistence::Standalone {
             dir: tmpdir.path().to_path_buf(),
             durability: ultima_db::Durability::Eventual,
+            wal_write: ultima_db::WalWrite::PerEntry,
         },
         ..StoreConfig::default()
     };

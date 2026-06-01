@@ -1811,11 +1811,12 @@ fn readable_trait_generic_access() {
 #[cfg(feature = "persistence")]
 #[test]
 fn store_new_returns_error_on_bad_wal_path() {
-    use ultima_db::{Durability, Persistence, StoreConfig};
+    use ultima_db::{Durability, Persistence, StoreConfig, WalWrite};
     let result = Store::new(StoreConfig {
         persistence: Persistence::Standalone {
             dir: std::path::PathBuf::from("/nonexistent/deeply/nested/path/that/cannot/exist"),
             durability: Durability::Consistent,
+            wal_write: WalWrite::PerEntry,
         },
         ..StoreConfig::default()
     });

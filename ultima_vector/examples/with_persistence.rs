@@ -13,7 +13,7 @@
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use ultima_db::{Durability, Persistence, Store, StoreConfig};
+use ultima_db::{Durability, Persistence, Store, StoreConfig, WalWrite};
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 
 #[cfg(feature = "persistence")]
@@ -36,6 +36,7 @@ fn config(dir: &std::path::Path) -> StoreConfig {
         persistence: Persistence::Standalone {
             dir: dir.to_path_buf(),
             durability: Durability::Consistent,
+            wal_write: WalWrite::PerEntry,
         },
         ..StoreConfig::default()
     }

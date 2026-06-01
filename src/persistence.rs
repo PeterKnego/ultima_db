@@ -45,6 +45,25 @@ pub enum Durability {
 }
 
 // ---------------------------------------------------------------------------
+// WalWrite — how the WAL writes a committed batch to disk
+// ---------------------------------------------------------------------------
+
+/// How the WAL writes a committed batch to disk (Standalone mode).
+///
+/// Orthogonal to [`Durability`], which controls *when* `commit()` returns. All
+/// four combinations are valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalWrite {
+    /// One `write` per entry, then `sync_all` per batch. The original behavior.
+    #[default]
+    PerEntry,
+    /// The whole batch is coalesced into a single `write`, then `sync_all`. Same
+    /// durability as `PerEntry` (full fsync); fewer syscalls per batch — better
+    /// group-commit throughput under Eventual / high-concurrency loads.
+    Coalesced,
+}
+
+// ---------------------------------------------------------------------------
 // Persistence — persistence mode
 // ---------------------------------------------------------------------------
 
@@ -61,6 +80,8 @@ pub enum Persistence {
         dir: PathBuf,
         /// WAL fsync behavior.
         durability: Durability,
+        /// How the WAL writes each committed batch to disk.
+        wal_write: WalWrite,
     },
     /// Consensus log owns durability. Checkpoints only — no WAL.
     /// Used in SMR deployments where the Raft/Paxos log provides durability.

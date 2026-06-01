@@ -31,7 +31,7 @@ pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
 pub use intents::CommitWaiter;
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
-pub use persistence::{Durability, Persistence, Record};
+pub use persistence::{Durability, Persistence, Record, WalWrite};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;
 pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};

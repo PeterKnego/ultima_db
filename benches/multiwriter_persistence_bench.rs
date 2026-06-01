@@ -16,7 +16,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ultima_db::{Persistence, Store, StoreConfig, WriterMode};
+use ultima_db::{Persistence, Store, StoreConfig, WalWrite, WriterMode};
 
 // ---------------------------------------------------------------------------
 // Record type
@@ -47,6 +47,7 @@ fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Sto
             Persistence::Standalone { durability, .. } => Persistence::Standalone {
                 dir: dir.to_path_buf(),
                 durability,
+                wal_write: WalWrite::PerEntry,
             },
             other => other,
         };
@@ -136,6 +137,7 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
             Persistence::Standalone {
                 dir: std::path::PathBuf::new(),
                 durability: ultima_db::Durability::Consistent,
+                wal_write: WalWrite::PerEntry,
             },
             Some(tmpdir.path()),
         );
@@ -154,6 +156,7 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
             Persistence::Standalone {
                 dir: std::path::PathBuf::new(),
                 durability: ultima_db::Durability::Eventual,
+                wal_write: WalWrite::PerEntry,
             },
             Some(tmpdir.path()),
         );

@@ -1381,6 +1381,7 @@ mod tests {
             persistence: crate::Persistence::Standalone {
                 dir: dir.path().to_path_buf(),
                 durability: crate::Durability::Consistent,
+                wal_write: crate::WalWrite::PerEntry,
             },
             ..crate::StoreConfig::default()
         })
@@ -1795,6 +1796,7 @@ mod tests {
             persistence: crate::Persistence::Standalone {
                 dir: dir.path().to_path_buf(),
                 durability: crate::Durability::Eventual,
+                wal_write: crate::WalWrite::PerEntry,
             },
             ..crate::StoreConfig::default()
         })

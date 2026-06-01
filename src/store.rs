@@ -241,12 +241,17 @@ impl Store {
         let wal_poison = Arc::new(crate::wal::WalPoison::new());
         #[cfg(feature = "persistence")]
         let wal_handle = match &config.persistence {
-            crate::persistence::Persistence::Standalone { dir, durability } => {
+            crate::persistence::Persistence::Standalone { dir, durability, wal_write } => {
                 let consistent = matches!(durability, crate::persistence::Durability::Consistent);
-                Some(crate::wal::WalHandle::new(
+                let kind = match wal_write {
+                    crate::persistence::WalWrite::PerEntry => crate::wal::WalSinkKind::FsWrite,
+                    crate::persistence::WalWrite::Coalesced => crate::wal::WalSinkKind::Coalesced,
+                };
+                Some(crate::wal::WalHandle::with_sink_kind(
                     dir,
                     consistent,
                     Arc::clone(&wal_poison),
+                    kind,
                 )?)
             }
             _ => None,

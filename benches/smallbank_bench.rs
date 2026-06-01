@@ -56,6 +56,7 @@ impl SmallBankConfig {
             persistence: ultima_db::Persistence::Standalone {
                 dir: std::path::PathBuf::new(),
                 durability: ultima_db::Durability::Eventual,
+                wal_write: ultima_db::WalWrite::PerEntry,
             },
         }
     }
@@ -82,6 +83,7 @@ impl UltimaEngine {
                 store_config.persistence = ultima_db::Persistence::Standalone {
                     dir: dir.path().to_path_buf(),
                     durability: *durability,
+                    wal_write: ultima_db::WalWrite::PerEntry,
                 };
                 Some(dir)
             }
