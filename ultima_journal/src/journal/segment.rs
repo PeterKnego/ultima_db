@@ -80,23 +80,31 @@ pub fn decode_header(bytes: &[u8]) -> Result<SegmentHeader, JournalError> {
     })
 }
 
-/// Returns the encoded record bytes (length-prefix + body + CRC).
-pub fn encode_record(seq: u64, meta: u64, payload: &[u8]) -> Vec<u8> {
-    // Layout:
-    //   [len: u32 (= 16 + payload.len() — covers seq + meta + payload, NOT crc)]
-    //   [seq: u64]
-    //   [meta: u64]
-    //   [payload bytes]
-    //   [crc32 over seq + meta + payload]
+/// Append one framed record (length prefix + seq + meta + payload + crc) to `buf`.
+/// Single source of truth for the on-disk record framing.
+///
+/// Layout:
+///   [len: u32 (= 16 + payload.len() — covers seq + meta + payload, NOT crc)]
+///   [seq: u64]
+///   [meta: u64]
+///   [payload bytes]
+///   [crc32 over seq + meta + payload]
+fn encode_record_into(buf: &mut Vec<u8>, seq: u64, meta: u64, payload: &[u8]) {
     let body_len = 16usize + payload.len();
-    let total = 4 + body_len + 4;
-    let mut buf = Vec::with_capacity(total);
+    let start = buf.len();
     buf.extend_from_slice(&(body_len as u32).to_le_bytes());
     buf.extend_from_slice(&seq.to_le_bytes());
     buf.extend_from_slice(&meta.to_le_bytes());
     buf.extend_from_slice(payload);
-    let crc = crc32fast::hash(&buf[4..4 + body_len]);
+    let crc = crc32fast::hash(&buf[start + 4..start + 4 + body_len]);
     buf.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// Returns the encoded record bytes (length-prefix + body + CRC).
+#[allow(dead_code)] // Public utility; used in tests and available for callers outside this crate.
+pub fn encode_record(seq: u64, meta: u64, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + 16 + payload.len() + 4);
+    encode_record_into(&mut buf, seq, meta, payload);
     buf
 }
 
@@ -276,18 +284,20 @@ impl SegmentFile {
         if records.is_empty() {
             return Ok(start_offset);
         }
-        // Coalesce: encode every record into one buffer, tracking each
-        // record's absolute byte offset for the sparse index.
-        let mut buf = Vec::new();
+        // Coalesce: encode every record directly into one pre-sized buffer,
+        // tracking each record's absolute byte offset for the sparse index.
+        let total_bytes: usize = records.iter().map(|(_, _, p)| 4 + 16 + p.len() + 4).sum();
+        let mut buf = Vec::with_capacity(total_bytes);
         let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(records.len());
         let mut running = self.size;
         for (seq, meta, payload) in records {
-            let rec = encode_record(*seq, *meta, payload);
             offsets.push((*seq, running));
-            running += rec.len() as u64;
-            buf.extend_from_slice(&rec);
+            running += (4 + 16 + payload.len() + 4) as u64;
+            encode_record_into(&mut buf, *seq, *meta, payload);
         }
-        // Single seek + single write_all for the whole run.
+        // One seek + one write_all for the whole run. `self.size` is advanced only
+        // after write_all returns; a partial write on failure is fatal to the bg
+        // writer and is reconciled by recovery's torn-tail scan on the next open.
         self.file.seek(SeekFrom::Start(self.size))?;
         self.file.write_all(&buf)?;
         self.size += buf.len() as u64;
@@ -566,6 +576,35 @@ mod tests {
         let sb = SegmentFile::open_for_read(&p2).unwrap().scan().unwrap();
         assert_eq!(sa.records, sb.records);
         assert_eq!(sb.records.len(), 3);
+    }
+
+    #[test]
+    fn append_records_sparse_index_matches_per_record_across_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~20 KiB payloads → records cross the 64 KiB SPARSE_INDEX_GAP every few records.
+        let payload = vec![0x5Au8; 20 * 1024];
+        let recs: Vec<(u64, u64, &[u8])> =
+            (1..=12u64).map(|i| (i, i * 2, payload.as_slice())).collect();
+
+        let p1 = dir.path().join("seg-00000000000000000001.log");
+        let mut a = SegmentFile::create(&p1, 1).unwrap();
+        for (seq, meta, pl) in &recs {
+            a.append_record(*seq, *meta, pl).unwrap();
+        }
+
+        let p2 = dir.path().join("seg-00000000000000000100.log");
+        let mut b = SegmentFile::create(&p2, 1).unwrap();
+        b.append_records(&recs).unwrap();
+
+        // Same number of records, same size, and identical sparse index entries.
+        assert_eq!(a.size().unwrap(), b.size().unwrap());
+        assert_eq!(a.index_snapshot(), b.index_snapshot());
+        // The gap was actually crossed (more than just the first record indexed).
+        assert!(
+            b.index_snapshot().len() > 1,
+            "expected multiple sparse-index entries across the 64 KiB gap, got {}",
+            b.index_snapshot().len()
+        );
     }
 
     #[test]
