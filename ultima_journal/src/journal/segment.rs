@@ -258,6 +258,10 @@ impl SegmentFile {
     /// Install a precomputed sparse index (built by `scan` at open time) so the
     /// read path can use windowed reads without re-scanning. See `read_record`.
     pub fn set_index(&mut self, index: Vec<(u64, u64)>) {
+        debug_assert!(
+            index.windows(2).all(|w| w[0].0 < w[1].0),
+            "sparse index must be strictly ascending by seq"
+        );
         self.index = index;
     }
 

@@ -1075,7 +1075,9 @@ mod tests {
         // Reopen: the index is installed from the open-time scan, so reads take the
         // windowed path (not the empty-index fallback).
         let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
-        assert!(j2.state.lock().unwrap().segments[0].index_snapshot().len() > 1);
+        // 30 × 20 KiB ≈ 600 KiB over a 64 KiB gap → ~9 index entries; >= 5 is a safe,
+        // tighter lower bound that also guards against a SPARSE_INDEX_GAP regression.
+        assert!(j2.state.lock().unwrap().segments[0].index_snapshot().len() >= 5);
         for i in [1u64, 7, 15, 23, 30] {
             let (meta, p) = j2.read(i).unwrap().unwrap();
             assert_eq!(meta, i * 5);
