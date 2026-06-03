@@ -109,6 +109,34 @@ fn bench_point_read(c: &mut Criterion) {
     });
 }
 
+fn bench_range_read(c: &mut Criterion) {
+    // Fill one large (~16 MiB) segment, then read a small localized range (64
+    // consecutive seqs) from a rotating position. before: full scan of the whole
+    // segment; after: bounded windowed span read. Eventual durability + wait-last
+    // keeps the fill fast and ensures all records are written before reads.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = JournalConfig::new(dir.path());
+    cfg.durability = Durability::Eventual;
+    let j = Journal::open(cfg).unwrap();
+    let payload = vec![0xABu8; 1024];
+    let n: u64 = 16 * 1024; // ~16 MiB of 1 KiB records, one segment
+    let mut last = None;
+    for i in 1..=n {
+        last = Some(j.append(i, i, &payload).unwrap());
+    }
+    last.unwrap().wait().unwrap();
+
+    let mut k = 0u64;
+    c.bench_function("range_read", |b| {
+        b.iter(|| {
+            // Rotate the 64-wide slice start deterministically across [1, n-64].
+            k = k.wrapping_add(2_654_435_761) % (n - 64) + 1;
+            let v = j.read_range(black_box(k)..=black_box(k + 63)).unwrap();
+            black_box(v);
+        });
+    });
+}
+
 fn bench_iter_range(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
@@ -129,6 +157,7 @@ criterion_group!(
     bench_append_eventual,
     bench_append_batched,
     bench_point_read,
+    bench_range_read,
     bench_iter_range
 );
 criterion_main!(benches);
