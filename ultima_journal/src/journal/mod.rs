@@ -220,22 +220,16 @@ impl Journal {
     // is deferred per the plan's open questions §12.  The refactor was scoped out of Task 15
     // ("take option (a) — add the concurrency test, keep `Mutex<WriterState>`").
 
+    /// Read a single record by `seq`. Uses the segment's sparse index to read
+    /// only a bounded window (~64 KiB) rather than scanning the whole segment;
+    /// consequently a point read CRC-verifies only the records in that window,
+    /// not the entire segment (recovery's `scan` does full validation).
     pub fn read(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
         let st = self.state.lock().unwrap();
         let Some(seg) = st.segments.iter().rev().find(|s| s.base_seq() <= seq) else {
             return Ok(None);
         };
-        // NOTE: this initial impl scans the whole segment linearly — correctness-first.
-        let scan = seg.scan()?;
-        for r in &scan.records {
-            if r.seq == seq {
-                return Ok(Some((r.meta, r.payload.clone())));
-            }
-            if r.seq > seq {
-                return Ok(None);
-            }
-        }
-        Ok(None)
+        seg.read_record(seq)
     }
 
     pub fn read_range(
