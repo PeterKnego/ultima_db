@@ -169,9 +169,8 @@ pub struct ScanResult {
     pub last_durable_offset: u64,
     /// True if there were trailing bytes that didn't form a valid record.
     pub had_torn_tail: bool,
-    /// Sparse seq → byte offset index built during the scan. Currently
-    /// unused by the read path (deferred sparse-index-seek optimization).
-    #[allow(dead_code)]
+    /// Sparse seq → byte offset index built during the scan. Installed into the
+    /// `SegmentFile` at `Journal::open` and used by `read_record`.
     pub index: Vec<(u64, u64)>,
 }
 
@@ -183,10 +182,8 @@ pub struct SegmentFile {
     /// Current end-of-file (= last durable offset for the writer's view).
     size: u64,
     base_seq: u64,
-    /// Sparse seq → byte offset index. Maintained on append; rebuilt on scan.
-    /// Currently unused on the read path (see deferred work in `task26_journal.md` —
-    /// `Journal::read` linear-scans rather than seeking via this index).
-    #[allow(dead_code)]
+    /// Sparse seq → byte offset index. Maintained on append, installed at open,
+    /// and binary-searched by `read_record` to bound point-read I/O to one window.
     index: Vec<(u64, u64)>,
 }
 
@@ -253,9 +250,15 @@ impl SegmentFile {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    #[allow(dead_code)] // Used by future sparse-index-seek read path.
+    #[allow(dead_code)] // Inspection helper; used in tests.
     pub fn index_snapshot(&self) -> &[(u64, u64)] {
         &self.index
+    }
+
+    /// Install a precomputed sparse index (built by `scan` at open time) so the
+    /// read path can use windowed reads without re-scanning. See `read_record`.
+    pub fn set_index(&mut self, index: Vec<(u64, u64)>) {
+        self.index = index;
     }
 
     /// Append one record at end-of-file. Thin wrapper over [`append_records`].

@@ -110,8 +110,15 @@ impl Journal {
             }
         }
 
-        let segments: Vec<segment::SegmentFile> =
-            segments_with_scan.into_iter().map(|(seg, _)| seg).collect();
+        // Install each segment's sparse index from the scan we already performed
+        // above, so point reads can use the windowed `read_record` path.
+        let segments: Vec<segment::SegmentFile> = segments_with_scan
+            .into_iter()
+            .map(|(mut seg, scan)| {
+                seg.set_index(scan.index);
+                seg
+            })
+            .collect();
 
         let state = Arc::new(Mutex::new(WriterState {
             dir: config.dir.clone(),
@@ -1051,5 +1058,29 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("callback did not fire on close");
         assert!(matches!(got, Err(JournalError::Closed)));
+    }
+
+    #[test]
+    fn windowed_read_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        // Payloads large enough that the segment spans several 64 KiB index windows.
+        let payload = vec![0x7Eu8; 20 * 1024];
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            for i in 1..=30u64 {
+                j.append(i, i * 5, &payload).unwrap().wait().unwrap();
+            }
+        }
+        // Reopen: the index is installed from the open-time scan, so reads take the
+        // windowed path (not the empty-index fallback).
+        let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+        assert!(j2.state.lock().unwrap().segments[0].index_snapshot().len() > 1);
+        for i in [1u64, 7, 15, 23, 30] {
+            let (meta, p) = j2.read(i).unwrap().unwrap();
+            assert_eq!(meta, i * 5);
+            assert_eq!(p, payload);
+        }
+        assert!(j2.read(1000).unwrap().is_none()); // out of range
     }
 }
