@@ -364,6 +364,17 @@ impl SegmentFile {
         }
     }
 
+    /// Read the raw bytes in `[start, end)` with one portable `try_clone()` +
+    /// seek + `read_exact`. Offsets come from the sparse index; the caller
+    /// guarantees `start <= end <= self.size`.
+    fn read_span(&self, start: u64, end: u64) -> Result<Vec<u8>, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
     /// Read a single record by `seq`, using the sparse index to bound I/O to one
     /// ~64 KiB window instead of scanning the whole segment. Returns `Ok(None)`
     /// if `seq` is absent (a gap, or out of this segment's range). Falls back to
@@ -397,10 +408,7 @@ impl SegmentFile {
         let end = self.index.get(n).map(|&(_, o)| o).unwrap_or(self.size);
 
         // Read just the bounded window [start, end).
-        let mut f = self.file.try_clone()?;
-        f.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0u8; (end - start) as usize];
-        f.read_exact(&mut buf)?;
+        let buf = self.read_span(start, end)?;
 
         // Decode forward to the target seq.
         let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
