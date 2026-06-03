@@ -333,7 +333,7 @@ impl SegmentFile {
         f.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let segname = self.segname();
         let mut records = Vec::new();
         let mut index: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0usize;
@@ -362,6 +362,22 @@ impl SegmentFile {
                 }
             }
         }
+    }
+
+    /// The segment's file name as a `String`, for error/corruption context.
+    fn segname(&self) -> String {
+        self.path.file_name().unwrap().to_string_lossy().to_string()
+    }
+
+    /// Read the raw bytes in `[start, end)` with one portable `try_clone()` +
+    /// seek + `read_exact`. Offsets come from the sparse index; the caller
+    /// guarantees `start <= end <= self.size`.
+    fn read_span(&self, start: u64, end: u64) -> Result<Vec<u8>, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     /// Read a single record by `seq`, using the sparse index to bound I/O to one
@@ -397,13 +413,10 @@ impl SegmentFile {
         let end = self.index.get(n).map(|&(_, o)| o).unwrap_or(self.size);
 
         // Read just the bounded window [start, end).
-        let mut f = self.file.try_clone()?;
-        f.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0u8; (end - start) as usize];
-        f.read_exact(&mut buf)?;
+        let buf = self.read_span(start, end)?;
 
         // Decode forward to the target seq.
-        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let segname = self.segname();
         let mut cursor = 0usize;
         while cursor < buf.len() {
             let abs_offset = start + cursor as u64;
@@ -421,6 +434,69 @@ impl SegmentFile {
             }
         }
         Ok(None)
+    }
+
+    /// Return every record with `lo <= seq <= hi` in this segment, reading only
+    /// the index-bounded byte span covering `[lo, hi]` rather than the whole
+    /// segment. Falls back to a full `scan` when the index is empty.
+    ///
+    /// Only records in the read span are CRC-verified; a partial range read does
+    /// not validate the whole segment (use `scan` for that).
+    pub fn read_window(
+        &self,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
+        // Defensive fallback: index not yet populated.
+        if self.index.is_empty() {
+            let scan = self.scan()?;
+            let mut out = Vec::new();
+            for r in scan.records {
+                if r.seq > hi {
+                    break;
+                }
+                if r.seq >= lo {
+                    out.push((r.seq, r.meta, r.payload));
+                }
+            }
+            return Ok(out);
+        }
+
+        // Byte span covering [lo, hi]: start at the window holding lo (or the
+        // first record if lo is below the segment); end at the offset of the
+        // first record with seq > hi (or EOF).
+        let s = self.index.partition_point(|&(sq, _)| sq <= lo);
+        let start = if s == 0 { self.index[0].1 } else { self.index[s - 1].1 };
+        let e = self.index.partition_point(|&(sq, _)| sq <= hi);
+        let end = if e < self.index.len() {
+            self.index[e].1
+        } else {
+            self.size
+        };
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        let buf = self.read_span(start, end)?;
+        let segname = self.segname();
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < buf.len() {
+            let abs_offset = start + cursor as u64;
+            match decode_record(&buf[cursor..], &segname, abs_offset)? {
+                Some((rec, consumed)) => {
+                    if rec.seq > hi {
+                        break;
+                    }
+                    if rec.seq >= lo {
+                        out.push((rec.seq, rec.meta, rec.payload));
+                    }
+                    cursor += consumed;
+                }
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Truncate the file to `len` bytes and fsync. Drops in-memory index
@@ -738,5 +814,67 @@ mod tests {
         // read_record still returns correct results via the scan fallback.
         assert_eq!(seg.read_record(2).unwrap(), Some((200u64, b"yy".to_vec())));
         assert_eq!(seg.read_record(9).unwrap(), None);
+    }
+
+    #[test]
+    fn read_window_matches_scan_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        // ~20 KiB payloads → multiple 64 KiB index windows.
+        let payload = vec![0x44u8; 20 * 1024];
+        let recs: Vec<(u64, u64, &[u8])> =
+            (1..=20u64).map(|i| (i, i * 9, payload.as_slice())).collect();
+        seg.append_records(&recs).unwrap();
+        seg.fsync().unwrap();
+        assert!(seg.index_snapshot().len() > 1);
+
+        let all = seg.scan().unwrap().records;
+        let expect = |lo: u64, hi: u64| -> Vec<(u64, u64, Vec<u8>)> {
+            all.iter()
+                .filter(|r| r.seq >= lo && r.seq <= hi)
+                .map(|r| (r.seq, r.meta, r.payload.clone()))
+                .collect()
+        };
+        for (lo, hi) in [(1u64, 20u64), (5, 9), (1, 1), (20, 20), (8, 15), (3, 3), (12, 100)] {
+            assert_eq!(seg.read_window(lo, hi).unwrap(), expect(lo, hi), "[{lo},{hi}]");
+        }
+    }
+
+    #[test]
+    fn read_window_empty_and_inverted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000010.log");
+        let mut seg = SegmentFile::create(&path, 10).unwrap();
+        seg.append_records(&[(10, 0, b"a"), (20, 0, b"b"), (30, 0, b"c")])
+            .unwrap();
+        seg.fsync().unwrap();
+
+        assert_eq!(seg.read_window(25, 15).unwrap(), Vec::new()); // inverted lo > hi
+        assert_eq!(seg.read_window(1, 5).unwrap(), Vec::new()); // entirely below
+        assert_eq!(seg.read_window(40, 50).unwrap(), Vec::new()); // entirely above
+        assert_eq!(
+            seg.read_window(20, 30).unwrap(),
+            vec![(20, 0, b"b".to_vec()), (30, 0, b"c".to_vec())]
+        );
+    }
+
+    #[test]
+    fn read_window_empty_index_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        {
+            let mut seg = SegmentFile::create(&path, 1).unwrap();
+            seg.append_records(&[(1, 100, b"x"), (2, 200, b"yy"), (3, 300, b"zzz")])
+                .unwrap();
+            seg.fsync().unwrap();
+        }
+        let seg = SegmentFile::open_for_read(&path).unwrap();
+        assert!(seg.index_snapshot().is_empty());
+        assert_eq!(
+            seg.read_window(2, 3).unwrap(),
+            vec![(2, 200, b"yy".to_vec()), (3, 300, b"zzz".to_vec())]
+        );
+        assert_eq!(seg.read_window(5, 9).unwrap(), Vec::new());
     }
 }

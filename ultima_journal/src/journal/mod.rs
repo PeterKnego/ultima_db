@@ -239,26 +239,34 @@ impl Journal {
         seg.read_record(seq)
     }
 
+    /// Read all records with `seq` in `range`, in order. Uses each segment's
+    /// sparse index to read only the byte span covering the range, and prunes
+    /// segments whose seq range does not overlap it. A partial range therefore
+    /// CRC-verifies only the records in the spans it reads, not whole segments;
+    /// a full/unbounded range reads and verifies everything, as before.
     pub fn read_range(
         &self,
         range: impl RangeBounds<u64>,
     ) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
-        // Compute bounds inside the locked scope so first/last_seq and the
-        // scan see the same atomic snapshot of state.
+        // Bounds + reads under one lock so first/last_seq and the segment state
+        // are a consistent snapshot.
         let st = self.state.lock().unwrap();
         let (lo, hi) = bounds_to_inclusive(range, st.first_seq, st.last_seq);
         let mut out = Vec::new();
-        for seg in &st.segments {
-            let scan = seg.scan()?;
-            for r in scan.records {
-                if r.seq < lo {
-                    continue;
-                }
-                if r.seq > hi {
-                    return Ok(out);
-                }
-                out.push((r.seq, r.meta, r.payload));
+        for (i, seg) in st.segments.iter().enumerate() {
+            // Prune: segments are seq-ordered; once one starts above hi, so do
+            // all later ones.
+            if seg.base_seq() > hi {
+                break;
             }
+            // Prune: skip a segment whose records all fall below lo — true when
+            // the next segment's base_seq <= lo (this segment's max seq < it).
+            if let Some(next) = st.segments.get(i + 1)
+                && next.base_seq() <= lo
+            {
+                continue;
+            }
+            out.extend(seg.read_window(lo, hi)?);
         }
         Ok(out)
     }
@@ -1058,6 +1066,50 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("callback did not fire on close");
         assert!(matches!(got, Err(JournalError::Closed)));
+    }
+
+    #[test]
+    fn read_range_partial_across_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 2 * 1024; // small → many segments
+        let j = Journal::open(cfg).unwrap();
+        let payload = [0x5Au8; 200];
+        for i in 1..=50u64 {
+            j.append(i, i * 2, &payload).unwrap().wait().unwrap();
+        }
+        let nseg = j.state.lock().unwrap().segments.len();
+        assert!(nseg >= 4, "want several segments to exercise pruning, got {nseg}");
+
+        // Localized partial range in the middle: leading and trailing segments prune.
+        let v = j.read_range(20..=29).unwrap();
+        let seqs: Vec<u64> = v.iter().map(|(s, _, _)| *s).collect();
+        assert_eq!(seqs, (20..=29).collect::<Vec<_>>());
+        assert_eq!(v[0], (20, 40, payload.to_vec()));
+        assert_eq!(v[9], (29, 58, payload.to_vec()));
+
+        // Full unbounded range is unchanged (no regression).
+        assert_eq!(j.read_range(..).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn read_range_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let payload = vec![0x6Bu8; 20 * 1024]; // multi-window single segment
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            for i in 1..=30u64 {
+                j.append(i, i * 5, &payload).unwrap().wait().unwrap();
+            }
+        }
+        // Reopen: index installed at open → windowed range path.
+        let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+        let v = j2.read_range(10..=15).unwrap();
+        let seqs: Vec<u64> = v.iter().map(|(s, _, _)| *s).collect();
+        assert_eq!(seqs, vec![10, 11, 12, 13, 14, 15]);
+        assert_eq!(v[0].1, 50); // meta = 10 * 5
+        assert_eq!(v[5].2, payload);
     }
 
     #[test]
