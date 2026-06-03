@@ -333,7 +333,7 @@ impl SegmentFile {
         f.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let segname = self.segname();
         let mut records = Vec::new();
         let mut index: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0usize;
@@ -367,6 +367,11 @@ impl SegmentFile {
     /// Read the raw bytes in `[start, end)` with one portable `try_clone()` +
     /// seek + `read_exact`. Offsets come from the sparse index; the caller
     /// guarantees `start <= end <= self.size`.
+    /// The segment's file name as a `String`, for error/corruption context.
+    fn segname(&self) -> String {
+        self.path.file_name().unwrap().to_string_lossy().to_string()
+    }
+
     fn read_span(&self, start: u64, end: u64) -> Result<Vec<u8>, JournalError> {
         let mut f = self.file.try_clone()?;
         f.seek(SeekFrom::Start(start))?;
@@ -411,7 +416,7 @@ impl SegmentFile {
         let buf = self.read_span(start, end)?;
 
         // Decode forward to the target seq.
-        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let segname = self.segname();
         let mut cursor = 0usize;
         while cursor < buf.len() {
             let abs_offset = start + cursor as u64;
@@ -473,7 +478,7 @@ impl SegmentFile {
         }
 
         let buf = self.read_span(start, end)?;
-        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let segname = self.segname();
         let mut out = Vec::new();
         let mut cursor = 0usize;
         while cursor < buf.len() {
