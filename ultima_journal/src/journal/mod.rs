@@ -110,8 +110,15 @@ impl Journal {
             }
         }
 
-        let segments: Vec<segment::SegmentFile> =
-            segments_with_scan.into_iter().map(|(seg, _)| seg).collect();
+        // Install each segment's sparse index from the scan we already performed
+        // above, so point reads can use the windowed `read_record` path.
+        let segments: Vec<segment::SegmentFile> = segments_with_scan
+            .into_iter()
+            .map(|(mut seg, scan)| {
+                seg.set_index(scan.index);
+                seg
+            })
+            .collect();
 
         let state = Arc::new(Mutex::new(WriterState {
             dir: config.dir.clone(),
@@ -220,22 +227,16 @@ impl Journal {
     // is deferred per the plan's open questions §12.  The refactor was scoped out of Task 15
     // ("take option (a) — add the concurrency test, keep `Mutex<WriterState>`").
 
+    /// Read a single record by `seq`. Uses the segment's sparse index to read
+    /// only a bounded window (~64 KiB) rather than scanning the whole segment;
+    /// consequently a point read CRC-verifies only the records in that window,
+    /// not the entire segment (recovery's `scan` does full validation).
     pub fn read(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
         let st = self.state.lock().unwrap();
         let Some(seg) = st.segments.iter().rev().find(|s| s.base_seq() <= seq) else {
             return Ok(None);
         };
-        // NOTE: this initial impl scans the whole segment linearly — correctness-first.
-        let scan = seg.scan()?;
-        for r in &scan.records {
-            if r.seq == seq {
-                return Ok(Some((r.meta, r.payload.clone())));
-            }
-            if r.seq > seq {
-                return Ok(None);
-            }
-        }
-        Ok(None)
+        seg.read_record(seq)
     }
 
     pub fn read_range(
@@ -1057,5 +1058,31 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("callback did not fire on close");
         assert!(matches!(got, Err(JournalError::Closed)));
+    }
+
+    #[test]
+    fn windowed_read_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        // Payloads large enough that the segment spans several 64 KiB index windows.
+        let payload = vec![0x7Eu8; 20 * 1024];
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            for i in 1..=30u64 {
+                j.append(i, i * 5, &payload).unwrap().wait().unwrap();
+            }
+        }
+        // Reopen: the index is installed from the open-time scan, so reads take the
+        // windowed path (not the empty-index fallback).
+        let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+        // 30 × 20 KiB ≈ 600 KiB over a 64 KiB gap → ~9 index entries; >= 5 is a safe,
+        // tighter lower bound that also guards against a SPARSE_INDEX_GAP regression.
+        assert!(j2.state.lock().unwrap().segments[0].index_snapshot().len() >= 5);
+        for i in [1u64, 7, 15, 23, 30] {
+            let (meta, p) = j2.read(i).unwrap().unwrap();
+            assert_eq!(meta, i * 5);
+            assert_eq!(p, payload);
+        }
+        assert!(j2.read(1000).unwrap().is_none()); // out of range
     }
 }

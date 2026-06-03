@@ -169,9 +169,8 @@ pub struct ScanResult {
     pub last_durable_offset: u64,
     /// True if there were trailing bytes that didn't form a valid record.
     pub had_torn_tail: bool,
-    /// Sparse seq → byte offset index built during the scan. Currently
-    /// unused by the read path (deferred sparse-index-seek optimization).
-    #[allow(dead_code)]
+    /// Sparse seq → byte offset index built during the scan. Installed into the
+    /// `SegmentFile` at `Journal::open` and used by `read_record`.
     pub index: Vec<(u64, u64)>,
 }
 
@@ -183,10 +182,8 @@ pub struct SegmentFile {
     /// Current end-of-file (= last durable offset for the writer's view).
     size: u64,
     base_seq: u64,
-    /// Sparse seq → byte offset index. Maintained on append; rebuilt on scan.
-    /// Currently unused on the read path (see deferred work in `task26_journal.md` —
-    /// `Journal::read` linear-scans rather than seeking via this index).
-    #[allow(dead_code)]
+    /// Sparse seq → byte offset index. Maintained on append, installed at open,
+    /// and binary-searched by `read_record` to bound point-read I/O to one window.
     index: Vec<(u64, u64)>,
 }
 
@@ -253,9 +250,19 @@ impl SegmentFile {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    #[allow(dead_code)] // Used by future sparse-index-seek read path.
+    #[allow(dead_code)] // Inspection helper; used in tests.
     pub fn index_snapshot(&self) -> &[(u64, u64)] {
         &self.index
+    }
+
+    /// Install a precomputed sparse index (built by `scan` at open time) so the
+    /// read path can use windowed reads without re-scanning. See `read_record`.
+    pub fn set_index(&mut self, index: Vec<(u64, u64)>) {
+        debug_assert!(
+            index.windows(2).all(|w| w[0].0 < w[1].0),
+            "sparse index must be strictly ascending by seq"
+        );
+        self.index = index;
     }
 
     /// Append one record at end-of-file. Thin wrapper over [`append_records`].
@@ -355,6 +362,65 @@ impl SegmentFile {
                 }
             }
         }
+    }
+
+    /// Read a single record by `seq`, using the sparse index to bound I/O to one
+    /// ~64 KiB window instead of scanning the whole segment. Returns `Ok(None)`
+    /// if `seq` is absent (a gap, or out of this segment's range). Falls back to
+    /// a full `scan` when the index has not been populated.
+    ///
+    /// Only records within the read window are CRC-verified; a point read does
+    /// not validate the whole segment (use `scan` for that).
+    pub fn read_record(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
+        // Defensive fallback: index not yet populated (e.g. opened, not installed).
+        if self.index.is_empty() {
+            let scan = self.scan()?;
+            for r in scan.records {
+                if r.seq == seq {
+                    return Ok(Some((r.meta, r.payload)));
+                }
+                if r.seq > seq {
+                    return Ok(None);
+                }
+            }
+            return Ok(None);
+        }
+
+        // Largest index entry whose seq is <= the target. Because we pick the
+        // largest seq_i <= seq, the next entry's seq exceeds seq, so the target
+        // (if present) lies strictly within [start, end).
+        let n = self.index.partition_point(|&(s, _)| s <= seq);
+        if n == 0 {
+            return Ok(None); // below this segment's first record
+        }
+        let start = self.index[n - 1].1;
+        let end = self.index.get(n).map(|&(_, o)| o).unwrap_or(self.size);
+
+        // Read just the bounded window [start, end).
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut buf)?;
+
+        // Decode forward to the target seq.
+        let segname = self.path.file_name().unwrap().to_string_lossy().to_string();
+        let mut cursor = 0usize;
+        while cursor < buf.len() {
+            let abs_offset = start + cursor as u64;
+            match decode_record(&buf[cursor..], &segname, abs_offset)? {
+                Some((rec, consumed)) => {
+                    if rec.seq == seq {
+                        return Ok(Some((rec.meta, rec.payload)));
+                    }
+                    if rec.seq > seq {
+                        return Ok(None);
+                    }
+                    cursor += consumed;
+                }
+                None => break,
+            }
+        }
+        Ok(None)
     }
 
     /// Truncate the file to `len` bytes and fsync. Drops in-memory index
@@ -615,5 +681,62 @@ mod tests {
         let before = seg.size().unwrap();
         seg.append_records(&[]).unwrap();
         assert_eq!(seg.size().unwrap(), before);
+    }
+
+    #[test]
+    fn read_record_matches_scan_across_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        // ~20 KiB payloads → cross the 64 KiB SPARSE_INDEX_GAP several times.
+        let payload = vec![0x33u8; 20 * 1024];
+        let recs: Vec<(u64, u64, &[u8])> =
+            (1..=20u64).map(|i| (i, i * 3, payload.as_slice())).collect();
+        seg.append_records(&recs).unwrap();
+        seg.fsync().unwrap();
+
+        // The append path populated more than one index window.
+        assert!(seg.index_snapshot().len() > 1);
+
+        // read_record matches a full scan for every seq, including boundaries.
+        let scan = seg.scan().unwrap();
+        for r in &scan.records {
+            let got = seg.read_record(r.seq).unwrap();
+            assert_eq!(got, Some((r.meta, r.payload.clone())));
+        }
+    }
+
+    #[test]
+    fn read_record_gap_and_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        let mut seg = SegmentFile::create(&path, 10).unwrap();
+        // Strictly-increasing seqs with gaps: 10, 20, 30.
+        seg.append_records(&[(10, 0, b"a"), (20, 0, b"b"), (30, 0, b"c")])
+            .unwrap();
+        seg.fsync().unwrap();
+
+        assert_eq!(seg.read_record(10).unwrap(), Some((0u64, b"a".to_vec())));
+        assert_eq!(seg.read_record(30).unwrap(), Some((0u64, b"c".to_vec())));
+        assert_eq!(seg.read_record(15).unwrap(), None); // gap between records
+        assert_eq!(seg.read_record(99).unwrap(), None); // above last
+        assert_eq!(seg.read_record(5).unwrap(), None); // below first (partition_point == 0)
+    }
+
+    #[test]
+    fn read_record_empty_index_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-00000000000000000001.log");
+        {
+            let mut seg = SegmentFile::create(&path, 1).unwrap();
+            seg.append_records(&[(1, 100, b"x"), (2, 200, b"yy")]).unwrap();
+            seg.fsync().unwrap();
+        }
+        // Reopen: open_for_read leaves the index empty (not yet populated).
+        let seg = SegmentFile::open_for_read(&path).unwrap();
+        assert!(seg.index_snapshot().is_empty());
+        // read_record still returns correct results via the scan fallback.
+        assert_eq!(seg.read_record(2).unwrap(), Some((200u64, b"yy".to_vec())));
+        assert_eq!(seg.read_record(9).unwrap(), None);
     }
 }

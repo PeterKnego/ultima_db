@@ -79,6 +79,36 @@ fn bench_append_batched(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_point_read(c: &mut Criterion) {
+    // Fill one large (~16 MiB) segment, then point-read at deterministically
+    // rotating seqs. Measures per-read cost: full-segment scan (before) vs the
+    // bounded windowed read (after). Eventual durability keeps the fill fast
+    // (no per-append fsync); waiting the last notifier ensures every record is
+    // written to the file before reads begin.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = JournalConfig::new(dir.path());
+    cfg.durability = Durability::Eventual;
+    let j = Journal::open(cfg).unwrap();
+    let payload = vec![0xABu8; 1024];
+    let n: u64 = 16 * 1024; // ~16 MiB of 1 KiB records, one segment
+    let mut last = None;
+    for i in 1..=n {
+        last = Some(j.append(i, i, &payload).unwrap());
+    }
+    last.unwrap().wait().unwrap();
+
+    let mut k = 0u64;
+    c.bench_function("point_read", |b| {
+        b.iter(|| {
+            // Rotate the target deterministically across [1, n] to hit
+            // different index windows without RNG.
+            k = k.wrapping_add(2_654_435_761) % n + 1;
+            let r = j.read(black_box(k)).unwrap();
+            black_box(r);
+        });
+    });
+}
+
 fn bench_iter_range(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
@@ -98,6 +128,7 @@ criterion_group!(
     bench_append_consistent,
     bench_append_eventual,
     bench_append_batched,
+    bench_point_read,
     bench_iter_range
 );
 criterion_main!(benches);
