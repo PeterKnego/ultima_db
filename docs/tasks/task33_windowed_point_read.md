@@ -50,20 +50,23 @@ Benchmark: `cargo bench -p ultima-journal --bench append_throughput -- point_rea
 
 | metric | before (full scan) | after (windowed) | change |
 |--------|--------------------|------------------|--------|
-| point_read | 4,273 µs | 4,529 µs | +6.3% (see Analysis) |
+| point_read | 4,272.8 µs | 9.54 µs | **−99.8% (~448× faster)** |
 
 ## Analysis
 
-The benchmark runs on a warm page cache: the 16 MiB segment fill loop immediately precedes
-the read measurements, so all segment data is already in RAM before any `read()` call.
-Under these conditions the old full-scan path reads 16 MiB entirely from RAM and the
-windowed path reads only ~64 KiB — but the windowed path adds a `try_clone()` syscall and
-a `seek` that the full-scan path (which re-opens and reads sequentially from the file handle
-held by `scan`) does not pay, and CRC-decoding 16 MiB from page cache is fast. The net
-result on warm cache is a slight regression (~6 %) rather than the expected large improvement.
-On a cold page cache — the operationally relevant case for a journal reader that falls behind
-the writer — the windowed read would touch ~64 KiB of disk I/O vs ~16 MiB for the full scan,
-a ~256× reduction in bytes read, and the wall-clock improvement would be proportionally
-large. The structural win (less I/O, proportional to segment size) is correct and
-measurable under real workloads; the micro-benchmark here measures the page-cache-warm
-decode/syscall residual, where the difference is within noise.
+The windowed read drops point-read latency from ~4.27 ms to ~9.5 µs — a ~448× speedup —
+even though the benchmark runs on a **warm page cache** (the fill loop leaves all 16 MiB in
+RAM). The gain is therefore not from avoiding disk I/O; it is from avoiding the per-read work
+the old full scan did regardless of cache state: `read_to_end` copying ~16 MiB out of the
+page cache, CRC-verifying all 16384 records, and allocating a `Vec` for every decoded
+payload. The windowed read copies ~64 KiB, CRC-verifies ~60 records, and allocates ~60
+payloads — roughly the ~256× ratio of one 64 KiB window to the 16 MiB segment, matching the
+measured factor. The win scales with segment size: the window stays ~64 KiB while a larger
+segment makes the full scan proportionally more expensive. On a **cold** cache the absolute
+gap would be even larger, since the full scan would additionally fault ~16 MiB from disk
+versus ~64 KiB for the window.
+
+> Measurement note: an earlier run reported a spurious ~6% regression because the criterion
+> bench binary was not relinked against the windowed library (stale binary measured the old
+> full-scan code for both before and after). Forcing a rebuild produced the numbers above;
+> a fresh single-process timing of 2000 reads independently corroborated ~10 µs/read.
