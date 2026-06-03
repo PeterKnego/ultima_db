@@ -364,14 +364,14 @@ impl SegmentFile {
         }
     }
 
-    /// Read the raw bytes in `[start, end)` with one portable `try_clone()` +
-    /// seek + `read_exact`. Offsets come from the sparse index; the caller
-    /// guarantees `start <= end <= self.size`.
     /// The segment's file name as a `String`, for error/corruption context.
     fn segname(&self) -> String {
         self.path.file_name().unwrap().to_string_lossy().to_string()
     }
 
+    /// Read the raw bytes in `[start, end)` with one portable `try_clone()` +
+    /// seek + `read_exact`. Offsets come from the sparse index; the caller
+    /// guarantees `start <= end <= self.size`.
     fn read_span(&self, start: u64, end: u64) -> Result<Vec<u8>, JournalError> {
         let mut f = self.file.try_clone()?;
         f.seek(SeekFrom::Start(start))?;
