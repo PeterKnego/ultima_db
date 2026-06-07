@@ -49,9 +49,9 @@ UltimaDB is an MVCC store built on a persistent copy-on-write B-tree. The data l
 
 ## Feature Development Workflow
 
-Using superpowers (brainstorming, writing-plans, executing-plans) during feature development is fine — the generated plans/notes under `docs/superpowers/` are working artifacts, not deliverables. Before finishing and committing the feature:
+Using superpowers (brainstorming, writing-plans, executing-plans) during feature development is fine — the generated plans/notes under `docs/superpowers/` capture the design reasoning behind a feature. Before finishing and committing the feature:
 
 1. Consolidate the architectural decisions and implementation details into `docs/tasks/taskXX_feature_name.md` (the canonical per-feature doc).
-2. Delete the corresponding superpowers artifacts (`docs/superpowers/plans/*.md`, etc.) for that feature. They must not be committed alongside the `taskXX_feature_name.md`.
+2. Keep the corresponding superpowers artifacts (`docs/superpowers/plans/*.md`, `docs/superpowers/specs/*.md`, etc.) for that feature. Commit them alongside the `taskXX_feature_name.md` — they are retained as the design-history record.
 
-Superpowers artifacts are ephemeral scaffolding; `docs/tasks/` is the permanent record.
+`docs/tasks/` is the canonical per-feature record; the `docs/superpowers/` plan/spec docs are kept as the supporting design history.
