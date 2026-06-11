@@ -127,6 +127,9 @@ impl Journal {
             segments,
             last_seq,
             first_seq,
+            // Empty on open: recovery rebuilds visibility from the scanned
+            // segments; `append()` repopulates this going forward.
+            pending: std::collections::BTreeMap::new(),
         }));
         let durability = SeqWatermark::new();
         let writer = Writer::spawn(Arc::clone(&state), Arc::clone(&durability));
@@ -187,7 +190,7 @@ impl Journal {
         let (signal, notifier) = Notifier::pending();
 
         {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
             if total > st.segment_size {
                 return Err(JournalError::PayloadTooLargeForSegment {
                     segment_size: st.segment_size,
@@ -204,15 +207,32 @@ impl Journal {
             }
             // Claim the seq under the lock: send to channel while still holding it,
             // so the channel ordering matches the monotonic seq order.
+            let payload_vec = payload.to_vec();
             let req = AppendRequest {
                 seq,
                 meta,
-                payload: payload.to_vec(),
+                payload: payload_vec.clone(),
                 signal,
             };
             let writer_guard = self.writer.lock().unwrap();
             let w = writer_guard.as_ref().ok_or(JournalError::Closed)?;
             w.tx.send(req).map_err(|_| JournalError::Closed)?;
+            drop(writer_guard);
+
+            // Publish the record for IMMEDIATE read visibility, still holding the
+            // state lock, so a reader sees it the instant `append()` returns —
+            // before the bg writer persists it and before the flush callback
+            // (openraft's `RaftLogStorage::append()` readability contract). The
+            // writer evicts this seq from `pending` once it lands in a segment;
+            // both happen under this lock, so there is no window where the record
+            // is invisible and none where it is double-counted. `append()` now
+            // owns `last_seq`/`first_seq` advancement (the writer no longer sets
+            // them — it would regress them behind these synchronous updates).
+            if st.first_seq.is_none() {
+                st.first_seq = Some(seq);
+            }
+            st.last_seq = Some(seq);
+            st.pending.insert(seq, (meta, payload_vec));
         }
 
         Ok(notifier)
@@ -233,6 +253,13 @@ impl Journal {
     /// not the entire segment (recovery's `scan` does full validation).
     pub fn read(&self, seq: u64) -> Result<Option<(u64, Vec<u8>)>, JournalError> {
         let st = self.state.lock().unwrap();
+        // Overlay the not-yet-persisted tail: an appended-but-unwritten record is
+        // served from memory (it is not yet in any segment). Disjoint from the
+        // segment path — the writer evicts a seq from `pending` exactly when it
+        // becomes segment-readable, under this same lock.
+        if let Some((meta, payload)) = st.pending.get(&seq) {
+            return Ok(Some((*meta, payload.clone())));
+        }
         let Some(seg) = st.segments.iter().rev().find(|s| s.base_seq() <= seq) else {
             return Ok(None);
         };
@@ -268,6 +295,17 @@ impl Journal {
             }
             out.extend(seg.read_window(lo, hi)?);
         }
+        // Overlay the not-yet-persisted tail. These seqs are not in any segment
+        // (disjoint — the writer evicts on persist under this lock), so append
+        // then sort by seq to restore ascending order across the merge. Guard the
+        // `lo > hi` case (e.g. an empty `n..n` range) — `BTreeMap::range` panics
+        // on an inverted range, unlike the segment path.
+        if lo <= hi {
+            for (&seq, (meta, payload)) in st.pending.range(lo..=hi) {
+                out.push((seq, *meta, payload.clone()));
+            }
+            out.sort_by_key(|(seq, _, _)| *seq);
+        }
         Ok(out)
     }
 
@@ -301,6 +339,11 @@ impl Journal {
     /// Returns a `Notifier::done()` — the operation is fully synchronous.
     pub fn truncate_after(&self, keep_seq: u64) -> Result<Notifier, JournalError> {
         let mut st = self.state.lock().unwrap();
+
+        // Drop any not-yet-persisted records past the truncation point so the
+        // in-memory overlay matches the truncated log (openraft truncates a
+        // conflicting suffix that may still be sitting in `pending`).
+        st.pending.retain(|&s, _| s <= keep_seq);
 
         // Find the last segment whose base_seq <= keep_seq.
         let seg_idx = match st.segments.iter().rposition(|s| s.base_seq() <= keep_seq) {
@@ -915,6 +958,57 @@ mod tests {
         // Linear scan walks past all records; r.seq > seq never triggers because
         // the target is beyond the tail. Falls through to Ok(None).
         assert!(j.read(99).unwrap().is_none());
+    }
+
+    /// openraft's `RaftLogStorage::append()` requires an appended entry to be
+    /// readable the instant `append()` returns — before the flush callback and
+    /// before durability. Verify every read path sees the record WITHOUT waiting
+    /// on the Notifier (i.e. while the bg writer may not have persisted it yet),
+    /// in both durability modes. Regression for the read-after-append visibility
+    /// gap that tripped openraft's apply-drain debug-assert (openraft#1780): the
+    /// reader used to lag `append()` until the writer thread drained the channel,
+    /// yielding a short read that omitted the just-appended tail entry.
+    #[test]
+    fn append_is_immediately_readable_before_flush() {
+        for durability in [crate::Durability::Eventual, crate::Durability::Consistent] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = JournalConfig::new(dir.path());
+            cfg.durability = durability;
+            let j = Journal::open(cfg).unwrap();
+
+            for i in 1..=200u64 {
+                // Do NOT wait on the notifier — visibility must not depend on the
+                // bg writer having processed/persisted the record.
+                let _notifier = j.append(i, i * 3, b"payload").unwrap();
+
+                // Point read sees it immediately.
+                let (meta, payload) = j.read(i).unwrap().unwrap_or_else(|| {
+                    panic!("seq {i} not readable immediately after append ({durability:?})")
+                });
+                assert_eq!(meta, i * 3);
+                assert_eq!(&payload, b"payload");
+
+                // last_seq reflects it immediately.
+                assert_eq!(j.last_seq(), Some(i));
+
+                // Range read returns the whole prefix with NO short read — the
+                // exact invariant openraft's apply path relies on.
+                let v = j.read_range(1..=i).unwrap();
+                assert_eq!(
+                    v.len() as u64,
+                    i,
+                    "short read at seq {i} ({durability:?}): got {} entries",
+                    v.len()
+                );
+                assert_eq!(v.last().unwrap().0, i);
+            }
+
+            // Drain to durability and confirm the overlay was fully evicted (no
+            // double-counting once everything is persisted).
+            j.wait_durable(200).unwrap();
+            assert!(j.state.lock().unwrap().pending.is_empty());
+            assert_eq!(j.read_range(1..=200).unwrap().len(), 200);
+        }
     }
 
     #[test]

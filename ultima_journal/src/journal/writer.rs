@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -189,6 +190,14 @@ pub(crate) struct WriterState {
     pub segments: Vec<SegmentFile>,
     pub last_seq: Option<u64>,
     pub first_seq: Option<u64>,
+    /// Records that have been `append()`ed but not yet written to a segment by
+    /// the bg writer. openraft's `RaftLogStorage::append()` contract requires an
+    /// appended entry to be readable the instant `append()` returns — before the
+    /// flush callback fires — so `append()` publishes here synchronously and
+    /// `read`/`read_range` overlay it on the durable segments. The writer evicts
+    /// each seq once it is persisted (both under this same lock, so a seq is in
+    /// `pending` XOR a segment, never both and never neither). seq → (meta, payload).
+    pub pending: BTreeMap<u64, (u64, Vec<u8>)>,
 }
 
 pub(crate) struct Writer {
@@ -317,15 +326,20 @@ fn write_batch(
         Some(seg) => seg.size()?,
         None => 0,
     };
+    // Last seq written so far in THIS batch. `append()` now owns `st.last_seq`
+    // (it advances it synchronously, possibly past this batch for entries not yet
+    // persisted), so the writer can no longer use `st.last_seq` for its in-batch
+    // monotonic guard — it tracks the locally-written high-water instead.
+    let mut prev_written: Option<u64> = None;
     for req in batch {
-        // Monotonic-seq guard (redundant with append()'s enqueue check, kept
-        // as defense). `st.last_seq` is updated per record below and the state
-        // lock is held for the whole batch, so it already reflects records
-        // buffered in `run`. On failure flush the good prefix first so earlier
-        // records are persisted, matching the old per-record write-then-error
-        // behavior. A flush error here supersedes the guard error — acceptable,
-        // as the segment I/O failure is the more fundamental problem.
-        if let Some(last) = st.last_seq
+        // Monotonic-seq guard (redundant with append()'s enqueue check, kept as
+        // defense; the channel is FIFO and append() validates global
+        // monotonicity under the state lock, so this only ever guards against an
+        // internal batching bug). On failure flush the good prefix first so
+        // earlier records are persisted, matching the old per-record
+        // write-then-error behavior. A flush error here supersedes the guard
+        // error — acceptable, as the segment I/O failure is more fundamental.
+        if let Some(last) = prev_written
             && req.seq <= last
         {
             flush_run(&mut st, &mut run)?;
@@ -356,18 +370,18 @@ fn write_batch(
 
         run.push((req.seq, req.meta, &req.payload));
         projected += total;
-        if st.first_seq.is_none() {
-            st.first_seq = Some(req.seq);
-        }
-        st.last_seq = Some(req.seq);
+        prev_written = Some(req.seq);
     }
 
     // Flush the final run for the active segment.
     flush_run(&mut st, &mut run)?;
-    // The fsync (Consistent) is issued by the caller so the durable_seq
-    // watermark can be published after it, outside this lock. Return the
-    // high-water seq written this batch (max == last, monotonic).
-    Ok(st.last_seq)
+    // The fsync (Consistent) is issued by the caller so the durable_seq watermark
+    // can be published after it, outside this lock. Return the high-water seq
+    // PERSISTED by this batch — NOT `st.last_seq`, which `append()` may have
+    // advanced past this batch for entries not yet written; using it would
+    // over-report durability. On the Ok path the whole batch was flushed, so the
+    // last entry is the persisted high-water.
+    Ok(prev_written)
 }
 
 /// Write all accumulated records to the active segment with a single
@@ -379,11 +393,22 @@ fn flush_run(
     if run.is_empty() {
         return Ok(());
     }
-    let seg = st
-        .segments
-        .last_mut()
-        .expect("flush_run called with a non-empty run but no active segment");
-    seg.append_records(run.as_slice())?;
+    {
+        let seg = st
+            .segments
+            .last_mut()
+            .expect("flush_run called with a non-empty run but no active segment");
+        seg.append_records(run.as_slice())?;
+    }
+    // These records are now segment-readable, so evict them from the in-memory
+    // overlay `append()` populated — under the same state lock, so a seq is in a
+    // segment XOR `pending`, never double-counted by a concurrent read. Only
+    // successfully-persisted records are evicted (on an `append_records` error we
+    // returned above, leaving them visible-but-unpersisted, as the failed write
+    // demands).
+    for (seq, _, _) in run.iter() {
+        st.pending.remove(seq);
+    }
     run.clear();
     Ok(())
 }
