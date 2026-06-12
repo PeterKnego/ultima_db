@@ -83,6 +83,11 @@ where
 /// back-references on other nodes at layers above the new level are left
 /// in place — they degrade to dead ends during traversal but don't break
 /// correctness.
+///
+/// If the updated node is the current entry point, the graph is entered
+/// through the highest-level other live node instead (the freshly-reset
+/// node has no out-edges to descend through), and the entry point is
+/// re-elected from actual levels afterwards.
 #[allow(clippy::too_many_arguments)]
 pub fn update_embedding<Meta, D, R>(
     tx: &mut WriteTx,
@@ -110,6 +115,14 @@ where
     let new_level = sampler.sample(rng);
 
     let ep = read_entry_point(tx, entry_name)?;
+    let updating_entry_node = ep.node_id == Some(id);
+
+    // When the node being rebuilt *is* the entry point, the graph can't be
+    // entered through it (its adjacency was just reset to empty) — find the
+    // highest-level other live node to enter through instead. Same scan as
+    // `delete`'s entry-point promotion; linear, and rare (only when the
+    // updated node happens to be the entry point).
+    let mut alt: Option<(u64, u8)> = None;
 
     {
         let mut data = tx.open_table::<VectorRow<Meta>>(data_name)?;
@@ -121,20 +134,52 @@ where
         };
         data.update(id, fresh)?;
 
-        // If the only node in the graph is the one being updated, there's no
-        // graph to connect into — entry point handling below covers it.
-        let has_other = ep.node_id.is_some_and(|epid| epid != id);
-        if has_other {
+        if updating_entry_node {
+            for (rid, r) in data.iter() {
+                if rid == id || r.hnsw.is_tombstoned() {
+                    continue;
+                }
+                let l = r.hnsw.level();
+                if alt.is_none_or(|(_, bl)| l > bl) {
+                    alt = Some((rid, l));
+                }
+            }
+            // No other live node: nothing to connect into — entry-point
+            // handling below covers the singleton graph.
+            if let Some((alt_id, alt_level)) = alt {
+                let alt_ep = EntryPoint {
+                    node_id: Some(alt_id),
+                    max_level: alt_level,
+                };
+                connect_node(&mut data, distance, &embedding, id, new_level, &alt_ep, params)?;
+            }
+        } else if ep.node_id.is_some() {
             connect_node(&mut data, distance, &embedding, id, new_level, &ep, params)?;
         }
     }
 
-    if ep.node_id == Some(id) || new_level > ep.max_level {
-        // Either we just rebuilt the entry-point node itself, or this node
-        // now sits above the previous top.
+    if updating_entry_node {
+        // Re-elect the entry point from *actual* levels: the rebuilt node's
+        // fresh level vs. the best alternative. The old `max_level` is
+        // dropped — the previous top layers belonged to the adjacency that
+        // was just reset, and carrying the stale maximum forward would make
+        // every search descend through phantom empty layers.
+        let new_ep = match alt {
+            Some((alt_id, alt_level)) if alt_level > new_level => EntryPoint {
+                node_id: Some(alt_id),
+                max_level: alt_level,
+            },
+            _ => EntryPoint {
+                node_id: Some(id),
+                max_level: new_level,
+            },
+        };
+        write_entry_point(tx, entry_name, new_ep)?;
+    } else if new_level > ep.max_level {
+        // This node now sits above the previous top.
         let new_ep = EntryPoint {
             node_id: Some(id),
-            max_level: new_level.max(ep.max_level),
+            max_level: new_level,
         };
         write_entry_point(tx, entry_name, new_ep)?;
     }

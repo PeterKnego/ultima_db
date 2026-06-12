@@ -61,6 +61,16 @@ remaining major work is HNSW itself plus a pre-filter integration.
   the new level are left alone — they degrade to dead ends during
   traversal but don't break correctness. Cheaper than walking the whole
   table to strip references.
+- **Updating the entry-point node re-enters through an alternative.**
+  When the updated node *is* the current entry point, its adjacency was
+  just reset, so the graph cannot be entered through it. The data table
+  is scanned for the highest-level other live node (same scan as
+  `delete`'s entry-point promotion) and `connect_node` runs through that
+  instead; the entry point is then re-elected from actual levels (the
+  rebuilt node's fresh level vs. the alternative's), dropping the old
+  `max_level` so searches don't descend through phantom empty layers.
+  Without this, updating the entry point's embedding emptied its
+  adjacency and every subsequent search returned only that one node.
 - **Crate boundary: sibling crate `ultima_vector`** in the same
   workspace. The repo was converted from a single-crate package to a
   workspace with `ultima-db` as both root crate and member, plus

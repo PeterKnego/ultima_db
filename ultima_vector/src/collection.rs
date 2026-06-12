@@ -394,6 +394,87 @@ mod tests {
         assert_eq!(res[0].0, id, "id should match new embedding location");
     }
 
+    /// Updating the embedding of the node that happens to be the HNSW entry
+    /// point must keep the graph connected. The update resets the node's
+    /// adjacency and rebuilds it — if the rebuild is skipped because the
+    /// node *is* the entry point, every subsequent search greedy-descends
+    /// from a node with no out-edges and returns only that node.
+    #[test]
+    fn update_embedding_of_entry_point_keeps_graph_connected() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(2), Cosine).unwrap();
+
+        // A spread of vectors around the unit circle.
+        let n = 21u64;
+        for i in 0..n {
+            let theta = (i as f32) * 0.25;
+            coll.upsert(vec![theta.cos(), theta.sin()], i).unwrap();
+        }
+
+        // Identify the current entry point.
+        let ep_id = {
+            let rtx = store.begin_read(None).unwrap();
+            let entry = rtx.open_table::<EntryPoint>("vec_entry").unwrap();
+            entry.get(1).unwrap().node_id.unwrap()
+        };
+
+        // Move the entry point's embedding.
+        coll.update_embedding(ep_id, vec![-1.0, 0.0]).unwrap();
+
+        // The rest of the graph must still be reachable.
+        let res = coll.search(&[1.0, 0.0], 10, None, None).unwrap();
+        assert_eq!(
+            res.len(),
+            10,
+            "graph disconnected after updating the entry point's embedding"
+        );
+
+        // And the moved node itself is findable at its new location.
+        let res = coll.search(&[-1.0, 0.0], 1, None, None).unwrap();
+        assert_eq!(res[0].0, ep_id, "moved entry point not found at new location");
+    }
+
+    /// Updating the sole node in a collection (necessarily the entry point)
+    /// must keep it searchable — there is nothing to reconnect to.
+    #[test]
+    fn update_embedding_of_sole_node_stays_searchable() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        let id = coll.upsert(vec![1.0, 0.0], 1).unwrap();
+        coll.update_embedding(id, vec![0.0, 1.0]).unwrap();
+
+        let res = coll.search(&[0.0, 1.0], 5, None, None).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, id);
+    }
+
+    /// Updating the entry point when every other node is tombstoned behaves
+    /// like the sole-node case.
+    #[test]
+    fn update_embedding_of_entry_point_with_only_tombstoned_others() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store.clone(), "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        let a = coll.upsert(vec![1.0, 0.0], 1).unwrap();
+        let b = coll.upsert(vec![0.0, 1.0], 2).unwrap();
+
+        // Delete whichever is NOT the entry point, then update the EP.
+        let ep_id = {
+            let rtx = store.begin_read(None).unwrap();
+            let entry = rtx.open_table::<EntryPoint>("vec_entry").unwrap();
+            entry.get(1).unwrap().node_id.unwrap()
+        };
+        let other = if ep_id == a { b } else { a };
+        coll.delete(other).unwrap();
+        coll.update_embedding(ep_id, vec![0.7, 0.7]).unwrap();
+
+        let res = coll.search(&[0.7, 0.7], 5, None, None).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, ep_id);
+    }
+
     #[test]
     fn bulk_insert_returns_one_id_per_item() {
         let store = Store::new(StoreConfig::default()).unwrap();
