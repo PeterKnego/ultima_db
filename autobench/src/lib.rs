@@ -6,5 +6,7 @@
 //! these modules so smoke tests can drive the same code with quick configs.
 
 pub mod baseline;
+pub mod diskcheck;
+pub mod journal_bench;
 pub mod sampling;
 pub mod task_spec;
