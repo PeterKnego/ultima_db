@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines
 
 build:
 	cargo build
@@ -42,21 +42,21 @@ bench/ycsb:
 	cargo bench --bench ycsb_bench
 
 bench/ycsb/fjall:
-	cargo bench --bench ycsb_fjall_bench
+	cargo bench -p compare-benches --bench ycsb_fjall_bench
 
 bench/ycsb/rocksdb:
-	cargo bench --bench ycsb_rocksdb_bench
+	cargo bench -p compare-benches --bench ycsb_rocksdb_bench
 
 bench/ycsb/redb:
-	cargo bench --bench ycsb_redb_bench
+	cargo bench -p compare-benches --bench ycsb_redb_bench
 
 # Run all YCSB suites with named baselines and compare side-by-side
 bench/ycsb/compare:
 	$(call check_cmd,critcmp)
 	cargo bench --bench ycsb_bench -- --save-baseline ultima
-	cargo bench --bench ycsb_fjall_bench -- --save-baseline fjall
-	cargo bench --bench ycsb_rocksdb_bench -- --save-baseline rocksdb
-	cargo bench --bench ycsb_redb_bench -- --save-baseline redb
+	cargo bench -p compare-benches --bench ycsb_fjall_bench -- --save-baseline fjall
+	cargo bench -p compare-benches --bench ycsb_rocksdb_bench -- --save-baseline rocksdb
+	cargo bench -p compare-benches --bench ycsb_redb_bench -- --save-baseline redb
 	critcmp -g '(.+)/[^/]+' ultima fjall rocksdb redb
 
 # Multi-writer contention benchmarks
@@ -69,16 +69,16 @@ bench/multiwriter:
 	cargo bench --bench ycsb_multiwriter_bench
 
 bench/multiwriter/rocksdb:
-	cargo bench --bench ycsb_multiwriter_rocksdb_bench
+	cargo bench -p compare-benches --bench ycsb_multiwriter_rocksdb_bench
 
 bench/multiwriter/fjall:
-	cargo bench --bench ycsb_multiwriter_fjall_bench
+	cargo bench -p compare-benches --bench ycsb_multiwriter_fjall_bench
 
 bench/multiwriter/compare:
 	$(call check_cmd,critcmp)
 	cargo bench --bench ycsb_multiwriter_bench -- --save-baseline mw-ultima
-	cargo bench --bench ycsb_multiwriter_rocksdb_bench -- --save-baseline mw-rocksdb
-	cargo bench --bench ycsb_multiwriter_fjall_bench -- --save-baseline mw-fjall
+	cargo bench -p compare-benches --bench ycsb_multiwriter_rocksdb_bench -- --save-baseline mw-rocksdb
+	cargo bench -p compare-benches --bench ycsb_multiwriter_fjall_bench -- --save-baseline mw-fjall
 	critcmp mw-ultima mw-rocksdb mw-fjall
 
 # SmallBank multi-table transactional benchmark
@@ -111,3 +111,7 @@ bench/compare:
 bench/flamegraph:
 	cargo bench --bench ycsb_bench -- --profile-time 5
 	@echo "Flamegraphs: target/criterion/*/profile/flamegraph.svg"
+
+# Competitor baseline tier (RocksDB/Fjall/ReDB) — not part of `make bench`
+bench/compare-engines:
+	cargo bench -p compare-benches

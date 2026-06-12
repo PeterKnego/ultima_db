@@ -254,6 +254,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 
 [[package]]
+name = "compare-benches"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "criterion",
+ "fjall",
+ "rand",
+ "redb",
+ "rocksdb",
+ "serde",
+ "tempfile",
+ "ultima-bench-workloads",
+ "ultima-db",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1235,13 +1251,10 @@ dependencies = [
  "crc32fast",
  "criterion",
  "dashmap",
- "fjall",
  "io-uring",
  "memmap2",
  "metrics",
  "rand",
- "redb",
- "rocksdb",
  "serde",
  "tempfile",
  "thiserror",

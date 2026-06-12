@@ -1,0 +1,47 @@
+[package]
+name = "compare-benches"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Competitor baseline benchmarks (RocksDB, Fjall, ReDB) — opt-in tier"
+license = "Apache-2.0"
+
+[dev-dependencies]
+ultima-db = { path = "..", features = ["persistence"] }
+ultima-bench-workloads = { path = "../bench_workloads" }
+criterion = { version = "0.8", features = ["html_reports"] }
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+tempfile = "3"
+fjall = "3"
+rocksdb = "0.24.0"
+redb = "4.0.0"
+
+[[bench]]
+name = "ycsb_fjall_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_rocksdb_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_redb_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_multiwriter_rocksdb_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_multiwriter_fjall_bench"
+harness = false
+
+[[bench]]
+name = "smallbank_rocksdb_bench"
+harness = false
+
+[[bench]]
+name = "smallbank_fjall_bench"
+harness = false
