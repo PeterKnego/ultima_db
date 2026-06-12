@@ -19,9 +19,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use ultima_db::{Store, StoreConfig, WriterMode};
 
-#[path = "ycsb_common.rs"]
-mod ycsb_common;
-use ycsb_common::{
+use ultima_bench_workloads::ycsb::{
     BurstResult, MW_OPS_PER_WRITER, MW_WRITERS, MultiWriterEngine, NUM_RECORDS, YcsbRecord,
     ZipfianGenerator, bench_multiwriter_workloads, ycsb_criterion,
 };

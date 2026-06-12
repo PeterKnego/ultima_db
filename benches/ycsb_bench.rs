@@ -6,9 +6,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ultima_db::{Store, StoreConfig};
 
-#[path = "ycsb_common.rs"]
-mod ycsb_common;
-use ycsb_common::*;
+use ultima_bench_workloads::ycsb::*;
 
 // ---------------------------------------------------------------------------
 // UltimaDB engine

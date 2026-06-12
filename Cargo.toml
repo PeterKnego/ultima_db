@@ -1,5 +1,5 @@
 [workspace]
-members = ["ultima_vector", "ultima_journal"]
+members = ["ultima_vector", "ultima_journal", "bench_workloads"]
 
 [package]
 name = "ultima-db"
@@ -40,6 +40,7 @@ tempfile = "3"
 fjall = "3"
 rocksdb = "0.24.0"
 redb = "4.0.0"
+ultima-bench-workloads = { path = "bench_workloads" }
 
 [[bench]]
 name = "ycsb_bench"

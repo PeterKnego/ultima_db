@@ -7,9 +7,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
 
-#[path = "ycsb_common.rs"]
-mod ycsb_common;
-use ycsb_common::*;
+use ultima_bench_workloads::ycsb::*;
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 

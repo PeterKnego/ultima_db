@@ -1,0 +1,12 @@
+[package]
+name = "ultima-bench-workloads"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Shared YCSB/SmallBank workload generators for UltimaDB benches"
+license = "Apache-2.0"
+
+[dependencies]
+criterion = "0.8"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }

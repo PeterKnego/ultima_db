@@ -14,9 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rocksdb::{OptimisticTransactionDB, Options};
 use tempfile::TempDir;
 
-#[path = "ycsb_common.rs"]
-mod ycsb_common;
-use ycsb_common::{
+use ultima_bench_workloads::ycsb::{
     BurstResult, MultiWriterEngine, NUM_RECORDS, YcsbRecord, bench_multiwriter_workloads,
     ycsb_criterion,
 };

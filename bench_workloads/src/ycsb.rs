@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-// Included via `#[path]` in multiple bench binaries, each using a different subset.
-#![allow(dead_code, unused_imports)]
-
 use std::cell::Cell;
 use std::hint::black_box;
 use std::time::Duration;
@@ -72,8 +69,6 @@ pub struct ZipfianGenerator {
     item_count: u64,
     theta: f64,
     zeta_n: f64,
-    #[allow(dead_code)]
-    zeta_2: f64,
     alpha: f64,
     eta: f64,
 }
@@ -89,7 +84,6 @@ impl ZipfianGenerator {
             item_count,
             theta,
             zeta_n,
-            zeta_2,
             alpha,
             eta,
         }

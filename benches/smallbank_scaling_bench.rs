@@ -22,9 +22,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use ultima_db::{IndexKind, Store, StoreConfig, WriterMode};
 
-#[path = "smallbank_common.rs"]
-mod smallbank_common;
-use smallbank_common::*;
+use ultima_bench_workloads::smallbank::*;
 
 const WRITER_COUNTS: &[usize] = &[2, 4, 8, 16];
 const OPS_PER_WRITER_LOCAL: usize = 50;

@@ -25,9 +25,7 @@ use std::thread;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ultima_db::{IndexKind, Store, StoreConfig, WriterMode};
 
-#[path = "smallbank_common.rs"]
-mod smallbank_common;
-use smallbank_common::*;
+use ultima_bench_workloads::smallbank::*;
 
 // ---------------------------------------------------------------------------
 // Benchmark configuration

@@ -9,9 +9,7 @@ use redb::{
     backends::InMemoryBackend,
 };
 
-#[path = "ycsb_common.rs"]
-mod ycsb_common;
-use ycsb_common::*;
+use ultima_bench_workloads::ycsb::*;
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 

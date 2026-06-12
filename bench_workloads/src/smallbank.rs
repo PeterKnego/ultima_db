@@ -6,9 +6,7 @@
 //! and the pre-generated `WorkloadFixture` + reference implementation that
 //! lets cross-DB parity tests verify identical final state.
 //!
-//! Included via `#[path = "smallbank_common.rs"]` in each bench binary.
-
-#![allow(dead_code, unused_imports)]
+//! Extracted from the former `benches/smallbank_common.rs` `#[path]` include.
 
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};

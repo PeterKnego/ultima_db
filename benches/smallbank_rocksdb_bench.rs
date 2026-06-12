@@ -19,9 +19,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rocksdb::{ColumnFamilyDescriptor, OptimisticTransactionDB, Options, SingleThreaded};
 use tempfile::TempDir;
 
-#[path = "smallbank_common.rs"]
-mod smallbank_common;
-use smallbank_common::*;
+use ultima_bench_workloads::smallbank::*;
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 const CF_ACCOUNTS: &str = "accounts";
