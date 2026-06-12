@@ -51,7 +51,7 @@ by adding one `TaskSpec` row in `autobench/src/task_spec.rs`.
    - The primary metric key must match the `primary_metric` field in the
      `TaskSpec` row.
 
-3. **Frozen torture suite** — add `autobench/tests/<name>_torture.rs (wired via `TaskSpec::torture_test` — e.g. journal-commit uses `journal_torture`)`.  
+3. **Frozen torture suite** — add `autobench/tests/<name>_torture.rs` (wired via `TaskSpec::torture_test` — e.g. journal-commit uses `journal_torture`).  
    This is a behavioral correctness suite, not a perf suite. It must pass
    before any KEEP is recorded. Do not skip this step.
 

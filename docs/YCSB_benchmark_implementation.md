@@ -8,11 +8,11 @@ UltimaDB implements all six standard YCSB (Yahoo! Cloud Serving Benchmark) workl
 
 | File | Description |
 |------|-------------|
-| `benches/ycsb_common.rs` | Shared types, distributions, generators, `YcsbEngine` trait |
+| `bench_workloads/src/ycsb.rs` | Shared types, distributions, generators, `YcsbEngine` trait |
 | `benches/ycsb_bench.rs` | UltimaDB benchmark |
-| `benches/ycsb_fjall_bench.rs` | Fjall benchmark |
-| `benches/ycsb_rocksdb_bench.rs` | RocksDB benchmark |
-| `benches/ycsb_redb_bench.rs` | ReDB benchmark |
+| `compare_benches/benches/ycsb_fjall_bench.rs` | Fjall benchmark |
+| `compare_benches/benches/ycsb_rocksdb_bench.rs` | RocksDB benchmark |
+| `compare_benches/benches/ycsb_redb_bench.rs` | ReDB benchmark |
 
 ## Configuration
 
