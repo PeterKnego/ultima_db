@@ -1,0 +1,55 @@
+{
+  "note": "PLACEHOLDER baselines recorded on a noisy virtualized sandbox host (fsync p99 varies up to ~2x run-to-run there; tolerances were widened to match). Re-record on the real bench machine with `make perf/baseline` before relying on `make perf/check` \u2014 on quiet hardware tolerances of ~5-10% are appropriate.",
+  "metrics": {
+    "apply_mw_p99_ns": {
+      "value": 87341.0,
+      "tolerance_pct": 35.0,
+      "direction": "minimize"
+    },
+    "apply_mw_throughput": {
+      "value": 79405.76431588328,
+      "tolerance_pct": 39.0,
+      "direction": "maximize"
+    },
+    "apply_p99_ns": {
+      "value": 12247.0,
+      "tolerance_pct": 36.0,
+      "direction": "minimize"
+    },
+    "apply_sw_batch_throughput": {
+      "value": 380894.4849906624,
+      "tolerance_pct": 23.0,
+      "direction": "maximize"
+    },
+    "apply_throughput": {
+      "value": 23560.908569374456,
+      "tolerance_pct": 11.0,
+      "direction": "maximize"
+    },
+    "checkpoint_ms": {
+      "value": 28.885544,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "read_p99_under_load_ns": {
+      "value": 1542.0,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "restore_install_ms": {
+      "value": 25.535345,
+      "tolerance_pct": 35.0,
+      "direction": "minimize"
+    },
+    "snapshot_freeze_p99_us": {
+      "value": 2.593,
+      "tolerance_pct": 451.0,
+      "direction": "minimize"
+    },
+    "snapshot_stream_ms": {
+      "value": 41.05919,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    }
+  }
+}

@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline
 
 build:
 	cargo build
@@ -119,3 +119,17 @@ bench/flamegraph:
 # Competitor baseline tier (RocksDB/Fjall/ReDB) — not part of `make bench`
 bench/compare-engines:
 	cargo bench -p compare-benches
+
+# Perf regression gate (fitness binaries in --check mode, ~3-6 min total)
+perf/check:
+	cargo run -p ultima-autobench --bin journal-microbench --release -- \
+		--json --check --baseline autobench/baselines/journal-commit.json > /dev/null
+	cargo run -p ultima-autobench --bin smr-apply-microbench --release -- \
+		--json --check --baseline autobench/baselines/smr-apply.json > /dev/null
+
+# Re-record perf baselines (run only after a deliberate perf change lands)
+perf/baseline:
+	cargo run -p ultima-autobench --bin journal-microbench --release -- \
+		--json --write-baseline autobench/baselines/journal-commit.json > /dev/null
+	cargo run -p ultima-autobench --bin smr-apply-microbench --release -- \
+		--json --write-baseline autobench/baselines/smr-apply.json > /dev/null
