@@ -96,6 +96,25 @@ impl Journal {
             segments_with_scan[idx].1 = new_scan;
         }
 
+        // Phase 2b: complete an interrupted `truncate_after`. A valid intent
+        // file means the intent was durable but the destructive phase may not
+        // have finished — re-run it idempotently. A torn/corrupt intent means
+        // the crash happened while writing the intent, before anything
+        // destructive — ignore it. Either way the file is consumed.
+        if let Some(keep_seq) = read_truncate_intent(&config.dir) {
+            let mut segs: Vec<segment::SegmentFile> =
+                segments_with_scan.into_iter().map(|(s, _)| s).collect();
+            apply_truncate_to_segments(&config.dir, &mut segs, keep_seq)?;
+            segments_with_scan = segs
+                .into_iter()
+                .map(|mut s| {
+                    let scan = s.scan()?;
+                    Ok((s, scan))
+                })
+                .collect::<Result<Vec<_>, JournalError>>()?;
+        }
+        remove_truncate_intent(&config.dir)?;
+
         // Phase 3: compute first_seq / last_seq from final state.
         let mut first_seq: Option<u64> = None;
         let mut last_seq: Option<u64> = None;
@@ -130,6 +149,11 @@ impl Journal {
             // Empty on open: recovery rebuilds visibility from the scanned
             // segments; `append()` repopulates this going forward.
             pending: std::collections::BTreeMap::new(),
+            truncate_gen: 0,
+            persisted_hwm: 0,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_fsync: false,
         }));
         let durability = SeqWatermark::new();
         let writer = Writer::spawn(Arc::clone(&state), Arc::clone(&durability));
@@ -191,6 +215,11 @@ impl Journal {
 
         {
             let mut st = self.state.lock().unwrap();
+            if st.poisoned {
+                // Fail-stop: a WAL fsync failed; the writer has halted and
+                // nothing further may be acknowledged.
+                return Err(JournalError::Closed);
+            }
             if total > st.segment_size {
                 return Err(JournalError::PayloadTooLargeForSegment {
                     segment_size: st.segment_size,
@@ -213,6 +242,7 @@ impl Journal {
                 meta,
                 payload: payload_vec.clone(),
                 signal,
+                generation: st.truncate_gen,
             };
             let writer_guard = self.writer.lock().unwrap();
             let w = writer_guard.as_ref().ok_or(JournalError::Closed)?;
@@ -232,7 +262,8 @@ impl Journal {
                 st.first_seq = Some(seq);
             }
             st.last_seq = Some(seq);
-            st.pending.insert(seq, (meta, payload_vec));
+            let generation = st.truncate_gen;
+            st.pending.insert(seq, (generation, meta, payload_vec));
         }
 
         Ok(notifier)
@@ -257,7 +288,7 @@ impl Journal {
         // served from memory (it is not yet in any segment). Disjoint from the
         // segment path — the writer evicts a seq from `pending` exactly when it
         // becomes segment-readable, under this same lock.
-        if let Some((meta, payload)) = st.pending.get(&seq) {
+        if let Some((_, meta, payload)) = st.pending.get(&seq) {
             return Ok(Some((*meta, payload.clone())));
         }
         let Some(seg) = st.segments.iter().rev().find(|s| s.base_seq() <= seq) else {
@@ -301,7 +332,7 @@ impl Journal {
         // `lo > hi` case (e.g. an empty `n..n` range) — `BTreeMap::range` panics
         // on an inverted range, unlike the segment path.
         if lo <= hi {
-            for (&seq, (meta, payload)) in st.pending.range(lo..=hi) {
+            for (&seq, (_, meta, payload)) in st.pending.range(lo..=hi) {
                 out.push((seq, *meta, payload.clone()));
             }
             out.sort_by_key(|(seq, _, _)| *seq);
@@ -327,84 +358,54 @@ impl Journal {
 
     /// Truncate the journal so that only records with `seq <= keep_seq` remain.
     ///
-    /// Crash-safe via a two-phase sentinel protocol:
-    /// 1. Truncate the tail segment to just past the last-kept record (`new_end`).
-    /// 2. Append a sentinel record at `new_end` and fsync — intent is now durable.
-    /// 3. Truncate back to `new_end`, removing the sentinel.
-    /// 4. Unlink any later segments, then fsync the directory.
+    /// Crash-safe via a durable intent file:
+    /// 1. Write `truncate.intent` (keep_seq + CRC), fsync it and the dir —
+    ///    the intent is durable *before* anything destructive happens.
+    /// 2. Truncate the boundary segment past the last kept record and unlink
+    ///    all later segments, then fsync the dir.
+    /// 3. Remove the intent file, fsync the dir.
     ///
-    /// If a crash occurs between steps 2 and 3, Task 14 recovery detects the
-    /// sentinel on the next open and re-truncates.
+    /// A crash before 1 completes leaves the journal untouched (a torn
+    /// intent is ignored on open); a crash any time after leaves the intent,
+    /// and `Journal::open` re-runs step 2 idempotently before consuming it.
+    ///
+    /// Queued-but-unwritten appends past `keep_seq` are fenced: the writer
+    /// drops them via the truncation generation (see `AppendRequest::gen`),
+    /// and the durable-seq watermark is pulled back to `keep_seq` so a
+    /// subsequent re-append at a truncated seq is only reported durable by
+    /// its own fsync.
     ///
     /// Returns a `Notifier::done()` — the operation is fully synchronous.
     pub fn truncate_after(&self, keep_seq: u64) -> Result<Notifier, JournalError> {
         let mut st = self.state.lock().unwrap();
+        if st.poisoned {
+            return Err(JournalError::Closed);
+        }
 
         // Drop any not-yet-persisted records past the truncation point so the
         // in-memory overlay matches the truncated log (openraft truncates a
-        // conflicting suffix that may still be sitting in `pending`).
+        // conflicting suffix that may still be sitting in `pending`), and
+        // bump the truncation generation so the writer skips queued requests
+        // for the seqs we just dropped.
         st.pending.retain(|&s, _| s <= keep_seq);
+        st.truncate_gen += 1;
 
-        // Find the last segment whose base_seq <= keep_seq.
-        let seg_idx = match st.segments.iter().rposition(|s| s.base_seq() <= keep_seq) {
-            Some(i) => i,
-            None => {
-                // keep_seq is below every segment — drop everything.
-                let paths: Vec<_> = st.segments.iter().map(|s| s.path().to_path_buf()).collect();
-                st.segments.clear();
-                for p in paths {
-                    let _ = std::fs::remove_file(&p);
-                }
-                if let Ok(d) = std::fs::File::open(&st.dir) {
-                    let _ = d.sync_all();
-                }
-                st.first_seq = None;
-                st.last_seq = None;
-                return Ok(Notifier::done());
-            }
-        };
+        // Pull the durability watermark back: durable seqs past keep_seq no
+        // longer exist, and an in-flight publish for pre-truncate bytes must
+        // not re-advance it (stale generation).
+        st.persisted_hwm = st.persisted_hwm.min(keep_seq);
+        self.durability.reset_to(keep_seq, st.truncate_gen);
 
-        // Compute the byte offset just past the last record with seq <= keep_seq.
-        let scan = st.segments[seg_idx].scan()?;
-        let new_end = scan
-            .records
-            .iter()
-            .position(|r| r.seq > keep_seq)
-            .map(|pos| {
-                segment::SEGMENT_HEADER_SIZE as u64
-                    + scan.records[..pos]
-                        .iter()
-                        .map(|r| (4 + 16 + r.payload.len() + 4) as u64)
-                        .sum::<u64>()
-            })
-            .unwrap_or(scan.last_durable_offset);
+        // Intent → destructive phase → consume intent.
+        let dir = st.dir.clone();
+        write_truncate_intent(&dir, keep_seq)?;
+        apply_truncate_to_segments(&dir, &mut st.segments, keep_seq)?;
+        remove_truncate_intent(&dir)?;
 
-        // Phase 1: truncate to new_end (remove records past keep_seq).
-        st.segments[seg_idx].truncate(new_end)?;
-
-        // Phase 2: write sentinel at new_end and fsync (crash-safety marker).
-        st.segments[seg_idx].append_record(
-            keep_seq.saturating_add(1),
-            segment::SENTINEL_META,
-            segment::SENTINEL_PAYLOAD,
-        )?;
-        st.segments[seg_idx].fsync()?;
-
-        // Phase 3: truncate back to new_end, removing the sentinel.
-        let after_sentinel = new_end;
-        st.segments[seg_idx].truncate(after_sentinel)?;
-
-        // Phase 4: unlink all later segments, then fsync directory.
-        let to_remove: Vec<_> = st.segments.drain(seg_idx + 1..).collect();
-        for seg in to_remove {
-            let _ = std::fs::remove_file(seg.path());
-        }
-        if let Ok(d) = std::fs::File::open(&st.dir) {
-            let _ = d.sync_all();
-        }
-
-        // Update in-memory state.
-        st.last_seq = if st.first_seq.is_none_or(|first| keep_seq >= first) {
+        // Update in-memory bounds. Anything <= keep_seq survives (on disk or
+        // in `pending`), so the journal is non-empty iff some record at or
+        // below keep_seq ever existed — i.e. first_seq <= keep_seq.
+        st.last_seq = if st.first_seq.is_some_and(|first| keep_seq >= first) {
             Some(keep_seq)
         } else {
             None
@@ -487,6 +488,109 @@ impl Drop for Journal {
         // Release any waiter parked on a seq that was never written so it cannot
         // block forever (task28). Idempotent if close() already ran.
         self.durability.close();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Truncate intent file — crash-safe two-phase truncate_after
+// ---------------------------------------------------------------------------
+
+/// Name of the durable truncate-intent file. Written and fsynced *before*
+/// any destructive step of `truncate_after`, removed only after the last
+/// one; `Journal::open` completes the truncate if it finds one.
+const TRUNCATE_INTENT_FILENAME: &str = "truncate.intent";
+const TRUNCATE_INTENT_MAGIC: &[u8; 8] = b"ULTJINT1";
+
+fn sync_dir(dir: &std::path::Path) -> Result<(), JournalError> {
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Write + fsync the intent file (magic, keep_seq, CRC), then fsync the dir.
+fn write_truncate_intent(dir: &std::path::Path, keep_seq: u64) -> Result<(), JournalError> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(20);
+    buf.extend_from_slice(TRUNCATE_INTENT_MAGIC);
+    buf.extend_from_slice(&keep_seq.to_le_bytes());
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    let mut f = std::fs::File::create(dir.join(TRUNCATE_INTENT_FILENAME))?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    sync_dir(dir)
+}
+
+/// Read a valid intent's keep_seq. A missing, short, or CRC-failing file
+/// returns `None` — a torn intent means the crash happened while writing it,
+/// before any destructive step, so ignoring it is safe.
+fn read_truncate_intent(dir: &std::path::Path) -> Option<u64> {
+    let buf = std::fs::read(dir.join(TRUNCATE_INTENT_FILENAME)).ok()?;
+    if buf.len() != 20 || &buf[0..8] != TRUNCATE_INTENT_MAGIC {
+        return None;
+    }
+    let stored = u32::from_le_bytes(buf[16..20].try_into().ok()?);
+    if crc32fast::hash(&buf[0..16]) != stored {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[8..16].try_into().ok()?))
+}
+
+/// Remove the intent file (idempotent) and fsync the dir.
+fn remove_truncate_intent(dir: &std::path::Path) -> Result<(), JournalError> {
+    match std::fs::remove_file(dir.join(TRUNCATE_INTENT_FILENAME)) {
+        Ok(()) => sync_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Destructive phase of a truncate: drop every record with seq > `keep_seq`
+/// from the segment files (truncating the boundary segment, unlinking later
+/// ones), then fsync the dir. Idempotent — always runs under a durable
+/// intent file, so a crash at any point is completed on the next open.
+///
+/// Returns the highest surviving on-disk seq, if any.
+fn apply_truncate_to_segments(
+    dir: &std::path::Path,
+    segments: &mut Vec<segment::SegmentFile>,
+    keep_seq: u64,
+) -> Result<Option<u64>, JournalError> {
+    match segments.iter().rposition(|s| s.base_seq() <= keep_seq) {
+        None => {
+            // keep_seq is below every segment — drop everything.
+            let removed: Vec<_> = segments.drain(..).collect();
+            for seg in removed {
+                let _ = std::fs::remove_file(seg.path());
+            }
+            sync_dir(dir)?;
+            Ok(None)
+        }
+        Some(seg_idx) => {
+            // Byte offset just past the last record with seq <= keep_seq.
+            let scan = segments[seg_idx].scan()?;
+            let cut = scan.records.iter().position(|r| r.seq > keep_seq);
+            let new_end = cut
+                .map(|pos| {
+                    segment::SEGMENT_HEADER_SIZE as u64
+                        + scan.records[..pos]
+                            .iter()
+                            .map(|r| (4 + 16 + r.payload.len() + 4) as u64)
+                            .sum::<u64>()
+                })
+                .unwrap_or(scan.last_durable_offset);
+            let survivor = match cut {
+                Some(0) => None,
+                Some(pos) => Some(scan.records[pos - 1].seq),
+                None => scan.records.last().map(|r| r.seq),
+            };
+            segments[seg_idx].truncate(new_end)?;
+            let to_remove: Vec<_> = segments.drain(seg_idx + 1..).collect();
+            for seg in to_remove {
+                let _ = std::fs::remove_file(seg.path());
+            }
+            sync_dir(dir)?;
+            Ok(survivor)
+        }
     }
 }
 
@@ -1204,6 +1308,193 @@ mod tests {
         assert_eq!(seqs, vec![10, 11, 12, 13, 14, 15]);
         assert_eq!(v[0].1, 50); // meta = 10 * 5
         assert_eq!(v[5].2, payload);
+    }
+
+    // --- truncate_after crash-safety (intent file), watermark, fencing ---
+
+    /// Write a truncate-intent file the way `truncate_after` does, simulating
+    /// a crash after the intent was made durable but before (or during) the
+    /// destructive steps.
+    fn write_intent_bytes(dir: &std::path::Path, keep_seq: u64) {
+        let mut buf = Vec::with_capacity(20);
+        buf.extend_from_slice(b"ULTJINT1");
+        buf.extend_from_slice(&keep_seq.to_le_bytes());
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(dir.join("truncate.intent"), buf).unwrap();
+    }
+
+    /// A durable truncate intent left behind by a crash must be completed on
+    /// open: records past keep_seq dropped, later segments unlinked, the
+    /// intent consumed, and the journal usable afterwards.
+    #[test]
+    fn open_completes_truncate_from_intent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.segment_size_bytes = 256;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=12u64 {
+                j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
+            }
+        }
+        write_intent_bytes(dir.path(), 4);
+
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.last_seq(), Some(4), "intent truncate not completed");
+        assert!(j2.read(5).unwrap().is_none());
+        assert!(
+            !dir.path().join("truncate.intent").exists(),
+            "intent file must be consumed after completion"
+        );
+        j2.append(5, 0, b"new").unwrap().wait().unwrap();
+        assert_eq!(j2.read(5).unwrap().unwrap().1, b"new".to_vec());
+    }
+
+    /// A torn/garbage intent file means the crash happened *while writing the
+    /// intent* — before any destructive step — so it is ignored and removed.
+    #[test]
+    fn corrupt_truncate_intent_is_ignored_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+            for i in 1..=3u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        std::fs::write(dir.path().join("truncate.intent"), b"garbage").unwrap();
+
+        let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        assert_eq!(j2.last_seq(), Some(3), "journal must be intact");
+        assert!(
+            !dir.path().join("truncate.intent").exists(),
+            "corrupt intent must be removed"
+        );
+    }
+
+    /// A completed truncate_after leaves no intent file behind.
+    #[test]
+    fn truncate_after_leaves_no_intent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=10u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        j.truncate_after(5).unwrap().wait().unwrap();
+        assert!(!dir.path().join("truncate.intent").exists());
+    }
+
+    /// `truncate_after` must pull the durable watermark back to keep_seq:
+    /// otherwise a fresh append at a truncated seq is instantly reported
+    /// durable (`wait_durable`/`on_durable`/`durable_seq`) before any fsync —
+    /// in a Raft log that acks un-fsynced replacement entries.
+    #[test]
+    fn truncate_after_resets_durable_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for i in 1..=10u64 {
+            j.append(i, 0, b"x").unwrap().wait().unwrap();
+        }
+        j.wait_durable(10).unwrap();
+
+        j.truncate_after(5).unwrap().wait().unwrap();
+        assert!(
+            j.durable_seq() <= 5,
+            "watermark {} not reset by truncate_after(5)",
+            j.durable_seq()
+        );
+
+        // The replacement entry becomes durable through its own fsync.
+        j.append(6, 0, b"new").unwrap().wait().unwrap();
+        j.wait_durable(6).unwrap();
+        assert!(j.durable_seq() >= 6);
+    }
+
+    /// Appends still queued in the writer channel when `truncate_after` runs
+    /// must not be written afterwards: they would resurrect truncated seqs,
+    /// produce non-monotonic on-disk sequences, and shadow a re-appended
+    /// entry at the same seq with the stale payload.
+    #[test]
+    fn truncated_queued_appends_do_not_resurrect() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+
+        for round in 0..200u64 {
+            let base = round * 100;
+            // Burst without waiting so some requests are still queued when
+            // the truncate runs.
+            for s in (base + 1)..=(base + 20) {
+                let _ = j.append(s, 0, format!("old{round}").as_bytes()).unwrap();
+            }
+            j.truncate_after(base + 10).unwrap().wait().unwrap();
+
+            // Re-append at a truncated seq with a different payload.
+            j.append(base + 11, 0, format!("new{round}").as_bytes())
+                .unwrap()
+                .wait()
+                .unwrap();
+
+            let (_, p) = j.read(base + 11).unwrap().unwrap();
+            assert_eq!(
+                p,
+                format!("new{round}").as_bytes(),
+                "round {round}: stale queued append shadowed the re-appended entry"
+            );
+            let tail = j.read_range(base + 12..).unwrap();
+            assert!(
+                tail.is_empty(),
+                "round {round}: truncated seqs resurrected: {:?}",
+                tail.iter().map(|t| t.0).collect::<Vec<_>>()
+            );
+        }
+
+        // On-disk state after reopen must be strictly ascending.
+        drop(j);
+        let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        let v = j2.read_range(..).unwrap();
+        for w in v.windows(2) {
+            assert!(
+                w[0].0 < w[1].0,
+                "non-monotonic on-disk seqs after reopen: {} then {}",
+                w[0].0,
+                w[1].0
+            );
+        }
+    }
+
+    /// A failed fsync must halt the journal (fail-stop): the failed batch
+    /// errors, subsequent appends are refused, and the durable watermark
+    /// never advances past the failure — a later successful fsync cannot
+    /// retroactively make the lost bytes durable (the classic fsync-retry
+    /// hazard).
+    #[test]
+    fn fsync_failure_halts_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        j.append(1, 0, b"x").unwrap().wait().unwrap();
+        j.wait_durable(1).unwrap();
+
+        j.state.lock().unwrap().fail_next_fsync = true;
+        let n = j.append(2, 0, b"y").unwrap();
+        assert!(
+            n.wait().is_err(),
+            "append covered by a failed fsync must report the failure"
+        );
+
+        // Fail-stop: the journal refuses further work...
+        let halted = match j.append(3, 0, b"z") {
+            Err(JournalError::Closed) => true,
+            Err(other) => panic!("expected Closed, got {other:?}"),
+            Ok(n) => n.wait().is_err(),
+        };
+        assert!(halted, "writer kept accepting work after an fsync failure");
+
+        // ...and the watermark stays at the last truly durable seq.
+        assert_eq!(
+            j.durable_seq(),
+            1,
+            "watermark advanced past a failed fsync"
+        );
     }
 
     #[test]

@@ -128,15 +128,48 @@ The append path validates monotonicity under the `WriterState` mutex *and* sends
 
 - **Append (Consistent):** Notifier reflects actual fsync completion. Records that hadn't fsynced are absent on recovery.
 - **Append (Eventual):** caller is told "queued"; durability is best-effort up to the next periodic fsync.
-- **`truncate_after`:** Four-phase sentinel protocol. (1) truncate segment to `new_end`, (2) append a sentinel record (`meta = u64::MAX`, `payload = b"ULTJTRUNC"`) and fsync — intent is now durable, (3) truncate back to `new_end` removing the sentinel, (4) unlink later segments, fsync dir.
-  - Crash between (2) and (3) is fully recoverable: `Journal::open` detects the sentinel and re-runs the cleanup, producing the same final state as if no crash had occurred.
-  - Crash between (1) and (2), or between (3) and (4), leaves orphaned later segments on disk with seq > `keep_seq`. Recovery cannot detect this case (no sentinel exists). The journal will reopen with those records still present. Raft tolerates this — those records are speculative uncommitted entries, and the leader's protocol re-truncates on reconnect. **Non-Raft callers must understand that `truncate_after` is durable only to the granularity of "either fully complete or producing extra speculative tail records."**
+- **`truncate_after`:** Durable intent-file protocol. (1) Write `truncate.intent`
+  (magic + `keep_seq` + CRC), fsync the file and the dir — the intent is durable
+  *before* anything destructive happens. (2) Truncate the boundary segment past
+  the last kept record and unlink later segments, fsync dir. (3) Remove the
+  intent, fsync dir.
+  - A crash at any point is fully recoverable: before (1) completes, a
+    torn/CRC-failing intent is ignored (nothing destructive happened); after
+    (1), `Journal::open` finds the intent and re-runs the destructive phase
+    idempotently before consuming it. No crash window leaves orphaned
+    later-segment records (the old four-phase in-segment sentinel protocol
+    could resurrect a truncated suffix if the crash hit before the sentinel
+    was written or after it was removed — exactly the conflicting entries a
+    Raft leader ordered removed).
+  - Queued-but-unwritten appends past `keep_seq` are fenced by a truncation
+    generation: `append()` stamps each request and `pending` entry with
+    `WriterState::truncate_gen`; the bg writer persists a request only while
+    it still owns its `pending` entry under the same generation. Without
+    this, requests sitting in the channel during a truncate were written
+    afterwards — resurrecting truncated seqs, breaking on-disk monotonicity,
+    and shadowing a re-appended entry at the same seq.
+  - The `durable_seq` watermark is pulled back to `keep_seq`
+    (`SeqWatermark::reset_to`) and generation-guarded, so a re-appended entry
+    at a truncated seq is only reported durable by its own fsync, and an
+    in-flight publish for pre-truncate bytes is dropped as stale.
 - **`purge_before`:** Pure segment unlinks. Idempotent.
-- **Recovery (`Journal::open`):** Three phases —
+- **Segment creation** fsyncs the directory after creating the file, so a
+  power loss cannot vanish a segment whose records were already
+  fsync-acknowledged.
+- **Fsync failure is fail-stop:** the writer reports the failed batch,
+  poisons the journal (subsequent `append`/`truncate_after` return
+  `Closed`), drains queued requests, and halts. A failed fsync may have
+  dropped dirty pages, so a later "successful" fsync is never allowed to
+  advance the durability watermark past the failure (the classic
+  fsync-retry hazard). The Eventual idle fsync publishes the *persisted*
+  high-water seq, never `last_seq` (which `append()` advances for entries
+  still queued and unwritten).
+- **Recovery (`Journal::open`):** Four phases —
   - **Torn-tail repair:** for each segment, if scan sees `had_torn_tail`, truncate to `last_durable_offset` + fsync.
-  - **Sentinel completion:** backwards-search for a sentinel record as the last record. If found, truncate the segment at the sentinel's offset, drop later segments.
+  - **Sentinel completion (legacy):** backwards-search for a sentinel record as the last record. If found, truncate the segment at the sentinel's offset, drop later segments. Kept for crash states written by older builds.
+  - **Intent completion:** a valid `truncate.intent` re-runs the truncate's destructive phase; the intent file is consumed either way.
   - **State compute:** derive `first_seq` / `last_seq` from final scan results.
-- Recovery is idempotent — after a recovery pass, no sentinel remains on disk; reopening produces identical state.
+- Recovery is idempotent — after a recovery pass, no sentinel or intent remains on disk; reopening produces identical state.
 
 ### Concurrency
 

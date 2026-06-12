@@ -19,6 +19,12 @@ pub(crate) struct AppendRequest {
     pub meta: u64,
     pub payload: Vec<u8>,
     pub signal: Signal,
+    /// `WriterState::truncate_gen` at submission. The writer persists this
+    /// request only while `pending[seq]` still carries the same generation —
+    /// a `truncate_after` in between bumps the generation, fencing off
+    /// queued requests for truncated seqs (they would otherwise resurrect
+    /// on disk, or shadow a re-appended entry at the same seq).
+    pub generation: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -41,8 +47,14 @@ type DurabilityCallback = Box<dyn FnOnce(Result<(), JournalError>) + Send>;
 /// Strictly additive: it does not change the existing per-append [`Signal`]
 /// semantics (which still fire after the buffered write in Eventual mode).
 pub(crate) struct SeqWatermark {
-    /// Highest seq known fsync-durable. Monotonic; only ever advances.
+    /// Highest seq known fsync-durable. Advances on publish; pulled back
+    /// only by `reset_to` (truncate_after removing durable suffix entries).
     durable_seq: AtomicU64,
+    /// Truncation generation (mirrors `WriterState::truncate_gen`). A
+    /// publish carries the generation captured when its bytes were written;
+    /// a stale-generation publish is dropped — its bytes were truncated
+    /// away after the write, so they must not advance the watermark.
+    generation: AtomicU64,
     /// Set when the writer thread is gone; releases parked waiters so they
     /// cannot block forever on a seq that will never be reached.
     closed: AtomicBool,
@@ -64,6 +76,7 @@ impl SeqWatermark {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             durable_seq: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             inner: Mutex::new(Waiters::default()),
             condvar: Condvar::new(),
@@ -75,11 +88,28 @@ impl SeqWatermark {
         self.durable_seq.load(Ordering::Acquire)
     }
 
+    /// Called by `truncate_after` (under the state lock): pull the watermark
+    /// back to `keep_seq` — durable seqs past it no longer exist — and adopt
+    /// the new truncation generation so an in-flight publish for bytes
+    /// written before the truncate (now removed) is dropped as stale.
+    pub(crate) fn reset_to(&self, keep_seq: u64, generation: u64) {
+        let _w = self.inner.lock().unwrap();
+        if self.durable_seq.load(Ordering::Acquire) > keep_seq {
+            self.durable_seq.store(keep_seq, Ordering::Release);
+        }
+        self.generation.store(generation, Ordering::Release);
+    }
+
     /// Called by the writer after a successful fsync. `seq` is the high-water
-    /// mark of everything flushed by that fsync.
-    pub(crate) fn publish(&self, seq: u64) {
+    /// mark of everything flushed by that fsync; `gen` is the truncation
+    /// generation captured (under the state lock) when those bytes were
+    /// written. A stale generation means a truncate removed them — skip.
+    pub(crate) fn publish(&self, seq: u64, generation: u64) {
         let ready = {
             let mut w = self.inner.lock().unwrap();
+            if generation != self.generation.load(Ordering::Acquire) {
+                return;
+            }
             let new = self.durable_seq.load(Ordering::Acquire).max(seq);
             // Store under the mutex so a concurrent wait/on_complete cannot read
             // the old value and then miss the notify (lost wakeup).
@@ -93,10 +123,14 @@ impl SeqWatermark {
     }
 
     /// Called by the writer when an fsync fails. Waiters at/below `seq` resolve
-    /// to `Err`; the watermark is NOT advanced.
-    pub(crate) fn publish_error(&self, seq: u64, err: JournalError) {
+    /// to `Err`; the watermark is NOT advanced. Stale generations are dropped
+    /// like in [`publish`].
+    pub(crate) fn publish_error(&self, seq: u64, generation: u64, err: JournalError) {
         let ready = {
             let mut w = self.inner.lock().unwrap();
+            if generation != self.generation.load(Ordering::Acquire) {
+                return;
+            }
             match &w.last_error {
                 Some((es, _)) if *es >= seq => {}
                 _ => w.last_error = Some((seq, clone_err(&err))),
@@ -196,8 +230,27 @@ pub(crate) struct WriterState {
     /// flush callback fires — so `append()` publishes here synchronously and
     /// `read`/`read_range` overlay it on the durable segments. The writer evicts
     /// each seq once it is persisted (both under this same lock, so a seq is in
-    /// `pending` XOR a segment, never both and never neither). seq → (meta, payload).
-    pub pending: BTreeMap<u64, (u64, Vec<u8>)>,
+    /// `pending` XOR a segment, never both and never neither).
+    /// seq → (truncate_gen at append, meta, payload).
+    pub pending: BTreeMap<u64, (u64, u64, Vec<u8>)>,
+    /// Bumped by every `truncate_after`. Stamped onto pending entries and
+    /// `AppendRequest`s; the writer only persists a request whose generation
+    /// still matches its pending entry (see `AppendRequest::generation`).
+    pub truncate_gen: u64,
+    /// Highest seq actually written to a segment (0 = none). The Eventual
+    /// idle fsync publishes this — NOT `last_seq`, which `append()` advances
+    /// for entries still queued and unwritten (publishing those would
+    /// over-report durability). Pulled back by `truncate_after`.
+    pub persisted_hwm: u64,
+    /// Set (under this lock) by the writer before it halts on an I/O error.
+    /// `append`/`truncate_after` refuse with `Closed` once set — fail-stop:
+    /// a failed fsync may have dropped dirty pages, so a later "successful"
+    /// fsync must never be allowed to claim the lost bytes are durable.
+    pub poisoned: bool,
+    /// Test-only fault injection: the next segment fsync fails with an I/O
+    /// error, exercising the writer's fail-stop path.
+    #[cfg(test)]
+    pub fail_next_fsync: bool,
 }
 
 pub(crate) struct Writer {
@@ -232,21 +285,30 @@ fn writer_loop(
             Durability::Eventual => {
                 let elapsed = last_eventual_fsync.elapsed();
                 if elapsed >= eventual_interval {
-                    // Snapshot the high-water seq, fsync, then publish it — so
-                    // the watermark only advances to seqs whose bytes the fsync
-                    // definitely flushed (task28). Single-threaded writer, so
-                    // last_seq cannot change underneath us here.
-                    let hwm = state.lock().unwrap().last_seq;
+                    // Snapshot the persisted high-water seq + truncation
+                    // generation, fsync, then publish — so the watermark only
+                    // advances to seqs whose bytes the fsync definitely
+                    // flushed (task28), and never to seqs that `append()`
+                    // claimed but the writer hasn't written yet.
+                    let (hwm, generation) = {
+                        let st = state.lock().unwrap();
+                        (st.persisted_hwm, st.truncate_gen)
+                    };
                     match fsync_active_segment(&state) {
                         Ok(()) => {
-                            if let Some(s) = hwm {
-                                watermark.publish(s);
+                            if hwm > 0 {
+                                watermark.publish(hwm, generation);
                             }
                         }
                         Err(e) => {
-                            if let Some(s) = hwm {
-                                watermark.publish_error(s, e);
+                            // Fail-stop (see halt_writer): a failed fsync may
+                            // have dropped dirty pages; nothing after it may
+                            // be reported durable.
+                            if hwm > 0 {
+                                watermark.publish_error(hwm, generation, e);
                             }
+                            halt_writer(&state, &rx);
+                            break;
                         }
                     }
                     last_eventual_fsync = Instant::now();
@@ -277,7 +339,8 @@ fn writer_loop(
         while let Ok(req) = rx.try_recv() {
             batch.push(req);
         }
-        // Write (no fsync). `write_batch` returns the high-water seq written.
+        // Write (no fsync). `write_batch` returns the high-water seq written
+        // and the truncation generation captured while writing.
         let write_res = write_batch(&state, &batch);
         // Determine the result reported to per-append Signals, and advance the
         // durable_seq watermark. In Consistent mode the fsync happens here
@@ -287,16 +350,16 @@ fn writer_loop(
         // advanced later by the idle-timer fsync above.
         let result: Result<(), JournalError> = match durability {
             Durability::Consistent => match write_res {
-                Ok(hwm) => match fsync_active_segment(&state) {
+                Ok((hwm, generation)) => match fsync_active_segment(&state) {
                     Ok(()) => {
                         if let Some(s) = hwm {
-                            watermark.publish(s);
+                            watermark.publish(s, generation);
                         }
                         Ok(())
                     }
                     Err(e) => {
                         if let Some(s) = hwm {
-                            watermark.publish_error(s, clone_err(&e));
+                            watermark.publish_error(s, generation, clone_err(&e));
                         }
                         Err(e)
                     }
@@ -305,17 +368,37 @@ fn writer_loop(
             },
             Durability::Eventual => write_res.map(|_| ()),
         };
+        let failed = result.is_err();
         for req in batch {
             req.signal
                 .complete(result.as_ref().map(|_| ()).map_err(clone_err));
         }
+        if failed {
+            // Fail-stop: a write or fsync error leaves the on-disk state
+            // unknown. Halt instead of continuing — a later "successful"
+            // fsync must never advance the watermark past the failure
+            // (the failed fsync may have dropped the dirty pages).
+            halt_writer(&state, &rx);
+            break;
+        }
+    }
+}
+
+/// Poison the journal and drain queued requests before the writer exits on an
+/// I/O error. The flag is set under the state lock — `append()` sends while
+/// holding that lock, so every request is either drained here or refused with
+/// `Closed` at `append()`; none can be left with a forever-pending Notifier.
+fn halt_writer(state: &Arc<Mutex<WriterState>>, rx: &Receiver<AppendRequest>) {
+    state.lock().unwrap().poisoned = true;
+    while let Ok(req) = rx.try_recv() {
+        req.signal.complete(Err(JournalError::Closed));
     }
 }
 
 fn write_batch(
     state: &Arc<Mutex<WriterState>>,
     batch: &[AppendRequest],
-) -> Result<Option<u64>, JournalError> {
+) -> Result<(Option<u64>, u64), JournalError> {
     let mut st = state.lock().unwrap();
 
     // Records accumulated for the current (last) segment, not yet written.
@@ -332,6 +415,21 @@ fn write_batch(
     // monotonic guard — it tracks the locally-written high-water instead.
     let mut prev_written: Option<u64> = None;
     for req in batch {
+        // Truncation fence: persist this request only if it is still the
+        // current owner of its seq — i.e. `pending[seq]` carries the same
+        // generation. A `truncate_after` since submission either removed the
+        // seq from `pending` (truncated) or a re-append replaced it under a
+        // newer generation; writing the stale request would resurrect a
+        // truncated record or shadow its replacement. Skipped requests are
+        // settled by the caller's signal fan-out (the append was accepted,
+        // then explicitly truncated).
+        let owns = st
+            .pending
+            .get(&req.seq)
+            .is_some_and(|(generation, _, _)| *generation == req.generation);
+        if !owns {
+            continue;
+        }
         // Monotonic-seq guard (redundant with append()'s enqueue check, kept as
         // defense; the channel is FIFO and append() validates global
         // monotonicity under the state lock, so this only ever guards against an
@@ -379,9 +477,10 @@ fn write_batch(
     // can be published after it, outside this lock. Return the high-water seq
     // PERSISTED by this batch — NOT `st.last_seq`, which `append()` may have
     // advanced past this batch for entries not yet written; using it would
-    // over-report durability. On the Ok path the whole batch was flushed, so the
-    // last entry is the persisted high-water.
-    Ok(prev_written)
+    // over-report durability. The truncation generation is captured under this
+    // same lock so a truncate that lands after we release it invalidates the
+    // eventual watermark publish for these bytes.
+    Ok((prev_written, st.truncate_gen))
 }
 
 /// Write all accumulated records to the active segment with a single
@@ -409,12 +508,22 @@ fn flush_run(
     for (seq, _, _) in run.iter() {
         st.pending.remove(seq);
     }
+    if let Some((seq, _, _)) = run.last() {
+        st.persisted_hwm = st.persisted_hwm.max(*seq);
+    }
     run.clear();
     Ok(())
 }
 
 fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalError> {
     let mut st = state.lock().unwrap();
+    #[cfg(test)]
+    if st.fail_next_fsync {
+        st.fail_next_fsync = false;
+        return Err(JournalError::Io(std::io::Error::other(
+            "injected fsync failure",
+        )));
+    }
     if let Some(seg) = st.segments.last_mut() {
         seg.fsync()?;
     }
@@ -459,12 +568,12 @@ mod tests {
     #[test]
     fn publish_error_poisons_without_advancing() {
         let wm = SeqWatermark::new();
-        wm.publish_error(5, JournalError::Closed);
+        wm.publish_error(5, 0, JournalError::Closed);
         assert_eq!(wm.current(), 0, "watermark must not advance on error");
         assert!(matches!(wm.wait(3), Err(JournalError::Closed)));
 
         // A later successful fsync advances and resolves higher seqs.
-        wm.publish(6);
+        wm.publish(6, 0);
         assert_eq!(wm.current(), 6);
         wm.wait(6).unwrap();
         // The already-resolved low seq is durable now too (6 >= 3).
@@ -476,8 +585,8 @@ mod tests {
     #[test]
     fn publish_is_monotonic() {
         let wm = SeqWatermark::new();
-        wm.publish(10);
-        wm.publish(4);
+        wm.publish(10, 0);
+        wm.publish(4, 0);
         assert_eq!(wm.current(), 10);
     }
 

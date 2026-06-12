@@ -202,6 +202,12 @@ impl SegmentFile {
         let bytes = encode_header(&header);
         file.write_all(&bytes)?;
         file.sync_all()?;
+        // Make the directory entry durable too: without this, a power loss
+        // can vanish the file itself — taking every record in it, including
+        // ones whose fsync already succeeded and was acknowledged.
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             file,
