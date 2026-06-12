@@ -79,7 +79,14 @@ pub struct BulkLoadOptions {
     /// If false and the table is missing, returns `Error::TableNotFound`.
     pub create_if_missing: bool,
     /// If true, after install write a checkpoint and prune the WAL up to
-    /// the new version. No-op for `Persistence::OffDisk`.
+    /// the new version. No-op for `Persistence::None`.
+    ///
+    /// If false on a Standalone (WAL-backed) store, the load is in memory
+    /// only until the next checkpoint — a crash in that window loses it.
+    /// Commits made on top of the un-checkpointed load cannot be replayed
+    /// from the WAL; recovery detects this and fails with
+    /// [`crate::Error::BulkLoadNotCheckpointed`] rather than recovering a
+    /// state that mixes pre-load data with post-load commits.
     pub checkpoint_after: bool,
 }
 

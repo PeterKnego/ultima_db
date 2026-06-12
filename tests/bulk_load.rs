@@ -818,3 +818,222 @@ fn bulk_load_replace_preserves_unique_index_definition() {
         .unwrap();
     assert!(stale.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Bulk loads vs in-flight writers (OCC visibility)
+// ---------------------------------------------------------------------------
+
+mod bulk_load_occ {
+    use ultima_db::{
+        BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IsolationLevel, Store,
+        StoreConfig, WriterMode,
+    };
+
+    fn replace_input(n: u64) -> BulkLoadInput<String> {
+        let rows: Vec<(u64, String)> = (1..=n).map(|i| (i, format!("bulk{i}"))).collect();
+        BulkLoadInput::Replace(BulkSource::sorted_vec(rows))
+    }
+
+    fn seed(store: &Store, table: &str, rows: &[&str]) {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>(table).unwrap();
+        for r in rows {
+            t.insert((*r).to_string()).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+
+    fn multi_writer_store() -> Store {
+        Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// A MultiWriter transaction whose writes were computed against the
+    /// pre-replace table must conflict at commit — its dirty table would
+    /// otherwise wholesale-overwrite the bulk-loaded data.
+    #[test]
+    fn inflight_writer_on_replaced_table_conflicts_at_commit() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t")
+            .unwrap()
+            .update(1, "from_writer".into())
+            .unwrap();
+
+        let bulk_v = store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::WriteConflict { .. })),
+            "writer based on pre-replace data must conflict, got {res:?}"
+        );
+
+        // The bulk-loaded data must be intact at latest.
+        assert_eq!(store.latest_version(), bulk_v);
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+    }
+
+    /// Same as above through the Delta path.
+    #[test]
+    fn inflight_writer_on_delta_loaded_table_conflicts_at_commit() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t")
+            .unwrap()
+            .update(2, "from_writer".into())
+            .unwrap();
+
+        let delta = BulkDelta {
+            inserts: vec![(3, "delta3".to_string())],
+            updates: vec![],
+            deletes: vec![],
+        };
+        store
+            .bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::WriteConflict { .. })),
+            "writer based on pre-delta data must conflict, got {res:?}"
+        );
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(3).map(String::as_str), Some("delta3"));
+    }
+
+    /// A writer that never touched the replaced table is unaffected: it
+    /// commits cleanly and both its data and the bulk data are present.
+    #[test]
+    fn inflight_writer_on_other_table_unaffected() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("other")
+            .unwrap()
+            .insert("writer_row".into())
+            .unwrap();
+
+        store
+            .bulk_load::<String>("t", replace_input(2), BulkLoadOptions::default())
+            .unwrap();
+
+        wtx.commit().expect("writer on a different table must commit");
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 2, "bulk data lost");
+        let other = rtx.open_table::<String>("other").unwrap();
+        assert_eq!(other.len(), 1, "writer data lost");
+    }
+
+    /// SingleWriter mode has no commit-time OCC, so the load itself must be
+    /// refused while a writer is active — otherwise the writer's eventual
+    /// commit silently overwrites the loaded table.
+    #[test]
+    fn refused_while_single_writer_active() {
+        let store = Store::default(); // SingleWriter
+        seed(&store, "t", &["seed1"]);
+
+        let wtx = store.begin_write(None).unwrap();
+        let res = store.bulk_load::<String>("t", replace_input(2), BulkLoadOptions::default());
+        assert!(
+            matches!(res, Err(Error::WriterBusy)),
+            "bulk load with an active SingleWriter must be refused, got {res:?}"
+        );
+        drop(wtx);
+
+        // Once the writer is gone the load goes through.
+        store
+            .bulk_load::<String>("t", replace_input(2), BulkLoadOptions::default())
+            .expect("load after writer release");
+    }
+
+    /// Delta path: same SingleWriter refusal.
+    #[test]
+    fn delta_refused_while_single_writer_active() {
+        let store = Store::default();
+        seed(&store, "t", &["seed1"]);
+
+        let wtx = store.begin_write(None).unwrap();
+        let delta = BulkDelta {
+            inserts: vec![(2, "delta2".to_string())],
+            updates: vec![],
+            deletes: vec![],
+        };
+        let res =
+            store.bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default());
+        assert!(
+            matches!(res, Err(Error::WriterBusy)),
+            "delta load with an active SingleWriter must be refused, got {res:?}"
+        );
+        drop(wtx);
+    }
+
+    /// Under Serializable isolation, a transaction that *read* the replaced
+    /// table must fail with SerializationFailure (its reads no longer hold).
+    #[test]
+    fn serializable_reader_of_replaced_table_fails() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        seed(&store, "t", &["seed1"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        // Point-read the soon-to-be-replaced table; write a different one.
+        let _ = wtx.open_table::<String>("t").unwrap().get(1);
+        wtx.open_table::<String>("other")
+            .unwrap()
+            .insert("x".into())
+            .unwrap();
+
+        store
+            .bulk_load::<String>("t", replace_input(2), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::SerializationFailure { .. })),
+            "serializable reader of replaced table must fail, got {res:?}"
+        );
+    }
+
+    /// Under plain Snapshot Isolation the same read is permitted — only the
+    /// transaction's *writes* matter, and they're on a different table.
+    #[test]
+    fn snapshot_isolation_reader_of_replaced_table_commits() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        let _ = wtx.open_table::<String>("t").unwrap().get(1);
+        wtx.open_table::<String>("other")
+            .unwrap()
+            .insert("x".into())
+            .unwrap();
+
+        store
+            .bulk_load::<String>("t", replace_input(2), BulkLoadOptions::default())
+            .unwrap();
+
+        wtx.commit()
+            .expect("SI reader of replaced table must commit");
+    }
+}

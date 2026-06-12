@@ -965,3 +965,179 @@ fn standalone_perentry_default_still_recovers() {
     let rtx = store2.begin_read(None).unwrap();
     assert_eq!(rtx.open_table::<User>("users").unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Bulk loads vs WAL recovery
+// ---------------------------------------------------------------------------
+
+/// Commits that land *after* an uncheckpointed bulk load cannot be replayed
+/// on recovery — they were computed against post-load state, but the WAL
+/// only reaches pre-load state. Recovery must fail with a clear error
+/// instead of silently producing a state no client ever observed.
+#[test]
+fn recovery_fails_cleanly_when_commits_follow_uncheckpointed_bulk_load() {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, Error};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Eventual);
+
+    {
+        let store = open_store(config.clone());
+
+        // Seed commit (WAL v1).
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "seed".into(),
+                age: 1,
+            })
+            .unwrap();
+        wtx.commit().unwrap();
+
+        // Bulk load without a checkpoint.
+        let rows: Vec<(u64, User)> = (1..=3)
+            .map(|i| {
+                (
+                    i,
+                    User {
+                        name: format!("bulk{i}"),
+                        age: i as u32,
+                    },
+                )
+            })
+            .collect();
+        store
+            .bulk_load::<User>(
+                "users",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                BulkLoadOptions {
+                    checkpoint_after: false,
+                    ..BulkLoadOptions::default()
+                },
+            )
+            .unwrap();
+
+        // A normal commit on top of the loaded state (WAL entry exists,
+        // but its semantics assume the post-load table).
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "after".into(),
+                age: 99,
+            })
+            .unwrap();
+        wtx.commit().unwrap();
+        // Store dropped: WAL flushed to disk.
+    }
+
+    let store = Store::new(config).unwrap();
+    store.register_table::<User>("users").unwrap();
+    let res = store.recover();
+    assert!(
+        matches!(res, Err(Error::BulkLoadNotCheckpointed { .. })),
+        "recovery across an uncheckpointed bulk load with later commits \
+         must fail cleanly, got {res:?}"
+    );
+}
+
+/// With no commits after the load, recovery falls back to the pre-load
+/// state — the documented `checkpoint_after: false` contract ("crash loses
+/// the load") — rather than failing.
+#[test]
+fn recovery_without_commits_after_uncheckpointed_bulk_load_loses_only_the_load() {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Eventual);
+
+    {
+        let store = open_store(config.clone());
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "seed".into(),
+                age: 1,
+            })
+            .unwrap();
+        wtx.commit().unwrap();
+
+        let rows: Vec<(u64, User)> = vec![(
+            1,
+            User {
+                name: "bulk".into(),
+                age: 2,
+            },
+        )];
+        store
+            .bulk_load::<User>(
+                "users",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                BulkLoadOptions {
+                    checkpoint_after: false,
+                    ..BulkLoadOptions::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let store = open_store(config);
+    let rtx = store.begin_read(None).unwrap();
+    let users = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users.get(1).unwrap().name, "seed");
+}
+
+/// `checkpoint_after: true` makes the load durable: recovery returns the
+/// post-load state and later commits replay cleanly on top of it.
+#[test]
+fn recovery_after_checkpointed_bulk_load_replays_later_commits() {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = standalone_config(dir.path(), Durability::Eventual);
+
+    {
+        let store = open_store(config.clone());
+        let rows: Vec<(u64, User)> = (1..=2)
+            .map(|i| {
+                (
+                    i,
+                    User {
+                        name: format!("bulk{i}"),
+                        age: i as u32,
+                    },
+                )
+            })
+            .collect();
+        store
+            .bulk_load::<User>(
+                "users",
+                BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                BulkLoadOptions {
+                    checkpoint_after: true,
+                    ..BulkLoadOptions::default()
+                },
+            )
+            .unwrap();
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: "after".into(),
+                age: 99,
+            })
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let store = open_store(config);
+    let rtx = store.begin_read(None).unwrap();
+    let users = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(users.len(), 3, "bulk rows + later commit expected");
+    assert_eq!(users.get(1).unwrap().name, "bulk1");
+    assert_eq!(users.get(3).unwrap().name, "after");
+}

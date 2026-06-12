@@ -199,6 +199,12 @@ impl PromoteGate {
         *self.turn.lock().unwrap() == ticket
     }
 
+    /// The ticket currently allowed to promote. Equal to the store's
+    /// `next_ticket` exactly when no ticketed commit is in flight.
+    fn current_turn(&self) -> u64 {
+        *self.turn.lock().unwrap()
+    }
+
     /// Blocks until it is `ticket`'s turn to promote.
     fn wait_turn(&self, ticket: u64) {
         let mut turn = self.turn.lock().unwrap();
@@ -718,7 +724,28 @@ impl Store {
                     }
                     let mut latest_version = inner.latest_version;
 
+                    // Version of the last bulk-load marker seen, if any.
+                    // Bulk-loaded data is not in the WAL, so commits that
+                    // follow an uncovered marker were computed against
+                    // state we cannot reconstruct — refuse instead of
+                    // replaying them onto pre-load state. A marker with
+                    // nothing after it is skipped: recovery falls back to
+                    // the pre-load state (the documented contract for
+                    // loads without `checkpoint_after`).
+                    let mut pending_bulk_load: Option<u64> = None;
+
                     for entry in &to_replay {
+                        if entry
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op, crate::wal::WalOp::BulkLoad { .. }))
+                        {
+                            pending_bulk_load = Some(entry.version);
+                            continue;
+                        }
+                        if let Some(version) = pending_bulk_load {
+                            return Err(Error::BulkLoadNotCheckpointed { version });
+                        }
                         for op in &entry.ops {
                             match op {
                                 crate::wal::WalOp::Insert { table, id, data }
@@ -769,6 +796,10 @@ impl Store {
                                 crate::wal::WalOp::DeleteTable { name } => {
                                     tables.remove(name);
                                 }
+                                // Marker entries are skipped before this
+                                // loop; a marker mixed into a commit entry
+                                // is never written.
+                                crate::wal::WalOp::BulkLoad { .. } => {}
                             }
                         }
                         latest_version = entry.version;
@@ -939,10 +970,22 @@ impl Store {
     /// For `Replace`, materializes the source into sorted rows off-lock,
     /// builds a fresh data tree and indexes via `Table::from_bulk` (preserving
     /// any existing index *definitions* with empty storage), then atomically
-    /// installs the result as a new MVCC snapshot.
+    /// installs the result as a new MVCC snapshot. For `Delta`, applies
+    /// inserts/updates/deletes on top of the current table into a freshly
+    /// built tree.
     ///
-    /// `Delta` is not implemented in this phase and returns
-    /// [`Error::InvalidBulkLoadInput`].
+    /// # Concurrency
+    ///
+    /// - In `SingleWriter` mode, returns [`Error::WriterBusy`] while any
+    ///   [`WriteTx`] is live (the writer's commit could not see the load).
+    /// - In `MultiWriter` mode, the load conflicts like a delete+recreate of
+    ///   the table: an in-flight transaction that wrote to the loaded table
+    ///   gets [`Error::WriteConflict`] at commit (under `Serializable`, one
+    ///   that read it gets [`Error::SerializationFailure`]); transactions on
+    ///   other tables are unaffected.
+    /// - Returns [`Error::WriteConflict`] if a commit advanced or is in the
+    ///   middle of advancing `latest_version` since the load was built —
+    ///   retry against the new state.
     ///
     /// See `docs/tasks/task23_bulk_load.md`.
     pub fn bulk_load<R: Record>(
@@ -1011,51 +1054,23 @@ impl Store {
 
     /// Install a freshly-built table as a new snapshot, refusing the install
     /// if a concurrent commit advanced `latest_version` since the delta was
-    /// computed against `base_version`. Mirrors the install tail of
-    /// `WriteTx::commit_single_writer`, adding the version-drift check up front.
+    /// computed against `base_version`. Delegates to [`install_batch_inner`]
+    /// so the single-table delta path shares the writer-exclusion, parked-
+    /// commit, and OCC-visibility handling of batch installs.
     fn install_after_delta_check<R: Record>(
         &self,
         name: &str,
         new_table: crate::table::Table<R>,
         base_version: u64,
     ) -> Result<u64> {
-        let mut inner = self.inner.write().unwrap();
-
-        if inner.latest_version != base_version {
-            return Err(Error::WriteConflict {
-                table: name.to_string(),
-                keys: vec![],
-                version: inner.latest_version,
-                wait_for: None,
-            });
-        }
-
-        let new_version = inner.latest_version + 1;
-        if new_version >= inner.next_version {
-            inner.next_version = new_version + 1;
-        }
-
-        let prev = &inner.snapshots[&inner.latest_version];
-        let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = prev
-            .tables
-            .iter()
-            .map(|(k, v)| (k.clone(), Arc::clone(v)))
-            .collect();
-        tables.insert(
-            name.to_string(),
-            Arc::new(new_table) as Arc<dyn MergeableTable>,
-        );
-
-        let snapshot = Arc::new(Snapshot {
-            version: new_version,
-            tables,
-        });
-        inner.snapshots.insert(new_version, snapshot);
-        inner.latest_version = new_version;
-        if inner.config.auto_snapshot_gc {
-            gc_inner(&mut inner);
-        }
-        Ok(new_version)
+        self.install_batch_inner(
+            vec![crate::bulk_load::PendingTable {
+                name: name.to_string(),
+                table: Arc::new(new_table) as Arc<dyn MergeableTable>,
+            }],
+            base_version,
+            None,
+        )
     }
 
     /// Checkpoint + WAL prune after a bulk load.
@@ -1178,6 +1193,31 @@ impl Store {
         );
         let mut inner = self.inner.write().unwrap();
 
+        // SingleWriter has no commit-time OCC: an active writer's eventual
+        // commit installs its dirty tables wholesale and cannot detect this
+        // install, so it would silently overwrite the loaded data. Refuse
+        // the install while any writer is live; the caller retries after.
+        if matches!(inner.config.writer_mode, WriterMode::SingleWriter)
+            && inner.active_writer_count > 0
+        {
+            return Err(Error::WriterBusy);
+        }
+
+        // A commit parked in the Consistent-mode fsync wait holds a
+        // promotion ticket and a reserved version. Installing now would
+        // either steal that version (snapshot overwrite) or advance
+        // `latest` past it so the parked commit's data never becomes
+        // visible — and the moment it promotes, this install would be
+        // stale anyway. Surface that staleness immediately.
+        if inner.next_ticket != inner.promote_gate.current_turn() {
+            return Err(Error::WriteConflict {
+                table: pending[0].name.clone(),
+                keys: vec![],
+                version: inner.latest_version,
+                wait_for: None,
+            });
+        }
+
         if inner.latest_version != base_version {
             return Err(Error::WriteConflict {
                 table: pending[0].name.clone(),
@@ -1187,9 +1227,12 @@ impl Store {
             });
         }
 
-        let new_version = inner.latest_version + 1;
-        if new_version >= inner.next_version {
-            inner.next_version = new_version + 1;
+        // Allocate from `next_version` (not `latest + 1`) so the install can
+        // never collide with a version already handed to a writer.
+        let new_version = inner.next_version;
+        inner.next_version += 1;
+        if new_version > inner.last_submitted_version {
+            inner.last_submitted_version = new_version;
         }
 
         let prev = &inner.snapshots[&inner.latest_version];
@@ -1206,6 +1249,37 @@ impl Store {
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
                 .collect(),
         };
+
+        // Tables replaced by this install, plus any dropped by `keep_set` —
+        // recorded as a committed write set below so in-flight MultiWriter
+        // transactions based on the pre-install snapshot conflict at commit
+        // instead of silently overwriting the loaded data.
+        let mut replaced: BTreeSet<String> = pending.iter().map(|p| p.name.clone()).collect();
+        if keep_set.is_some() {
+            for name in prev.tables.keys() {
+                if !tables.contains_key(name) {
+                    replaced.insert(name.clone());
+                }
+            }
+        }
+
+        // Record the load in the WAL (marker only — the data itself is not
+        // WAL-logged). Recovery uses it to refuse replaying commits that
+        // were made on top of a load no checkpoint covers. No fsync wait:
+        // WAL entries become durable in order, so any later commit that is
+        // acknowledged durable implies the marker is durable too. Submitted
+        // before any state mutation so a WAL error leaves the store
+        // unchanged.
+        #[cfg(feature = "persistence")]
+        if let Some(wal) = &inner.wal_handle {
+            let _ = wal.write(crate::wal::WalEntry {
+                version: new_version,
+                ops: vec![crate::wal::WalOp::BulkLoad {
+                    tables: replaced.iter().cloned().collect(),
+                }],
+            })?;
+        }
+
         for p in pending {
             tables.insert(p.name, p.table);
         }
@@ -1216,6 +1290,18 @@ impl Store {
         });
         inner.snapshots.insert(new_version, snapshot);
         inner.latest_version = new_version;
+
+        // Make the install visible to MultiWriter OCC and Serializable
+        // read-set validation: a wholesale replacement invalidates both
+        // writes to and reads of the table, exactly like delete+recreate.
+        if matches!(inner.config.writer_mode, WriterMode::MultiWriter) {
+            inner.committed_write_sets.push(CommittedWriteSet {
+                version: new_version,
+                tables: BTreeMap::new(),
+                deleted_tables: replaced,
+            });
+        }
+
         if inner.config.auto_snapshot_gc {
             gc_inner(&mut inner);
         }
@@ -2743,9 +2829,17 @@ impl WriteTx {
             if cws.version <= base_version {
                 continue;
             }
-            // Did a concurrent commit delete a table we modified?
+            // Did a concurrent commit delete (or bulk-replace) a table we
+            // modified? `open_table` inserts an empty write-set entry
+            // eagerly, so "opened but nothing written" must not count —
+            // a snapshot read of a since-replaced table is fine under SI
+            // (Serializable read-set validation handles the rest).
             for deleted in &cws.deleted_tables {
-                if self.write_set.contains_key(deleted) {
+                if self
+                    .write_set
+                    .get(deleted)
+                    .is_some_and(|keys| !keys.is_empty())
+                {
                     return Some(Error::WriteConflict {
                         table: deleted.clone(),
                         keys: vec![],
@@ -4393,6 +4487,70 @@ mod tests {
             .expect("table_b lost from latest snapshot");
         assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
         assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
+    }
+
+    /// A bulk load attempted while a commit is parked in the fsync wait must
+    /// be refused. Installing it would either steal the parked commit's
+    /// reserved version (snapshot overwrite) or advance `latest` past it so
+    /// the parked commit's data never becomes visible.
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn mock_wal_bulk_load_refused_while_commit_parked() {
+        let config = StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        };
+        let mock = std::sync::Arc::new(crate::wal::MockWal::new());
+        let store = Store::new(config).unwrap();
+        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+
+        // Writer parks in the fsync wait.
+        let ss = store.clone();
+        let t1 = std::thread::spawn(move || {
+            let mut wtx = ss.begin_write(None).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
+            wtx.commit().unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(mock.pending(), 1, "writer should be parked");
+
+        // Bulk load on an unrelated table while the commit is parked.
+        let rows: Vec<(u64, Item)> = vec![(1, Item { name: "bulk".into() })];
+        let res = store.bulk_load::<Item>(
+            "bulk_t",
+            crate::bulk_load::BulkLoadInput::Replace(crate::bulk_load::BulkSource::sorted_vec(
+                rows,
+            )),
+            crate::bulk_load::BulkLoadOptions::default(),
+        );
+        assert!(
+            matches!(res, Err(Error::WriteConflict { .. })),
+            "bulk load during a parked commit must be refused, got {res:?}"
+        );
+
+        // The parked commit completes untouched.
+        mock.flush();
+        let v1 = t1.join().unwrap();
+        assert_eq!(store.latest_version(), v1);
+        let rtx = store.begin_read(None).unwrap();
+        let items = rtx.open_table::<Item>("items").unwrap();
+        assert_eq!(items.get(1).unwrap(), &Item { name: "A".into() });
+
+        // And with no parked commit, the same load succeeds.
+        let rows: Vec<(u64, Item)> = vec![(1, Item { name: "bulk".into() })];
+        store.inner.write().unwrap().mock_wal = None;
+        store
+            .bulk_load::<Item>(
+                "bulk_t",
+                crate::bulk_load::BulkLoadInput::Replace(
+                    crate::bulk_load::BulkSource::sorted_vec(rows),
+                ),
+                crate::bulk_load::BulkLoadOptions::default(),
+            )
+            .expect("bulk load with no parked commits");
     }
 
     /// Two parked MultiWriter commits whose pre-assigned versions are both

@@ -233,16 +233,30 @@ drops the partial table; the original `Table` (if any) is unchanged.
 - **Readers:** never blocked. `ReadTx`s started before install see
   pre-load state; `ReadTx`s started after see loaded state. Old data
   lives until those `ReadTx`s drop, then `gc()` reclaims.
-- **SingleWriter mode:** build runs concurrently with at most one
-  `WriteTx`; commit phase serializes on `commit_lock`.
-- **MultiWriter mode:** `Replace` always wins at install (it is a
-  wholesale replacement). For a writer that committed against the
-  same table *before* our install, their commit is already in the
-  snapshot map at a lower version — we don't undo it. For a writer
-  attempting to commit *after* our install, our table is their merge
-  base and per-key merge replays their dirty keys onto our loaded
-  data — consistent with existing `MergeableTable::merge_keys_from`
-  semantics.
+- **SingleWriter mode:** the install is refused with
+  `Error::WriterBusy` while any `WriteTx` is live. SingleWriter has no
+  commit-time OCC, so an active writer's eventual commit would install
+  its dirty tables wholesale and silently overwrite the loaded data;
+  refusing up front is the only safe option. Retry after the writer
+  finishes.
+- **MultiWriter mode:** the install records a synthetic
+  `CommittedWriteSet` marking the affected tables as wholesale-replaced
+  (the `deleted_tables` marker — same semantics as delete+recreate).
+  An in-flight `WriteTx` based on the pre-install snapshot that *wrote*
+  to a replaced table gets `Error::WriteConflict` at commit; under
+  `IsolationLevel::Serializable`, a transaction that *read* a replaced
+  table gets `Error::SerializationFailure`. Writers on other tables are
+  unaffected. A transaction that merely opened a replaced table without
+  writing does not conflict (empty write-set entries are skipped).
+- **Commits parked in the Consistent-durability fsync wait:** the
+  install is refused with `Error::WriteConflict` while promotion
+  tickets are outstanding — installing would race the parked commit's
+  reserved version and promotion ordering (see task15, "Promotion
+  ordering"). The parked commit's promotion advances `latest_version`,
+  so the load would be stale the moment it completed anyway.
+- **Version assignment:** installs allocate from `next_version` (not
+  `latest_version + 1`) so they can never collide with a version
+  already reserved by a writer.
 - **`!Send`/`!Sync` of `WriteTx`:** unaffected — `bulk_load` is on
   `Store`, which is `Send + Sync + Clone`.
 
@@ -266,6 +280,19 @@ trade-off for "I'll batch many bulk loads, then checkpoint once at
 the end" — covered by
 `bulk_load_skip_checkpoint_loses_data_on_crash` in
 `tests/persistence_integration.rs`).
+
+In Standalone mode the install does write a single `WalOp::BulkLoad`
+*marker* entry (no data). Recovery uses it to protect commits made on
+top of an uncheckpointed load: their WAL entries assume the post-load
+state, which the WAL cannot reconstruct, so replaying them onto
+pre-load state would produce data no client ever observed. If recovery
+encounters commit entries after a marker no checkpoint covers, it
+fails with `Error::BulkLoadNotCheckpointed` instead of recovering
+silently-wrong state. A marker with nothing after it is skipped —
+recovery falls back to pre-load state, preserving the documented
+"crash loses the load" contract. The marker needs no fsync of its own:
+WAL entries become durable in order, so any later durable commit
+implies the marker is durable.
 
 ## Atomicity and memory model
 

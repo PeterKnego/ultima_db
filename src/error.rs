@@ -75,6 +75,20 @@ pub enum Error {
     /// Checkpoint file is corrupted (bad magic, bad CRC, truncated, etc.).
     #[error("checkpoint corrupted: {0}")]
     CheckpointCorrupted(String),
+    /// Recovery found WAL commits that were made on top of a bulk load no
+    /// checkpoint covers. Bulk loads are not WAL-logged, so those commits
+    /// cannot be replayed (their semantics assume the post-load state).
+    /// Recover from a newer checkpoint, or re-run the load and subsequent
+    /// writes. Avoid the situation by loading with `checkpoint_after: true`
+    /// (the default) or checkpointing manually before further commits.
+    #[error(
+        "recovery requires a checkpoint covering the bulk load at version {version}: \
+         later WAL commits cannot be replayed against pre-load state"
+    )]
+    BulkLoadNotCheckpointed {
+        /// The version at which the uncovered bulk load was installed.
+        version: u64,
+    },
     /// Table not present in the snapshot (used by bulk-load when a Delta
     /// targets a missing table or when `create_if_missing` is false).
     #[error("table '{0}' not found")]

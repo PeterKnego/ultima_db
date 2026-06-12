@@ -98,6 +98,15 @@ pub enum WalOp {
     DeleteTable {
         name: String,
     },
+    /// Marker recording that a bulk load replaced `tables` at this entry's
+    /// version. Bulk-loaded data itself is not WAL-logged; the marker lets
+    /// recovery detect WAL commits that were made on top of a load no
+    /// checkpoint covers (such commits cannot be replayed against pre-load
+    /// state) and fail with [`Error::BulkLoadNotCheckpointed`] instead of
+    /// silently producing a state no client ever observed.
+    BulkLoad {
+        tables: Vec<String>,
+    },
 }
 
 /// A complete WAL entry for one committed transaction.
@@ -117,6 +126,7 @@ const TAG_UPDATE: u8 = 2;
 const TAG_DELETE: u8 = 3;
 const TAG_CREATE_TABLE: u8 = 4;
 const TAG_DELETE_TABLE: u8 = 5;
+const TAG_BULK_LOAD: u8 = 6;
 
 fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
@@ -162,6 +172,11 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
             WalOp::DeleteTable { name } => {
                 buf.push(TAG_DELETE_TABLE);
                 bincode::encode_into_std_write(name.as_str(), &mut buf, config)
+                    .map_err(|e| Error::Persistence(e.to_string()))?;
+            }
+            WalOp::BulkLoad { tables } => {
+                buf.push(TAG_BULK_LOAD);
+                bincode::encode_into_std_write(tables, &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
         }
@@ -238,6 +253,13 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
                 ops.push(WalOp::DeleteTable { name });
+            }
+            TAG_BULK_LOAD => {
+                let (tables, read): (Vec<String>, _) =
+                    bincode::decode_from_slice(&data[offset..], config)
+                        .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+                offset += read;
+                ops.push(WalOp::BulkLoad { tables });
             }
             _ => return Err(Error::WalCorrupted(format!("unknown op tag: {tag}"))),
         }
