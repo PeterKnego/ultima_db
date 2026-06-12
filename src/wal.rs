@@ -197,7 +197,10 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
     offset += read;
 
-    let mut ops = Vec::with_capacity(op_count as usize);
+    // Cap the preallocation: `op_count` comes from the file, and the CRC only
+    // guards against accidental corruption — a crafted count must not drive a
+    // huge allocation. The Vec grows normally past the hint if needed.
+    let mut ops = Vec::with_capacity(op_count.min(1024) as usize);
     for _ in 0..op_count {
         if offset >= data.len() {
             return Err(Error::WalCorrupted("unexpected end of entry".into()));
@@ -2041,6 +2044,35 @@ mod tests {
         let entries = read_wal(&path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].version, 1);
+    }
+
+    /// A crafted WAL entry with a valid CRC but an absurd op count must
+    /// produce `WalCorrupted`, not attempt a multi-gigabyte preallocation.
+    /// (The CRC only guards against accidental corruption.)
+    #[test]
+    fn wal_huge_op_count_errors_not_allocates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+
+        let config = bincode::config::standard();
+        let mut data = Vec::new();
+        bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
+        bincode::encode_into_std_write(u32::MAX, &mut data, config).unwrap(); // op_count
+        // No op bytes follow — the count is a lie.
+
+        let mut file = File::create(&path).unwrap();
+        let len = data.len() as u32;
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(&data).unwrap();
+        let crc = crc32(&data);
+        file.write_all(&crc.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+
+        let res = read_wal(&path);
+        assert!(
+            matches!(res, Err(Error::WalCorrupted(_))),
+            "expected WalCorrupted, got {res:?}"
+        );
     }
 
     /// Unknown op tag in WAL entry data triggers WalCorrupted error.

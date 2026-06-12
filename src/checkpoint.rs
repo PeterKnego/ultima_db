@@ -138,7 +138,12 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
             .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
         offset += read;
 
-        let end = offset + data_len as usize;
+        // Checked: the CRC only guards against accidental corruption, so a
+        // crafted/garbled length must not overflow into a panic.
+        let end = usize::try_from(data_len)
+            .ok()
+            .and_then(|l| offset.checked_add(l))
+            .ok_or_else(|| Error::CheckpointCorrupted("table data length overflow".into()))?;
         if end > payload.len() {
             return Err(Error::CheckpointCorrupted("truncated table data".into()));
         }
@@ -428,6 +433,32 @@ mod tests {
             files.iter().any(|f| f.contains("checkpoint_12")),
             "newer checkpoint must never be deleted: {files:?}"
         );
+    }
+
+    /// A crafted checkpoint with a *valid* whole-file CRC but an absurd
+    /// `data_len` must produce `CheckpointCorrupted`, not an arithmetic
+    /// overflow panic (debug) or wrapped-slice panic (release). The CRC only
+    /// guards against accidental corruption; length fields still need
+    /// checked arithmetic.
+    #[test]
+    fn deserialize_huge_table_len_errors_not_panics() {
+        let config = bincode::config::standard();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(7u64, &mut buf, config).unwrap(); // snapshot version
+        bincode::encode_into_std_write(1u32, &mut buf, config).unwrap(); // num_tables
+        bincode::encode_into_std_write("users", &mut buf, config).unwrap();
+        bincode::encode_into_std_write(u64::MAX, &mut buf, config).unwrap(); // data_len
+        let crc = crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        let reg = TableRegistry::default();
+        match deserialize_snapshot(&buf, &reg) {
+            Err(Error::CheckpointCorrupted(_)) => {}
+            Err(other) => panic!("expected CheckpointCorrupted, got {other:?}"),
+            Ok(_) => panic!("expected CheckpointCorrupted, got Ok"),
+        }
     }
 
     #[test]
