@@ -1141,3 +1141,73 @@ fn recovery_after_checkpointed_bulk_load_replays_later_commits() {
     assert_eq!(users.get(1).unwrap().name, "bulk1");
     assert_eq!(users.get(3).unwrap().name, "after");
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint / WAL-prune vs concurrent commits
+// ---------------------------------------------------------------------------
+
+/// Checkpointing (which prunes the WAL) concurrently with commits must never
+/// destroy an acknowledged commit. The WAL rewrite must be serialized with
+/// the background WAL writer: a read→truncate→rewrite racing live appends
+/// destroys entries whose committers were already told they are durable.
+/// Each round commits N rows (every commit() Ok = acknowledged durable in
+/// Consistent mode) while a checkpoint loop runs, then recovers from disk
+/// and verifies all N rows survived.
+#[test]
+fn checkpoint_concurrent_with_commits_loses_no_acknowledged_commit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ROUNDS: usize = 12;
+    const COMMITS: usize = 150;
+
+    for round in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        let config = standalone_config(dir.path(), Durability::Consistent);
+
+        {
+            let store = open_store(config.clone());
+
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let ckpt_done = done.clone();
+            let ckpt_store = store.clone();
+            let checkpointer = std::thread::spawn(move || {
+                let mut count = 0usize;
+                while !ckpt_done.load(Ordering::Acquire) {
+                    // Errors (e.g. transient conflicts) are fine; destroying
+                    // acknowledged WAL entries is not.
+                    let _ = ckpt_store.checkpoint();
+                    count += 1;
+                }
+                count
+            });
+
+            for i in 0..COMMITS {
+                let mut wtx = store.begin_write(None).unwrap();
+                wtx.open_table::<User>("users")
+                    .unwrap()
+                    .insert(User {
+                        name: format!("row{i}"),
+                        age: i as u32,
+                    })
+                    .unwrap();
+                // Ok(commit) in Consistent mode = fsync-acknowledged.
+                wtx.commit().unwrap();
+            }
+
+            done.store(true, Ordering::Release);
+            let ckpt_runs = checkpointer.join().unwrap();
+            assert!(ckpt_runs > 0, "checkpoint loop never ran");
+        }
+
+        // Recover from disk: every acknowledged commit must be present.
+        let store = open_store(config);
+        let rtx = store.begin_read(None).unwrap();
+        let users = rtx.open_table::<User>("users").unwrap();
+        assert_eq!(
+            users.len(),
+            COMMITS,
+            "round {round}: acknowledged commits lost after recovery \
+             (checkpoint/prune raced the WAL writer)"
+        );
+    }
+}

@@ -317,6 +317,11 @@ pub struct Store {
     /// parallel and only briefly share the global `inner` write lock at
     /// install time.
     pub(crate) table_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    /// Serializes [`Store::checkpoint`] against itself. Two interleaved
+    /// checkpoints could otherwise prune the WAL past a version whose
+    /// only covering checkpoint the slower one then deletes.
+    #[cfg(feature = "persistence")]
+    checkpoint_lock: Arc<Mutex<()>>,
 }
 
 impl Store {
@@ -390,6 +395,8 @@ impl Store {
             intents: Arc::new(IntentMap::default()),
             next_writer_id: Arc::new(AtomicU64::new(1)),
             table_locks: Arc::new(DashMap::new()),
+            #[cfg(feature = "persistence")]
+            checkpoint_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -613,15 +620,21 @@ impl Store {
     ///
     /// Blocks the caller until the checkpoint is fully written and fsynced,
     /// but does not hold any store lock during I/O — reads and writes
-    /// proceed without contention.
+    /// proceed without contention. Concurrent `checkpoint()` calls
+    /// serialize against each other.
     ///
-    /// In `Standalone` mode, the WAL is pruned after the checkpoint is written.
+    /// In `Standalone` mode, the WAL is pruned after the checkpoint is
+    /// written. The prune is executed by the WAL background thread between
+    /// batches, so it can never race a concurrent commit's append.
     /// Returns the version of the checkpointed snapshot.
     #[cfg(feature = "persistence")]
     pub fn checkpoint(&self) -> Result<u64> {
+        // Serialize whole checkpoints: an interleaved slower checkpoint
+        // could otherwise prune/cleanup state only the faster one covers.
+        let _serialize = self.checkpoint_lock.lock().unwrap();
+
         let (dir, snap, registry) = {
             let inner = self.inner.read().unwrap();
-            #[cfg(feature = "persistence")]
             inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
                 crate::persistence::Persistence::Standalone { dir, .. }
@@ -639,17 +652,33 @@ impl Store {
 
         let version = crate::checkpoint::write_checkpoint(&dir, &snap, &registry)?;
 
-        // Prune WAL in Standalone mode
-        let inner = self.inner.read().unwrap();
-        if matches!(
-            inner.config.persistence,
-            crate::persistence::Persistence::Standalone { .. }
-        ) {
-            let wal_path = crate::wal::wal_path(&dir);
-            crate::wal::prune_wal(&wal_path, version)?;
+        // Prune WAL in Standalone mode — routed through the WAL background
+        // thread (serialized with appends). Only the brief request is made
+        // under the store lock; the wait happens with no lock held.
+        let prune_rx = {
+            let inner = self.inner.read().unwrap();
+            match (&inner.config.persistence, &inner.wal_handle) {
+                (crate::persistence::Persistence::Standalone { .. }, Some(wal)) => {
+                    Some(wal.request_prune(version)?)
+                }
+                _ => None,
+            }
+        };
+        if let Some(rx) = prune_rx {
+            match rx.recv() {
+                Ok(res) => res?,
+                Err(_) => {
+                    // WAL thread stopped before pruning: poisoned (surface
+                    // that error) or shutting down.
+                    self.inner.read().unwrap().wal_poison.check()?;
+                    return Err(Error::Persistence(
+                        "WAL writer stopped before prune completed".into(),
+                    ));
+                }
+            }
         }
 
-        // Clean up old checkpoints
+        // Clean up old checkpoints (never deletes newer ones).
         crate::checkpoint::cleanup_old_checkpoints(&dir, version)?;
 
         Ok(version)

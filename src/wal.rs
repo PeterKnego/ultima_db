@@ -361,18 +361,17 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
     Ok(entries)
 }
 
-/// Truncate the WAL file, removing all entries with version <= `up_to_version`.
+/// Rewrite the WAL file, removing all entries with version <= `up_to_version`.
+/// Returns `true` if a rewrite happened, `false` if there was nothing to prune.
 ///
-/// This truncates and rewrites the file in place rather than using atomic
-/// rename, because the WalHandle background thread may have the file open in
-/// append mode. An atomic rename would cause the bg thread to write to the
-/// old (unlinked) inode, losing subsequent entries.
-///
-/// Crash safety: if the process crashes mid-rewrite, the WAL may be truncated
-/// or partially rewritten. Recovery handles this by stopping at the first
-/// corrupt/truncated entry and falling back to the checkpoint. Since prune_wal
-/// is only called after a successful checkpoint, no committed data is lost.
-pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
+/// Uses write-to-temp + atomic rename: a crash at any point leaves either the
+/// complete old WAL or the complete pruned WAL (plus possibly a stray `.tmp`
+/// that the next prune overwrites). The caller must be the only appender —
+/// in production this runs *on* the WAL background thread (via
+/// [`WalSink::prune`]), which reopens its append handle on the renamed file
+/// afterwards. Rewriting concurrently with a live appender would destroy
+/// acknowledged entries.
+pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<bool> {
     let entries = read_wal(path)?;
     let remaining: Vec<&WalEntry> = entries
         .iter()
@@ -380,25 +379,29 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<()> {
         .collect();
 
     if remaining.len() == entries.len() {
-        return Ok(()); // nothing to prune
+        return Ok(false); // nothing to prune
     }
 
-    // Serialize all remaining entries into a buffer first, then do a
-    // single truncate + write + sync to minimize the window of corruption.
     let mut buf = Vec::new();
     for entry in &remaining {
         buf.extend_from_slice(&frame_entry(entry)?);
     }
 
-    let mut file = File::create(path).map_err(|e| Error::Persistence(e.to_string()))?;
-    file.write_all(&buf)
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut tmp = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    tmp.write_all(&buf)
         .map_err(|e| Error::Persistence(e.to_string()))?;
-    file.sync_all()
+    tmp.sync_all()
         .map_err(|e| Error::Persistence(e.to_string()))?;
+    drop(tmp);
+    std::fs::rename(&tmp_path, path).map_err(|e| Error::Persistence(e.to_string()))?;
     if let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +472,15 @@ impl SyncWaiter {
 pub(crate) trait WalSink: Send {
     fn append(&mut self, entry: &WalEntry) -> Result<()>;
     fn sync(&mut self) -> Result<()>;
+    /// Remove entries with version <= `up_to_version` from the backing
+    /// store. Runs on the WAL background thread between batches, so it is
+    /// serialized with appends by construction. Sinks that rewrite the
+    /// file must reopen their handle afterwards.
+    fn prune(&mut self, _up_to_version: u64) -> Result<()> {
+        Err(Error::Persistence(
+            "prune not supported by this WAL sink".into(),
+        ))
+    }
 }
 
 /// Selects which `WalSink` implementation a `WalHandle` uses. `FsWrite` (the
@@ -496,6 +508,7 @@ pub enum WalSinkKind {
 /// Production sink: appends framed entries to a file and fsyncs it.
 struct FileSink {
     file: File,
+    path: std::path::PathBuf,
 }
 
 impl FileSink {
@@ -503,14 +516,22 @@ impl FileSink {
     fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
+        let file = open_wal_append(&wal_path)?;
         sync_dir(dir)?;
-        Ok(FileSink { file })
+        Ok(FileSink {
+            file,
+            path: wal_path,
+        })
     }
+}
+
+/// Open a WAL file for appending (creating it if needed).
+fn open_wal_append(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| Error::Persistence(e.to_string()))
 }
 
 impl WalSink for FileSink {
@@ -522,6 +543,15 @@ impl WalSink for FileSink {
             .sync_all()
             .map_err(|e| Error::Persistence(e.to_string()))
     }
+    fn prune(&mut self, up_to_version: u64) -> Result<()> {
+        if prune_wal(&self.path, up_to_version)? {
+            // The rewrite replaced the file via rename; reopen the append
+            // handle so subsequent appends land in the new file, not the
+            // old (unlinked) inode.
+            self.file = open_wal_append(&self.path)?;
+        }
+        Ok(())
+    }
 }
 
 /// Coalescing sink: `append` frames into an in-memory buffer (no syscall);
@@ -529,6 +559,7 @@ impl WalSink for FileSink {
 /// (one `write` per batch) is identical regardless of the sync mode.
 struct BufferedFileSink {
     file: File,
+    path: std::path::PathBuf,
     buf: Vec<u8>,
     /// When true, `sync` uses `sync_data` (fdatasync); when false, `sync_all`
     /// (full fsync). Coalescing (one `write` per batch) is identical either way.
@@ -539,13 +570,14 @@ impl BufferedFileSink {
     fn open(dir: &Path, datasync: bool) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
+        let file = open_wal_append(&wal_path)?;
         sync_dir(dir)?;
-        Ok(BufferedFileSink { file, buf: Vec::new(), datasync })
+        Ok(BufferedFileSink {
+            file,
+            path: wal_path,
+            buf: Vec::new(),
+            datasync,
+        })
     }
 }
 
@@ -564,6 +596,17 @@ impl WalSink for BufferedFileSink {
         } else {
             self.file.sync_all().map_err(|e| Error::Persistence(e.to_string()))
         }
+    }
+    fn prune(&mut self, up_to_version: u64) -> Result<()> {
+        // The bg thread always syncs a batch before pruning, so the buffer
+        // is empty here; flush defensively in case that ever changes.
+        if !self.buf.is_empty() {
+            self.sync()?;
+        }
+        if prune_wal(&self.path, up_to_version)? {
+            self.file = open_wal_append(&self.path)?;
+        }
+        Ok(())
     }
 }
 
@@ -962,6 +1005,17 @@ fn drain_le(callbacks: &mut Vec<(u64, DurabilityCallback)>, version: u64) -> Vec
 // WalHandle — background-thread WAL writer for both modes
 // ---------------------------------------------------------------------------
 
+/// Message processed by the WAL background thread: an entry to append, or a
+/// prune request (executed between batches, serialized with appends).
+pub(crate) enum WalMsg {
+    Entry(WalEntry),
+    Prune {
+        up_to_version: u64,
+        /// Completion ack; the requester blocks on the paired receiver.
+        done: mpsc::Sender<Result<()>>,
+    },
+}
+
 /// Handle for the background WAL writer thread.
 ///
 /// Both Consistent and Eventual modes use a background thread with a channel.
@@ -972,7 +1026,7 @@ fn drain_le(callbacks: &mut Vec<(u64, DurabilityCallback)>, version: u64) -> Vec
 /// The background thread batches queued entries (recv + try_recv drain) and
 /// issues a single fsync for the batch.
 pub(crate) struct WalHandle {
-    sender: Option<mpsc::Sender<WalEntry>>,
+    sender: Option<mpsc::Sender<WalMsg>>,
     bg_thread: Option<thread::JoinHandle<()>>,
     consistent: bool,
     sync_state: Option<Arc<WalSyncState>>,
@@ -1037,7 +1091,7 @@ impl WalHandle {
 
         let durability = WalDurability::new();
 
-        let (tx, rx) = mpsc::channel::<WalEntry>();
+        let (tx, rx) = mpsc::channel::<WalMsg>();
         let bg_in_flight = in_flight.clone();
         let bg_sync_state = sync_state.clone();
         let bg_poison = poison.clone();
@@ -1073,7 +1127,7 @@ impl WalHandle {
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sender
-            .send(entry)
+            .send(WalMsg::Entry(entry))
             .map_err(|e| Error::Persistence(e.to_string()))?;
 
         if self.consistent {
@@ -1089,6 +1143,25 @@ impl WalHandle {
         } else {
             Ok(SyncWaiter::Done)
         }
+    }
+
+    /// Request a prune of entries with version <= `up_to_version`, executed
+    /// by the background thread between batches — serialized with appends,
+    /// so a concurrent commit's entry can never be caught mid-rewrite and
+    /// destroyed. Returns a receiver that yields the prune's result; wait on
+    /// it without holding any store lock. A `RecvError` means the WAL
+    /// thread stopped (poisoned or shutting down) before pruning.
+    pub fn request_prune(&self, up_to_version: u64) -> Result<mpsc::Receiver<Result<()>>> {
+        self.poison.check()?;
+        let sender = self.sender.as_ref().expect("WalHandle used after drop");
+        let (done, rx) = mpsc::channel();
+        sender
+            .send(WalMsg::Prune {
+                up_to_version,
+                done,
+            })
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        Ok(rx)
     }
 
     /// Returns the number of WAL entries sent but not yet fsynced.
@@ -1113,7 +1186,7 @@ impl WalHandle {
 /// wakes all waiters, and stops.
 fn spawn_wal_thread<S: WalSink + 'static>(
     mut sink: S,
-    rx: mpsc::Receiver<WalEntry>,
+    rx: mpsc::Receiver<WalMsg>,
     in_flight: Arc<std::sync::atomic::AtomicU64>,
     sync_state: Option<Arc<WalSyncState>>,
     poison: Arc<WalPoison>,
@@ -1121,9 +1194,38 @@ fn spawn_wal_thread<S: WalSink + 'static>(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(first) = rx.recv() {
-            let mut batch = vec![first];
-            while let Ok(entry) = rx.try_recv() {
-                batch.push(entry);
+            // Collect a batch of entries; stop draining at a prune request
+            // so it executes after this batch is flushed (and before any
+            // later appends — they stay queued in the channel).
+            let mut batch = Vec::new();
+            let mut prune_req = None;
+            match first {
+                WalMsg::Entry(e) => batch.push(e),
+                WalMsg::Prune {
+                    up_to_version,
+                    done,
+                } => prune_req = Some((up_to_version, done)),
+            }
+            if prune_req.is_none() {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        WalMsg::Entry(e) => batch.push(e),
+                        WalMsg::Prune {
+                            up_to_version,
+                            done,
+                        } => {
+                            prune_req = Some((up_to_version, done));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if batch.is_empty() {
+                if let Some((up_to_version, done)) = prune_req {
+                    let _ = done.send(sink.prune(up_to_version));
+                }
+                continue;
             }
             let count = batch.len() as u64;
             // Batch high-water mark: the max version in the batch. Entries
@@ -1154,6 +1256,12 @@ fn spawn_wal_thread<S: WalSink + 'static>(
                     }
                     // ...and advance the version-keyed watermark (task28).
                     durability.publish(hwm);
+                    // Batch flushed — now safe to run a pending prune. Any
+                    // entry submitted after the prune request is still
+                    // queued and will be appended to the rewritten file.
+                    if let Some((up_to_version, done)) = prune_req {
+                        let _ = done.send(sink.prune(up_to_version));
+                    }
                 }
                 Err(e) => {
                     // Poison is authoritative (task29): latch the store, wake
@@ -1581,6 +1689,54 @@ mod tests {
         }
 
         assert!(matches!(read_wal(&path), Err(Error::WalCorrupted(_))));
+    }
+
+    /// Prune requests routed through the WAL background thread are
+    /// serialized with appends: entries submitted around the prune — even
+    /// immediately after the request, before it executes — must survive,
+    /// and the sink must keep appending to the rewritten file (not the old
+    /// unlinked inode).
+    #[test]
+    fn prune_through_wal_thread_keeps_interleaved_appends() {
+        for kind in [WalSinkKind::FsWrite, WalSinkKind::Coalesced] {
+            let dir = tempfile::tempdir().unwrap();
+            let poison = Arc::new(WalPoison::new());
+            let handle =
+                WalHandle::with_sink_kind(dir.path(), true, Arc::clone(&poison), kind).unwrap();
+
+            for v in 1..=3u64 {
+                handle
+                    .write(WalEntry {
+                        version: v,
+                        ops: vec![],
+                    })
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+            }
+
+            let rx = handle.request_prune(2).unwrap();
+            // Submitted right behind the prune request — must land in the
+            // rewritten file.
+            for v in 4..=5u64 {
+                handle
+                    .write(WalEntry {
+                        version: v,
+                        ops: vec![],
+                    })
+                    .unwrap();
+            }
+            rx.recv().unwrap().unwrap();
+            drop(handle); // joins the bg thread, flushing everything
+
+            let entries = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+            let versions: Vec<u64> = entries.iter().map(|e| e.version).collect();
+            assert_eq!(
+                versions,
+                vec![3, 4, 5],
+                "sink kind {kind:?}: pruned WAL lost or kept wrong entries"
+            );
+        }
     }
 
     #[test]

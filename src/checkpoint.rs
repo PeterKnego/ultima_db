@@ -224,7 +224,13 @@ pub(crate) fn load_checkpoint(path: &Path, registry: &TableRegistry) -> Result<S
     deserialize_snapshot(&data, registry)
 }
 
-/// Delete all checkpoint files except the one for `keep_version`.
+/// Delete checkpoint files *older* than `keep_version`.
+///
+/// Newer checkpoints are never deleted: a slower checkpoint finishing after
+/// a faster concurrent one must not remove the newer file — it may be the
+/// only checkpoint covering WAL entries the faster checkpoint already
+/// pruned, and deleting it would make those commits unrecoverable.
+/// Unparseable `checkpoint_*.bin` names are left alone.
 pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -235,9 +241,11 @@ pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64) -> Result<(
         let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str.starts_with("checkpoint_")
-            && name_str.ends_with(".bin")
-            && name_str != checkpoint_filename(keep_version)
+        if let Some(version) = name_str
+            .strip_prefix("checkpoint_")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .and_then(|s| s.parse::<u64>().ok())
+            && version < keep_version
         {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -384,6 +392,42 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1);
         assert!(files[0].contains("checkpoint_42"));
+    }
+
+    /// A slow checkpoint at version V must never delete a checkpoint a
+    /// faster concurrent checkpoint wrote at a *newer* version — that
+    /// newer checkpoint may be the only one covering already-pruned WAL
+    /// entries; deleting it makes those commits unrecoverable.
+    #[test]
+    fn cleanup_old_checkpoints_never_deletes_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (snapshot, reg) = make_snapshot_with_users();
+
+        for v in [8u64, 10, 12] {
+            let mut snap = snapshot.clone();
+            snap.version = v;
+            write_checkpoint(dir.path(), &snap, &reg).unwrap();
+        }
+
+        cleanup_old_checkpoints(dir.path(), 10).unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains("checkpoint_8")),
+            "older checkpoint should be removed: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("checkpoint_10")),
+            "kept checkpoint missing: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("checkpoint_12")),
+            "newer checkpoint must never be deleted: {files:?}"
+        );
     }
 
     #[test]
