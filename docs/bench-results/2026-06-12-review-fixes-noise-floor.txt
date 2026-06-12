@@ -1,0 +1,16 @@
+--- snapshot_throughput self-comparison ---
+snapshot_build/rows=1000	                        time:   [−1.0469% −0.3523% +0.4087%] (p = 0.34 > 0.05)
+snapshot_build/rows=10000	                        time:   [−3.8330% −2.6016% −1.1257%] (p = 0.00 < 0.05)
+snapshot_build/rows=100000	                        time:   [−6.3192% −5.8580% −5.3546%] (p = 0.00 < 0.05)
+snapshot_install/rows=1000	                        time:   [−5.6166% −5.0794% −4.4972%] (p = 0.00 < 0.05)
+snapshot_install/rows=10000	                        time:   [−11.872% −9.3013% −6.8403%] (p = 0.00 < 0.05)
+snapshot_install/rows=100000	                        time:   [−1.8807% −1.3669% −0.8019%] (p = 0.00 < 0.05)
+--- bulk_load_bench self-comparison ---
+bulk_vs_insert_batch/insert_batch/100000	                        time:   [−0.4621% −0.0667% +0.2562%] (p = 0.74 > 0.05)
+bulk_vs_insert_batch/bulk_load_sorted/100000	                        time:   [−1.2280% −0.6791% −0.2852%] (p = 0.00 < 0.05)
+bulk_vs_insert_batch/insert_batch/1000000	                        time:   [−0.7330% −0.5227% −0.3218%] (p = 0.00 < 0.05)
+bulk_vs_insert_batch/bulk_load_sorted/1000000	                        time:   [−5.1834% −4.9496% −4.7007%] (p = 0.00 < 0.05)
+--- multiwriter_persistence_bench self-comparison ---
+mw_persistent/inmemory	                        time:   [−1.0766% −0.5800% −0.1010%] (p = 0.03 < 0.05)
+mw_persistent/standalone_consistent	                        time:   [−3.3928% −2.5651% −1.5916%] (p = 0.00 < 0.05)
+mw_persistent/standalone_eventual	                        time:   [+1.7069% +2.4847% +3.3696%] (p = 0.00 < 0.05)

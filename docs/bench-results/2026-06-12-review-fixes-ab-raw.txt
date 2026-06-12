@@ -1,0 +1,1042 @@
+Preparing worktree (detached HEAD 1de711a)
+HEAD is now at 1de711a fix(journal): make appended records readable before flush (RaftLogStorage::append contract)
+=== BASELINE (1de711a) ===
+--- ycsb_bench (baseline) ---
+Benchmarking ycsb_a_update_heavy/burst: Analyzing
+                        time:   [1.3454 ms 1.3503 ms 1.3557 ms]
+                        thrpt:  [737.63 Kelem/s 740.55 Kelem/s 743.29 Kelem/s]
+Benchmarking ycsb_b_read_mostly/burst: Analyzing
+                        time:   [271.09 µs 272.23 µs 273.66 µs]
+                        thrpt:  [3.6542 Melem/s 3.6734 Melem/s 3.6887 Melem/s]
+Benchmarking ycsb_c_read_only/burst: Analyzing
+ycsb_c_read_only/burst  time:   [141.57 µs 141.91 µs 142.35 µs]
+                        thrpt:  [7.0248 Melem/s 7.0465 Melem/s 7.0639 Melem/s]
+Benchmarking ycsb_d_read_latest/burst: Analyzing
+                        time:   [439.20 µs 443.53 µs 446.99 µs]
+                        thrpt:  [2.2372 Melem/s 2.2546 Melem/s 2.2769 Melem/s]
+Benchmarking ycsb_e_short_ranges/burst: Analyzing
+                        time:   [876.57 µs 1.0316 ms 1.1658 ms]
+                        thrpt:  [857.78 Kelem/s 969.36 Kelem/s 1.1408 Melem/s]
+Benchmarking ycsb_f_read_modify_write/burst: Analyzing
+                        time:   [2.0380 ms 2.0531 ms 2.0665 ms]
+                        thrpt:  [483.90 Kelem/s 487.08 Kelem/s 490.69 Kelem/s]
+--- ycsb_multiwriter_bench (baseline) ---
+Benchmarking multiwriter/baseline_single_writer: Analyzing
+                        time:   [478.02 µs 480.31 µs 482.96 µs]
+                        thrpt:  [414.12 Kelem/s 416.40 Kelem/s 418.39 Kelem/s]
+Benchmarking multiwriter/no_contention_diff_tables: Analyzing
+                        time:   [940.86 µs 944.92 µs 949.19 µs]
+                        thrpt:  [210.71 Kelem/s 211.66 Kelem/s 212.57 Kelem/s]
+Benchmarking multiwriter_low_contention/burst: Analyzing
+                        time:   [1.0746 ms 1.0853 ms 1.0954 ms]
+                        thrpt:  [182.59 Kelem/s 184.29 Kelem/s 186.11 Kelem/s]
+Benchmarking multiwriter_high_contention/burst: Analyzing
+                        time:   [504.58 µs 507.37 µs 510.73 µs]
+                        thrpt:  [391.60 Kelem/s 394.19 Kelem/s 396.37 Kelem/s]
+Benchmarking multiwriter_scaling/1: Analyzing
+multiwriter_scaling/1   time:   [246.71 µs 248.36 µs 249.90 µs]
+                        thrpt:  [200.08 Kelem/s 201.32 Kelem/s 202.67 Kelem/s]
+Benchmarking multiwriter_scaling/2: Analyzing
+multiwriter_scaling/2   time:   [638.37 µs 641.08 µs 643.66 µs]
+                        thrpt:  [155.36 Kelem/s 155.99 Kelem/s 156.65 Kelem/s]
+Benchmarking multiwriter_scaling/4: Analyzing
+multiwriter_scaling/4   time:   [1.0842 ms 1.0902 ms 1.0966 ms]
+                        thrpt:  [182.39 Kelem/s 183.46 Kelem/s 184.48 Kelem/s]
+Benchmarking multiwriter_scaling/8: Analyzing
+multiwriter_scaling/8   time:   [2.3420 ms 2.3510 ms 2.3600 ms]
+                        thrpt:  [169.49 Kelem/s 170.14 Kelem/s 170.80 Kelem/s]
+--- smallbank_bench (baseline) ---
+Benchmarking smallbank_mixed/ultima/ops: Analyzing
+                        time:   [2.3456 ms 2.3658 ms 2.3867 ms]
+                        thrpt:  [209.50 Kelem/s 211.34 Kelem/s 213.17 Kelem/s]
+Benchmarking smallbank_read_heavy/ultima/ops: Analyzing
+                        time:   [808.49 µs 812.54 µs 816.32 µs]
+                        thrpt:  [612.50 Kelem/s 615.36 Kelem/s 618.44 Kelem/s]
+Benchmarking smallbank_write_heavy/ultima/ops: Analyzing
+                        time:   [2.8102 ms 2.8636 ms 2.9155 ms]
+                        thrpt:  [171.50 Kelem/s 174.60 Kelem/s 177.92 Kelem/s]
+Benchmarking smallbank_contention_low/ultima/burst: Analyzing
+                        time:   [1.2299 ms 1.2331 ms 1.2368 ms]
+                        thrpt:  [161.71 Kelem/s 162.19 Kelem/s 162.61 Kelem/s]
+Benchmarking smallbank_contention_high/ultima/burst: Analyzing
+                        time:   [766.28 µs 767.66 µs 769.18 µs]
+                        thrpt:  [260.02 Kelem/s 260.53 Kelem/s 261.00 Kelem/s]
+Benchmarking smallbank_contention_low_n16/ultima/burst: Analyzing
+                        time:   [5.8477 ms 5.8691 ms 5.8935 ms]
+                        thrpt:  [135.74 Kelem/s 136.31 Kelem/s 136.81 Kelem/s]
+Benchmarking smallbank_contention_high_n16/ultima/burst: Analyzing
+                        time:   [3.5154 ms 3.5356 ms 3.5622 ms]
+                        thrpt:  [224.58 Kelem/s 226.27 Kelem/s 227.57 Kelem/s]
+--- smallbank_scaling_bench (baseline) ---
+Benchmarking smallbank_scaling_high/2: Analyzing
+                        time:   [372.46 µs 373.57 µs 374.83 µs]
+                        thrpt:  [266.79 Kelem/s 267.69 Kelem/s 268.49 Kelem/s]
+Benchmarking smallbank_scaling_high/4: Analyzing
+                        time:   [729.32 µs 733.94 µs 740.72 µs]
+                        thrpt:  [270.01 Kelem/s 272.50 Kelem/s 274.23 Kelem/s]
+Benchmarking smallbank_scaling_high/8: Analyzing
+                        time:   [1.5277 ms 1.5304 ms 1.5333 ms]
+                        thrpt:  [260.88 Kelem/s 261.38 Kelem/s 261.83 Kelem/s]
+Benchmarking smallbank_scaling_high/16: Analyzing
+                        time:   [3.2839 ms 3.2914 ms 3.2985 ms]
+                        thrpt:  [242.53 Kelem/s 243.06 Kelem/s 243.61 Kelem/s]
+--- disjoint_tables_bench (baseline) ---
+Benchmarking disjoint_tables/2: Analyzing
+disjoint_tables/2       time:   [434.93 µs 436.80 µs 438.93 µs]
+                        thrpt:  [227.83 Kelem/s 228.94 Kelem/s 229.92 Kelem/s]
+                 change:
+                        time:   [+2.1307% +2.7070% +3.2895%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.1847% −2.6357% −2.0863%]
+                        Performance has regressed.
+Benchmarking disjoint_tables/4: Analyzing
+disjoint_tables/4       time:   [681.37 µs 683.39 µs 685.24 µs]
+                        thrpt:  [291.87 Kelem/s 292.66 Kelem/s 293.53 Kelem/s]
+                 change:
+                        time:   [+0.5851% +1.2131% +1.8778%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.8431% −1.1985% −0.5817%]
+Benchmarking disjoint_tables/8: Analyzing
+disjoint_tables/8       time:   [1.3715 ms 1.3751 ms 1.3790 ms]
+                        thrpt:  [290.07 Kelem/s 290.89 Kelem/s 291.65 Kelem/s]
+                 change:
+                        time:   [+1.8698% +2.6040% +3.4315%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.3177% −2.5379% −1.8355%]
+                        Performance has regressed.
+Benchmarking disjoint_tables/16: Analyzing
+disjoint_tables/16      time:   [2.7347 ms 2.7460 ms 2.7583 ms]
+                        thrpt:  [290.04 Kelem/s 291.33 Kelem/s 292.54 Kelem/s]
+                 change:
+                        time:   [+5.1956% +6.1420% +7.0782%] (p = 0.00 < 0.05)
+                        thrpt:  [−6.6103% −5.7865% −4.9390%]
+                        Performance has regressed.
+--- multiwriter_persistence_bench (baseline) ---
+Benchmarking mw_persistent/inmemory: Analyzing
+mw_persistent/inmemory  time:   [1.8629 ms 1.8753 ms 1.8966 ms]
+                        thrpt:  [105.45 Kelem/s 106.65 Kelem/s 107.36 Kelem/s]
+                 change:
+                        time:   [−1.7267% −0.0056% +2.3534%] (p = 1.00 > 0.05)
+                        thrpt:  [−2.2993% +0.0056% +1.7571%]
+                        No change in performance detected.
+Benchmarking mw_persistent/standalone_consistent: Analyzing
+                        time:   [6.6038 ms 6.6227 ms 6.6436 ms]
+                        thrpt:  [30.104 Kelem/s 30.199 Kelem/s 30.286 Kelem/s]
+                 change:
+                        time:   [−4.7584% −3.9497% −3.2487%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.3578% +4.1121% +4.9961%]
+                        Performance has improved.
+Benchmarking mw_persistent/standalone_eventual: Analyzing
+                        time:   [2.6718 ms 2.7996 ms 2.8954 ms]
+                        thrpt:  [69.076 Kelem/s 71.438 Kelem/s 74.856 Kelem/s]
+                 change:
+                        time:   [−4.3767% −2.1547% −0.0522%] (p = 0.06 > 0.05)
+                        thrpt:  [+0.0522% +2.2021% +4.5770%]
+                        No change in performance detected.
+--- bulk_load_bench (baseline) ---
+Benchmarking bulk_vs_insert_batch/insert_batch/100000: Analyzing
+                        time:   [272.33 ms 272.52 ms 272.73 ms]
+                        thrpt:  [366.66 Kelem/s 366.94 Kelem/s 367.20 Kelem/s]
+Benchmarking bulk_vs_insert_batch/bulk_load_sorted/100000: Analyzing
+                        time:   [12.614 ms 12.632 ms 12.651 ms]
+                        thrpt:  [7.9044 Melem/s 7.9162 Melem/s 7.9274 Melem/s]
+Benchmarking bulk_vs_insert_batch/insert_batch/1000000: Analyzing
+                        time:   [3.3631 s 3.3650 s 3.3670 s]
+                        thrpt:  [297.00 Kelem/s 297.17 Kelem/s 297.34 Kelem/s]
+Benchmarking bulk_vs_insert_batch/bulk_load_sorted/1000000: Analyzing
+                        time:   [129.18 ms 129.32 ms 129.46 ms]
+                        thrpt:  [7.7246 Melem/s 7.7329 Melem/s 7.7411 Melem/s]
+--- snapshot_throughput (baseline) ---
+Benchmarking snapshot_build/rows=1000: Analyzing
+                        time:   [110.04 µs 110.52 µs 111.07 µs]
+                        thrpt:  [9.0029 Melem/s 9.0481 Melem/s 9.0874 Melem/s]
+Benchmarking snapshot_build/rows=10000: Analyzing
+                        time:   [1.5890 ms 1.5930 ms 1.5968 ms]
+                        thrpt:  [6.2625 Melem/s 6.2774 Melem/s 6.2932 Melem/s]
+Benchmarking snapshot_build/rows=100000: Analyzing
+                        time:   [19.612 ms 19.657 ms 19.705 ms]
+                        thrpt:  [5.0749 Melem/s 5.0874 Melem/s 5.0990 Melem/s]
+Benchmarking snapshot_install/rows=1000: Analyzing
+                        time:   [156.77 µs 157.11 µs 157.51 µs]
+                        thrpt:  [6.3489 Melem/s 6.3650 Melem/s 6.3789 Melem/s]
+Benchmarking snapshot_install/rows=10000: Analyzing
+                        time:   [1.5561 ms 1.5589 ms 1.5624 ms]
+                        thrpt:  [6.4006 Melem/s 6.4146 Melem/s 6.4264 Melem/s]
+Benchmarking snapshot_install/rows=100000: Analyzing
+                        time:   [16.443 ms 16.486 ms 16.531 ms]
+                        thrpt:  [6.0492 Melem/s 6.0658 Melem/s 6.0817 Melem/s]
+--- wal_bench (baseline) ---
+Benchmarking wal_commit_consistent/fswrite/1KiB: Analyzing
+                        time:   [403.31 µs 459.87 µs 578.80 µs]
+                        thrpt:  [1.6872 MiB/s 2.1236 MiB/s 2.4214 MiB/s]
+Benchmarking wal_commit_consistent/fswrite/2KiB: Analyzing
+                        time:   [421.53 µs 426.10 µs 432.49 µs]
+                        thrpt:  [4.5160 MiB/s 4.5837 MiB/s 4.6335 MiB/s]
+Benchmarking wal_commit_consistent/fswrite/4KiB: Analyzing
+                        time:   [435.30 µs 443.34 µs 452.56 µs]
+                        thrpt:  [8.6314 MiB/s 8.8110 MiB/s 8.9738 MiB/s]
+Benchmarking wal_commit_consistent/fswrite/8KiB: Analyzing
+                        time:   [420.23 µs 428.29 µs 437.14 µs]
+                        thrpt:  [17.872 MiB/s 18.241 MiB/s 18.591 MiB/s]
+Benchmarking wal_commit_consistent/fswrite/16KiB: Analyzing
+                        time:   [444.12 µs 454.98 µs 463.81 µs]
+                        thrpt:  [33.689 MiB/s 34.342 MiB/s 35.182 MiB/s]
+Benchmarking wal_commit_consistent/coalesced/1KiB: Analyzing
+                        time:   [408.12 µs 413.85 µs 419.91 µs]
+                        thrpt:  [2.3257 MiB/s 2.3597 MiB/s 2.3928 MiB/s]
+Benchmarking wal_commit_consistent/coalesced/2KiB: Analyzing
+                        time:   [403.59 µs 411.78 µs 420.05 µs]
+                        thrpt:  [4.6498 MiB/s 4.7431 MiB/s 4.8394 MiB/s]
+Benchmarking wal_commit_consistent/coalesced/4KiB: Analyzing
+                        time:   [423.09 µs 432.66 µs 443.46 µs]
+                        thrpt:  [8.8086 MiB/s 9.0285 MiB/s 9.2326 MiB/s]
+Benchmarking wal_commit_consistent/coalesced/8KiB: Analyzing
+                        time:   [426.50 µs 440.20 µs 456.09 µs]
+                        thrpt:  [17.129 MiB/s 17.748 MiB/s 18.318 MiB/s]
+Benchmarking wal_commit_consistent/coalesced/16KiB: Analyzing
+                        time:   [449.92 µs 456.81 µs 463.70 µs]
+                        thrpt:  [33.696 MiB/s 34.204 MiB/s 34.728 MiB/s]
+Benchmarking wal_commit_consistent/buffered/1KiB: Analyzing
+                        time:   [432.55 µs 448.23 µs 468.89 µs]
+                        thrpt:  [2.0827 MiB/s 2.1787 MiB/s 2.2577 MiB/s]
+Benchmarking wal_commit_consistent/buffered/2KiB: Analyzing
+                        time:   [416.69 µs 423.08 µs 428.16 µs]
+                        thrpt:  [4.5617 MiB/s 4.6164 MiB/s 4.6872 MiB/s]
+Benchmarking wal_commit_consistent/buffered/4KiB: Analyzing
+                        time:   [411.70 µs 415.85 µs 419.84 µs]
+                        thrpt:  [9.3042 MiB/s 9.3935 MiB/s 9.4882 MiB/s]
+Benchmarking wal_commit_consistent/buffered/8KiB: Analyzing
+                        time:   [430.20 µs 437.04 µs 443.44 µs]
+                        thrpt:  [17.618 MiB/s 17.876 MiB/s 18.160 MiB/s]
+Benchmarking wal_commit_consistent/buffered/16KiB: Analyzing
+                        time:   [466.84 µs 472.11 µs 477.69 µs]
+                        thrpt:  [32.709 MiB/s 33.096 MiB/s 33.470 MiB/s]
+Benchmarking wal_commit_consistent/mmap/1KiB: Analyzing
+                        time:   [457.41 µs 464.92 µs 470.80 µs]
+                        thrpt:  [2.0743 MiB/s 2.1005 MiB/s 2.1350 MiB/s]
+Benchmarking wal_commit_consistent/mmap/2KiB: Analyzing
+                        time:   [459.69 µs 467.88 µs 476.55 µs]
+                        thrpt:  [4.0985 MiB/s 4.1744 MiB/s 4.2488 MiB/s]
+Benchmarking wal_commit_consistent/mmap/4KiB: Analyzing
+                        time:   [461.28 µs 468.64 µs 477.44 µs]
+                        thrpt:  [8.1817 MiB/s 8.3353 MiB/s 8.4683 MiB/s]
+Benchmarking wal_commit_consistent/mmap/8KiB: Analyzing
+                        time:   [492.83 µs 497.76 µs 502.27 µs]
+                        thrpt:  [15.554 MiB/s 15.695 MiB/s 15.852 MiB/s]
+Benchmarking wal_commit_consistent/mmap/16KiB: Analyzing
+                        time:   [519.84 µs 531.22 µs 542.49 µs]
+                        thrpt:  [28.802 MiB/s 29.413 MiB/s 30.057 MiB/s]
+Benchmarking wal_commit_eventual/fswrite/1KiB: Analyzing
+                        time:   [1.0568 µs 1.0837 µs 1.1146 µs]
+                        thrpt:  [876.12 MiB/s 901.12 MiB/s 924.12 MiB/s]
+Benchmarking wal_commit_eventual/fswrite/2KiB: Analyzing
+                        time:   [1.0903 µs 1.1198 µs 1.1509 µs]
+                        thrpt:  [1.6572 GiB/s 1.7033 GiB/s 1.7494 GiB/s]
+Benchmarking wal_commit_eventual/fswrite/4KiB: Analyzing
+                        time:   [1.4929 µs 1.5499 µs 1.6281 µs]
+                        thrpt:  [2.3431 GiB/s 2.4613 GiB/s 2.5552 GiB/s]
+Benchmarking wal_commit_eventual/fswrite/8KiB: Analyzing
+                        time:   [1.7625 µs 1.7991 µs 1.8365 µs]
+                        thrpt:  [4.1544 GiB/s 4.2407 GiB/s 4.3288 GiB/s]
+Benchmarking wal_commit_eventual/fswrite/16KiB: Analyzing
+                        time:   [3.2940 µs 3.3220 µs 3.3518 µs]
+                        thrpt:  [4.5524 GiB/s 4.5933 GiB/s 4.6323 GiB/s]
+Benchmarking wal_commit_eventual/coalesced/1KiB: Analyzing
+                        time:   [1.0087 µs 1.0374 µs 1.0669 µs]
+                        thrpt:  [915.37 MiB/s 941.36 MiB/s 968.13 MiB/s]
+Benchmarking wal_commit_eventual/coalesced/2KiB: Analyzing
+                        time:   [995.18 ns 1.0151 µs 1.0369 µs]
+                        thrpt:  [1.8395 GiB/s 1.8789 GiB/s 1.9166 GiB/s]
+Benchmarking wal_commit_eventual/coalesced/4KiB: Analyzing
+                        time:   [1.5428 µs 1.5641 µs 1.5863 µs]
+                        thrpt:  [2.4048 GiB/s 2.4389 GiB/s 2.4727 GiB/s]
+Benchmarking wal_commit_eventual/coalesced/8KiB: Analyzing
+                        time:   [1.9312 µs 1.9698 µs 2.0107 µs]
+                        thrpt:  [3.7944 GiB/s 3.8733 GiB/s 3.9506 GiB/s]
+Benchmarking wal_commit_eventual/coalesced/16KiB: Analyzing
+                        time:   [3.1609 µs 3.1974 µs 3.2367 µs]
+                        thrpt:  [4.7144 GiB/s 4.7722 GiB/s 4.8274 GiB/s]
+Benchmarking wal_commit_eventual/buffered/1KiB: Analyzing
+                        time:   [1.0783 µs 1.1227 µs 1.1653 µs]
+                        thrpt:  [838.06 MiB/s 869.86 MiB/s 905.69 MiB/s]
+Benchmarking wal_commit_eventual/buffered/2KiB: Analyzing
+                        time:   [1.2704 µs 1.2876 µs 1.3086 µs]
+                        thrpt:  [1.4576 GiB/s 1.4813 GiB/s 1.5014 GiB/s]
+Benchmarking wal_commit_eventual/buffered/4KiB: Analyzing
+                        time:   [1.4593 µs 1.4718 µs 1.4845 µs]
+                        thrpt:  [2.5697 GiB/s 2.5918 GiB/s 2.6141 GiB/s]
+Benchmarking wal_commit_eventual/buffered/8KiB: Analyzing
+                        time:   [2.1504 µs 2.1785 µs 2.2134 µs]
+                        thrpt:  [3.4469 GiB/s 3.5021 GiB/s 3.5479 GiB/s]
+Benchmarking wal_commit_eventual/buffered/16KiB: Analyzing
+                        time:   [3.3546 µs 3.3869 µs 3.4213 µs]
+                        thrpt:  [4.4600 GiB/s 4.5053 GiB/s 4.5486 GiB/s]
+Benchmarking wal_commit_eventual/mmap/1KiB: Analyzing
+                        time:   [1.1871 µs 1.2290 µs 1.2891 µs]
+                        thrpt:  [757.53 MiB/s 794.60 MiB/s 822.65 MiB/s]
+Benchmarking wal_commit_eventual/mmap/2KiB: Analyzing
+                        time:   [1.3468 µs 1.3816 µs 1.4186 µs]
+                        thrpt:  [1.3446 GiB/s 1.3805 GiB/s 1.4162 GiB/s]
+Benchmarking wal_commit_eventual/mmap/4KiB: Analyzing
+                        time:   [1.6402 µs 1.6821 µs 1.7253 µs]
+                        thrpt:  [2.2110 GiB/s 2.2678 GiB/s 2.3257 GiB/s]
+Benchmarking wal_commit_eventual/mmap/8KiB: Analyzing
+                        time:   [2.0996 µs 2.1424 µs 2.1964 µs]
+                        thrpt:  [3.4737 GiB/s 3.5612 GiB/s 3.6337 GiB/s]
+Benchmarking wal_commit_eventual/mmap/16KiB: Analyzing
+                        time:   [3.3883 µs 3.4527 µs 3.5105 µs]
+                        thrpt:  [4.3466 GiB/s 4.4193 GiB/s 4.5034 GiB/s]
+Benchmarking wal_eventual_batch/fswrite/1KiB: Analyzing
+                        time:   [2.1935 ms 2.2137 ms 2.2366 ms]
+                        thrpt:  [111.78 MiB/s 112.93 MiB/s 113.98 MiB/s]
+Benchmarking wal_eventual_batch/fswrite/2KiB: Analyzing
+                        time:   [3.2330 ms 3.2738 ms 3.3420 ms]
+                        thrpt:  [149.61 MiB/s 152.73 MiB/s 154.65 MiB/s]
+Benchmarking wal_eventual_batch/fswrite/4KiB: Analyzing
+                        time:   [5.1662 ms 5.1912 ms 5.2152 ms]
+                        thrpt:  [191.75 MiB/s 192.63 MiB/s 193.57 MiB/s]
+Benchmarking wal_eventual_batch/fswrite/8KiB: Analyzing
+                        time:   [8.9343 ms 9.0100 ms 9.1241 ms]
+                        thrpt:  [219.20 MiB/s 221.97 MiB/s 223.86 MiB/s]
+Benchmarking wal_eventual_batch/fswrite/16KiB: Analyzing
+                        time:   [15.427 ms 15.524 ms 15.622 ms]
+                        thrpt:  [256.05 MiB/s 257.67 MiB/s 259.29 MiB/s]
+Benchmarking wal_eventual_batch/coalesced/1KiB: Analyzing
+                        time:   [1.6571 ms 1.6828 ms 1.7021 ms]
+                        thrpt:  [146.88 MiB/s 148.56 MiB/s 150.86 MiB/s]
+Benchmarking wal_eventual_batch/coalesced/2KiB: Analyzing
+                        time:   [2.4428 ms 2.4599 ms 2.4770 ms]
+                        thrpt:  [201.85 MiB/s 203.26 MiB/s 204.69 MiB/s]
+Benchmarking wal_eventual_batch/coalesced/4KiB: Analyzing
+                        time:   [3.8740 ms 3.8929 ms 3.9145 ms]
+                        thrpt:  [255.46 MiB/s 256.87 MiB/s 258.13 MiB/s]
+Benchmarking wal_eventual_batch/coalesced/8KiB: Analyzing
+                        time:   [6.8026 ms 6.8451 ms 6.8862 ms]
+                        thrpt:  [290.44 MiB/s 292.18 MiB/s 294.00 MiB/s]
+Benchmarking wal_eventual_batch/coalesced/16KiB: Analyzing
+                        time:   [12.575 ms 12.672 ms 12.798 ms]
+                        thrpt:  [312.54 MiB/s 315.66 MiB/s 318.08 MiB/s]
+Benchmarking wal_eventual_batch/buffered/1KiB: Analyzing
+                        time:   [1.6624 ms 1.6827 ms 1.7013 ms]
+                        thrpt:  [146.94 MiB/s 148.57 MiB/s 150.39 MiB/s]
+Benchmarking wal_eventual_batch/buffered/2KiB: Analyzing
+                        time:   [2.4423 ms 2.4635 ms 2.4853 ms]
+                        thrpt:  [201.19 MiB/s 202.96 MiB/s 204.72 MiB/s]
+Benchmarking wal_eventual_batch/buffered/4KiB: Analyzing
+                        time:   [3.8545 ms 3.8854 ms 3.9096 ms]
+                        thrpt:  [255.78 MiB/s 257.37 MiB/s 259.44 MiB/s]
+Benchmarking wal_eventual_batch/buffered/8KiB: Analyzing
+                        time:   [6.7520 ms 6.7860 ms 6.8233 ms]
+                        thrpt:  [293.11 MiB/s 294.73 MiB/s 296.21 MiB/s]
+Benchmarking wal_eventual_batch/buffered/16KiB: Analyzing
+                        time:   [12.659 ms 12.696 ms 12.737 ms]
+                        thrpt:  [314.04 MiB/s 315.06 MiB/s 315.99 MiB/s]
+Benchmarking wal_eventual_batch/mmap/1KiB: Analyzing
+                        time:   [1.9350 ms 1.9526 ms 1.9701 ms]
+                        thrpt:  [126.90 MiB/s 128.04 MiB/s 129.20 MiB/s]
+Benchmarking wal_eventual_batch/mmap/2KiB: Analyzing
+                        time:   [2.8296 ms 2.8613 ms 2.8909 ms]
+                        thrpt:  [172.96 MiB/s 174.75 MiB/s 176.71 MiB/s]
+Benchmarking wal_eventual_batch/mmap/4KiB: Analyzing
+                        time:   [4.3621 ms 4.4590 ms 4.6511 ms]
+                        thrpt:  [215.00 MiB/s 224.27 MiB/s 229.25 MiB/s]
+Benchmarking wal_eventual_batch/mmap/8KiB: Analyzing
+                        time:   [7.4795 ms 7.6114 ms 7.7482 ms]
+                        thrpt:  [258.12 MiB/s 262.76 MiB/s 267.40 MiB/s]
+Benchmarking wal_eventual_batch/mmap/16KiB: Analyzing
+                        time:   [13.731 ms 13.799 ms 13.864 ms]
+                        thrpt:  [288.51 MiB/s 289.87 MiB/s 291.32 MiB/s]
+=== CURRENT (HEAD) ===
+--- ycsb_bench (current) ---
+Benchmarking ycsb_a_update_heavy/burst: Analyzing
+                        time:   [1.3322 ms 1.3359 ms 1.3399 ms]
+                        thrpt:  [746.34 Kelem/s 748.58 Kelem/s 750.65 Kelem/s]
+                 change:
+                        time:   [−4.7562% −3.2427% −1.9423%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.9807% +3.3514% +4.9937%]
+                        Performance has improved.
+Benchmarking ycsb_b_read_mostly/burst: Analyzing
+                        time:   [274.45 µs 275.31 µs 276.25 µs]
+                        thrpt:  [3.6200 Melem/s 3.6323 Melem/s 3.6437 Melem/s]
+                 change:
+                        time:   [+0.6528% +1.1250% +1.5930%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.5680% −1.1125% −0.6485%]
+Benchmarking ycsb_c_read_only/burst: Analyzing
+ycsb_c_read_only/burst  time:   [142.34 µs 142.92 µs 143.43 µs]
+                        thrpt:  [6.9721 Melem/s 6.9968 Melem/s 7.0254 Melem/s]
+                 change:
+                        time:   [+0.5282% +0.9628% +1.3739%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.3553% −0.9537% −0.5255%]
+Benchmarking ycsb_d_read_latest/burst: Analyzing
+                        time:   [447.24 µs 452.20 µs 456.41 µs]
+                        thrpt:  [2.1910 Melem/s 2.2114 Melem/s 2.2359 Melem/s]
+                 change:
+                        time:   [+0.4331% +1.9100% +3.5762%] (p = 0.02 < 0.05)
+                        thrpt:  [−3.4527% −1.8742% −0.4312%]
+Benchmarking ycsb_e_short_ranges/burst: Analyzing
+                        time:   [868.42 µs 1.0206 ms 1.1529 ms]
+                        thrpt:  [867.39 Kelem/s 979.79 Kelem/s 1.1515 Melem/s]
+                 change:
+                        time:   [−12.146% −0.2713% +12.973%] (p = 0.96 > 0.05)
+                        thrpt:  [−11.483% +0.2720% +13.825%]
+                        No change in performance detected.
+Benchmarking ycsb_f_read_modify_write/burst: Analyzing
+                        time:   [2.0553 ms 2.0596 ms 2.0648 ms]
+                        thrpt:  [484.32 Kelem/s 485.52 Kelem/s 486.55 Kelem/s]
+                 change:
+                        time:   [+0.5748% +1.0478% +1.5211%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.4983% −1.0369% −0.5715%]
+--- ycsb_multiwriter_bench (current) ---
+Benchmarking multiwriter/baseline_single_writer: Analyzing
+                        time:   [492.39 µs 494.61 µs 497.11 µs]
+                        thrpt:  [402.32 Kelem/s 404.36 Kelem/s 406.18 Kelem/s]
+                 change:
+                        time:   [+0.2226% +1.2600% +2.2779%] (p = 0.02 < 0.05)
+                        thrpt:  [−2.2271% −1.2443% −0.2221%]
+Benchmarking multiwriter/no_contention_diff_tables: Analyzing
+                        time:   [928.31 µs 934.57 µs 940.94 µs]
+                        thrpt:  [212.55 Kelem/s 214.00 Kelem/s 215.45 Kelem/s]
+                 change:
+                        time:   [−2.1727% −1.4751% −0.7605%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.7663% +1.4972% +2.2209%]
+Benchmarking multiwriter_low_contention/burst: Analyzing
+                        time:   [1.0535 ms 1.0574 ms 1.0610 ms]
+                        thrpt:  [188.50 Kelem/s 189.15 Kelem/s 189.84 Kelem/s]
+                 change:
+                        time:   [−2.5597% −1.8126% −1.0717%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.0833% +1.8461% +2.6269%]
+                        Performance has improved.
+Benchmarking multiwriter_high_contention/burst: Analyzing
+                        time:   [496.49 µs 499.89 µs 504.88 µs]
+                        thrpt:  [396.14 Kelem/s 400.08 Kelem/s 402.83 Kelem/s]
+                 change:
+                        time:   [−3.1617% −1.9571% −0.1785%] (p = 0.01 < 0.05)
+                        thrpt:  [+0.1788% +1.9962% +3.2649%]
+Benchmarking multiwriter_scaling/1: Analyzing
+multiwriter_scaling/1   time:   [249.51 µs 251.27 µs 253.01 µs]
+                        thrpt:  [197.62 Kelem/s 198.99 Kelem/s 200.39 Kelem/s]
+                 change:
+                        time:   [+0.3711% +1.6084% +2.8071%] (p = 0.01 < 0.05)
+                        thrpt:  [−2.7304% −1.5830% −0.3697%]
+Benchmarking multiwriter_scaling/2: Analyzing
+multiwriter_scaling/2   time:   [634.09 µs 637.46 µs 641.46 µs]
+                        thrpt:  [155.90 Kelem/s 156.87 Kelem/s 157.71 Kelem/s]
+                 change:
+                        time:   [−1.5614% −0.8941% −0.2225%] (p = 0.01 < 0.05)
+                        thrpt:  [+0.2230% +0.9022% +1.5861%]
+Benchmarking multiwriter_scaling/4: Analyzing
+multiwriter_scaling/4   time:   [1.0676 ms 1.0727 ms 1.0779 ms]
+                        thrpt:  [185.54 Kelem/s 186.44 Kelem/s 187.34 Kelem/s]
+                 change:
+                        time:   [−2.3148% −1.5469% −0.7568%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.7626% +1.5712% +2.3697%]
+Benchmarking multiwriter_scaling/8: Analyzing
+multiwriter_scaling/8   time:   [2.3176 ms 2.3274 ms 2.3386 ms]
+                        thrpt:  [171.04 Kelem/s 171.87 Kelem/s 172.59 Kelem/s]
+                 change:
+                        time:   [−1.5876% −0.9814% −0.3526%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.3538% +0.9911% +1.6132%]
+--- smallbank_bench (current) ---
+Benchmarking smallbank_mixed/ultima/ops: Analyzing
+                        time:   [2.3239 ms 2.4180 ms 2.5721 ms]
+                        thrpt:  [194.39 Kelem/s 206.78 Kelem/s 215.15 Kelem/s]
+                 change:
+                        time:   [−1.2572% +1.0966% +3.9884%] (p = 0.48 > 0.05)
+                        thrpt:  [−3.8354% −1.0847% +1.2732%]
+                        No change in performance detected.
+Benchmarking smallbank_read_heavy/ultima/ops: Analyzing
+                        time:   [799.00 µs 801.55 µs 804.17 µs]
+                        thrpt:  [621.76 Kelem/s 623.79 Kelem/s 625.78 Kelem/s]
+                 change:
+                        time:   [−1.4529% −0.8441% −0.2392%] (p = 0.01 < 0.05)
+                        thrpt:  [+0.2398% +0.8513% +1.4743%]
+Benchmarking smallbank_write_heavy/ultima/ops: Analyzing
+                        time:   [2.7756 ms 2.8273 ms 2.8692 ms]
+                        thrpt:  [174.27 Kelem/s 176.85 Kelem/s 180.14 Kelem/s]
+                 change:
+                        time:   [−4.6383% −1.7466% +1.2202%] (p = 0.27 > 0.05)
+                        thrpt:  [−1.2055% +1.7777% +4.8639%]
+                        No change in performance detected.
+Benchmarking smallbank_contention_low/ultima/burst: Analyzing
+                        time:   [1.2098 ms 1.2132 ms 1.2183 ms]
+                        thrpt:  [164.17 Kelem/s 164.86 Kelem/s 165.32 Kelem/s]
+                 change:
+                        time:   [−1.8839% −1.2585% −0.6667%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.6712% +1.2746% +1.9201%]
+Benchmarking smallbank_contention_high/ultima/burst: Analyzing
+                        time:   [759.33 µs 761.04 µs 763.04 µs]
+                        thrpt:  [262.11 Kelem/s 262.80 Kelem/s 263.39 Kelem/s]
+                 change:
+                        time:   [−1.3041% −0.9709% −0.6261%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.6301% +0.9804% +1.3213%]
+Benchmarking smallbank_contention_low_n16/ultima/burst: Analyzing
+                        time:   [5.7561 ms 5.7852 ms 5.8208 ms]
+                        thrpt:  [137.44 Kelem/s 138.28 Kelem/s 138.98 Kelem/s]
+                 change:
+                        time:   [−2.4551% −1.4642% −0.5185%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.5212% +1.4860% +2.5169%]
+Benchmarking smallbank_contention_high_n16/ultima/burst: Analyzing
+                        time:   [3.4771 ms 3.4945 ms 3.5150 ms]
+                        thrpt:  [227.59 Kelem/s 228.93 Kelem/s 230.08 Kelem/s]
+                 change:
+                        time:   [−1.4729% −0.8049% −0.1658%] (p = 0.02 < 0.05)
+                        thrpt:  [+0.1660% +0.8115% +1.4950%]
+--- smallbank_scaling_bench (current) ---
+Benchmarking smallbank_scaling_high/2: Analyzing
+                        time:   [371.24 µs 372.80 µs 374.41 µs]
+                        thrpt:  [267.09 Kelem/s 268.24 Kelem/s 269.37 Kelem/s]
+                 change:
+                        time:   [−0.6217% −0.2076% +0.2622%] (p = 0.37 > 0.05)
+                        thrpt:  [−0.2615% +0.2081% +0.6255%]
+                        No change in performance detected.
+Benchmarking smallbank_scaling_high/4: Analyzing
+                        time:   [723.34 µs 724.95 µs 727.00 µs]
+                        thrpt:  [275.10 Kelem/s 275.88 Kelem/s 276.49 Kelem/s]
+                 change:
+                        time:   [−2.4973% −1.4124% −0.5393%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.5422% +1.4326% +2.5612%]
+Benchmarking smallbank_scaling_high/8: Analyzing
+                        time:   [1.5166 ms 1.5190 ms 1.5210 ms]
+                        thrpt:  [262.98 Kelem/s 263.33 Kelem/s 263.75 Kelem/s]
+                 change:
+                        time:   [−1.2158% −0.8514% −0.5190%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.5217% +0.8587% +1.2308%]
+Benchmarking smallbank_scaling_high/16: Analyzing
+                        time:   [3.2697 ms 3.2789 ms 3.2886 ms]
+                        thrpt:  [243.27 Kelem/s 243.98 Kelem/s 244.67 Kelem/s]
+                 change:
+                        time:   [−0.8266% −0.3466% +0.1059%] (p = 0.16 > 0.05)
+                        thrpt:  [−0.1058% +0.3478% +0.8335%]
+                        No change in performance detected.
+--- disjoint_tables_bench (current) ---
+Benchmarking disjoint_tables/2: Analyzing
+disjoint_tables/2       time:   [445.03 µs 446.65 µs 448.22 µs]
+                        thrpt:  [223.10 Kelem/s 223.89 Kelem/s 224.71 Kelem/s]
+                 change:
+                        time:   [+1.2731% +1.9686% +2.6235%] (p = 0.00 < 0.05)
+                        thrpt:  [−2.5565% −1.9306% −1.2571%]
+                        Performance has regressed.
+Benchmarking disjoint_tables/4: Analyzing
+disjoint_tables/4       time:   [687.64 µs 690.20 µs 692.83 µs]
+                        thrpt:  [288.67 Kelem/s 289.77 Kelem/s 290.85 Kelem/s]
+                 change:
+                        time:   [+0.7409% +1.1682% +1.5772%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.5527% −1.1547% −0.7354%]
+Benchmarking disjoint_tables/8: Analyzing
+disjoint_tables/8       time:   [1.3524 ms 1.3597 ms 1.3679 ms]
+                        thrpt:  [292.42 Kelem/s 294.18 Kelem/s 295.78 Kelem/s]
+                 change:
+                        time:   [−2.3335% −1.4481% −0.6509%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.6551% +1.4694% +2.3892%]
+Benchmarking disjoint_tables/16: Analyzing
+disjoint_tables/16      time:   [2.6967 ms 2.7055 ms 2.7142 ms]
+                        thrpt:  [294.74 Kelem/s 295.69 Kelem/s 296.66 Kelem/s]
+                 change:
+                        time:   [−3.4340% −2.3979% −1.3287%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.3466% +2.4568% +3.5561%]
+                        Performance has improved.
+--- multiwriter_persistence_bench (current) ---
+Benchmarking mw_persistent/inmemory: Analyzing
+mw_persistent/inmemory  time:   [1.8736 ms 1.8796 ms 1.8851 ms]
+                        thrpt:  [106.09 Kelem/s 106.41 Kelem/s 106.75 Kelem/s]
+                 change:
+                        time:   [−3.4676% −0.9659% +0.8712%] (p = 0.50 > 0.05)
+                        thrpt:  [−0.8637% +0.9753% +3.5922%]
+                        No change in performance detected.
+Benchmarking mw_persistent/standalone_consistent: Analyzing
+                        time:   [6.8948 ms 6.9408 ms 6.9885 ms]
+                        thrpt:  [28.618 Kelem/s 28.815 Kelem/s 29.007 Kelem/s]
+                 change:
+                        time:   [+3.4294% +4.0163% +4.7276%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.5142% −3.8612% −3.3157%]
+                        Performance has regressed.
+Benchmarking mw_persistent/standalone_eventual: Analyzing
+                        time:   [2.8201 ms 2.8465 ms 2.8635 ms]
+                        thrpt:  [69.844 Kelem/s 70.262 Kelem/s 70.920 Kelem/s]
+                 change:
+                        time:   [−2.1399% −0.1077% +2.5246%] (p = 0.93 > 0.05)
+                        thrpt:  [−2.4625% +0.1079% +2.1867%]
+                        No change in performance detected.
+--- bulk_load_bench (current) ---
+Benchmarking bulk_vs_insert_batch/insert_batch/100000: Analyzing
+                        time:   [273.63 ms 274.46 ms 275.52 ms]
+                        thrpt:  [362.95 Kelem/s 364.35 Kelem/s 365.45 Kelem/s]
+                 change:
+                        time:   [+0.4328% +0.7111% +1.0326%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.0220% −0.7060% −0.4309%]
+Benchmarking bulk_vs_insert_batch/bulk_load_sorted/100000: Analyzing
+                        time:   [12.628 ms 12.672 ms 12.740 ms]
+                        thrpt:  [7.8495 Melem/s 7.8914 Melem/s 7.9188 Melem/s]
+                 change:
+                        time:   [−0.0783% +0.3145% +0.8385%] (p = 0.22 > 0.05)
+                        thrpt:  [−0.8315% −0.3135% +0.0783%]
+                        No change in performance detected.
+Benchmarking bulk_vs_insert_batch/insert_batch/1000000: Analyzing
+                        time:   [3.3702 s 3.3762 s 3.3829 s]
+                        thrpt:  [295.60 Kelem/s 296.19 Kelem/s 296.72 Kelem/s]
+                 change:
+                        time:   [+0.1398% +0.3332% +0.5369%] (p = 0.00 < 0.05)
+                        thrpt:  [−0.5340% −0.3321% −0.1396%]
+Benchmarking bulk_vs_insert_batch/bulk_load_sorted/1000000: Analyzing
+                        time:   [134.86 ms 135.18 ms 135.48 ms]
+                        thrpt:  [7.3814 Melem/s 7.3977 Melem/s 7.4151 Melem/s]
+                 change:
+                        time:   [+4.2873% +4.5309% +4.7981%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.5784% −4.3345% −4.1110%]
+                        Performance has regressed.
+--- snapshot_throughput (current) ---
+Benchmarking snapshot_build/rows=1000: Analyzing
+                        time:   [112.58 µs 113.12 µs 113.65 µs]
+                        thrpt:  [8.7992 Melem/s 8.8402 Melem/s 8.8823 Melem/s]
+                 change:
+                        time:   [+1.8418% +2.3460% +2.8277%] (p = 0.00 < 0.05)
+                        thrpt:  [−2.7499% −2.2922% −1.8085%]
+                        Performance has regressed.
+Benchmarking snapshot_build/rows=10000: Analyzing
+                        time:   [1.6485 ms 1.6533 ms 1.6582 ms]
+                        thrpt:  [6.0307 Melem/s 6.0484 Melem/s 6.0661 Melem/s]
+                 change:
+                        time:   [+3.7917% +4.1376% +4.4867%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.2940% −3.9732% −3.6532%]
+                        Performance has regressed.
+Benchmarking snapshot_build/rows=100000: Analyzing
+                        time:   [20.639 ms 20.714 ms 20.792 ms]
+                        thrpt:  [4.8096 Melem/s 4.8276 Melem/s 4.8451 Melem/s]
+                 change:
+                        time:   [+4.9321% +5.3804% +5.8104%] (p = 0.00 < 0.05)
+                        thrpt:  [−5.4913% −5.1057% −4.7003%]
+                        Performance has regressed.
+Benchmarking snapshot_install/rows=1000: Analyzing
+                        time:   [162.65 µs 163.17 µs 163.70 µs]
+                        thrpt:  [6.1087 Melem/s 6.1287 Melem/s 6.1483 Melem/s]
+                 change:
+                        time:   [+3.7387% +4.2003% +4.6810%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.4717% −4.0310% −3.6040%]
+                        Performance has regressed.
+Benchmarking snapshot_install/rows=10000: Analyzing
+                        time:   [1.6132 ms 1.6201 ms 1.6274 ms]
+                        thrpt:  [6.1450 Melem/s 6.1723 Melem/s 6.1989 Melem/s]
+                 change:
+                        time:   [+6.5260% +9.3518% +13.223%] (p = 0.00 < 0.05)
+                        thrpt:  [−11.678% −8.5520% −6.1262%]
+                        Performance has regressed.
+Benchmarking snapshot_install/rows=100000: Analyzing
+                        time:   [16.614 ms 16.680 ms 16.749 ms]
+                        thrpt:  [5.9706 Melem/s 5.9951 Melem/s 6.0189 Melem/s]
+                 change:
+                        time:   [+0.6421% +1.1797% +1.6293%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.6032% −1.1659% −0.6380%]
+--- wal_bench (current) ---
+Benchmarking wal_commit_consistent/fswrite/1KiB: Analyzing
+                        time:   [414.77 µs 423.12 µs 431.27 µs]
+                        thrpt:  [2.2644 MiB/s 2.3080 MiB/s 2.3545 MiB/s]
+                 change:
+                        time:   [−18.758% −4.6064% +6.0449%] (p = 0.72 > 0.05)
+                        thrpt:  [−5.7003% +4.8289% +23.089%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/fswrite/2KiB: Analyzing
+                        time:   [427.29 µs 434.77 µs 442.50 µs]
+                        thrpt:  [4.4138 MiB/s 4.4924 MiB/s 4.5710 MiB/s]
+                 change:
+                        time:   [+2.3808% +7.7089% +14.698%] (p = 0.01 < 0.05)
+                        thrpt:  [−12.815% −7.1571% −2.3255%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/fswrite/4KiB: Analyzing
+                        time:   [424.50 µs 430.88 µs 437.71 µs]
+                        thrpt:  [8.9243 MiB/s 9.0658 MiB/s 9.2021 MiB/s]
+                 change:
+                        time:   [−5.1098% −3.0808% −1.1611%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.1748% +3.1787% +5.3850%]
+                        Performance has improved.
+Benchmarking wal_commit_consistent/fswrite/8KiB: Analyzing
+                        time:   [447.11 µs 457.18 µs 469.39 µs]
+                        thrpt:  [16.644 MiB/s 17.089 MiB/s 17.474 MiB/s]
+                 change:
+                        time:   [+2.7746% +5.5562% +8.3455%] (p = 0.00 < 0.05)
+                        thrpt:  [−7.7027% −5.2638% −2.6997%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/fswrite/16KiB: Analyzing
+                        time:   [467.37 µs 473.40 µs 478.41 µs]
+                        thrpt:  [32.660 MiB/s 33.006 MiB/s 33.432 MiB/s]
+                 change:
+                        time:   [+2.1270% +4.4349% +6.7117%] (p = 0.00 < 0.05)
+                        thrpt:  [−6.2896% −4.2466% −2.0827%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/coalesced/1KiB: Analyzing
+                        time:   [399.61 µs 407.29 µs 416.04 µs]
+                        thrpt:  [2.3473 MiB/s 2.3977 MiB/s 2.4438 MiB/s]
+                 change:
+                        time:   [−4.1354% −1.5686% +1.8853%] (p = 0.32 > 0.05)
+                        thrpt:  [−1.8504% +1.5936% +4.3138%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/coalesced/2KiB: Analyzing
+                        time:   [409.09 µs 414.20 µs 421.11 µs]
+                        thrpt:  [4.6381 MiB/s 4.7154 MiB/s 4.7743 MiB/s]
+                 change:
+                        time:   [−1.0397% +1.5475% +3.8344%] (p = 0.24 > 0.05)
+                        thrpt:  [−3.6928% −1.5239% +1.0506%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/coalesced/4KiB: Analyzing
+                        time:   [416.50 µs 426.72 µs 438.17 µs]
+                        thrpt:  [8.9149 MiB/s 9.1541 MiB/s 9.3788 MiB/s]
+                 change:
+                        time:   [−1.3418% +1.2376% +3.7719%] (p = 0.36 > 0.05)
+                        thrpt:  [−3.6348% −1.2225% +1.3600%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/coalesced/8KiB: Analyzing
+                        time:   [425.31 µs 433.57 µs 441.51 µs]
+                        thrpt:  [17.695 MiB/s 18.019 MiB/s 18.369 MiB/s]
+                 change:
+                        time:   [−2.1194% +0.3919% +2.8519%] (p = 0.76 > 0.05)
+                        thrpt:  [−2.7728% −0.3903% +2.1653%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/coalesced/16KiB: Analyzing
+                        time:   [462.77 µs 473.49 µs 483.69 µs]
+                        thrpt:  [32.304 MiB/s 33.000 MiB/s 33.764 MiB/s]
+                 change:
+                        time:   [−3.2439% −1.0144% +1.3258%] (p = 0.39 > 0.05)
+                        thrpt:  [−1.3085% +1.0248% +3.3526%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/buffered/1KiB: Analyzing
+                        time:   [407.37 µs 417.25 µs 428.05 µs]
+                        thrpt:  [2.2814 MiB/s 2.3405 MiB/s 2.3972 MiB/s]
+                 change:
+                        time:   [−7.9003% −4.0335% −0.4334%] (p = 0.04 < 0.05)
+                        thrpt:  [+0.4353% +4.2031% +8.5779%]
+Benchmarking wal_commit_consistent/buffered/2KiB: Analyzing
+                        time:   [417.32 µs 426.53 µs 437.28 µs]
+                        thrpt:  [4.4665 MiB/s 4.5791 MiB/s 4.6801 MiB/s]
+                 change:
+                        time:   [−0.7262% +1.5555% +4.1942%] (p = 0.21 > 0.05)
+                        thrpt:  [−4.0254% −1.5317% +0.7315%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/buffered/4KiB: Analyzing
+                        time:   [426.43 µs 436.75 µs 447.01 µs]
+                        thrpt:  [8.7387 MiB/s 8.9438 MiB/s 9.1604 MiB/s]
+                 change:
+                        time:   [+2.9720% +4.6867% +6.5049%] (p = 0.00 < 0.05)
+                        thrpt:  [−6.1076% −4.4769% −2.8862%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/buffered/8KiB: Analyzing
+                        time:   [457.70 µs 468.83 µs 481.91 µs]
+                        thrpt:  [16.212 MiB/s 16.664 MiB/s 17.069 MiB/s]
+                 change:
+                        time:   [+2.3773% +4.8115% +7.7308%] (p = 0.00 < 0.05)
+                        thrpt:  [−7.1761% −4.5906% −2.3221%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/buffered/16KiB: Analyzing
+                        time:   [476.92 µs 481.95 µs 488.03 µs]
+                        thrpt:  [32.016 MiB/s 32.420 MiB/s 32.762 MiB/s]
+                 change:
+                        time:   [−0.9196% +1.6128% +4.1276%] (p = 0.22 > 0.05)
+                        thrpt:  [−3.9640% −1.5872% +0.9282%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/mmap/1KiB: Analyzing
+                        time:   [455.20 µs 464.85 µs 474.18 µs]
+                        thrpt:  [2.0595 MiB/s 2.1008 MiB/s 2.1453 MiB/s]
+                 change:
+                        time:   [+1.2042% +4.2810% +7.5821%] (p = 0.01 < 0.05)
+                        thrpt:  [−7.0477% −4.1053% −1.1898%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/mmap/2KiB: Analyzing
+                        time:   [463.04 µs 470.71 µs 480.12 µs]
+                        thrpt:  [4.0680 MiB/s 4.1493 MiB/s 4.2180 MiB/s]
+                 change:
+                        time:   [−1.0636% +1.2684% +3.7878%] (p = 0.31 > 0.05)
+                        thrpt:  [−3.6496% −1.2525% +1.0751%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/mmap/4KiB: Analyzing
+                        time:   [487.08 µs 493.58 µs 501.80 µs]
+                        thrpt:  [7.7844 MiB/s 7.9142 MiB/s 8.0197 MiB/s]
+                 change:
+                        time:   [+2.8676% +4.4979% +6.0891%] (p = 0.00 < 0.05)
+                        thrpt:  [−5.7396% −4.3043% −2.7876%]
+                        Performance has regressed.
+Benchmarking wal_commit_consistent/mmap/8KiB: Analyzing
+                        time:   [492.88 µs 507.29 µs 521.35 µs]
+                        thrpt:  [14.985 MiB/s 15.400 MiB/s 15.851 MiB/s]
+                 change:
+                        time:   [−5.1251% −1.4138% +1.9078%] (p = 0.47 > 0.05)
+                        thrpt:  [−1.8721% +1.4341% +5.4020%]
+                        No change in performance detected.
+Benchmarking wal_commit_consistent/mmap/16KiB: Analyzing
+                        time:   [553.27 µs 562.40 µs 574.12 µs]
+                        thrpt:  [27.216 MiB/s 27.783 MiB/s 28.241 MiB/s]
+                 change:
+                        time:   [+4.1053% +6.5021% +8.9425%] (p = 0.00 < 0.05)
+                        thrpt:  [−8.2085% −6.1051% −3.9434%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/fswrite/1KiB: Analyzing
+                        time:   [973.39 ns 999.67 ns 1.0374 µs]
+                        thrpt:  [941.32 MiB/s 976.89 MiB/s 1003.3 MiB/s]
+                 change:
+                        time:   [−9.1653% −5.1745% −0.1882%] (p = 0.02 < 0.05)
+                        thrpt:  [+0.1885% +5.4569% +10.090%]
+Benchmarking wal_commit_eventual/fswrite/2KiB: Analyzing
+                        time:   [1.0981 µs 1.1479 µs 1.2204 µs]
+                        thrpt:  [1.5629 GiB/s 1.6616 GiB/s 1.7370 GiB/s]
+                 change:
+                        time:   [−3.2206% +1.3083% +6.5988%] (p = 0.63 > 0.05)
+                        thrpt:  [−6.1903% −1.2914% +3.3278%]
+                        No change in performance detected.
+Benchmarking wal_commit_eventual/fswrite/4KiB: Analyzing
+                        time:   [1.5442 µs 1.5734 µs 1.6089 µs]
+                        thrpt:  [2.3710 GiB/s 2.4245 GiB/s 2.4703 GiB/s]
+                 change:
+                        time:   [−1.6714% +2.6321% +7.5175%] (p = 0.26 > 0.05)
+                        thrpt:  [−6.9919% −2.5646% +1.6998%]
+                        No change in performance detected.
+Benchmarking wal_commit_eventual/fswrite/8KiB: Analyzing
+                        time:   [2.2816 µs 2.3289 µs 2.3827 µs]
+                        thrpt:  [3.2020 GiB/s 3.2760 GiB/s 3.3438 GiB/s]
+                 change:
+                        time:   [+27.644% +33.702% +41.444%] (p = 0.00 < 0.05)
+                        thrpt:  [−29.301% −25.207% −21.657%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/fswrite/16KiB: Analyzing
+                        time:   [3.3644 µs 3.4123 µs 3.4639 µs]
+                        thrpt:  [4.4051 GiB/s 4.4717 GiB/s 4.5353 GiB/s]
+                 change:
+                        time:   [+3.0940% +5.1261% +7.4978%] (p = 0.00 < 0.05)
+                        thrpt:  [−6.9749% −4.8762% −3.0011%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/coalesced/1KiB: Analyzing
+                        time:   [1.0558 µs 1.0733 µs 1.0910 µs]
+                        thrpt:  [895.13 MiB/s 909.90 MiB/s 924.94 MiB/s]
+                 change:
+                        time:   [+3.3484% +6.8497% +11.235%] (p = 0.00 < 0.05)
+                        thrpt:  [−10.100% −6.4106% −3.2400%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/coalesced/2KiB: Analyzing
+                        time:   [1.0575 µs 1.0801 µs 1.1041 µs]
+                        thrpt:  [1.7275 GiB/s 1.7659 GiB/s 1.8036 GiB/s]
+                 change:
+                        time:   [+3.9614% +6.5049% +9.2203%] (p = 0.00 < 0.05)
+                        thrpt:  [−8.4419% −6.1076% −3.8105%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/coalesced/4KiB: Analyzing
+                        time:   [1.4538 µs 1.4784 µs 1.5063 µs]
+                        thrpt:  [2.5326 GiB/s 2.5803 GiB/s 2.6240 GiB/s]
+                 change:
+                        time:   [−5.8574% −3.4674% −1.0147%] (p = 0.01 < 0.05)
+                        thrpt:  [+1.0251% +3.5919% +6.2218%]
+                        Performance has improved.
+Benchmarking wal_commit_eventual/coalesced/8KiB: Analyzing
+                        time:   [2.1268 µs 2.1677 µs 2.2187 µs]
+                        thrpt:  [3.4387 GiB/s 3.5196 GiB/s 3.5873 GiB/s]
+                 change:
+                        time:   [+6.2721% +8.5424% +10.904%] (p = 0.00 < 0.05)
+                        thrpt:  [−9.8317% −7.8701% −5.9019%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/coalesced/16KiB: Analyzing
+                        time:   [3.2926 µs 3.3349 µs 3.3843 µs]
+                        thrpt:  [4.5086 GiB/s 4.5755 GiB/s 4.6342 GiB/s]
+                 change:
+                        time:   [+2.5991% +4.9836% +7.4836%] (p = 0.00 < 0.05)
+                        thrpt:  [−6.9626% −4.7470% −2.5332%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/buffered/1KiB: Analyzing
+                        time:   [885.32 ns 897.61 ns 911.32 ns]
+                        thrpt:  [1.0465 GiB/s 1.0625 GiB/s 1.0772 GiB/s]
+                 change:
+                        time:   [−21.699% −18.247% −15.023%] (p = 0.00 < 0.05)
+                        thrpt:  [+17.678% +22.320% +27.712%]
+                        Performance has improved.
+Benchmarking wal_commit_eventual/buffered/2KiB: Analyzing
+                        time:   [1.2553 µs 1.2784 µs 1.3046 µs]
+                        thrpt:  [1.4620 GiB/s 1.4920 GiB/s 1.5195 GiB/s]
+                 change:
+                        time:   [−2.5619% +1.9471% +8.2993%] (p = 0.58 > 0.05)
+                        thrpt:  [−7.6633% −1.9099% +2.6293%]
+                        No change in performance detected.
+Benchmarking wal_commit_eventual/buffered/4KiB: Analyzing
+                        time:   [1.5719 µs 1.6216 µs 1.6774 µs]
+                        thrpt:  [2.2741 GiB/s 2.3524 GiB/s 2.4267 GiB/s]
+                 change:
+                        time:   [+7.8091% +10.983% +15.069%] (p = 0.00 < 0.05)
+                        thrpt:  [−13.095% −9.8965% −7.2434%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/buffered/8KiB: Analyzing
+                        time:   [2.2494 µs 2.2735 µs 2.3038 µs]
+                        thrpt:  [3.3117 GiB/s 3.3557 GiB/s 3.3918 GiB/s]
+                 change:
+                        time:   [+2.8483% +10.082% +22.855%] (p = 0.04 < 0.05)
+                        thrpt:  [−18.603% −9.1587% −2.7694%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/buffered/16KiB: Analyzing
+                        time:   [3.1192 µs 3.1618 µs 3.2110 µs]
+                        thrpt:  [4.7521 GiB/s 4.8260 GiB/s 4.8918 GiB/s]
+                 change:
+                        time:   [−7.6169% −5.9905% −4.2991%] (p = 0.00 < 0.05)
+                        thrpt:  [+4.4922% +6.3722% +8.2449%]
+                        Performance has improved.
+Benchmarking wal_commit_eventual/mmap/1KiB: Analyzing
+                        time:   [1.6063 µs 1.6428 µs 1.6839 µs]
+                        thrpt:  [579.93 MiB/s 594.47 MiB/s 607.94 MiB/s]
+                 change:
+                        time:   [+24.786% +31.839% +39.264%] (p = 0.00 < 0.05)
+                        thrpt:  [−28.194% −24.150% −19.863%]
+                        Performance has regressed.
+Benchmarking wal_commit_eventual/mmap/2KiB: Analyzing
+                        time:   [1.4067 µs 1.4310 µs 1.4582 µs]
+                        thrpt:  [1.3080 GiB/s 1.3329 GiB/s 1.3559 GiB/s]
+                 change:
+                        time:   [−4.2338% +2.3639% +8.4419%] (p = 0.49 > 0.05)
+                        thrpt:  [−7.7847% −2.3093% +4.4210%]
+                        No change in performance detected.
+Benchmarking wal_commit_eventual/mmap/4KiB: Analyzing
+                        time:   [1.6298 µs 1.6520 µs 1.6777 µs]
+                        thrpt:  [2.2738 GiB/s 2.3091 GiB/s 2.3406 GiB/s]
+                 change:
+                        time:   [−3.8887% −0.2195% +3.3747%] (p = 0.91 > 0.05)
+                        thrpt:  [−3.2646% +0.2200% +4.0461%]
+                        No change in performance detected.
+Benchmarking wal_commit_eventual/mmap/8KiB: Analyzing
+                        time:   [2.1420 µs 2.1775 µs 2.2105 µs]
+                        thrpt:  [3.4514 GiB/s 3.5038 GiB/s 3.5618 GiB/s]
+                 change:
+                        time:   [−0.0348% +2.6351% +5.5590%] (p = 0.07 > 0.05)
+                        thrpt:  [−5.2662% −2.5674% +0.0348%]
+                        No change in performance detected.
+Benchmarking wal_commit_eventual/mmap/16KiB: Analyzing
+                        time:   [2.9891 µs 3.0394 µs 3.0918 µs]
+                        thrpt:  [4.9353 GiB/s 5.0203 GiB/s 5.1048 GiB/s]
+                 change:
+                        time:   [−12.956% −11.136% −9.1795%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.107% +12.531% +14.885%]
+                        Performance has improved.
+Benchmarking wal_eventual_batch/fswrite/1KiB: Analyzing
+                        time:   [2.2199 ms 2.2562 ms 2.2847 ms]
+                        thrpt:  [109.42 MiB/s 110.81 MiB/s 112.62 MiB/s]
+                 change:
+                        time:   [−1.0068% +0.3273% +1.7263%] (p = 0.65 > 0.05)
+                        thrpt:  [−1.6970% −0.3263% +1.0170%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/fswrite/2KiB: Analyzing
+                        time:   [3.2635 ms 3.2952 ms 3.3244 ms]
+                        thrpt:  [150.40 MiB/s 151.74 MiB/s 153.21 MiB/s]
+                 change:
+                        time:   [−4.1601% −1.4296% +0.9453%] (p = 0.32 > 0.05)
+                        thrpt:  [−0.9364% +1.4503% +4.3406%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/fswrite/4KiB: Analyzing
+                        time:   [5.1900 ms 5.2428 ms 5.2995 ms]
+                        thrpt:  [188.70 MiB/s 190.74 MiB/s 192.68 MiB/s]
+                 change:
+                        time:   [−0.2686% +0.6589% +1.5241%] (p = 0.17 > 0.05)
+                        thrpt:  [−1.5012% −0.6546% +0.2693%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/fswrite/8KiB: Analyzing
+                        time:   [8.9202 ms 8.9604 ms 9.0009 ms]
+                        thrpt:  [222.20 MiB/s 223.20 MiB/s 224.21 MiB/s]
+                 change:
+                        time:   [−0.6471% +0.1963% +0.9504%] (p = 0.64 > 0.05)
+                        thrpt:  [−0.9415% −0.1959% +0.6514%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/fswrite/16KiB: Analyzing
+                        time:   [15.494 ms 15.572 ms 15.663 ms]
+                        thrpt:  [255.39 MiB/s 256.88 MiB/s 258.17 MiB/s]
+                 change:
+                        time:   [−0.2518% +0.4748% +1.2306%] (p = 0.23 > 0.05)
+                        thrpt:  [−1.2157% −0.4725% +0.2525%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/coalesced/1KiB: Analyzing
+                        time:   [1.6975 ms 1.7264 ms 1.7536 ms]
+                        thrpt:  [142.56 MiB/s 144.81 MiB/s 147.27 MiB/s]
+                 change:
+                        time:   [+1.3727% +2.9839% +4.6679%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.4597% −2.8974% −1.3541%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/coalesced/2KiB: Analyzing
+                        time:   [2.4751 ms 2.5081 ms 2.5397 ms]
+                        thrpt:  [196.87 MiB/s 199.36 MiB/s 202.02 MiB/s]
+                 change:
+                        time:   [+1.5978% +3.0921% +4.6174%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.4136% −2.9993% −1.5727%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/coalesced/4KiB: Analyzing
+                        time:   [3.9094 ms 3.9573 ms 4.0091 ms]
+                        thrpt:  [249.43 MiB/s 252.70 MiB/s 255.79 MiB/s]
+                 change:
+                        time:   [+1.6828% +2.6616% +3.7852%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.6471% −2.5926% −1.6550%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/coalesced/8KiB: Analyzing
+                        time:   [6.8693 ms 6.9187 ms 6.9712 ms]
+                        thrpt:  [286.89 MiB/s 289.07 MiB/s 291.15 MiB/s]
+                 change:
+                        time:   [−0.2362% +0.7247% +1.7334%] (p = 0.16 > 0.05)
+                        thrpt:  [−1.7039% −0.7195% +0.2368%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/coalesced/16KiB: Analyzing
+                        time:   [12.782 ms 12.962 ms 13.152 ms]
+                        thrpt:  [304.14 MiB/s 308.58 MiB/s 312.94 MiB/s]
+                 change:
+                        time:   [+1.4895% +2.4748% +3.6180%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.4917% −2.4151% −1.4677%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/buffered/1KiB: Analyzing
+                        time:   [1.7112 ms 1.7287 ms 1.7444 ms]
+                        thrpt:  [143.32 MiB/s 144.62 MiB/s 146.09 MiB/s]
+                 change:
+                        time:   [+1.3907% +2.6486% +4.0469%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.8895% −2.5802% −1.3716%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/buffered/2KiB: Analyzing
+                        time:   [2.4732 ms 2.4885 ms 2.5044 ms]
+                        thrpt:  [199.65 MiB/s 200.92 MiB/s 202.16 MiB/s]
+                 change:
+                        time:   [−0.8841% +0.8616% +2.4553%] (p = 0.34 > 0.05)
+                        thrpt:  [−2.3965% −0.8542% +0.8920%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/buffered/4KiB: Analyzing
+                        time:   [3.9383 ms 3.9576 ms 3.9842 ms]
+                        thrpt:  [250.99 MiB/s 252.68 MiB/s 253.92 MiB/s]
+                 change:
+                        time:   [+0.9568% +1.7407% +2.6176%] (p = 0.00 < 0.05)
+                        thrpt:  [−2.5508% −1.7109% −0.9478%]
+Benchmarking wal_eventual_batch/buffered/8KiB: Analyzing
+                        time:   [7.0355 ms 7.1027 ms 7.1571 ms]
+                        thrpt:  [279.44 MiB/s 281.58 MiB/s 284.27 MiB/s]
+                 change:
+                        time:   [+2.5105% +3.7518% +4.9772%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.7413% −3.6161% −2.4490%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/buffered/16KiB: Analyzing
+                        time:   [12.879 ms 13.004 ms 13.150 ms]
+                        thrpt:  [304.19 MiB/s 307.59 MiB/s 310.59 MiB/s]
+                 change:
+                        time:   [+0.9552% +1.8314% +2.7501%] (p = 0.00 < 0.05)
+                        thrpt:  [−2.6765% −1.7985% −0.9461%]
+Benchmarking wal_eventual_batch/mmap/1KiB: Analyzing
+                        time:   [2.0338 ms 2.0653 ms 2.0866 ms]
+                        thrpt:  [119.81 MiB/s 121.05 MiB/s 122.92 MiB/s]
+                 change:
+                        time:   [+2.7346% +4.2727% +5.9548%] (p = 0.00 < 0.05)
+                        thrpt:  [−5.6201% −4.0976% −2.6618%]
+                        Performance has regressed.
+Benchmarking wal_eventual_batch/mmap/2KiB: Analyzing
+                        time:   [2.8878 ms 2.9304 ms 2.9707 ms]
+                        thrpt:  [168.31 MiB/s 170.62 MiB/s 173.14 MiB/s]
+                 change:
+                        time:   [+0.0927% +1.3009% +2.6326%] (p = 0.06 > 0.05)
+                        thrpt:  [−2.5651% −1.2842% −0.0926%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/mmap/4KiB: Analyzing
+                        time:   [4.3344 ms 4.3813 ms 4.4373 ms]
+                        thrpt:  [225.36 MiB/s 228.24 MiB/s 230.71 MiB/s]
+                 change:
+                        time:   [−4.4129% −1.2124% +1.0192%] (p = 0.51 > 0.05)
+                        thrpt:  [−1.0089% +1.2272% +4.6166%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/mmap/8KiB: Analyzing
+                        time:   [7.5929 ms 7.6429 ms 7.6953 ms]
+                        thrpt:  [259.90 MiB/s 261.68 MiB/s 263.40 MiB/s]
+                 change:
+                        time:   [−0.2205% +0.8887% +1.8541%] (p = 0.11 > 0.05)
+                        thrpt:  [−1.8203% −0.8809% +0.2210%]
+                        No change in performance detected.
+Benchmarking wal_eventual_batch/mmap/16KiB: Analyzing
+                        time:   [13.839 ms 13.950 ms 14.091 ms]
+                        thrpt:  [283.86 MiB/s 286.73 MiB/s 289.03 MiB/s]
+                 change:
+                        time:   [+0.3967% +1.1237% +2.0050%] (p = 0.01 < 0.05)
+                        thrpt:  [−1.9656% −1.1112% −0.3951%]
+=== DONE ===
