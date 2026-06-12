@@ -67,11 +67,6 @@ name = "bulk_load_bench"
 harness = false
 
 [[bench]]
-name = "snapshot_throughput"
-harness = false
-required-features = ["persistence"]
-
-[[bench]]
 name = "wal_bench"
 harness = false
 required-features = ["bench-internals"]
