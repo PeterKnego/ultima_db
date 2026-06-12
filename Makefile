@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines
 
 build:
 	cargo build
@@ -35,8 +35,12 @@ define check_cmd
 	@command -v $(1) >/dev/null 2>&1 || { echo "Error: '$(1)' is not installed. Run: cargo install $(1)"; exit 1; }
 endef
 
+# First-party tier (default). Competitor baselines: bench/compare-engines.
 bench:
-	cargo bench
+	cargo bench --features bench-internals
+
+bench/scaling:
+	cargo bench --bench multiwriter_scaling_bench --features persistence
 
 bench/ycsb:
 	cargo bench --bench ycsb_bench
