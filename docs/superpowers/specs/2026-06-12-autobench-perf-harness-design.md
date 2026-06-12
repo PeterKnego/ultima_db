@@ -104,15 +104,22 @@ Must run on a real disk (tmpfs check, as in `wal_bench.rs`).
 
 ## 4. Task 2: `smr-apply`
 
-Reproduces the apply loop exactly: `Persistence::Smr`, `SingleWriter`, one
-`WriteTx` per entry via `begin_write(Some(log_index))`, immediate commit;
-a reader thread issuing `begin_read(None)` queries throughout; snapshot freeze
-+ `stream_snapshot` + `checkpoint()` every 5000 entries.
+Reproduces the apply loop: `Persistence::Smr`; each state-machine iteration
+executes a configurable number of transactions T, either sequentially
+(`SingleWriter`) or in parallel via MultiWriter OCC. Matrix: T=1 SingleWriter
+pinned via `begin_write(Some(log_index))` (the current cluster hot path),
+T=8 SingleWriter sequential, and T=8 across 4 parallel MultiWriter writers
+(auto-assigned versions within the iteration; conflict/retry rate reported).
+A reader thread issues `begin_read(None)` queries throughout; snapshot freeze
++ `stream_snapshot` + `checkpoint()` every 5000 iterations.
 
 | Metric | Direction | Notes |
 |---|---|---|
-| `apply_p99_ns` | minimize, **primary** | per-entry begin_write→commit |
-| `apply_throughput` | maximize | entries/s sustained incl. snapshot cadence |
+| `apply_p99_ns` | minimize, **primary** (initial campaign) | T=1 SingleWriter pinned, per-entry begin_write→commit |
+| `apply_throughput` | maximize | iterations/s sustained incl. snapshot cadence |
+| `apply_sw_batch_throughput` | maximize | txns/s, T=8 sequential per iteration |
+| `apply_mw_throughput` | maximize | txns/s, T=8 over 4 parallel writers (OCC) |
+| `apply_mw_p99_ns` | minimize | per-txn commit p99 under parallel apply |
 | `read_p99_under_load_ns` | minimize | concurrent `begin_read(None)` + point query |
 | `snapshot_freeze_p99_us` | minimize | MVCC pin under load |
 | `snapshot_stream_ms` | minimize | serialize ~100k-row state |
@@ -124,7 +131,9 @@ a reader thread issuing `begin_read(None)` queries throughout; snapshot freeze
 - **Torture floor** (`smr_apply_torture.rs`, frozen, <60 s): apply N entries
   with pinned versions → `latest_version == last index`; snapshot/restore
   round-trip equality; read-during-apply isolation; checkpoint+recover
-  equality (reusing corruption-injection patterns from the persistence tests).
+  equality (reusing corruption-injection patterns from the persistence tests);
+  multi-writer iteration equivalence — T commutative txns applied in parallel
+  converge to the same state as the sequential reference.
 
 ## 5. run-iter
 
