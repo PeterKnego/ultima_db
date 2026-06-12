@@ -146,10 +146,13 @@ timeouts, stderr-tail capture):
 4. **Gates** (conditional: only when primary metric ≤ baseline × 1.05):
    - **Gate A (always when reached):** full `cargo test --features persistence`
      + `cargo test -p ultima-journal` — the workspace verification rule.
-   - **Gate B (journal-commit + smr-apply, cross-repo):** `cargo build` in
-     `../ultima_cluster` (path dep picks up local edits) and run its
-     `commit-path-load` with a small request count; fail on >5% e2e p99
-     regression vs recorded baseline. Skipped with an explicit reason if
+   - **Gate B (journal-commit + smr-apply, cross-repo):** in
+     `../ultima_cluster` (path dep picks up local edits), run uc_autobench's
+     `shmem-e2e --json` — an in-process single-node cluster driving 2k
+     submit→response round-trips through the full stack (journal, store state
+     machine); fail on >5% `submit_to_resp_p99_ns` regression vs recorded
+     baseline. (`commit-path-load` was considered but is a CSV rate-sweep
+     generator, not gate-shaped.) Skipped with an explicit reason if
      `../ultima_cluster` is absent.
 
 Output: single JSON object (`status`, `stage`, `duration_s`, `metrics`,
