@@ -74,7 +74,7 @@ pub enum IsolationLevel {
     /// Serializable. WriteTx records every read; commit fails with
     /// [`Error::SerializationFailure`] if any read was invalidated by a
     /// concurrent commit since the tx's base version. Equivalent to
-    /// [`SnapshotIsolation`] in [`WriterMode::SingleWriter`] (no concurrent
+    /// [`SnapshotIsolation`](IsolationLevel::SnapshotIsolation) in [`WriterMode::SingleWriter`] (no concurrent
     /// writers, no validation needed). v1 tracks point reads precisely;
     /// any range/scan/index read is recorded as a coarse "table touched"
     /// flag (false positives possible on read-heavy scan workloads).
@@ -108,7 +108,7 @@ pub struct StoreConfig {
     /// Enable this in SMR (state machine replication) deployments where the
     /// consensus layer assigns log indices as version numbers.
     pub require_explicit_version: bool,
-    /// Persistence mode. Default: [`Persistence::None`] (in-memory only).
+    /// Persistence mode. Default: [`Persistence::None`](crate::Persistence::None) (in-memory only).
     #[cfg(feature = "persistence")]
     pub persistence: crate::persistence::Persistence,
 }
@@ -602,7 +602,7 @@ impl Store {
     }
 
     /// Register a table type for persistence. Must be called before any
-    /// transactions that touch this table, and before [`Store::open`] or
+    /// transactions that touch this table, and before [`Store::recover`] or
     /// [`Store::checkpoint`].
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
@@ -854,7 +854,7 @@ impl Store {
 
     /// Build a streaming reader over a frozen snapshot.
     ///
-    /// The returned [`SnapshotReader`] implements [`std::io::Read`] and emits the
+    /// The returned [`SnapshotReader`](crate::SnapshotReader) implements [`std::io::Read`] and emits the
     /// `ULTSNAP` wire format (file header → per-table data → file trailer) without
     /// holding any write lock — concurrent writes proceed normally thanks to MVCC.
     ///
@@ -924,7 +924,7 @@ impl Store {
         Ok(versions)
     }
 
-    /// Open a specific on-disk checkpoint as a [`SnapshotReader`] without
+    /// Open a specific on-disk checkpoint as a [`SnapshotReader`](crate::SnapshotReader) without
     /// installing it into the store.
     ///
     /// Useful for replaying a previously-written checkpoint to a remote peer
@@ -933,7 +933,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotStreamError::BulkLoad`] if the checkpoint file does
+    /// Returns [`SnapshotStreamError::BulkLoad`](crate::SnapshotStreamError::BulkLoad) if the checkpoint file does
     /// not exist, cannot be read, or fails CRC/deserialization checks.
     #[cfg(feature = "persistence")]
     pub fn open_checkpoint_reader(
@@ -1064,7 +1064,7 @@ impl Store {
                     .unwrap_or(base_typed.next_id())
                     .max(base_typed.next_id());
 
-                let index_defs = base_typed.empty_index_defs();
+                let index_defs = base_typed.empty_index_defs()?;
                 let new_table: crate::table::Table<R> =
                     crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
 
@@ -1171,7 +1171,7 @@ impl Store {
                     .as_any()
                     .downcast_ref::<crate::table::Table<R>>()
                     .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
-                typed.empty_index_defs()
+                typed.empty_index_defs()?
             } else if create_if_missing {
                 Vec::new()
             } else {
@@ -1501,7 +1501,7 @@ impl ReadTx {
 
     /// Borrow a table from this snapshot.
     ///
-    /// Returns [`Error::KeyNotFound`] if the table does not exist in this
+    /// Returns [`Error::TableNotFound`] if the table does not exist in this
     /// snapshot, or [`Error::TypeMismatch`] if it was created with a different
     /// record type.
     pub fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<TableReader<'_, R>> {
@@ -1510,14 +1510,15 @@ impl ReadTx {
             .snapshot
             .tables
             .get(name)
-            .ok_or(Error::KeyNotFound)?
+            .ok_or_else(|| Error::TableNotFound(name.to_string()))?
             .as_any()
             .downcast_ref::<Table<R>>()
             .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
-        self.metrics.register_table(name);
+        let table_metrics = self.metrics.register_table(name);
         Ok(TableReader {
             table,
             metrics: &self.metrics,
+            table_metrics,
             table_name: name.to_string(),
         })
     }
@@ -1621,6 +1622,8 @@ pub struct TableWriter<'tx, R: Record> {
     table: &'tx mut Table<R>,
     write_set: Option<&'tx mut BTreeSet<u64>>,
     metrics: Arc<StoreMetrics>,
+    /// Cached per-table counter handle (see `TableReader::table_metrics`).
+    table_metrics: Arc<crate::metrics::TableMetrics>,
     table_name: String,
     /// `Some` in MultiWriter mode: bundles the shared intent map with the
     /// caller-writer's id and waiter, so `update`/`delete` can perform
@@ -1697,14 +1700,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 id,
                 data,
             });
-            self.metrics.inc_inserts(&self.table_name, 1);
+            self.table_metrics.inc_inserts(1);
             return Ok(id);
         }
         let id = self.table.insert(record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
-        self.metrics.inc_inserts(&self.table_name, 1);
+        self.table_metrics.inc_inserts(1);
         Ok(id)
     }
 
@@ -1723,14 +1726,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 id,
                 data,
             });
-            self.metrics.inc_updates(&self.table_name, 1);
+            self.table_metrics.inc_updates(1);
             return Ok(());
         }
         self.table.update(id, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
-        self.metrics.inc_updates(&self.table_name, 1);
+        self.table_metrics.inc_updates(1);
         Ok(())
     }
 
@@ -1748,7 +1751,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 id,
             });
         }
-        self.metrics.inc_deletes(&self.table_name, 1);
+        self.table_metrics.inc_deletes(1);
         Ok(old)
     }
 
@@ -1771,14 +1774,14 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                     data,
                 });
             }
-            self.metrics.inc_inserts(&self.table_name, ids.len() as u64);
+            self.table_metrics.inc_inserts(ids.len() as u64);
             return Ok(ids);
         }
         let ids = self.table.insert_batch(records)?;
         if let Some(ws) = &mut self.write_set {
             ws.extend(ids.iter().copied());
         }
-        self.metrics.inc_inserts(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_inserts(ids.len() as u64);
         Ok(ids)
     }
 
@@ -1808,7 +1811,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                     data,
                 });
             }
-            self.metrics.inc_updates(&self.table_name, ids.len() as u64);
+            self.table_metrics.inc_updates(ids.len() as u64);
             return Ok(());
         }
         let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
@@ -1816,7 +1819,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(ws) = &mut self.write_set {
             ws.extend(ids.iter());
         }
-        self.metrics.inc_updates(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_updates(ids.len() as u64);
         Ok(())
     }
 
@@ -1836,7 +1839,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 });
             }
         }
-        self.metrics.inc_deletes(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_deletes(ids.len() as u64);
         Ok(())
     }
 
@@ -1851,7 +1854,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Look up a record by its ID.
     pub fn get(&self, id: u64) -> Option<&R> {
         record_point_read(self.read_set, &self.table_name, id);
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.get(id)
     }
 
@@ -1861,7 +1864,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         range: impl std::ops::RangeBounds<u64> + 'a,
     ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
         record_table_scan(self.read_set, &self.table_name);
-        self.metrics.inc_primary_key_scans(&self.table_name);
+        self.table_metrics.inc_primary_key_scans();
         self.table.range(range)
     }
 
@@ -1882,28 +1885,28 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Returns true if the table contains a record with the given ID.
     pub fn contains(&self, id: u64) -> bool {
         record_point_read(self.read_set, &self.table_name, id);
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.contains(id)
     }
 
     /// Returns the first (lowest ID) record, or `None` if empty.
     pub fn first(&self) -> Option<(u64, &R)> {
         record_table_scan(self.read_set, &self.table_name);
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.first()
     }
 
     /// Returns the last (highest ID) record, or `None` if empty.
     pub fn last(&self) -> Option<(u64, &R)> {
         record_table_scan(self.read_set, &self.table_name);
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.last()
     }
 
     /// Iterate over all records in ID order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
         record_table_scan(self.read_set, &self.table_name);
-        self.metrics.inc_primary_key_scans(&self.table_name);
+        self.table_metrics.inc_primary_key_scans();
         self.table.iter()
     }
 
@@ -1912,8 +1915,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         for id in ids {
             record_point_read(self.read_set, &self.table_name, *id);
         }
-        self.metrics
-            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
         self.table.get_many(ids)
     }
 
@@ -1997,8 +1999,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         for id in ids {
             record_point_read(self.read_set, &self.table_name, *id);
         }
-        self.metrics
-            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
         self.table.resolve(ids)
     }
 
@@ -2038,9 +2039,9 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             w.ops.push(op);
         }
         if had_prior {
-            self.metrics.inc_updates(&self.table_name, 1);
+            self.table_metrics.inc_updates(1);
         } else {
-            self.metrics.inc_inserts(&self.table_name, 1);
+            self.table_metrics.inc_inserts(1);
         }
         Ok(())
     }
@@ -2113,6 +2114,10 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 pub struct TableReader<'tx, R: Record> {
     table: &'tx Table<R>,
     metrics: &'tx StoreMetrics,
+    /// Cached per-table counter handle: read methods are hot (HNSW issues
+    /// thousands of `get`s per query) and must not take the metrics map's
+    /// `RwLock` + string hash per call.
+    table_metrics: Arc<crate::metrics::TableMetrics>,
     table_name: String,
 }
 
@@ -2147,7 +2152,7 @@ fn record_table_scan(rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntr
 impl<'tx, R: Record> TableReader<'tx, R> {
     /// Look up a record by its ID.
     pub fn get(&self, id: u64) -> Option<&R> {
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.get(id)
     }
 
@@ -2156,7 +2161,7 @@ impl<'tx, R: Record> TableReader<'tx, R> {
         &'a self,
         range: impl std::ops::RangeBounds<u64> + 'a,
     ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
-        self.metrics.inc_primary_key_scans(&self.table_name);
+        self.table_metrics.inc_primary_key_scans();
         self.table.range(range)
     }
 
@@ -2174,32 +2179,31 @@ impl<'tx, R: Record> TableReader<'tx, R> {
 
     /// Returns true if the table contains a record with the given ID.
     pub fn contains(&self, id: u64) -> bool {
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.contains(id)
     }
 
     /// Returns the first (lowest ID) record, or `None` if empty.
     pub fn first(&self) -> Option<(u64, &R)> {
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.first()
     }
 
     /// Returns the last (highest ID) record, or `None` if empty.
     pub fn last(&self) -> Option<(u64, &R)> {
-        self.metrics.inc_primary_key_reads(&self.table_name, 1);
+        self.table_metrics.inc_primary_key_reads(1);
         self.table.last()
     }
 
     /// Iterate over all records in ID order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
-        self.metrics.inc_primary_key_scans(&self.table_name);
+        self.table_metrics.inc_primary_key_scans();
         self.table.iter()
     }
 
     /// Look up multiple records by ID.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
-        self.metrics
-            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
         self.table.get_many(ids)
     }
 
@@ -2252,8 +2256,7 @@ impl<'tx, R: Record> TableReader<'tx, R> {
     /// Resolve a slice of record IDs to `(id, &record)` pairs.
     /// IDs that don't exist in the table are silently skipped.
     pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
-        self.metrics
-            .inc_primary_key_reads(&self.table_name, ids.len() as u64);
+        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
         self.table.resolve(ids)
     }
 }
@@ -2319,7 +2322,7 @@ impl WriteTx {
             }),
             _ => None,
         };
-        self.metrics.register_table(&name_str);
+        let table_metrics = self.metrics.register_table(&name_str);
         #[cfg(feature = "persistence")]
         let wal_ops = if self.wal_enabled {
             Some(WalOpsWriter {
@@ -2333,6 +2336,7 @@ impl WriteTx {
             table,
             write_set,
             metrics: Arc::clone(&self.metrics),
+            table_metrics,
             table_name: name_str,
             intent_ctx,
             #[cfg(feature = "persistence")]
@@ -3101,7 +3105,7 @@ mod tests {
         let rtx = store.begin_read(None).unwrap();
         assert!(matches!(
             rtx.open_table::<String>("nope"),
-            Err(Error::KeyNotFound)
+            Err(Error::TableNotFound(_))
         ));
     }
 
@@ -3161,7 +3165,7 @@ mod tests {
         // Do NOT commit yet — rtx should still see empty
         assert!(matches!(
             rtx.open_table::<String>("t"),
-            Err(Error::KeyNotFound)
+            Err(Error::TableNotFound(_))
         ));
         wtx.rollback();
     }

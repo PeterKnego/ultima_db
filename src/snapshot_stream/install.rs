@@ -50,7 +50,7 @@ pub enum OnExtra {
     Drop,
 }
 
-/// Options for [`Store::install_snapshot_stream`].
+/// Options for [`Store::install_snapshot_stream`](crate::Store::install_snapshot_stream).
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     /// How to handle tables present in the stream but not registered in the
@@ -85,7 +85,7 @@ impl Default for InstallOptions {
 // ---------------------------------------------------------------------------
 
 impl crate::store::Store {
-    /// Drain a snapshot wire stream produced by [`Store::snapshot_stream`],
+    /// Drain a snapshot wire stream produced by [`Store::snapshot_stream`](crate::Store::snapshot_stream),
     /// validate per-table and total CRC-32 checksums, and atomically install
     /// the result as the new latest snapshot.
     ///

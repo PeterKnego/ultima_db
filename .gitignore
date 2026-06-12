@@ -9,9 +9,5 @@ flamegraph.svg
 perf.data
 perf.data.old
 
-# Superpowers scratch (specs, plans) — consolidated into docs/tasks/ before commit
-/docs/superpowers
-
-
 # Stray local Claude settings sometimes copied to repo root (the real one lives under .claude/)
 /settings.local.json

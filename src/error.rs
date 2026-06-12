@@ -36,7 +36,7 @@ pub enum Error {
     #[error("serialization failure on table '{table}' (conflicting version {version})")]
     SerializationFailure { table: String, version: u64 },
     /// Returned when `begin_write` is called while another write transaction
-    /// is active in [`WriterMode::SingleWriter`] mode.
+    /// is active in [`WriterMode::SingleWriter`](crate::WriterMode::SingleWriter) mode.
     #[error("another write transaction is active (SingleWriter mode)")]
     WriterBusy,
     /// Table opened with a different record type than its original creation.
@@ -55,7 +55,7 @@ pub enum Error {
     #[error("index '{0}' already exists")]
     IndexAlreadyExists(String),
     /// Returned when `begin_write(None)` is called but
-    /// [`StoreConfig::require_explicit_version`] is `true`.
+    /// [`StoreConfig::require_explicit_version`](crate::StoreConfig::require_explicit_version) is `true`.
     #[error("explicit version required (require_explicit_version is enabled)")]
     ExplicitVersionRequired,
     /// An I/O or format error during persistence operations (WAL or checkpoint).

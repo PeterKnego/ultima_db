@@ -223,7 +223,7 @@ impl<R: Record> Table<R> {
 
     /// Clone each index's *definition* (extractor, name, kind, storage type)
     /// with empty storage. Used by bulk-load to rebuild indexes from new data.
-    pub(crate) fn empty_index_defs(&self) -> Vec<Box<dyn IndexMaintainer<R>>> {
+    pub(crate) fn empty_index_defs(&self) -> Result<Vec<Box<dyn IndexMaintainer<R>>>> {
         self.indexes.values().map(|i| i.empty_clone()).collect()
     }
 

@@ -185,7 +185,7 @@ fn two_tables_independent_across_versions() {
     assert_eq!(r1.open_table::<String>("users").unwrap().len(), 1);
     assert!(matches!(
         r1.open_table::<u64>("posts"),
-        Err(Error::KeyNotFound)
+        Err(Error::TableNotFound(_))
     ));
 
     let r2 = store.begin_read(Some(2)).unwrap();
@@ -355,7 +355,7 @@ fn two_overlapping_write_txs_to_different_tables() {
     );
     assert!(matches!(
         r1.open_table::<u32>("table_b"),
-        Err(Error::KeyNotFound)
+        Err(Error::TableNotFound(_))
     ));
 
     // v2 has BOTH tables. wtx_b rebased onto the current latest snapshot at
@@ -429,7 +429,7 @@ fn read_at_version_zero_sees_empty_store() {
     let rtx = store.begin_read(Some(0)).unwrap();
     assert!(matches!(
         rtx.open_table::<String>("t"),
-        Err(Error::KeyNotFound)
+        Err(Error::TableNotFound(_))
     ));
 }
 
@@ -1670,7 +1670,7 @@ fn delete_table_removes_table_from_snapshot() {
     let rtx = store.begin_read(None).unwrap();
     assert!(matches!(
         rtx.open_table::<String>("users"),
-        Err(Error::KeyNotFound)
+        Err(Error::TableNotFound(_))
     ));
     assert_eq!(
         rtx.open_table::<String>("logs").unwrap().get(1),

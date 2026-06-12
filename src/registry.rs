@@ -185,6 +185,7 @@ impl TableRegistry {
                         let index_defs = existing
                             .and_then(|t| t.as_any().downcast_ref::<Table<R>>())
                             .map(|t| t.empty_index_defs())
+                            .transpose()?
                             .unwrap_or_default();
                         let table = Table::<R>::from_bulk(sorted, next_id, index_defs)?;
                         Ok(Box::new(table))

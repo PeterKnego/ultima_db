@@ -8,6 +8,7 @@ edition = "2024"
 description = "Embedded in-memory B-tree store with MVCC"
 authors = ["Peter Knego"]
 license = "Apache-2.0"
+readme = "README.md"
 
 [features]
 default = []

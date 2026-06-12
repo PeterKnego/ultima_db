@@ -78,7 +78,14 @@ impl IndexMetrics {
 }
 
 /// Per-table atomic counters plus per-index metrics.
-struct TableMetrics {
+/// Per-table counters. Handed out as an `Arc` by
+/// [`StoreMetrics::register_table`] so hot paths (`TableReader::get` runs
+/// thousands of times per HNSW query) increment a plain atomic instead of
+/// taking the store-wide `RwLock` and hashing the table name on every call.
+pub(crate) struct TableMetrics {
+    /// Table name, kept for the optional metrics-facade emission labels.
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    name: String,
     inserts: AtomicU64,
     updates: AtomicU64,
     deletes: AtomicU64,
@@ -88,8 +95,9 @@ struct TableMetrics {
 }
 
 impl TableMetrics {
-    fn new() -> Self {
+    fn new(name: String) -> Self {
         Self {
+            name,
             inserts: AtomicU64::new(0),
             updates: AtomicU64::new(0),
             deletes: AtomicU64::new(0),
@@ -97,6 +105,44 @@ impl TableMetrics {
             primary_key_scans: AtomicU64::new(0),
             indexes: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn inc_inserts(&self, n: u64) {
+        self.inserts.fetch_add(n, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        emit("ultima.table.inserts", &[("table", self.name.clone())], n);
+    }
+
+    pub(crate) fn inc_updates(&self, n: u64) {
+        self.updates.fetch_add(n, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        emit("ultima.table.updates", &[("table", self.name.clone())], n);
+    }
+
+    pub(crate) fn inc_deletes(&self, n: u64) {
+        self.deletes.fetch_add(n, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        emit("ultima.table.deletes", &[("table", self.name.clone())], n);
+    }
+
+    pub(crate) fn inc_primary_key_reads(&self, n: u64) {
+        self.primary_key_reads.fetch_add(n, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        emit(
+            "ultima.table.primary_reads",
+            &[("table", self.name.clone())],
+            n,
+        );
+    }
+
+    pub(crate) fn inc_primary_key_scans(&self) {
+        self.primary_key_scans.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        emit(
+            "ultima.table.primary_scans",
+            &[("table", self.name.clone())],
+            1,
+        );
     }
 
     fn snapshot(&self) -> TableMetricsSnapshot {
@@ -130,7 +176,7 @@ pub(crate) struct StoreMetrics {
     commit_ns_phase1: AtomicU64,
     commit_ns_phase2: AtomicU64,
     commit_ns_phase3: AtomicU64,
-    tables: RwLock<HashMap<String, TableMetrics>>,
+    tables: RwLock<HashMap<String, std::sync::Arc<TableMetrics>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,11 +224,19 @@ impl StoreMetrics {
 
     // --- Registration -------------------------------------------------------
 
-    pub(crate) fn register_table(&self, name: &str) {
+    /// Register a table (idempotent) and return its counter handle. Callers
+    /// on hot paths cache the handle so increments are a single relaxed
+    /// `fetch_add` with no lock or string hash.
+    pub(crate) fn register_table(&self, name: &str) -> std::sync::Arc<TableMetrics> {
+        if let Some(t) = self.tables.read().unwrap().get(name) {
+            return std::sync::Arc::clone(t);
+        }
         let mut tables = self.tables.write().unwrap();
-        tables
-            .entry(name.to_string())
-            .or_insert_with(TableMetrics::new);
+        std::sync::Arc::clone(
+            tables
+                .entry(name.to_string())
+                .or_insert_with(|| std::sync::Arc::new(TableMetrics::new(name.to_string()))),
+        )
     }
 
     pub(crate) fn register_index(&self, table: &str, index: &str) {
@@ -231,61 +285,6 @@ impl StoreMetrics {
         self.serialization_failures.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
         emit("ultima.serialization_failures", &[], 1);
-    }
-
-    // --- Table-level increments ---------------------------------------------
-
-    pub(crate) fn inc_inserts(&self, table: &str, n: u64) {
-        let tables = self.tables.read().unwrap();
-        if let Some(t) = tables.get(table) {
-            t.inserts.fetch_add(n, Ordering::Relaxed);
-            #[cfg(feature = "metrics")]
-            emit("ultima.table.inserts", &[("table", table.to_string())], n);
-        }
-    }
-
-    pub(crate) fn inc_updates(&self, table: &str, n: u64) {
-        let tables = self.tables.read().unwrap();
-        if let Some(t) = tables.get(table) {
-            t.updates.fetch_add(n, Ordering::Relaxed);
-            #[cfg(feature = "metrics")]
-            emit("ultima.table.updates", &[("table", table.to_string())], n);
-        }
-    }
-
-    pub(crate) fn inc_deletes(&self, table: &str, n: u64) {
-        let tables = self.tables.read().unwrap();
-        if let Some(t) = tables.get(table) {
-            t.deletes.fetch_add(n, Ordering::Relaxed);
-            #[cfg(feature = "metrics")]
-            emit("ultima.table.deletes", &[("table", table.to_string())], n);
-        }
-    }
-
-    pub(crate) fn inc_primary_key_reads(&self, table: &str, n: u64) {
-        let tables = self.tables.read().unwrap();
-        if let Some(t) = tables.get(table) {
-            t.primary_key_reads.fetch_add(n, Ordering::Relaxed);
-            #[cfg(feature = "metrics")]
-            emit(
-                "ultima.table.primary_reads",
-                &[("table", table.to_string())],
-                n,
-            );
-        }
-    }
-
-    pub(crate) fn inc_primary_key_scans(&self, table: &str) {
-        let tables = self.tables.read().unwrap();
-        if let Some(t) = tables.get(table) {
-            t.primary_key_scans.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "metrics")]
-            emit(
-                "ultima.table.primary_scans",
-                &[("table", table.to_string())],
-                1,
-            );
-        }
     }
 
     // --- Index-level increments ---------------------------------------------
@@ -390,13 +389,13 @@ mod tests {
     #[test]
     fn table_level_increments() {
         let m = StoreMetrics::new();
-        m.register_table("users");
+        let users = m.register_table("users");
 
-        m.inc_inserts("users", 3);
-        m.inc_updates("users", 2);
-        m.inc_deletes("users", 1);
-        m.inc_primary_key_reads("users", 10);
-        m.inc_primary_key_scans("users");
+        users.inc_inserts(3);
+        users.inc_updates(2);
+        users.inc_deletes(1);
+        users.inc_primary_key_reads(10);
+        users.inc_primary_key_scans();
 
         let s = m.snapshot();
         let t = s.tables.get("users").expect("users table should exist");
@@ -438,19 +437,26 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_table_increments_are_ignored() {
+    fn unregistered_index_increments_are_ignored() {
         let m = StoreMetrics::new();
 
-        // None of these should panic
-        m.inc_inserts("ghost", 5);
-        m.inc_updates("ghost", 1);
-        m.inc_deletes("ghost", 1);
-        m.inc_primary_key_reads("ghost", 3);
-        m.inc_primary_key_scans("ghost");
+        // Index increments on unknown tables/indexes must not panic.
         m.inc_index_reads("ghost", "some_index");
         m.inc_index_range_scans("ghost", "some_index");
 
         let s = m.snapshot();
         assert!(s.tables.is_empty());
+    }
+
+    /// `register_table` is idempotent and both handles see shared counters.
+    #[test]
+    fn register_table_returns_shared_handle() {
+        let m = StoreMetrics::new();
+        let a = m.register_table("users");
+        let b = m.register_table("users");
+        a.inc_inserts(2);
+        b.inc_inserts(1);
+        let s = m.snapshot();
+        assert_eq!(s.tables.get("users").unwrap().inserts, 3);
     }
 }

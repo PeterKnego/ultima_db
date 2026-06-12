@@ -475,6 +475,61 @@ mod tests {
         assert_eq!(res[0].0, ep_id);
     }
 
+    /// A tombstoned node referenced as the entry point (a MultiWriter
+    /// delete race or a stale restore can produce this) must never appear
+    /// in search results — but the graph must still be reachable through
+    /// its out-edges.
+    #[test]
+    fn search_excludes_tombstoned_entry_point_node() {
+        use crate::row::HnswState;
+
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+
+        let mut dead = HnswState::empty(0);
+        dead.set_neighbors(0, vec![2]);
+        dead.tombstone();
+        let mut live = HnswState::empty(0);
+        live.set_neighbors(0, vec![1]);
+
+        let rows = vec![
+            (
+                1,
+                VectorRow {
+                    embedding: vec![1.0, 0.0],
+                    meta: 1u64,
+                    hnsw: dead,
+                },
+            ),
+            (
+                2,
+                VectorRow {
+                    embedding: vec![0.0, 1.0],
+                    meta: 2u64,
+                    hnsw: live,
+                },
+            ),
+        ];
+        coll.restore_vec(
+            rows,
+            EntryPoint {
+                node_id: Some(1),
+                max_level: 0,
+            },
+        )
+        .unwrap();
+
+        // Query right at the tombstoned node's position — strongest pull.
+        let res = coll.search(&[1.0, 0.0], 5, None, None).unwrap();
+        let ids: Vec<u64> = res.iter().map(|r| r.0).collect();
+        assert!(
+            !ids.contains(&1),
+            "tombstoned entry point returned from search: {ids:?}"
+        );
+        assert_eq!(ids, vec![2], "live nodes must stay reachable through it");
+    }
+
     #[test]
     fn bulk_insert_returns_one_id_per_item() {
         let store = Store::new(StoreConfig::default()).unwrap();

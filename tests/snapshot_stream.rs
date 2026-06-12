@@ -211,7 +211,7 @@ mod tests {
         assert!(res.is_err(), "truncated stream must fail");
 
         // Destination must remain empty — the table should not exist in the
-        // snapshot (open_table returns KeyNotFound for an unwritten table).
+        // snapshot (open_table returns TableNotFound for an unwritten table).
         let read = dst.begin_read(None).unwrap();
         let res = read.open_table::<Row>("rows");
         assert!(

@@ -1,0 +1,664 @@
+   Compiling ultima-db v0.1.0 (/home/claude/ultima/ultima_db)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 9.15s
+     Running benches/wal_bench.rs (target/release/deps/wal_bench-eea2890d3dd95618)
+Gnuplot not found, using plotters backend
+[wal_bench] WAL dir = /home/claude/ultima/ultima_db/target/wal-bench | mount = / | fs = ext4
+Benchmarking wal_commit_consistent/fswrite/1KiB
+Benchmarking wal_commit_consistent/fswrite/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/fswrite/1KiB: Collecting 30 samples in estimated 4.0536 s (3720 iterations)
+Benchmarking wal_commit_consistent/fswrite/1KiB: Analyzing
+wal_commit_consistent/fswrite/1KiB
+                        time:   [422.55 µs 430.61 µs 440.02 µs]
+                        thrpt:  [2.2194 MiB/s 2.2679 MiB/s 2.3111 MiB/s]
+                 change:
+                        time:   [−28.062% −16.645% −5.9304%] (p = 0.01 < 0.05)
+                        thrpt:  [+6.3043% +19.969% +39.008%]
+                        Performance has improved.
+Found 5 outliers among 30 measurements (16.67%)
+  2 (6.67%) high mild
+  3 (10.00%) high severe
+Benchmarking wal_commit_consistent/fswrite/2KiB
+Benchmarking wal_commit_consistent/fswrite/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/fswrite/2KiB: Collecting 30 samples in estimated 4.2031 s (2325 iterations)
+Benchmarking wal_commit_consistent/fswrite/2KiB: Analyzing
+wal_commit_consistent/fswrite/2KiB
+                        time:   [418.38 µs 430.50 µs 442.69 µs]
+                        thrpt:  [4.4120 MiB/s 4.5369 MiB/s 4.6683 MiB/s]
+                 change:
+                        time:   [−10.642% −2.1710% +10.274%] (p = 0.72 > 0.05)
+                        thrpt:  [−9.3164% +2.2192% +11.910%]
+                        No change in performance detected.
+Found 3 outliers among 30 measurements (10.00%)
+  1 (3.33%) high mild
+  2 (6.67%) high severe
+Benchmarking wal_commit_consistent/fswrite/4KiB
+Benchmarking wal_commit_consistent/fswrite/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/fswrite/4KiB: Collecting 30 samples in estimated 4.3040 s (4185 iterations)
+Benchmarking wal_commit_consistent/fswrite/4KiB: Analyzing
+wal_commit_consistent/fswrite/4KiB
+                        time:   [476.66 µs 483.71 µs 491.54 µs]
+                        thrpt:  [7.9470 MiB/s 8.0755 MiB/s 8.1951 MiB/s]
+                 change:
+                        time:   [−18.319% −6.8709% +4.0883%] (p = 0.32 > 0.05)
+                        thrpt:  [−3.9277% +7.3779% +22.427%]
+                        No change in performance detected.
+Found 3 outliers among 30 measurements (10.00%)
+  1 (3.33%) low mild
+  2 (6.67%) high mild
+Benchmarking wal_commit_consistent/fswrite/8KiB
+Benchmarking wal_commit_consistent/fswrite/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/fswrite/8KiB: Collecting 30 samples in estimated 4.0570 s (2790 iterations)
+Benchmarking wal_commit_consistent/fswrite/8KiB: Analyzing
+wal_commit_consistent/fswrite/8KiB
+                        time:   [533.75 µs 573.50 µs 640.54 µs]
+                        thrpt:  [12.197 MiB/s 13.623 MiB/s 14.637 MiB/s]
+                 change:
+                        time:   [+14.104% +52.825% +99.515%] (p = 0.01 < 0.05)
+                        thrpt:  [−49.878% −34.566% −12.361%]
+                        Performance has regressed.
+Found 5 outliers among 30 measurements (16.67%)
+  1 (3.33%) high mild
+  4 (13.33%) high severe
+Benchmarking wal_commit_consistent/fswrite/16KiB
+Benchmarking wal_commit_consistent/fswrite/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/fswrite/16KiB: Collecting 30 samples in estimated 4.2396 s (3720 iterations)
+Benchmarking wal_commit_consistent/fswrite/16KiB: Analyzing
+wal_commit_consistent/fswrite/16KiB
+                        time:   [509.68 µs 518.84 µs 528.83 µs]
+                        thrpt:  [29.546 MiB/s 30.115 MiB/s 30.656 MiB/s]
+                 change:
+                        time:   [−19.288% −7.3728% +3.6896%] (p = 0.31 > 0.05)
+                        thrpt:  [−3.5583% +7.9596% +23.897%]
+                        No change in performance detected.
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high severe
+Benchmarking wal_commit_consistent/buffered/1KiB
+Benchmarking wal_commit_consistent/buffered/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/buffered/1KiB: Collecting 30 samples in estimated 4.4156 s (2790 iterations)
+Benchmarking wal_commit_consistent/buffered/1KiB: Analyzing
+wal_commit_consistent/buffered/1KiB
+                        time:   [459.41 µs 557.12 µs 767.44 µs]
+                        thrpt:  [1.2725 MiB/s 1.7529 MiB/s 2.1257 MiB/s]
+Found 5 outliers among 30 measurements (16.67%)
+  5 (16.67%) high severe
+Benchmarking wal_commit_consistent/buffered/2KiB
+Benchmarking wal_commit_consistent/buffered/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/buffered/2KiB: Collecting 30 samples in estimated 4.4722 s (4185 iterations)
+Benchmarking wal_commit_consistent/buffered/2KiB: Analyzing
+wal_commit_consistent/buffered/2KiB
+                        time:   [426.46 µs 438.36 µs 449.40 µs]
+                        thrpt:  [4.3461 MiB/s 4.4555 MiB/s 4.5798 MiB/s]
+Benchmarking wal_commit_consistent/buffered/4KiB
+Benchmarking wal_commit_consistent/buffered/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/buffered/4KiB: Collecting 30 samples in estimated 4.1038 s (3720 iterations)
+Benchmarking wal_commit_consistent/buffered/4KiB: Analyzing
+wal_commit_consistent/buffered/4KiB
+                        time:   [522.58 µs 627.29 µs 798.66 µs]
+                        thrpt:  [4.8910 MiB/s 6.2272 MiB/s 7.4749 MiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  1 (3.33%) high mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_consistent/buffered/8KiB
+Benchmarking wal_commit_consistent/buffered/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/buffered/8KiB: Collecting 30 samples in estimated 4.4458 s (4185 iterations)
+Benchmarking wal_commit_consistent/buffered/8KiB: Analyzing
+wal_commit_consistent/buffered/8KiB
+                        time:   [457.09 µs 466.51 µs 476.79 µs]
+                        thrpt:  [16.386 MiB/s 16.747 MiB/s 17.092 MiB/s]
+Benchmarking wal_commit_consistent/buffered/16KiB
+Benchmarking wal_commit_consistent/buffered/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/buffered/16KiB: Collecting 30 samples in estimated 4.0177 s (3720 iterations)
+Benchmarking wal_commit_consistent/buffered/16KiB: Analyzing
+wal_commit_consistent/buffered/16KiB
+                        time:   [569.37 µs 673.59 µs 794.69 µs]
+                        thrpt:  [19.662 MiB/s 23.197 MiB/s 27.443 MiB/s]
+Found 3 outliers among 30 measurements (10.00%)
+  3 (10.00%) high mild
+Benchmarking wal_commit_consistent/mmap/1KiB
+Benchmarking wal_commit_consistent/mmap/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/mmap/1KiB: Collecting 30 samples in estimated 4.4127 s (2790 iterations)
+Benchmarking wal_commit_consistent/mmap/1KiB: Analyzing
+wal_commit_consistent/mmap/1KiB
+                        time:   [479.78 µs 487.65 µs 496.19 µs]
+                        thrpt:  [1.9681 MiB/s 2.0026 MiB/s 2.0355 MiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  1 (3.33%) low mild
+  2 (6.67%) high mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_consistent/mmap/2KiB
+Benchmarking wal_commit_consistent/mmap/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/mmap/2KiB: Collecting 30 samples in estimated 4.7353 s (2790 iterations)
+Benchmarking wal_commit_consistent/mmap/2KiB: Analyzing
+wal_commit_consistent/mmap/2KiB
+                        time:   [561.34 µs 676.53 µs 864.26 µs]
+                        thrpt:  [2.2599 MiB/s 2.8870 MiB/s 3.4794 MiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  1 (3.33%) high mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_consistent/mmap/4KiB
+Benchmarking wal_commit_consistent/mmap/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/mmap/4KiB: Collecting 30 samples in estimated 4.4689 s (2790 iterations)
+Benchmarking wal_commit_consistent/mmap/4KiB: Analyzing
+wal_commit_consistent/mmap/4KiB
+                        time:   [523.55 µs 530.92 µs 537.99 µs]
+                        thrpt:  [7.2608 MiB/s 7.3575 MiB/s 7.4611 MiB/s]
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high mild
+Benchmarking wal_commit_consistent/mmap/8KiB
+Benchmarking wal_commit_consistent/mmap/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/mmap/8KiB: Collecting 30 samples in estimated 4.7797 s (2790 iterations)
+Benchmarking wal_commit_consistent/mmap/8KiB: Analyzing
+wal_commit_consistent/mmap/8KiB
+                        time:   [577.14 µs 673.53 µs 831.03 µs]
+                        thrpt:  [9.4010 MiB/s 11.599 MiB/s 13.537 MiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  1 (3.33%) high mild
+  3 (10.00%) high severe
+Benchmarking wal_commit_consistent/mmap/16KiB
+Benchmarking wal_commit_consistent/mmap/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/mmap/16KiB: Collecting 30 samples in estimated 4.5301 s (2790 iterations)
+Benchmarking wal_commit_consistent/mmap/16KiB: Analyzing
+wal_commit_consistent/mmap/16KiB
+                        time:   [547.25 µs 556.75 µs 565.33 µs]
+                        thrpt:  [27.639 MiB/s 28.065 MiB/s 28.552 MiB/s]
+Benchmarking wal_commit_consistent/iouring/1KiB
+Benchmarking wal_commit_consistent/iouring/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/iouring/1KiB: Collecting 30 samples in estimated 4.6723 s (2325 iterations)
+Benchmarking wal_commit_consistent/iouring/1KiB: Analyzing
+wal_commit_consistent/iouring/1KiB
+                        time:   [575.56 µs 669.89 µs 834.63 µs]
+                        thrpt:  [1.1701 MiB/s 1.4578 MiB/s 1.6967 MiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  2 (6.67%) high mild
+  2 (6.67%) high severe
+Benchmarking wal_commit_consistent/iouring/2KiB
+Benchmarking wal_commit_consistent/iouring/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/iouring/2KiB: Collecting 30 samples in estimated 4.5256 s (3720 iterations)
+Benchmarking wal_commit_consistent/iouring/2KiB: Analyzing
+wal_commit_consistent/iouring/2KiB
+                        time:   [506.91 µs 518.86 µs 531.46 µs]
+                        thrpt:  [3.6750 MiB/s 3.7643 MiB/s 3.8530 MiB/s]
+Benchmarking wal_commit_consistent/iouring/4KiB
+Benchmarking wal_commit_consistent/iouring/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/iouring/4KiB: Collecting 30 samples in estimated 4.5370 s (3720 iterations)
+Benchmarking wal_commit_consistent/iouring/4KiB: Analyzing
+wal_commit_consistent/iouring/4KiB
+                        time:   [600.02 µs 701.75 µs 895.73 µs]
+                        thrpt:  [4.3610 MiB/s 5.5665 MiB/s 6.5102 MiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  3 (10.00%) high mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_consistent/iouring/8KiB
+Benchmarking wal_commit_consistent/iouring/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/iouring/8KiB: Collecting 30 samples in estimated 4.5304 s (3720 iterations)
+Benchmarking wal_commit_consistent/iouring/8KiB: Analyzing
+wal_commit_consistent/iouring/8KiB
+                        time:   [560.73 µs 589.52 µs 619.58 µs]
+                        thrpt:  [12.609 MiB/s 13.252 MiB/s 13.933 MiB/s]
+Found 5 outliers among 30 measurements (16.67%)
+  1 (3.33%) low mild
+  1 (3.33%) high mild
+  3 (10.00%) high severe
+Benchmarking wal_commit_consistent/iouring/16KiB
+Benchmarking wal_commit_consistent/iouring/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_consistent/iouring/16KiB: Collecting 30 samples in estimated 4.5939 s (2790 iterations)
+Benchmarking wal_commit_consistent/iouring/16KiB: Analyzing
+wal_commit_consistent/iouring/16KiB
+                        time:   [612.93 µs 714.43 µs 921.72 µs]
+                        thrpt:  [16.952 MiB/s 21.870 MiB/s 25.492 MiB/s]
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high severe
+
+Benchmarking wal_commit_eventual/fswrite/1KiB
+Benchmarking wal_commit_eventual/fswrite/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/fswrite/1KiB: Collecting 30 samples in estimated 4.0962 s (4185 iterations)
+Benchmarking wal_commit_eventual/fswrite/1KiB: Analyzing
+wal_commit_eventual/fswrite/1KiB
+                        time:   [1.3287 µs 1.3657 µs 1.4091 µs]
+                        thrpt:  [693.06 MiB/s 715.09 MiB/s 734.99 MiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) high mild
+Benchmarking wal_commit_eventual/fswrite/2KiB
+Benchmarking wal_commit_eventual/fswrite/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/fswrite/2KiB: Collecting 30 samples in estimated 4.3546 s (3720 iterations)
+Benchmarking wal_commit_eventual/fswrite/2KiB: Analyzing
+wal_commit_eventual/fswrite/2KiB
+                        time:   [1.3868 µs 1.5013 µs 1.6971 µs]
+                        thrpt:  [1.1239 GiB/s 1.2705 GiB/s 1.3753 GiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  1 (3.33%) high mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_eventual/fswrite/4KiB
+Benchmarking wal_commit_eventual/fswrite/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/fswrite/4KiB: Collecting 30 samples in estimated 4.1623 s (4185 iterations)
+Benchmarking wal_commit_eventual/fswrite/4KiB: Analyzing
+wal_commit_eventual/fswrite/4KiB
+                        time:   [1.5430 µs 1.5720 µs 1.6027 µs]
+                        thrpt:  [2.3802 GiB/s 2.4267 GiB/s 2.4722 GiB/s]
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high mild
+Benchmarking wal_commit_eventual/fswrite/8KiB
+Benchmarking wal_commit_eventual/fswrite/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/fswrite/8KiB: Collecting 30 samples in estimated 4.0482 s (4185 iterations)
+Benchmarking wal_commit_eventual/fswrite/8KiB: Analyzing
+wal_commit_eventual/fswrite/8KiB
+                        time:   [2.1804 µs 2.5139 µs 3.1319 µs]
+                        thrpt:  [2.4360 GiB/s 3.0348 GiB/s 3.4990 GiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) high severe
+Benchmarking wal_commit_eventual/fswrite/16KiB
+Benchmarking wal_commit_eventual/fswrite/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/fswrite/16KiB: Collecting 30 samples in estimated 4.3006 s (4185 iterations)
+Benchmarking wal_commit_eventual/fswrite/16KiB: Analyzing
+wal_commit_eventual/fswrite/16KiB
+                        time:   [2.9609 µs 3.0764 µs 3.2006 µs]
+                        thrpt:  [4.7675 GiB/s 4.9599 GiB/s 5.1535 GiB/s]
+Benchmarking wal_commit_eventual/buffered/1KiB
+Benchmarking wal_commit_eventual/buffered/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/buffered/1KiB: Collecting 30 samples in estimated 4.3425 s (4185 iterations)
+Benchmarking wal_commit_eventual/buffered/1KiB: Analyzing
+wal_commit_eventual/buffered/1KiB
+                        time:   [1.4620 µs 1.5595 µs 1.7194 µs]
+                        thrpt:  [567.97 MiB/s 626.20 MiB/s 667.98 MiB/s]
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high severe
+Benchmarking wal_commit_eventual/buffered/2KiB
+Benchmarking wal_commit_eventual/buffered/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/buffered/2KiB: Collecting 30 samples in estimated 4.2925 s (4650 iterations)
+Benchmarking wal_commit_eventual/buffered/2KiB: Analyzing
+wal_commit_eventual/buffered/2KiB
+                        time:   [1.4281 µs 1.4726 µs 1.5212 µs]
+                        thrpt:  [1.2539 GiB/s 1.2953 GiB/s 1.3356 GiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  1 (3.33%) low mild
+  1 (3.33%) high mild
+Benchmarking wal_commit_eventual/buffered/4KiB
+Benchmarking wal_commit_eventual/buffered/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/buffered/4KiB: Collecting 30 samples in estimated 4.3493 s (4185 iterations)
+Benchmarking wal_commit_eventual/buffered/4KiB: Analyzing
+wal_commit_eventual/buffered/4KiB
+                        time:   [1.8639 µs 5.6301 µs 15.258 µs]
+                        thrpt:  [256.01 MiB/s 693.82 MiB/s 2.0467 GiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  2 (6.67%) high mild
+  2 (6.67%) high severe
+Benchmarking wal_commit_eventual/buffered/8KiB
+Benchmarking wal_commit_eventual/buffered/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/buffered/8KiB: Collecting 30 samples in estimated 4.2120 s (3255 iterations)
+Benchmarking wal_commit_eventual/buffered/8KiB: Analyzing
+wal_commit_eventual/buffered/8KiB
+                        time:   [2.1481 µs 2.2307 µs 2.3059 µs]
+                        thrpt:  [3.3087 GiB/s 3.4202 GiB/s 3.5517 GiB/s]
+Benchmarking wal_commit_eventual/buffered/16KiB
+Benchmarking wal_commit_eventual/buffered/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/buffered/16KiB: Collecting 30 samples in estimated 4.4901 s (4185 iterations)
+Benchmarking wal_commit_eventual/buffered/16KiB: Analyzing
+wal_commit_eventual/buffered/16KiB
+                        time:   [2.7280 µs 2.9728 µs 3.2753 µs]
+                        thrpt:  [4.6588 GiB/s 5.1327 GiB/s 5.5934 GiB/s]
+Found 3 outliers among 30 measurements (10.00%)
+  2 (6.67%) low mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_eventual/mmap/1KiB
+Benchmarking wal_commit_eventual/mmap/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/mmap/1KiB: Collecting 30 samples in estimated 4.5853 s (3255 iterations)
+Benchmarking wal_commit_eventual/mmap/1KiB: Analyzing
+wal_commit_eventual/mmap/1KiB
+                        time:   [1.4365 µs 1.5028 µs 1.6035 µs]
+                        thrpt:  [609.01 MiB/s 649.82 MiB/s 679.80 MiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) high severe
+Benchmarking wal_commit_eventual/mmap/2KiB
+Benchmarking wal_commit_eventual/mmap/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/mmap/2KiB: Collecting 30 samples in estimated 4.2374 s (2790 iterations)
+Benchmarking wal_commit_eventual/mmap/2KiB: Analyzing
+wal_commit_eventual/mmap/2KiB
+                        time:   [1.7365 µs 1.8693 µs 2.0277 µs]
+                        thrpt:  [963.21 MiB/s 1.0204 GiB/s 1.0984 GiB/s]
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high severe
+Benchmarking wal_commit_eventual/mmap/4KiB
+Benchmarking wal_commit_eventual/mmap/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/mmap/4KiB: Collecting 30 samples in estimated 4.1968 s (2790 iterations)
+Benchmarking wal_commit_eventual/mmap/4KiB: Analyzing
+wal_commit_eventual/mmap/4KiB
+                        time:   [1.8487 µs 1.9063 µs 1.9619 µs]
+                        thrpt:  [1.9444 GiB/s 2.0011 GiB/s 2.0635 GiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  1 (3.33%) low mild
+  1 (3.33%) high severe
+Benchmarking wal_commit_eventual/mmap/8KiB
+Benchmarking wal_commit_eventual/mmap/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/mmap/8KiB: Collecting 30 samples in estimated 4.0863 s (2790 iterations)
+Benchmarking wal_commit_eventual/mmap/8KiB: Analyzing
+wal_commit_eventual/mmap/8KiB
+                        time:   [2.2714 µs 2.4346 µs 2.6312 µs]
+                        thrpt:  [2.8996 GiB/s 3.1337 GiB/s 3.3588 GiB/s]
+Found 5 outliers among 30 measurements (16.67%)
+  1 (3.33%) high mild
+  4 (13.33%) high severe
+Benchmarking wal_commit_eventual/mmap/16KiB
+Benchmarking wal_commit_eventual/mmap/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/mmap/16KiB: Collecting 30 samples in estimated 4.0560 s (2790 iterations)
+Benchmarking wal_commit_eventual/mmap/16KiB: Analyzing
+wal_commit_eventual/mmap/16KiB
+                        time:   [2.9147 µs 3.0083 µs 3.0881 µs]
+                        thrpt:  [4.9412 GiB/s 5.0722 GiB/s 5.2351 GiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  1 (3.33%) low mild
+  1 (3.33%) high mild
+Benchmarking wal_commit_eventual/iouring/1KiB
+Benchmarking wal_commit_eventual/iouring/1KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/iouring/1KiB: Collecting 30 samples in estimated 4.3046 s (3720 iterations)
+Benchmarking wal_commit_eventual/iouring/1KiB: Analyzing
+wal_commit_eventual/iouring/1KiB
+                        time:   [1.7971 µs 1.9415 µs 2.1075 µs]
+                        thrpt:  [463.37 MiB/s 502.99 MiB/s 543.40 MiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) high mild
+Benchmarking wal_commit_eventual/iouring/2KiB
+Benchmarking wal_commit_eventual/iouring/2KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/iouring/2KiB: Collecting 30 samples in estimated 4.3355 s (2325 iterations)
+Benchmarking wal_commit_eventual/iouring/2KiB: Analyzing
+wal_commit_eventual/iouring/2KiB
+                        time:   [1.8983 µs 2.0697 µs 2.3316 µs]
+                        thrpt:  [837.69 MiB/s 943.68 MiB/s 1.0047 GiB/s]
+Found 1 outliers among 30 measurements (3.33%)
+  1 (3.33%) high severe
+Benchmarking wal_commit_eventual/iouring/4KiB
+Benchmarking wal_commit_eventual/iouring/4KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/iouring/4KiB: Collecting 30 samples in estimated 4.5002 s (3720 iterations)
+Benchmarking wal_commit_eventual/iouring/4KiB: Analyzing
+wal_commit_eventual/iouring/4KiB
+                        time:   [1.9703 µs 2.0057 µs 2.0386 µs]
+                        thrpt:  [1.8713 GiB/s 1.9019 GiB/s 1.9361 GiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  2 (6.67%) low severe
+  1 (3.33%) low mild
+  1 (3.33%) high mild
+Benchmarking wal_commit_eventual/iouring/8KiB
+Benchmarking wal_commit_eventual/iouring/8KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/iouring/8KiB: Collecting 30 samples in estimated 4.0875 s (2325 iterations)
+Benchmarking wal_commit_eventual/iouring/8KiB: Analyzing
+wal_commit_eventual/iouring/8KiB
+                        time:   [2.3123 µs 2.3999 µs 2.5064 µs]
+                        thrpt:  [3.0440 GiB/s 3.1791 GiB/s 3.2995 GiB/s]
+Benchmarking wal_commit_eventual/iouring/16KiB
+Benchmarking wal_commit_eventual/iouring/16KiB: Warming up for 1.0000 s
+Benchmarking wal_commit_eventual/iouring/16KiB: Collecting 30 samples in estimated 4.2968 s (3720 iterations)
+Benchmarking wal_commit_eventual/iouring/16KiB: Analyzing
+wal_commit_eventual/iouring/16KiB
+                        time:   [2.9655 µs 3.1071 µs 3.2496 µs]
+                        thrpt:  [4.6956 GiB/s 4.9109 GiB/s 5.1454 GiB/s]
+Found 3 outliers among 30 measurements (10.00%)
+  1 (3.33%) low severe
+  2 (6.67%) high mild
+
+Benchmarking wal_eventual_batch/fswrite/1KiB
+Benchmarking wal_eventual_batch/fswrite/1KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/fswrite/1KiB: Collecting 20 samples in estimated 4.2680 s (1470 iterations)
+Benchmarking wal_eventual_batch/fswrite/1KiB: Analyzing
+wal_eventual_batch/fswrite/1KiB
+                        time:   [2.2891 ms 2.6184 ms 3.2440 ms]
+                        thrpt:  [77.065 MiB/s 95.477 MiB/s 109.21 MiB/s]
+                 change:
+                        time:   [−13.602% −0.3247% +16.979%] (p = 0.97 > 0.05)
+                        thrpt:  [−14.514% +0.3257% +15.744%]
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/fswrite/2KiB
+Benchmarking wal_eventual_batch/fswrite/2KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/fswrite/2KiB: Collecting 20 samples in estimated 4.2089 s (1050 iterations)
+Benchmarking wal_eventual_batch/fswrite/2KiB: Analyzing
+wal_eventual_batch/fswrite/2KiB
+                        time:   [3.2665 ms 3.3222 ms 3.3909 ms]
+                        thrpt:  [147.45 MiB/s 150.50 MiB/s 153.07 MiB/s]
+                 change:
+                        time:   [−9.1728% −7.0977% −4.9858%] (p = 0.00 < 0.05)
+                        thrpt:  [+5.2474% +7.6399% +10.099%]
+                        Performance has improved.
+Found 5 outliers among 20 measurements (25.00%)
+  2 (10.00%) low mild
+  1 (5.00%) high mild
+  2 (10.00%) high severe
+Benchmarking wal_eventual_batch/fswrite/4KiB
+Benchmarking wal_eventual_batch/fswrite/4KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/fswrite/4KiB: Collecting 20 samples in estimated 5.1699 s (840 iterations)
+Benchmarking wal_eventual_batch/fswrite/4KiB: Analyzing
+wal_eventual_batch/fswrite/4KiB
+                        time:   [5.3352 ms 5.5329 ms 5.8869 ms]
+                        thrpt:  [169.87 MiB/s 180.74 MiB/s 187.43 MiB/s]
+                 change:
+                        time:   [−11.031% −2.7268% +5.7547%] (p = 0.56 > 0.05)
+                        thrpt:  [−5.4416% +2.8032% +12.399%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild
+Benchmarking wal_eventual_batch/fswrite/8KiB
+Benchmarking wal_eventual_batch/fswrite/8KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/fswrite/8KiB: Collecting 20 samples in estimated 4.2569 s (420 iterations)
+Benchmarking wal_eventual_batch/fswrite/8KiB: Analyzing
+wal_eventual_batch/fswrite/8KiB
+                        time:   [8.9514 ms 9.1071 ms 9.3373 ms]
+                        thrpt:  [214.19 MiB/s 219.61 MiB/s 223.43 MiB/s]
+                 change:
+                        time:   [−8.0260% −5.8724% −3.2126%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.3192% +6.2387% +8.7263%]
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/fswrite/16KiB
+Benchmarking wal_eventual_batch/fswrite/16KiB: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 4.0s. You may wish to increase target time to 4.0s, enable flat sampling, or reduce sample count to 10.
+Benchmarking wal_eventual_batch/fswrite/16KiB: Collecting 20 samples in estimated 4.0497 s (210 iterations)
+Benchmarking wal_eventual_batch/fswrite/16KiB: Analyzing
+wal_eventual_batch/fswrite/16KiB
+                        time:   [16.063 ms 17.087 ms 18.830 ms]
+                        thrpt:  [212.42 MiB/s 234.09 MiB/s 249.02 MiB/s]
+                 change:
+                        time:   [−3.6288% +4.0472% +12.683%] (p = 0.47 > 0.05)
+                        thrpt:  [−11.255% −3.8898% +3.7655%]
+                        No change in performance detected.
+Found 4 outliers among 20 measurements (20.00%)
+  1 (5.00%) high mild
+  3 (15.00%) high severe
+Benchmarking wal_eventual_batch/buffered/1KiB
+Benchmarking wal_eventual_batch/buffered/1KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/buffered/1KiB: Collecting 20 samples in estimated 4.3657 s (1890 iterations)
+Benchmarking wal_eventual_batch/buffered/1KiB: Analyzing
+wal_eventual_batch/buffered/1KiB
+                        time:   [1.7363 ms 1.8069 ms 1.9257 ms]
+                        thrpt:  [129.82 MiB/s 138.36 MiB/s 143.98 MiB/s]
+                 change:
+                        time:   [−5.7336% −1.6028% +3.8549%] (p = 0.55 > 0.05)
+                        thrpt:  [−3.7118% +1.6289% +6.0823%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/buffered/2KiB
+Benchmarking wal_eventual_batch/buffered/2KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/buffered/2KiB: Collecting 20 samples in estimated 4.4955 s (1260 iterations)
+Benchmarking wal_eventual_batch/buffered/2KiB: Analyzing
+wal_eventual_batch/buffered/2KiB
+                        time:   [2.4827 ms 2.5971 ms 2.8265 ms]
+                        thrpt:  [176.90 MiB/s 192.53 MiB/s 201.39 MiB/s]
+                 change:
+                        time:   [−5.6425% +7.2481% +29.168%] (p = 0.46 > 0.05)
+                        thrpt:  [−22.581% −6.7582% +5.9799%]
+                        No change in performance detected.
+Found 4 outliers among 20 measurements (20.00%)
+  4 (20.00%) high severe
+Benchmarking wal_eventual_batch/buffered/4KiB
+Benchmarking wal_eventual_batch/buffered/4KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/buffered/4KiB: Collecting 20 samples in estimated 4.9800 s (1050 iterations)
+Benchmarking wal_eventual_batch/buffered/4KiB: Analyzing
+wal_eventual_batch/buffered/4KiB
+                        time:   [4.0106 ms 4.0623 ms 4.1378 ms]
+                        thrpt:  [241.67 MiB/s 246.17 MiB/s 249.34 MiB/s]
+                 change:
+                        time:   [−5.9016% −3.9593% −1.8708%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.9064% +4.1225% +6.2717%]
+                        Performance has improved.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/buffered/8KiB
+Benchmarking wal_eventual_batch/buffered/8KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/buffered/8KiB: Collecting 20 samples in estimated 4.3337 s (420 iterations)
+Benchmarking wal_eventual_batch/buffered/8KiB: Analyzing
+wal_eventual_batch/buffered/8KiB
+                        time:   [7.0127 ms 7.0741 ms 7.1666 ms]
+                        thrpt:  [279.07 MiB/s 282.72 MiB/s 285.20 MiB/s]
+                 change:
+                        time:   [−35.096% −21.541% −8.9891%] (p = 0.01 < 0.05)
+                        thrpt:  [+9.8770% +27.455% +54.074%]
+                        Performance has improved.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+Benchmarking wal_eventual_batch/buffered/16KiB
+Benchmarking wal_eventual_batch/buffered/16KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/buffered/16KiB: Collecting 20 samples in estimated 5.9504 s (420 iterations)
+Benchmarking wal_eventual_batch/buffered/16KiB: Analyzing
+wal_eventual_batch/buffered/16KiB
+                        time:   [13.113 ms 13.213 ms 13.372 ms]
+                        thrpt:  [299.12 MiB/s 302.73 MiB/s 305.03 MiB/s]
+                 change:
+                        time:   [−6.6978% −4.8758% −3.0842%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.1824% +5.1257% +7.1786%]
+                        Performance has improved.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/mmap/1KiB
+Benchmarking wal_eventual_batch/mmap/1KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/mmap/1KiB: Collecting 20 samples in estimated 4.1419 s (1260 iterations)
+Benchmarking wal_eventual_batch/mmap/1KiB: Analyzing
+wal_eventual_batch/mmap/1KiB
+                        time:   [2.0413 ms 2.0600 ms 2.0809 ms]
+                        thrpt:  [120.14 MiB/s 121.36 MiB/s 122.47 MiB/s]
+                 change:
+                        time:   [−6.5243% −5.0352% −3.5847%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.7180% +5.3021% +6.9797%]
+                        Performance has improved.
+Benchmarking wal_eventual_batch/mmap/2KiB
+Benchmarking wal_eventual_batch/mmap/2KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/mmap/2KiB: Collecting 20 samples in estimated 4.3507 s (1050 iterations)
+Benchmarking wal_eventual_batch/mmap/2KiB: Analyzing
+wal_eventual_batch/mmap/2KiB
+                        time:   [2.9095 ms 3.0325 ms 3.1742 ms]
+                        thrpt:  [157.52 MiB/s 164.88 MiB/s 171.85 MiB/s]
+                 change:
+                        time:   [−14.103% −8.7441% −3.6337%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.7707% +9.5820% +16.418%]
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking wal_eventual_batch/mmap/4KiB
+Benchmarking wal_eventual_batch/mmap/4KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/mmap/4KiB: Collecting 20 samples in estimated 5.0731 s (840 iterations)
+Benchmarking wal_eventual_batch/mmap/4KiB: Analyzing
+wal_eventual_batch/mmap/4KiB
+                        time:   [4.7138 ms 4.8168 ms 4.9549 ms]
+                        thrpt:  [201.82 MiB/s 207.61 MiB/s 212.14 MiB/s]
+                 change:
+                        time:   [+0.5512% +2.8592% +5.4447%] (p = 0.02 < 0.05)
+                        thrpt:  [−5.1635% −2.7798% −0.5482%]
+                        Change within noise threshold.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking wal_eventual_batch/mmap/8KiB
+Benchmarking wal_eventual_batch/mmap/8KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/mmap/8KiB: Collecting 20 samples in estimated 4.0552 s (420 iterations)
+Benchmarking wal_eventual_batch/mmap/8KiB: Analyzing
+wal_eventual_batch/mmap/8KiB
+                        time:   [8.2681 ms 8.8139 ms 9.5128 ms]
+                        thrpt:  [210.24 MiB/s 226.91 MiB/s 241.89 MiB/s]
+                 change:
+                        time:   [−5.7727% −0.5350% +5.2954%] (p = 0.86 > 0.05)
+                        thrpt:  [−5.0291% +0.5379% +6.1263%]
+                        No change in performance detected.
+Found 4 outliers among 20 measurements (20.00%)
+  3 (15.00%) high mild
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/mmap/16KiB
+Benchmarking wal_eventual_batch/mmap/16KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/mmap/16KiB: Collecting 20 samples in estimated 6.8516 s (420 iterations)
+Benchmarking wal_eventual_batch/mmap/16KiB: Analyzing
+wal_eventual_batch/mmap/16KiB
+                        time:   [14.762 ms 14.860 ms 14.972 ms]
+                        thrpt:  [267.16 MiB/s 269.18 MiB/s 270.97 MiB/s]
+                 change:
+                        time:   [−1.5410% −0.7927% +0.0211%] (p = 0.06 > 0.05)
+                        thrpt:  [−0.0211% +0.7990% +1.5651%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild
+Benchmarking wal_eventual_batch/iouring/1KiB
+Benchmarking wal_eventual_batch/iouring/1KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/iouring/1KiB: Collecting 20 samples in estimated 4.1321 s (1260 iterations)
+Benchmarking wal_eventual_batch/iouring/1KiB: Analyzing
+wal_eventual_batch/iouring/1KiB
+                        time:   [1.8897 ms 2.0321 ms 2.3269 ms]
+                        thrpt:  [107.44 MiB/s 123.03 MiB/s 132.30 MiB/s]
+                 change:
+                        time:   [+3.9487% +15.049% +30.587%] (p = 0.03 < 0.05)
+                        thrpt:  [−23.423% −13.080% −3.7987%]
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/iouring/2KiB
+Benchmarking wal_eventual_batch/iouring/2KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/iouring/2KiB: Collecting 20 samples in estimated 4.3854 s (1260 iterations)
+Benchmarking wal_eventual_batch/iouring/2KiB: Analyzing
+wal_eventual_batch/iouring/2KiB
+                        time:   [2.6380 ms 2.6957 ms 2.7793 ms]
+                        thrpt:  [179.90 MiB/s 185.48 MiB/s 189.54 MiB/s]
+                 change:
+                        time:   [−7.4998% −4.2775% −1.0522%] (p = 0.01 < 0.05)
+                        thrpt:  [+1.0634% +4.4686% +8.1079%]
+                        Performance has improved.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) high mild
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/iouring/4KiB
+Benchmarking wal_eventual_batch/iouring/4KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/iouring/4KiB: Collecting 20 samples in estimated 4.7806 s (840 iterations)
+Benchmarking wal_eventual_batch/iouring/4KiB: Analyzing
+wal_eventual_batch/iouring/4KiB
+                        time:   [4.2062 ms 4.4293 ms 4.9279 ms]
+                        thrpt:  [202.93 MiB/s 225.77 MiB/s 237.75 MiB/s]
+                 change:
+                        time:   [−18.285% −3.6776% +16.155%] (p = 0.72 > 0.05)
+                        thrpt:  [−13.908% +3.8180% +22.377%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking wal_eventual_batch/iouring/8KiB
+Benchmarking wal_eventual_batch/iouring/8KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/iouring/8KiB: Collecting 20 samples in estimated 5.1273 s (630 iterations)
+Benchmarking wal_eventual_batch/iouring/8KiB: Analyzing
+wal_eventual_batch/iouring/8KiB
+                        time:   [7.1848 ms 7.2399 ms 7.3095 ms]
+                        thrpt:  [273.62 MiB/s 276.25 MiB/s 278.37 MiB/s]
+                 change:
+                        time:   [−7.6579% −6.5479% −5.5025%] (p = 0.00 < 0.05)
+                        thrpt:  [+5.8229% +7.0067% +8.2930%]
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking wal_eventual_batch/iouring/16KiB
+Benchmarking wal_eventual_batch/iouring/16KiB: Warming up for 1.0000 s
+Benchmarking wal_eventual_batch/iouring/16KiB: Collecting 20 samples in estimated 7.2479 s (420 iterations)
+Benchmarking wal_eventual_batch/iouring/16KiB: Analyzing
+wal_eventual_batch/iouring/16KiB
+                        time:   [13.827 ms 13.891 ms 13.938 ms]
+                        thrpt:  [287.00 MiB/s 287.96 MiB/s 289.28 MiB/s]
+                 change:
+                        time:   [−6.8544% −4.9930% −3.2906%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.4026% +5.2554% +7.3588%]
+                        Performance has improved.
+

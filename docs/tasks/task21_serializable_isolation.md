@@ -278,6 +278,18 @@ the project's edition).
   is unusual.
 - **No SSI for `update_batch` / `delete_batch` early-fail.** Those
   still rely on commit-time OCC. Same as task 20's batch limitation.
+- **Table-existence observations are not tracked.** `WriteTx::table_names()`
+  and "does this table exist" probes don't enter the read set, so a
+  transaction whose logic branches on table existence can write-skew
+  against a concurrent `delete_table`/create.
+- **Index DDL is invisible to SSI and OCC.** `define_index` /
+  `define_custom_index` inside a transaction record nothing: the full-table
+  backfill read is not tracked as a scan, the DDL participates in no
+  conflict detection, and on the MultiWriter merge slow path (a concurrent
+  commit touched the same table) the new index definition is silently
+  dropped — only write-set *keys* are replayed onto the latest table.
+  Define indexes in their own transaction, with no concurrent writers on
+  the table.
 - **No support for serializable read-only transactions.** `ReadTx`
   doesn't track reads at all. Read-only transactions can't write-skew,
   so this is fine for the SSI guarantee, but a "snapshot isolation

@@ -48,8 +48,16 @@ where
         if !visited.insert(ep.id) {
             continue;
         }
+        // Always a traversal candidate — a tombstoned entry's out-edges may
+        // be the only way into the graph — but only live, filter-matching
+        // nodes may enter the result set (traversed neighbors are filtered
+        // below; the seeds must be too, or a tombstoned/filtered entry
+        // point is returned to the caller).
         candidates.push(Reverse(*ep));
-        if filter.is_none_or(|f| f.contains(ep.id)) {
+        let live = nodes
+            .get_row(ep.id)
+            .is_some_and(|r| !r.hnsw.is_tombstoned());
+        if live && filter.is_none_or(|f| f.contains(ep.id)) {
             results.push(*ep);
             if results.len() > ef {
                 results.pop();
@@ -129,7 +137,7 @@ where
     // Empty store: no entry table -> empty result.
     let entry = match tx.open_table::<EntryPoint>(entry_name) {
         Ok(e) => e,
-        Err(ultima_db::Error::KeyNotFound) => return Ok(Vec::new()),
+        Err(ultima_db::Error::TableNotFound(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
     let ep = entry.get(1).cloned().unwrap_or_default();

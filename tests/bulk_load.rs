@@ -323,7 +323,7 @@ fn bulk_load_batch_drop_without_commit_is_noop() {
     let rtx = store.begin_read(None).unwrap();
     assert!(matches!(
         rtx.open_table::<String>("t"),
-        Err(ultima_db::Error::KeyNotFound),
+        Err(ultima_db::Error::TableNotFound(_)),
     ));
 }
 
@@ -1035,5 +1035,94 @@ mod bulk_load_occ {
 
         wtx.commit()
             .expect("SI reader of replaced table must commit");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk loads on tables with custom indexes
+// ---------------------------------------------------------------------------
+
+mod bulk_load_custom_index {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, CustomIndex, Error, Store};
+
+    /// Minimal custom index: counts live records.
+    #[derive(Clone, Default)]
+    struct CountIndex {
+        n: u64,
+    }
+
+    impl CustomIndex<String> for CountIndex {
+        fn on_insert(&mut self, _id: u64, _r: &String) -> Result<(), Error> {
+            self.n += 1;
+            Ok(())
+        }
+        fn on_update(&mut self, _id: u64, _old: &String, _new: &String) -> Result<(), Error> {
+            Ok(())
+        }
+        fn on_delete(&mut self, _id: u64, _r: &String) {
+            self.n -= 1;
+        }
+    }
+
+    /// A bulk Replace on a table with a custom index cannot preserve the
+    /// index definition (custom indexes have no generic "make empty" hook).
+    /// That must surface as an `Err`, never a panic — it is a documented,
+    /// supported combination (`VectorCollection` steers users to define
+    /// indexes on its data table, then `restore_vec` hits this path).
+    #[test]
+    fn replace_with_custom_index_errors_instead_of_panicking() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("seed".into()).unwrap();
+            t.define_custom_index("count", CountIndex::default()).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let rows: Vec<(u64, String)> = vec![(1, "bulk".into())];
+        let res = store.bulk_load::<String>(
+            "t",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+            BulkLoadOptions::default(),
+        );
+        assert!(
+            res.is_err(),
+            "bulk Replace over a custom index must error, got {res:?}"
+        );
+
+        // The table is untouched by the failed load.
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(1).map(String::as_str), Some("seed"));
+    }
+
+    /// Same through the Delta path.
+    #[test]
+    fn delta_with_custom_index_errors_instead_of_panicking() {
+        use ultima_db::BulkDelta;
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("seed".into()).unwrap();
+            t.define_custom_index("count", CountIndex::default()).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let delta = BulkDelta {
+            inserts: vec![(2, "delta".to_string())],
+            updates: vec![],
+            deletes: vec![],
+        };
+        let res = store.bulk_load::<String>(
+            "t",
+            BulkLoadInput::Delta(delta),
+            BulkLoadOptions::default(),
+        );
+        assert!(
+            res.is_err(),
+            "bulk Delta over a custom index must error, got {res:?}"
+        );
     }
 }
