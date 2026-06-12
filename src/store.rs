@@ -166,6 +166,56 @@ struct ReadSetEntry {
 }
 
 // ---------------------------------------------------------------------------
+// PromoteGate — FIFO ordering for MultiWriter snapshot promotion
+// ---------------------------------------------------------------------------
+
+/// Serializes MultiWriter snapshot promotion in WAL-submission order.
+///
+/// A committing writer takes a ticket (under the `inner` write lock) when it
+/// submits its WAL entry, and may only promote its snapshot when `turn`
+/// reaches its ticket. Combined with monotonic version assignment at
+/// submission time, this guarantees `latest_version` strictly advances at
+/// every promote — so a commit parked in the fsync wait can never be
+/// overtaken by a later commit forking from a `latest` that lacks its data,
+/// and the WAL entry version always equals the final commit version.
+///
+/// A writer whose fsync fails must still advance `turn` past its ticket
+/// (without promoting) so later writers don't park forever.
+struct PromoteGate {
+    turn: Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl PromoteGate {
+    fn new() -> Self {
+        Self {
+            turn: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Returns true if it is `ticket`'s turn to promote (non-blocking).
+    fn is_turn(&self, ticket: u64) -> bool {
+        *self.turn.lock().unwrap() == ticket
+    }
+
+    /// Blocks until it is `ticket`'s turn to promote.
+    fn wait_turn(&self, ticket: u64) {
+        let mut turn = self.turn.lock().unwrap();
+        while *turn != ticket {
+            turn = self.cv.wait(turn).unwrap();
+        }
+    }
+
+    /// Advances past `ticket`, waking the next waiter.
+    fn advance(&self) {
+        let mut turn = self.turn.lock().unwrap();
+        *turn += 1;
+        self.cv.notify_all();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StoreInner — the interior-mutable state behind Store
 // ---------------------------------------------------------------------------
 
@@ -183,6 +233,20 @@ pub(crate) struct StoreInner {
     /// Write sets from recently committed transactions (MultiWriter mode only).
     /// Pruned when no in-flight writer has a base version ≤ entry.version.
     committed_write_sets: Vec<CommittedWriteSet>,
+    /// Highest version handed to a commit at WAL-submission time (MultiWriter
+    /// mode only). Auto-assigned versions ≤ this get bumped so versions are
+    /// strictly monotonic in submission order even while earlier commits are
+    /// still parked in the fsync wait (when `latest_version` lags behind).
+    last_submitted_version: u64,
+    /// Next promotion ticket (MultiWriter mode only). Taken at WAL
+    /// submission; promotion happens in ticket order via `promote_gate`.
+    next_ticket: u64,
+    /// FIFO gate enforcing ticket-order promotion (MultiWriter mode only).
+    promote_gate: Arc<PromoteGate>,
+    /// True iff this store uses Standalone persistence with Consistent
+    /// durability — the only configuration whose commits park in a WAL
+    /// fsync wait. See [`StoreInner::commit_may_park`].
+    wal_consistent: bool,
     /// WAL writer handle (persistence feature, Standalone mode only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_handle: Option<crate::wal::WalHandle>,
@@ -197,6 +261,25 @@ pub(crate) struct StoreInner {
     #[cfg(all(test, feature = "persistence"))]
     pub(crate) mock_wal: Option<std::sync::Arc<crate::wal::MockWal>>,
     pub(crate) metrics: Arc<StoreMetrics>,
+}
+
+impl StoreInner {
+    /// True iff a commit on this store can release the `inner` lock between
+    /// WAL submission and snapshot promotion (Consistent-durability fsync
+    /// wait, or a test mock WAL). When false, every commit holds the lock
+    /// continuously from version assignment through promotion, so promotion
+    /// order trivially equals submission order and the promote gate is
+    /// skipped — keeping the no-fsync commit path free of gate overhead.
+    ///
+    /// Tests must not remove a mock WAL while a commit is parked: a
+    /// gate-skipping commit could then promote past the parked one.
+    fn commit_may_park(&self) -> bool {
+        #[cfg(all(test, feature = "persistence"))]
+        if self.mock_wal.is_some() {
+            return true;
+        }
+        self.wal_consistent
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +340,17 @@ impl Store {
             _ => None,
         };
 
+        #[cfg(feature = "persistence")]
+        let wal_consistent = matches!(
+            &config.persistence,
+            crate::persistence::Persistence::Standalone {
+                durability: crate::persistence::Durability::Consistent,
+                ..
+            }
+        );
+        #[cfg(not(feature = "persistence"))]
+        let wal_consistent = false;
+
         let metrics = Arc::new(StoreMetrics::new());
         let empty = Arc::new(Snapshot {
             version: 0,
@@ -273,6 +367,10 @@ impl Store {
                 active_writer_count: 0,
                 active_writer_base_versions: Vec::new(),
                 committed_write_sets: Vec::new(),
+                last_submitted_version: 0,
+                next_ticket: 0,
+                promote_gate: Arc::new(PromoteGate::new()),
+                wal_consistent,
                 #[cfg(feature = "persistence")]
                 wal_handle,
                 #[cfg(feature = "persistence")]
@@ -2146,11 +2244,15 @@ impl WriteTx {
         }
     }
 
-    /// SingleWriter commit: acquires one `inner.write()` lock and does
-    /// validation, merge, install all under it. No per-table locks
-    /// because there's no other writer to exclude.
+    /// SingleWriter commit: WAL submission and snapshot install each run
+    /// under the `inner.write()` lock (a Consistent-durability fsync wait
+    /// happens between the two with the lock released so readers proceed).
+    /// No per-table locks because there's no other writer to exclude: the
+    /// writer slot (`active_writer_count`) is held until the snapshot is
+    /// promoted, so `begin_write` refuses a second writer for the entire
+    /// commit, including the fsync wait.
     fn commit_single_writer(mut self) -> Result<u64> {
-        let mut inner = self.store_inner.write().unwrap();
+        let inner = self.store_inner.write().unwrap();
 
         // WAL submit under lock (preserves ordering with snapshot promote).
         #[cfg(feature = "persistence")]
@@ -2177,6 +2279,43 @@ impl WriteTx {
             })
         });
 
+        #[cfg(feature = "persistence")]
+        let needs_wal_wait = {
+            #[allow(unused_mut)]
+            let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
+            #[cfg(test)]
+            {
+                w = w || mock_waiter.is_some();
+            }
+            w
+        };
+        #[cfg(not(feature = "persistence"))]
+        let needs_wal_wait = false;
+
+        // If WAL durability requires it, park for the fsync *before* any
+        // bookkeeping or snapshot assembly. The writer slot stays held
+        // (`active_writer_count` not yet decremented, `needs_cleanup` still
+        // true) so no second writer can be admitted, fork from a latest
+        // that lacks this commit, and silently drop it. On fsync failure
+        // the `?` propagates and Drop releases the slot.
+        #[allow(unused_mut)]
+        let mut inner = if needs_wal_wait {
+            drop(inner);
+            #[cfg(feature = "persistence")]
+            {
+                if let Some(w) = waiter {
+                    w.wait()?;
+                }
+                #[cfg(test)]
+                if let Some(w) = mock_waiter {
+                    w.wait()?;
+                }
+            }
+            self.store_inner.write().unwrap()
+        } else {
+            inner
+        };
+
         // SingleWriter: nobody else commits concurrently, so the fast
         // path always fires — install every dirty table wholesale.
         let latest_tables = &inner.snapshots[&inner.latest_version].tables;
@@ -2200,47 +2339,12 @@ impl WriteTx {
         inner.active_writer_count -= 1;
         self.needs_cleanup = false;
 
-        #[cfg(feature = "persistence")]
-        let needs_wal_wait = {
-            #[allow(unused_mut)]
-            let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
-            #[cfg(test)]
-            {
-                w = w || mock_waiter.is_some();
-            }
-            w
-        };
-        #[cfg(not(feature = "persistence"))]
-        let needs_wal_wait = false;
-
-        if needs_wal_wait {
-            drop(inner);
-            #[cfg(feature = "persistence")]
-            {
-                if let Some(w) = waiter {
-                    w.wait()?;
-                }
-                #[cfg(test)]
-                if let Some(w) = mock_waiter {
-                    w.wait()?;
-                }
-            }
-            let mut inner = self.store_inner.write().unwrap();
-            inner.snapshots.insert(v, snapshot);
-            if v > inner.latest_version {
-                inner.latest_version = v;
-            }
-            if inner.config.auto_snapshot_gc {
-                gc_inner(&mut inner);
-            }
-        } else {
-            inner.snapshots.insert(v, snapshot);
-            if v > inner.latest_version {
-                inner.latest_version = v;
-            }
-            if inner.config.auto_snapshot_gc {
-                gc_inner(&mut inner);
-            }
+        inner.snapshots.insert(v, snapshot);
+        if v > inner.latest_version {
+            inner.latest_version = v;
+        }
+        if inner.config.auto_snapshot_gc {
+            gc_inner(&mut inner);
         }
 
         self.metrics.inc_commit();
@@ -2350,19 +2454,28 @@ impl WriteTx {
 
         self.metrics.add_phase2(t2.elapsed().as_nanos() as u64);
 
-        // --- Phase 3: install under brief write lock ---
+        // --- Phase 3: WAL submission + bookkeeping under brief write lock ---
         let t3 = Instant::now();
         let mut inner = self.store_inner.write().unwrap();
 
-        // Commit-time version bump (auto-version only). Pre-assigned
-        // versions may be out of order by the time we reach install;
-        // bumping keeps commit order == version order. Explicit-version
-        // writers (SMR mode) are left alone.
-        if !self.explicit_version && self.version <= inner.latest_version {
-            self.version = inner.latest_version + 1;
-            if self.version >= inner.next_version {
-                inner.next_version = self.version + 1;
-            }
+        // Commit-time version bump (auto-version only). Versions must be
+        // strictly monotonic in WAL-submission order, not just greater than
+        // `latest_version` — `latest_version` lags behind while earlier
+        // commits are parked in the fsync wait, so comparing against it
+        // alone can assign the same version twice. Bumping against the last
+        // *submitted* version and allocating from `next_version` (which is
+        // ahead of every version ever handed out) keeps submission order ==
+        // version order == promotion order (see PromoteGate) and makes the
+        // WAL entry version always equal the final commit version.
+        // Explicit-version writers (SMR mode) are left alone.
+        if !self.explicit_version
+            && self.version <= inner.last_submitted_version.max(inner.latest_version)
+        {
+            self.version = inner.next_version;
+            inner.next_version += 1;
+        }
+        if self.version > inner.last_submitted_version {
+            inner.last_submitted_version = self.version;
         }
 
         // Submit WAL entry to background thread (no fsync yet).
@@ -2391,28 +2504,11 @@ impl WriteTx {
             })
         });
 
-        // Fork from the *current* latest (may have advanced since phase 1
-        // due to concurrent writers on other tables), then substitute in my
-        // merged tables. Tables I don't touch come through unchanged.
-        let fresh_latest_tables = &inner.snapshots[&inner.latest_version].tables;
-        let mut new_tables: BTreeMap<String, Arc<dyn MergeableTable>> = fresh_latest_tables
-            .iter()
-            .map(|(k, v)| (k.clone(), Arc::clone(v)))
-            .collect();
-        for (name, merged) in merged_tables {
-            new_tables.insert(name, merged);
-        }
-        for name in &self.deleted_tables {
-            new_tables.remove(name);
-        }
+        let v = self.version;
 
-        let snapshot = Arc::new(Snapshot {
-            version: self.version,
-            tables: new_tables,
-        });
-        let v = snapshot.version;
-
-        // Record write set (under write lock so concurrent OCC sees it).
+        // Record write set (under write lock so concurrent OCC and SSI
+        // validation see it even while this commit is parked in the fsync
+        // wait). The version is final here — promotion never renumbers.
         inner.committed_write_sets.push(CommittedWriteSet {
             version: v,
             tables: std::mem::take(&mut self.write_set),
@@ -2422,6 +2518,22 @@ impl WriteTx {
         prune_write_sets(&mut inner);
         inner.active_writer_count -= 1;
         self.needs_cleanup = false;
+
+        // Take a promotion ticket — but only when commits on this store can
+        // park in a fsync wait. Snapshots must install in submission order:
+        // if a later-submitted commit promoted first, an earlier parked
+        // commit would install at a version below `latest` and its data
+        // would never become visible. When no commit can ever park, every
+        // commit holds this lock continuously through promotion, promotion
+        // order trivially equals submission order, and the gate would be
+        // pure overhead on the hot path.
+        let gate = if inner.commit_may_park() {
+            let ticket = inner.next_ticket;
+            inner.next_ticket += 1;
+            Some((Arc::clone(&inner.promote_gate), ticket))
+        } else {
+            None
+        };
 
         // Determine if we need to wait for WAL fsync before promoting.
         #[cfg(feature = "persistence")]
@@ -2437,37 +2549,97 @@ impl WriteTx {
         #[cfg(not(feature = "persistence"))]
         let needs_wal_wait = false;
 
-        if needs_wal_wait {
+        let mut inner = if needs_wal_wait {
+            // A parking commit only exists when `commit_may_park` was true
+            // at submission (WaitForEpoch ⇒ Consistent mode; mock WAL ⇒
+            // commit_may_park forced true), so the gate is always present.
+            let (gate, ticket) = gate
+                .as_ref()
+                .expect("parked commit must hold a promotion ticket");
             drop(inner);
 
+            #[allow(unused_mut)]
+            let mut wal_result: Result<()> = Ok(());
             #[cfg(feature = "persistence")]
             {
                 if let Some(w) = waiter {
-                    w.wait()?;
+                    wal_result = w.wait();
                 }
                 #[cfg(test)]
-                if let Some(w) = mock_waiter {
-                    w.wait()?;
+                if wal_result.is_ok()
+                    && let Some(w) = mock_waiter
+                {
+                    wal_result = w.wait();
                 }
             }
 
-            let mut inner = self.store_inner.write().unwrap();
-            inner.snapshots.insert(v, snapshot);
-            if v > inner.latest_version {
-                inner.latest_version = v;
+            // Wait for our promotion turn even on fsync failure — earlier
+            // tickets must drain first — then on failure advance the gate
+            // (so later writers don't park forever) and bail without
+            // promoting. Drop releases the intents.
+            gate.wait_turn(*ticket);
+            if let Err(e) = wal_result {
+                gate.advance();
+                return Err(e);
             }
-            if inner.config.auto_snapshot_gc {
-                gc_inner(&mut inner);
+            self.store_inner.write().unwrap()
+        } else if let Some((gate, ticket)) = &gate {
+            if gate.is_turn(*ticket) {
+                // Ticket was taken under this same continuous lock hold, so
+                // it is necessarily our turn — promote without dropping the
+                // lock (e.g. an empty-ops commit in Consistent mode).
+                inner
+            } else {
+                // No fsync wait of our own, but an earlier-ticketed commit
+                // is still parked; promoting past it would fork from a
+                // latest that lacks its data.
+                drop(inner);
+                gate.wait_turn(*ticket);
+                self.store_inner.write().unwrap()
             }
         } else {
-            inner.snapshots.insert(v, snapshot);
-            if v > inner.latest_version {
-                inner.latest_version = v;
-            }
-            if inner.config.auto_snapshot_gc {
-                gc_inner(&mut inner);
-            }
+            // Common case (Eventual durability / no WAL): commits never
+            // park, the lock is held continuously, no gate needed.
+            inner
+        };
+
+        // --- Promotion: re-fork from the *current* latest and install ---
+        //
+        // `latest` may have advanced while we were parked (earlier-ticketed
+        // commits on other tables). Tables in `merged_tables` cannot have
+        // changed since phase 2 — we still hold their per-table locks — so
+        // substituting them over a fresh fork is exact.
+        let fresh_latest_tables = &inner.snapshots[&inner.latest_version].tables;
+        let mut new_tables: BTreeMap<String, Arc<dyn MergeableTable>> = fresh_latest_tables
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for (name, merged) in merged_tables {
+            new_tables.insert(name, merged);
         }
+        for name in &self.deleted_tables {
+            new_tables.remove(name);
+        }
+
+        let snapshot = Arc::new(Snapshot {
+            version: v,
+            tables: new_tables,
+        });
+
+        inner.snapshots.insert(v, snapshot);
+        if v > inner.latest_version {
+            inner.latest_version = v;
+        }
+        if inner.config.auto_snapshot_gc {
+            gc_inner(&mut inner);
+        }
+        // Advance the gate while still holding `inner`. Safe: waiters never
+        // hold the gate lock while acquiring `inner` (wait_turn releases it
+        // before the caller re-locks), so no lock-order cycle.
+        if let Some((gate, _)) = &gate {
+            gate.advance();
+        }
+        drop(inner);
 
         // Release write intents and signal waiters. Happens *after* the
         // snapshot is promoted so any writer that was parked on our waiter
@@ -3921,11 +4093,18 @@ mod tests {
         let v1 = t1.join().unwrap();
         let v2 = t2.join().unwrap();
 
-        // Both committed with sequential versions.
-        let mut versions = [v1, v2];
-        versions.sort();
-        assert_eq!(versions, [1, 2]);
-        assert_eq!(store.latest_version(), 2);
+        // Both committed with distinct versions; latest is the max. (Exact
+        // numbers depend on WAL-submission order: a pre-assigned version
+        // that trails an already-submitted one gets bumped.)
+        assert_ne!(v1, v2);
+        assert_eq!(store.latest_version(), v1.max(v2));
+
+        // The latest snapshot must contain both commits.
+        let rtx = store.begin_read(None).unwrap();
+        let table_a = rtx.open_table::<Item>("items_a").unwrap();
+        let table_b = rtx.open_table::<Item>("items_b").unwrap();
+        assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
+        assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
     }
 
     #[test]
@@ -4092,21 +4271,216 @@ mod tests {
         assert_eq!(mock.pending(), 2);
 
         // Flush all — both race to phase 3. Order is nondeterministic,
-        // but latest_version must be the max.
+        // but versions are unique and latest_version must be the max.
         mock.flush();
         let v_a = t_a.join().unwrap();
         let v_b = t_b.join().unwrap();
 
-        let mut versions = [v_a, v_b];
-        versions.sort();
-        assert_eq!(versions, [1, 2]);
-        assert_eq!(store.latest_version(), 2);
+        assert_ne!(v_a, v_b);
+        assert_eq!(store.latest_version(), v_a.max(v_b));
 
-        // Both snapshots must be accessible.
-        let rtx = store.begin_read(Some(1)).unwrap();
-        assert_eq!(rtx.version(), 1);
-        let rtx = store.begin_read(Some(2)).unwrap();
-        assert_eq!(rtx.version(), 2);
+        // Both snapshots must be accessible, and the latest must contain
+        // both commits.
+        let rtx = store.begin_read(Some(v_a)).unwrap();
+        assert_eq!(rtx.version(), v_a);
+        let rtx = store.begin_read(Some(v_b)).unwrap();
+        assert_eq!(rtx.version(), v_b);
+
+        let rtx = store.begin_read(None).unwrap();
+        let table_a = rtx.open_table::<Item>("table_a").unwrap();
+        let table_b = rtx.open_table::<Item>("table_b").unwrap();
+        assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
+        assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
+    }
+
+    /// SingleWriter exclusivity must hold through the entire commit,
+    /// including the phase-2 WAL fsync wait. A second `begin_write` admitted
+    /// during the window would fork from the stale latest and silently
+    /// drop the parked writer's commit.
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn mock_wal_single_writer_excluded_during_fsync_wait() {
+        let (store, mock) = store_with_mock_wal();
+
+        let ss = store.clone();
+        let t1 = std::thread::spawn(move || {
+            let mut wtx = ss.begin_write(None).unwrap();
+            wtx.open_table::<Item>("items")
+                .unwrap()
+                .insert(Item { name: "first".into() })
+                .unwrap();
+            wtx.commit().unwrap()
+        });
+
+        // Wait for writer 1 to park in the WAL fsync wait.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(store.latest_version(), 0, "writer 1 should be parked");
+
+        // Writer 1 is still committing — a second writer must be refused.
+        assert!(
+            matches!(store.begin_write(None), Err(Error::WriterBusy)),
+            "second writer admitted during writer 1's fsync wait"
+        );
+
+        mock.flush();
+        let v1 = t1.join().unwrap();
+        assert_eq!(v1, 1);
+        assert_eq!(store.latest_version(), 1);
+
+        // After promote the writer slot is free again.
+        let wtx2 = store.begin_write(None);
+        assert!(wtx2.is_ok(), "writer slot not released after promote");
+        drop(wtx2);
+
+        let rtx = store.begin_read(None).unwrap();
+        let table = rtx.open_table::<Item>("items").unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(1).unwrap(), &Item { name: "first".into() });
+    }
+
+    /// Two MultiWriter commits on disjoint tables both parked in the fsync
+    /// wait: whichever promotes second must not wipe the other's table.
+    /// Both committed `Ok`, so the latest snapshot must contain both rows.
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn mock_wal_multi_writer_disjoint_tables_no_lost_update() {
+        let config = StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        };
+        let mock = std::sync::Arc::new(crate::wal::MockWal::new());
+        let store = Store::new(config).unwrap();
+        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+
+        let ss_a = store.clone();
+        let t_a = std::thread::spawn(move || {
+            let mut wtx = ss_a.begin_write(None).unwrap();
+            wtx.open_table::<Item>("table_a")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
+            wtx.commit().unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let ss_b = store.clone();
+        let t_b = std::thread::spawn(move || {
+            let mut wtx = ss_b.begin_write(None).unwrap();
+            wtx.open_table::<Item>("table_b")
+                .unwrap()
+                .insert(Item { name: "B".into() })
+                .unwrap();
+            wtx.commit().unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert_eq!(mock.pending(), 2, "both writers should be parked");
+        assert_eq!(store.latest_version(), 0);
+
+        mock.flush();
+        let v_a = t_a.join().unwrap();
+        let v_b = t_b.join().unwrap();
+        assert_ne!(v_a, v_b, "commit versions must be unique");
+        assert_eq!(store.latest_version(), v_a.max(v_b));
+
+        // Both commits returned Ok — the latest snapshot must contain both.
+        let rtx = store.begin_read(None).unwrap();
+        let table_a = rtx
+            .open_table::<Item>("table_a")
+            .expect("table_a lost from latest snapshot");
+        let table_b = rtx
+            .open_table::<Item>("table_b")
+            .expect("table_b lost from latest snapshot");
+        assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
+        assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
+    }
+
+    /// Two parked MultiWriter commits whose pre-assigned versions are both
+    /// stale get bumped at commit. The bump must produce *unique* versions:
+    /// bumping both to `latest_version + 1` while neither has promoted yet
+    /// assigns the same version twice and the second snapshot insert
+    /// silently overwrites the first.
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn mock_wal_multi_writer_bumped_versions_are_unique() {
+        let config = StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        };
+        let mock = std::sync::Arc::new(crate::wal::MockWal::new());
+        let store = Store::new(config).unwrap();
+
+        // A and B begin first so their pre-assigned versions (1 and 2) go
+        // stale once the fillers below advance latest past them. A barrier
+        // holds their commits until the fillers are done.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let ss_a = store.clone();
+        let bar_a = barrier.clone();
+        let t_a = std::thread::spawn(move || {
+            let mut wtx = ss_a.begin_write(None).unwrap();
+            wtx.open_table::<Item>("table_a")
+                .unwrap()
+                .insert(Item { name: "A".into() })
+                .unwrap();
+            bar_a.wait(); // begun
+            bar_a.wait(); // fillers committed, mock installed
+            wtx.commit().unwrap()
+        });
+
+        let ss_b = store.clone();
+        let bar_b = barrier.clone();
+        let t_b = std::thread::spawn(move || {
+            let mut wtx = ss_b.begin_write(None).unwrap();
+            wtx.open_table::<Item>("table_b")
+                .unwrap()
+                .insert(Item { name: "B".into() })
+                .unwrap();
+            bar_b.wait();
+            bar_b.wait();
+            wtx.commit().unwrap()
+        });
+
+        barrier.wait(); // both writers have begun (versions 1 and 2)
+
+        // Push latest_version past both pre-assigned versions (no mock yet,
+        // so these commit without parking).
+        for i in 0..3 {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<Item>("filler")
+                .unwrap()
+                .insert(Item {
+                    name: format!("f{i}"),
+                })
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let latest_before = store.latest_version();
+        assert!(latest_before >= 2, "fillers must outpace A's and B's versions");
+
+        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        barrier.wait(); // release A and B into commit
+
+        // Both park in the fsync wait, both with stale versions to bump.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(mock.pending(), 2, "both writers should be parked");
+
+        mock.flush();
+        let v_a = t_a.join().unwrap();
+        let v_b = t_b.join().unwrap();
+
+        assert_ne!(v_a, v_b, "bumped commit versions collided");
+        assert_eq!(store.latest_version(), v_a.max(v_b));
+
+        let rtx = store.begin_read(None).unwrap();
+        let table_a = rtx
+            .open_table::<Item>("table_a")
+            .expect("table_a lost from latest snapshot");
+        let table_b = rtx
+            .open_table::<Item>("table_b")
+            .expect("table_b lost from latest snapshot");
+        assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
+        assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
     }
 
     /// Incremental flush: flush_one() releases only the first writer.
@@ -4171,9 +4545,15 @@ mod tests {
         mock.flush_one();
         let v1 = t1.join().unwrap();
         let v2 = t2.join().unwrap();
-        let mut versions = [v1, v2];
-        versions.sort();
-        assert_eq!(versions, [1, 2]);
+        assert_ne!(v1, v2);
+        assert_eq!(store.latest_version(), v1.max(v2));
+
+        // The latest snapshot must contain both commits.
+        let rtx = store.begin_read(None).unwrap();
+        let table_a = rtx.open_table::<Item>("items_a").unwrap();
+        let table_b = rtx.open_table::<Item>("items_b").unwrap();
+        assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
+        assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
     }
 
     /// A new writer can begin_write while another writer is blocked in phase 2.
@@ -4389,15 +4769,21 @@ mod tests {
 
         // Release writer B.
         mock.flush_one();
-        t_a.join().unwrap();
-        t_b.join().unwrap();
+        let v_a = t_a.join().unwrap();
+        let v_b = t_b.join().unwrap();
 
-        assert_eq!(store.latest_version(), 2);
+        assert_ne!(v_a, v_b);
+        assert_eq!(store.latest_version(), v_a.max(v_b));
 
-        // Both snapshots should have been created (GC may have removed the
-        // initial empty v0 snapshot). The key invariant: no panic or deadlock.
+        // GC may have removed older snapshots (num_snapshots_retained=1),
+        // but the latest must contain both commits — neither writer's
+        // promote may wipe the other's table.
         let rtx = store.begin_read(None).unwrap();
-        assert_eq!(rtx.version(), 2);
+        assert_eq!(rtx.version(), v_a.max(v_b));
+        let table_a = rtx.open_table::<Item>("table_a").unwrap();
+        let table_b = rtx.open_table::<Item>("table_b").unwrap();
+        assert_eq!(table_a.get(1).unwrap(), &Item { name: "A".into() });
+        assert_eq!(table_b.get(1).unwrap(), &Item { name: "B".into() });
     }
 
     #[test]

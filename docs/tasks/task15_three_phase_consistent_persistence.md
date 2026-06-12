@@ -31,18 +31,23 @@ WriteTx::commit(self)
   ├─ OCC validation (MultiWriter only, unchanged)
   │
   ├─ Phase 1: PREPARE (write lock held)
+  │   ├─ Finalize commit version (MultiWriter: bump if ≤ last submitted)
   │   ├─ Submit WAL entry to background thread via mpsc channel (no fsync)
-  │   ├─ Build new snapshot (table map assembly)
   │   ├─ Record committed write set (MultiWriter OCC)
-  │   ├─ Decrement active_writer_count
+  │   ├─ Take a promotion ticket (MultiWriter; see PromoteGate below)
   │   └─ Release write lock
   │
   ├─ Phase 2: SYNC (no lock held)
-  │   └─ Block on SyncWaiter until background thread fsyncs this entry
+  │   ├─ Block on SyncWaiter until background thread fsyncs this entry
+  │   └─ MultiWriter: wait for promotion turn (ticket order)
   │
   └─ Phase 3: PROMOTE (write lock re-acquired briefly)
+      ├─ Build new snapshot by forking the *current* latest and
+      │   substituting this commit's tables
       ├─ Insert snapshot into inner.snapshots
       ├─ Update latest_version
+      ├─ Decrement active_writer_count (SingleWriter holds the slot
+      │   through the fsync wait so begin_write stays exclusive)
       └─ Run auto GC if configured
 ```
 
@@ -58,20 +63,75 @@ the snapshot is never promoted — on recovery, the WAL entry will be replayed
 to reconstruct it.
 
 **Version gaps are temporary.** Between phase 1 and phase 3, the version number
-is "allocated" (the writer count has been decremented, the write set is recorded)
-but the snapshot is not yet visible. A concurrent `begin_read(None)` will get
-the previous `latest_version`. This is correct: the transaction is not committed
-until phase 3 completes. If the process crashes in phase 2, the version is
-recovered via WAL replay.
+is "allocated" (the write set is recorded) but the snapshot is not yet visible.
+A concurrent `begin_read(None)` will get the previous `latest_version`. This is
+correct: the transaction is not committed until phase 3 completes. If the
+process crashes in phase 2, the version is recovered via WAL replay.
 
 **OCC validation is unaffected.** Write sets are recorded in phase 1 under the
 lock, so concurrent writers performing OCC validation in their own phase 1 will
 see our write set. The write set being visible before the snapshot is promoted is
 conservative (may cause spurious conflicts), never unsafe (cannot miss a conflict).
 
-**`needs_cleanup` flag prevents double-decrement.** Phase 1 sets
-`self.needs_cleanup = false` after decrementing `active_writer_count`. If a panic
-occurs during phase 2 or 3, the `Drop` impl will not double-decrement the count.
+**`needs_cleanup` flag prevents double-decrement.** `self.needs_cleanup = false`
+is set after decrementing `active_writer_count`. If the commit errors or panics
+before that point (e.g. an fsync failure in phase 2), the `Drop` impl performs
+the decrement instead — exactly once either way.
+
+### Promotion ordering (lost-update fix)
+
+The original implementation assembled the snapshot and decremented
+`active_writer_count` in phase 1, *before* the fsync wait, and phase 3 merely
+inserted the pre-built snapshot. That had three reproducible failure modes
+while a commit was parked in phase 2:
+
+1. **SingleWriter exclusivity broke.** `begin_write` gates on
+   `active_writer_count`, which had already been decremented — a second
+   writer was admitted, forked from a latest that lacked the parked commit,
+   and whichever promoted at the higher version silently erased the other
+   (both `commit()` calls returned `Ok`; the WAL contained both, so recovery
+   diverged from live state).
+2. **MultiWriter disjoint-table commits erased each other.** Per-table locks
+   don't overlap for disjoint tables, so writer B's snapshot fork ran while
+   writer A's snapshot was still unpromoted; B's higher-versioned snapshot
+   lacked A's table wholesale.
+3. **Duplicate versions.** The auto-version bump compared against
+   `latest_version`, which lags while commits are parked — two writers could
+   both be bumped to the same version, and the second
+   `snapshots.insert(v, …)` silently replaced the first.
+
+The fix restructures commit around one rule: **`latest_version` must strictly
+advance at every promotion, and every promotion forks from the latest at
+promote time.**
+
+- **SingleWriter** holds the writer slot (`active_writer_count`) until the
+  snapshot is promoted, so `begin_write` returns `WriterBusy` for the entire
+  commit including the fsync wait, and builds the snapshot after the wait.
+- **MultiWriter** finalizes versions at WAL submission monotonically: the
+  bump compares against `max(latest_version, last_submitted_version)` and
+  allocates from `next_version`, so versions are unique and strictly
+  increasing in submission order, and the WAL entry version always equals
+  the final commit version (recovery's version-based replay filter and
+  `prune_wal` stay sound). A `PromoteGate` (ticket + condvar FIFO) then
+  forces phase-3 promotion in submission order, so each promote re-forks
+  from a latest that already contains every earlier commit. Tables in the
+  commit's merge set cannot have changed during the wait — their per-table
+  locks are held through promotion. A commit whose fsync fails advances the
+  gate without promoting so later writers don't park forever.
+- **Stores whose commits can never park skip the gate entirely**
+  (`StoreInner::commit_may_park`): with `Persistence::None`, SMR, or
+  Eventual durability, every commit holds the `inner` write lock
+  continuously from version assignment through promotion, so promotion
+  order trivially equals submission order and the ticket/gate would be
+  pure overhead. Benchmarks (`multiwriter_persistence_bench`) showed a
+  5–6% commit-throughput regression for inmemory/Eventual when all
+  commits paid the gate; with the skip, all configurations are within the
+  ±2% measurement noise floor of the pre-fix baseline. Only Standalone +
+  Consistent stores (and test mock WALs) use the gate — there its cost is
+  unmeasurable against the fsync wait. A commit that doesn't park on a
+  gated store (e.g. empty WAL ops) still takes a ticket and may briefly
+  wait for parked predecessors — required for correctness, since
+  promoting past them would fork from a latest that lacks their data.
 
 ### Background WAL writer
 
