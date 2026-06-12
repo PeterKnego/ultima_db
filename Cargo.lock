@@ -1241,6 +1241,8 @@ dependencies = [
  "criterion",
  "rand",
  "serde",
+ "tempfile",
+ "ultima-db",
 ]
 
 [[package]]

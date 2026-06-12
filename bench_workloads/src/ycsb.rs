@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput};
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
@@ -492,46 +492,6 @@ pub fn bench_multiwriter_workloads(c: &mut Criterion, engine: &mut impl MultiWri
         );
     }
 
-    // Scaling: vary number of concurrent writers (1, 2, 4, 8)
-    {
-        let zipf = ZipfianGenerator::new(NUM_RECORDS, ZIPFIAN_CONSTANT);
-        let mut rng = StdRng::seed_from_u64(500);
-
-        let mut group = c.benchmark_group("multiwriter_scaling");
-        for num_writers in [1, 2, 4, 8] {
-            let total_ops = (num_writers * MW_OPS_PER_WRITER) as u64;
-            group.throughput(Throughput::Elements(total_ops));
-            let burst_conflicts = Cell::new(0u64);
-            let burst_count = Cell::new(0u64);
-            group.bench_with_input(
-                BenchmarkId::from_parameter(num_writers),
-                &num_writers,
-                |b, &nw| {
-                    b.iter(|| {
-                        let key_sets: Vec<Vec<u64>> = (0..nw)
-                            .map(|_| {
-                                (0..MW_OPS_PER_WRITER)
-                                    .map(|_| zipf.next(&mut rng))
-                                    .collect()
-                            })
-                            .collect();
-                        let result = engine.execute_burst(&key_sets);
-                        burst_conflicts.set(burst_conflicts.get() + result.conflicts);
-                        burst_count.set(burst_count.get() + 1);
-                        black_box(result)
-                    });
-                },
-            );
-            report_conflicts(
-                &name,
-                &format!("scaling/{num_writers}w"),
-                burst_count.get(),
-                burst_conflicts.get(),
-                num_writers,
-            );
-        }
-        group.finish();
-    }
 }
 
 fn report_conflicts(engine: &str, scenario: &str, bursts: u64, conflicts: u64, writers: usize) {

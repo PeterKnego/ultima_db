@@ -10,3 +10,5 @@ license = "Apache-2.0"
 criterion = "0.8"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+ultima-db = { path = "..", features = ["persistence"] }

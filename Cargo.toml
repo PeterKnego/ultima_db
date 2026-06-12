@@ -53,12 +53,7 @@ harness = false
 required-features = ["persistence"]
 
 [[bench]]
-name = "smallbank_scaling_bench"
-harness = false
-required-features = ["persistence"]
-
-[[bench]]
-name = "disjoint_tables_bench"
+name = "multiwriter_scaling_bench"
 harness = false
 required-features = ["persistence"]
 

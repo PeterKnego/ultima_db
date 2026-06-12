@@ -11,13 +11,15 @@
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
+use ultima_db::{IndexKind, Store, StoreConfig, WriterMode};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -693,4 +695,238 @@ pub fn bench_contention_at_n(
 
     run(c, "low", &low_pool);
     run(c, "high", &high_pool);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent helpers — used by multiwriter_scaling_bench
+// ---------------------------------------------------------------------------
+
+/// Build a MultiWriter store with persistence (Eventual durability) and
+/// pre-seeded SmallBank tables (accounts, savings, checking).
+pub fn build_concurrent_store() -> (Store, tempfile::TempDir) {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig {
+        num_snapshots_retained: 2,
+        auto_snapshot_gc: true,
+        writer_mode: WriterMode::MultiWriter,
+        persistence: ultima_db::Persistence::Standalone {
+            dir: tmpdir.path().to_path_buf(),
+            durability: ultima_db::Durability::Eventual,
+            wal_write: ultima_db::WalWrite::PerEntry,
+        },
+        ..StoreConfig::default()
+    };
+    let store = Store::new(cfg).unwrap();
+    store.register_table::<Account>("accounts").unwrap();
+    store.register_table::<Savings>("savings").unwrap();
+    store.register_table::<Checking>("checking").unwrap();
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut accounts = wtx.open_table::<Account>("accounts").unwrap();
+            accounts
+                .define_index("customer_id", IndexKind::Unique, |a: &Account| {
+                    a.customer_id
+                })
+                .unwrap();
+            let batch: Vec<Account> = (1..=NUM_ACCOUNTS)
+                .map(|i| Account {
+                    customer_id: i,
+                    name: format!("C{i}"),
+                })
+                .collect();
+            accounts.insert_batch(batch).unwrap();
+        }
+        {
+            let mut s = wtx.open_table::<Savings>("savings").unwrap();
+            s.define_index("customer_id", IndexKind::Unique, |s: &Savings| {
+                s.customer_id
+            })
+            .unwrap();
+            let batch: Vec<Savings> = (1..=NUM_ACCOUNTS)
+                .map(|i| Savings {
+                    customer_id: i,
+                    balance: INITIAL_SAVINGS,
+                })
+                .collect();
+            s.insert_batch(batch).unwrap();
+        }
+        {
+            let mut c = wtx.open_table::<Checking>("checking").unwrap();
+            c.define_index("customer_id", IndexKind::Unique, |c: &Checking| {
+                c.customer_id
+            })
+            .unwrap();
+            let batch: Vec<Checking> = (1..=NUM_ACCOUNTS)
+                .map(|i| Checking {
+                    customer_id: i,
+                    balance: INITIAL_CHECKING,
+                })
+                .collect();
+            c.insert_batch(batch).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+    (store, tmpdir)
+}
+
+/// Generate hot-key op sets for `num_writers` writers, each with
+/// `OPS_PER_WRITER` ops over the hot 10-account range.
+pub fn gen_hot_ops(num_writers: usize, seed: u64) -> Vec<Vec<SmallBankOp>> {
+    let hot_zipf = ZipfianGenerator::new(10, ZIPFIAN_CONSTANT);
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..num_writers)
+        .map(|_| gen_mixed_workload_n(&mut rng, &hot_zipf, OPS_PER_WRITER))
+        .collect()
+}
+
+/// Execute a slice of SmallBank ops inside an open `WriteTx`. Returns
+/// `Err(WriteConflict)` immediately on the first conflict so the caller
+/// can retry the whole burst.
+pub(crate) fn execute_ops_on_tx(
+    wtx: &mut ultima_db::WriteTx,
+    ops: &[SmallBankOp],
+) -> Result<(), ultima_db::Error> {
+    for op in ops {
+        match op {
+            SmallBankOp::Balance(_) => {}
+            SmallBankOp::DepositChecking(cid, amount) => {
+                let mut c = wtx.open_table::<Checking>("checking").unwrap();
+                if let Some((id, rec)) = c.get_unique::<u64>("customer_id", cid).unwrap() {
+                    let new = Checking {
+                        balance: rec.balance + amount,
+                        ..*rec
+                    };
+                    c.update(id, new)?;
+                }
+            }
+            SmallBankOp::TransactSavings(cid, amount) => {
+                let mut s = wtx.open_table::<Savings>("savings").unwrap();
+                if let Some((id, rec)) = s.get_unique::<u64>("customer_id", cid).unwrap() {
+                    let new = Savings {
+                        balance: rec.balance + amount,
+                        ..*rec
+                    };
+                    s.update(id, new)?;
+                }
+            }
+            SmallBankOp::Amalgamate { source, dest } => {
+                let mut s = wtx.open_table::<Savings>("savings").unwrap();
+                let amt =
+                    if let Some((id, rec)) = s.get_unique::<u64>("customer_id", source).unwrap() {
+                        let a = rec.balance;
+                        s.update(
+                            id,
+                            Savings {
+                                balance: 0.0,
+                                ..*rec
+                            },
+                        )?;
+                        a
+                    } else {
+                        0.0
+                    };
+                drop(s);
+                let mut c = wtx.open_table::<Checking>("checking").unwrap();
+                if let Some((id, rec)) = c.get_unique::<u64>("customer_id", dest).unwrap() {
+                    c.update(
+                        id,
+                        Checking {
+                            balance: rec.balance + amt,
+                            ..*rec
+                        },
+                    )?;
+                }
+            }
+            SmallBankOp::WriteCheck(cid, amount) => {
+                let s = wtx.open_table::<Savings>("savings").unwrap();
+                let sbal = s
+                    .get_unique::<u64>("customer_id", cid)
+                    .unwrap()
+                    .map(|(_, s)| s.balance)
+                    .unwrap_or(0.0);
+                drop(s);
+                let mut c = wtx.open_table::<Checking>("checking").unwrap();
+                if let Some((id, rec)) = c.get_unique::<u64>("customer_id", cid).unwrap() {
+                    let tot = sbal + rec.balance;
+                    let penalty = if tot < *amount { 1.0 } else { 0.0 };
+                    c.update(
+                        id,
+                        Checking {
+                            balance: rec.balance - amount - penalty,
+                            ..*rec
+                        },
+                    )?;
+                }
+            }
+            SmallBankOp::SendPayment {
+                source,
+                dest,
+                amount,
+            } => {
+                let mut c = wtx.open_table::<Checking>("checking").unwrap();
+                if let Some((src_id, src_rec)) = c.get_unique::<u64>("customer_id", source).unwrap()
+                    && src_rec.balance >= *amount
+                    && let Some((dst_id, dst_rec)) =
+                        c.get_unique::<u64>("customer_id", dest).unwrap()
+                {
+                    let src_new = Checking {
+                        balance: src_rec.balance - amount,
+                        ..*src_rec
+                    };
+                    let dst_new = Checking {
+                        balance: dst_rec.balance + amount,
+                        ..*dst_rec
+                    };
+                    c.update(src_id, src_new)?;
+                    c.update(dst_id, dst_new)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run a burst of SmallBank writers concurrently: one thread per op set,
+/// all synchronized at a barrier, retrying on `WriteConflict`.
+pub fn run_smallbank_burst(store: &Store, op_sets: &[Vec<SmallBankOp>]) {
+    let barrier = Arc::new(Barrier::new(op_sets.len()));
+    let handles: Vec<_> = op_sets
+        .iter()
+        .cloned()
+        .map(|ops| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                loop {
+                    let mut wtx = store.begin_write(None).unwrap();
+                    match execute_ops_on_tx(&mut wtx, &ops) {
+                        Ok(()) => {}
+                        Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
+                            drop(wtx);
+                            if let Some(w) = wait_for {
+                                w.wait();
+                            }
+                            continue;
+                        }
+                        Err(e) => panic!("ops error: {e}"),
+                    }
+                    match wtx.commit() {
+                        Ok(_) => return,
+                        Err(ultima_db::Error::WriteConflict { wait_for, .. }) => {
+                            if let Some(w) = wait_for {
+                                w.wait();
+                            }
+                            continue;
+                        }
+                        Err(e) => panic!("commit error: {e}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
 }
