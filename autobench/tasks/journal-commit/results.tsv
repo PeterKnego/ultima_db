@@ -1,1 +1,2 @@
 commit	group_commit_throughput	append_consistent_p99_ns	e2e_p99_ns	memory_kb	status	description
+2249b81	59701.72	566379	823101	0	keep	baseline champion (no change): group_commit_throughput=59701.7/s, append_consistent_p99=566379ns, gate e2e_p99=823101ns PASS, torture green
