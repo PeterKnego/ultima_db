@@ -14,7 +14,9 @@ for the SMR state-store path (one pinned-version WriteTx per Raft entry).
 - **Floor:** `cargo test -p ultima-autobench --test smr_apply_torture` green.
 - **Gates:**
   - Gate A: `cargo test --features persistence` + `cargo test -p ultima-journal`
-  - Gate B: cluster `shmem-e2e` p99 within 5% of baseline
+  - Gate B: cluster `shmem-e2e` **p50 median-of-N** within the noise-aware band
+    (≤50% regression vs champion p50) — p99 recorded, not gated. See the
+    journal-commit overlay / `run-iter.rs` for the shared rationale.
 - **Implementation-agent model:** sonnet (escalate per generic rules — opus
   when touching lock-free code, unsafe, or fsync ordering, or after two failed
   sonnet build attempts).
@@ -24,15 +26,17 @@ for the SMR state-store path (one pinned-version WriteTx per Raft entry).
 ## results.tsv schema
 
 ```
-commit	apply_p99_ns	apply_throughput	e2e_p99_ns	memory_kb	status	description
+commit	apply_p99_ns	apply_throughput	e2e_p50_ns	e2e_p99_ns	memory_kb	status	description
 ```
 
 Column notes:
 - `commit`: git commit SHA (short) at the time of the iteration.
 - `apply_p99_ns`: primary metric — p99 apply latency, ns, median-of-5.
 - `apply_throughput`: sustained apply entries/sec (single-writer), median-of-5.
-- `e2e_p99_ns`: cluster `submit_to_resp_p99_ns` from Gate B; 0 if Gate B did
-  not run (no cluster dir or gate skipped as not plausible).
+- `e2e_p50_ns`: **gated** metric — median of `submit_to_resp_p50_ns` across the
+  Gate B samples; 0 if Gate B did not run.
+- `e2e_p99_ns`: median `submit_to_resp_p99_ns` across the Gate B samples —
+  recorded for observability only, NOT gated; 0 if Gate B did not run.
 - `memory_kb`: reserved — write `0` until a memory metric exists.
 - `status`: `keep` | `discard` | `crash`.
 - `description`: one-line hypothesis + measured deltas + gate/torture outcome.

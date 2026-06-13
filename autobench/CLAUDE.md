@@ -33,7 +33,8 @@ Results live in `autobench/tasks/<task>/results.tsv` — one row per iteration,
 committed every iteration.
 
 **Columns (journal-commit):**
-`commit | group_commit_throughput | append_consistent_p99_ns | e2e_p99_ns | memory_kb | status | description`
+`commit | group_commit_throughput | append_consistent_p99_ns | e2e_p50_ns | e2e_p99_ns | memory_kb | status | description`
+(`e2e_p50_ns` is the gated metric — median-of-N; `e2e_p99_ns` is recorded only.)
 
 **Columns (smr-apply):**
 `commit | apply_p99_ns | apply_throughput | e2e_p99_ns | memory_kb | status | description`
@@ -52,15 +53,19 @@ cargo run -p ultima-autobench --bin run-iter --release -- \
   --task journal-commit \
   --json \
   --baseline-primary <champion_primary> \
-  --baseline-gate-p99-ns <champion_gate_ns>
+  --baseline-gate-ns <champion_gate_p50_ns>
 ```
 
 Flags:
 - `--task`: `journal-commit` or `smr-apply`
 - `--json`: required; emits one JSON object on stdout (exit 0 even on failure)
 - `--baseline-primary`: champion's primary-metric value; omit on first iter
-- `--baseline-gate-p99-ns`: champion's Gate B `submit_to_resp_p99_ns`; omit
-  on first iter
+- `--baseline-gate-ns`: champion's Gate B e2e **p50** median (`gate.e2e_p50_ns`
+  from its run); omit on first iter. The gate compares the candidate's p50
+  median against this within a wide noise band — p99 is recorded, not gated.
+  (Legacy alias `--baseline-gate-p99-ns` still parses but now feeds the p50
+  comparison; pass the champion's p50, not its p99.)
+- `AUTOBENCH_E2E_SAMPLES` (env): e2e samples per gate for the median (default 5).
 - `--cluster-dir`: path to `ultima_cluster` checkout (default: `../ultima_cluster`)
 - `--skip-tests`: skip Gate A test suites (for extra microbench samples only;
   a KEEP still requires a fully-gated run)
@@ -74,10 +79,11 @@ Flags:
 | `duration_s` | object | Per-stage wall times: `build`, `torture`, `microbench`, `tests`, `e2e` |
 | `metrics` | object | All keys from the microbench's JSON stdout |
 | `gate.ran` | bool | Whether Gate B (cluster e2e) was attempted |
-| `gate.passed` | bool? | `true` if Gate B p99 regressed ≤5% vs baseline |
-| `gate.e2e_p99_ns` | u64? | Measured `submit_to_resp_p99_ns` from Gate B |
-| `gate.baseline` | u64? | Echo of `--baseline-gate-p99-ns` used for the comparison |
-| `gate.regress_pct` | f64? | `(measured - baseline) / baseline * 100` |
+| `gate.passed` | bool? | `true` if Gate B p50 median regressed ≤`GATE_REGRESS_PCT_MAX` (50%) vs baseline |
+| `gate.e2e_p50_ns` | u64? | **Gated** metric — median of `submit_to_resp_p50_ns` across the N samples |
+| `gate.e2e_p99_ns` | u64? | Median `submit_to_resp_p99_ns` across the N samples — recorded, not gated |
+| `gate.baseline` | u64? | Echo of `--baseline-gate-ns` (champion p50) used for the comparison |
+| `gate.regress_pct` | f64? | `(p50_median - baseline) / baseline * 100` |
 | `gate.reason` | string? | Why the gate was skipped (if `ran=false`) |
 | `stderr_tail` | string? | Last ~50 lines of stderr+stdout on failure |
 

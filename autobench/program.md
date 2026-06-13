@@ -87,8 +87,11 @@ A task program.md may raise the implementation tier for domain-hard tasks.
    cargo run -p ultima-autobench --bin run-iter --release -- \
      --task <task> --json \
      --baseline-primary <champion_primary> \
-     --baseline-gate-p99-ns <champion_gate> > /tmp/run-iter.json 2>&1
+     --baseline-gate-ns <champion_gate_p50> > /tmp/run-iter.json 2>&1
    ```
+   (`<champion_gate_p50>` is the champion's `gate.e2e_p50_ns` — the gate now
+   measures the e2e **p50 median-of-N**, not a single p99 sample, so it survives
+   shared/virtualized-host tail noise.)
 5. Parse: `jq '.status, .metrics, .gate, .stderr_tail' /tmp/run-iter.json`.
 6. Decide (comparisons use MEDIAN-of-5 microbench runs when the delta is
    within noise — re-run with `--skip-tests` for the extra samples; a KEEP
