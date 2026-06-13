@@ -350,20 +350,67 @@ fn writer_loop(
         // advanced later by the idle-timer fsync above.
         let result: Result<(), JournalError> = match durability {
             Durability::Consistent => match write_res {
-                Ok((hwm, generation)) => match fsync_active_segment(&state) {
-                    Ok(()) => {
-                        if let Some(s) = hwm {
-                            watermark.publish(s, generation);
+                Ok((mut hwm, mut generation)) => {
+                    // Re-drain window: appends that landed during `write_all`
+                    // above missed this batch's `try_recv` drain. Fold them into
+                    // the SAME fsync barrier so they don't each wait a full extra
+                    // fsync cycle. Bounded (a runaway producer cannot starve the
+                    // fsync) and bails the instant the channel is empty (an idle
+                    // producer never delays the fsync). Each `write_batch` goes
+                    // through the identical truncation/monotonic gating, so a
+                    // re-drained request is fenced exactly as in the first pass.
+                    const MAX_REDRAIN_ROUNDS: usize = 4;
+                    let mut redrain_err: Option<JournalError> = None;
+                    for _ in 0..MAX_REDRAIN_ROUNDS {
+                        let mut extra = Vec::new();
+                        while let Ok(req) = rx.try_recv() {
+                            extra.push(req);
                         }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let Some(s) = hwm {
-                            watermark.publish_error(s, generation, clone_err(&e));
+                        if extra.is_empty() {
+                            break;
                         }
-                        Err(e)
+                        match write_batch(&state, &extra) {
+                            // Fold the newcomers' high-water seq (take the max so
+                            // a skipped/empty round can't pull it back) and carry
+                            // the latest generation captured under the state lock.
+                            Ok((extra_hwm, extra_gen)) => {
+                                hwm = match (hwm, extra_hwm) {
+                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                    (a, b) => a.or(b),
+                                };
+                                generation = extra_gen;
+                                batch.append(&mut extra);
+                            }
+                            Err(e) => {
+                                // A re-drain write failed: settle these newcomers
+                                // with the same fail-stop error below, alongside
+                                // the original batch (none were fsynced).
+                                batch.append(&mut extra);
+                                redrain_err = Some(e);
+                                break;
+                            }
+                        }
                     }
-                },
+                    match redrain_err {
+                        Some(e) => Err(e),
+                        // One fsync covers the original batch plus every
+                        // re-drained request; publish the combined watermark once.
+                        None => match fsync_active_segment(&state) {
+                            Ok(()) => {
+                                if let Some(s) = hwm {
+                                    watermark.publish(s, generation);
+                                }
+                                Ok(())
+                            }
+                            Err(e) => {
+                                if let Some(s) = hwm {
+                                    watermark.publish_error(s, generation, clone_err(&e));
+                                }
+                                Err(e)
+                            }
+                        },
+                    }
+                }
                 Err(e) => Err(e),
             },
             Durability::Eventual => write_res.map(|_| ()),
@@ -516,16 +563,26 @@ fn flush_run(
 }
 
 fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalError> {
-    let mut st = state.lock().unwrap();
-    #[cfg(test)]
-    if st.fail_next_fsync {
-        st.fail_next_fsync = false;
-        return Err(JournalError::Io(std::io::Error::other(
-            "injected fsync failure",
-        )));
-    }
-    if let Some(seg) = st.segments.last_mut() {
-        seg.fsync()?;
+    // Grab a dup'd fd for the active segment under the lock, then DROP the lock
+    // before issuing `sync_all()` — so producers can keep enqueuing (and
+    // `write_batch` can buffer the next group-commit window) while the fsync
+    // syscall is in flight. The dup shares the same open file description, so it
+    // is the same durability barrier over the contiguous written prefix.
+    let f = {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut st = state.lock().unwrap();
+        #[cfg(test)]
+        if st.fail_next_fsync {
+            st.fail_next_fsync = false;
+            return Err(JournalError::Io(std::io::Error::other(
+                "injected fsync failure",
+            )));
+        }
+        // Preserve the existing "no active segment is a no-op" behavior.
+        st.segments.last().map(|s| s.fsync_handle()).transpose()?
+    };
+    if let Some(f) = f {
+        f.sync_all().map_err(JournalError::Io)?;
     }
     Ok(())
 }
