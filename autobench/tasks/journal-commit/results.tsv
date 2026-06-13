@@ -1,2 +1,3 @@
 commit	group_commit_throughput	append_consistent_p99_ns	e2e_p99_ns	memory_kb	status	description
 2249b81	59701.72	566379	823101	0	keep	baseline champion (no change): group_commit_throughput=59701.7/s, append_consistent_p99=566379ns, gate e2e_p99=823101ns PASS, torture green
+1582f07	43916	448667	0	0	discard	Arc<[u8]> shared payload (eliminate 2nd per-append Vec alloc): primary median-of-5=43916/s vs champ 59701 (NO improvement; samples 37627-62951, +-2x sandbox noise, distributions overlap); append_p99 improved 448667 vs 566379; gate auto-skipped (not plausible); reverted
