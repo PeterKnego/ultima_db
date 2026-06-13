@@ -327,9 +327,20 @@ impl SegmentFile {
         Ok(start_offset)
     }
 
+    #[allow(dead_code)] // Used by tests; the writer path now fsyncs a dup'd fd via `fsync_handle`.
     pub fn fsync(&mut self) -> Result<(), JournalError> {
         self.file.sync_all()?;
         Ok(())
+    }
+
+    /// Return a dup'd file descriptor for the active segment so the caller can
+    /// `sync_all()` it *without* holding the writer's state lock. The dup shares
+    /// the same open file description (and thus the same in-kernel dirty pages),
+    /// so fsyncing the clone is an identical durability barrier over the bytes
+    /// written so far. Mirrors the `try_clone()` already used by `scan` /
+    /// `read_span` for the read paths.
+    pub(crate) fn fsync_handle(&self) -> Result<File, JournalError> {
+        Ok(self.file.try_clone()?)
     }
 
     /// Read the entire body (after header) and decode all records.

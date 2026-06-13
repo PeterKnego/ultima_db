@@ -563,16 +563,26 @@ fn flush_run(
 }
 
 fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalError> {
-    let mut st = state.lock().unwrap();
-    #[cfg(test)]
-    if st.fail_next_fsync {
-        st.fail_next_fsync = false;
-        return Err(JournalError::Io(std::io::Error::other(
-            "injected fsync failure",
-        )));
-    }
-    if let Some(seg) = st.segments.last_mut() {
-        seg.fsync()?;
+    // Grab a dup'd fd for the active segment under the lock, then DROP the lock
+    // before issuing `sync_all()` — so producers can keep enqueuing (and
+    // `write_batch` can buffer the next group-commit window) while the fsync
+    // syscall is in flight. The dup shares the same open file description, so it
+    // is the same durability barrier over the contiguous written prefix.
+    let f = {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut st = state.lock().unwrap();
+        #[cfg(test)]
+        if st.fail_next_fsync {
+            st.fail_next_fsync = false;
+            return Err(JournalError::Io(std::io::Error::other(
+                "injected fsync failure",
+            )));
+        }
+        // Preserve the existing "no active segment is a no-op" behavior.
+        st.segments.last().map(|s| s.fsync_handle()).transpose()?
+    };
+    if let Some(f) = f {
+        f.sync_all().map_err(JournalError::Io)?;
     }
     Ok(())
 }
