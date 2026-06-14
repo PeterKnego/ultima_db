@@ -8,6 +8,7 @@
 pub mod baseline;
 pub mod diskcheck;
 pub mod journal_bench;
+pub mod mw_commit_bench;
 pub mod sampling;
 pub mod smr_bench;
 pub mod task_spec;

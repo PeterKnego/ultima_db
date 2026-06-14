@@ -126,6 +126,8 @@ perf/check:
 		--json --check --baseline autobench/baselines/journal-commit.json > /dev/null
 	cargo run -p ultima-autobench --bin smr-apply-microbench --release -- \
 		--json --check --baseline autobench/baselines/smr-apply.json > /dev/null
+	cargo run -p ultima-autobench --bin mw-commit-microbench --release -- \
+		--json --check --baseline autobench/baselines/multiwriter-commit.json > /dev/null
 
 # Re-record perf baselines (run only after a deliberate perf change lands)
 perf/baseline:
@@ -133,3 +135,5 @@ perf/baseline:
 		--json --write-baseline autobench/baselines/journal-commit.json > /dev/null
 	cargo run -p ultima-autobench --bin smr-apply-microbench --release -- \
 		--json --write-baseline autobench/baselines/smr-apply.json > /dev/null
+	cargo run -p ultima-autobench --bin mw-commit-microbench --release -- \
+		--json --write-baseline autobench/baselines/multiwriter-commit.json > /dev/null
