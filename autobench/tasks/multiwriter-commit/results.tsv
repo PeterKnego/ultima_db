@@ -1,1 +1,2 @@
 commit	mw_commit_throughput	mw_commit_p99_ns	e2e_p50_ns	e2e_p99_ns	memory_kb	status	description
+b67e16f	22182	192153	559174	1315109	0	keep	re-baseline champion: mw_commit_throughput median-of-7=22182/s (MAXIMIZE; samples 20671-22556, +-4% tight); mw_commit_p99=192153ns; conflict_rate=0.73 (stable workload sensor); gate e2e_p50=559174ns e2e_p99=1315109ns PASS; torture 5/5 + Gate A green. Establishes multiwriter-commit baseline
