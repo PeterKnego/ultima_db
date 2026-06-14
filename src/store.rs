@@ -1431,18 +1431,30 @@ fn prune_write_sets(inner: &mut StoreInner) {
 
 /// Run GC on an already-locked `StoreInner`.
 fn gc_inner(inner: &mut StoreInner) {
-    let versions: Vec<u64> = inner.snapshots.keys().copied().collect();
-
     // The N most recent versions to retain unconditionally.
     // latest_version is always kept (even if num_snapshots_retained is 0).
     let retain_count = inner.config.num_snapshots_retained.max(1);
-    let cutoff_idx = versions.len().saturating_sub(retain_count);
-    let protected: BTreeSet<u64> = versions[cutoff_idx..].iter().copied().collect();
+
+    // Fast path: nothing to collect.
+    if inner.snapshots.len() <= retain_count {
+        inner.metrics.inc_gc_run();
+        return;
+    }
+
+    // The cutoff is the oldest version still inside the newest-retain_count window.
+    // BTreeMap keys are sorted ascending, so nth_back(retain_count - 1) gives the
+    // (retain_count)-th key from the end — the minimum version we keep unconditionally.
+    // SAFETY: len > retain_count >= 1 guarantees nth_back returns Some.
+    let cutoff = *inner
+        .snapshots
+        .keys()
+        .nth_back(retain_count - 1)
+        .expect("len > retain_count guarantees a key exists");
 
     let before = inner.snapshots.len();
     inner
         .snapshots
-        .retain(|&v, snapshot| protected.contains(&v) || Arc::strong_count(snapshot) > 1);
+        .retain(|&v, snapshot| v >= cutoff || Arc::strong_count(snapshot) > 1);
     let removed = (before - inner.snapshots.len()) as u64;
     inner.metrics.inc_gc_run();
     if removed > 0 {
