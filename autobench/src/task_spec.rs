@@ -40,6 +40,14 @@ pub fn task_spec(task: &str) -> Option<TaskSpec> {
             torture_test: "smr_apply_torture",
             cluster_gate: true,
         }),
+        "multiwriter-commit" => Some(TaskSpec {
+            task: "multiwriter-commit",
+            microbench_bin: "mw-commit-microbench",
+            primary_metric: "mw_commit_throughput",
+            direction: Direction::Maximize,
+            torture_test: "mw_commit_torture",
+            cluster_gate: true,
+        }),
         _ => None,
     }
 }
@@ -57,6 +65,12 @@ mod tests {
         let s = task_spec("smr-apply").unwrap();
         assert_eq!(s.torture_test, "smr_apply_torture");
         assert_eq!(s.direction, Direction::Minimize);
+        let mw = task_spec("multiwriter-commit").unwrap();
+        assert_eq!(mw.microbench_bin, "mw-commit-microbench");
+        assert_eq!(mw.primary_metric, "mw_commit_throughput");
+        assert_eq!(mw.direction, Direction::Maximize);
+        assert_eq!(mw.torture_test, "mw_commit_torture");
+        assert!(mw.cluster_gate);
     }
 
     #[test]
