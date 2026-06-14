@@ -1,1 +1,2 @@
 commit	apply_p99_ns	apply_throughput	e2e_p50_ns	e2e_p99_ns	memory_kb	status	description
+eabe345	4131	22622	585614	1015267	0	keep	re-baseline champion: apply_p99 median-of-7=4131ns (MINIMIZE; samples 3890-9400, clean cluster 3890-4150 + 2 sched outliers); apply_throughput median=22622/s; gate e2e_p50=585614ns e2e_p99=1015267ns PASS; torture + Gate A (80 persistence tests) green. Establishes smr-apply p50 gate baseline
