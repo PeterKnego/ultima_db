@@ -686,6 +686,37 @@ mod tests {
     }
 
     #[test]
+    fn consistent_durability_survives_reopen() {
+        // Under Consistent durability the group-commit fdatasync (sync_data)
+        // must make every acked record durable, so a reopen recovers the full
+        // [1, N] range. This guards that fdatasync preserves the same durable
+        // prefix as a full fsync would.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Consistent;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=64u64 {
+                // append(seq, term, payload) — same call shape as
+                // reopen_sees_appended_records.
+                j.append(i, i, format!("rec-{i}").as_bytes()).unwrap();
+            }
+            // Wait the highest seq: the group-commit fsync barrier must make
+            // every record at or below seq 64 durable before we drop.
+            j.wait_durable(64).unwrap();
+            assert_eq!(
+                j.durable_seq(),
+                64,
+                "all 64 records durable after the commit-path fsync"
+            );
+        } // drop the Journal — clean process exit, no extra fsync on drop
+        // Reopen: recovery must locate every fsync'd record.
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.first_seq(), Some(1));
+        assert_eq!(j2.last_seq(), Some(64));
+    }
+
+    #[test]
     fn read_returns_appended_record() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
