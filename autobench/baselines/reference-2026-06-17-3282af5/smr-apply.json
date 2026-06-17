@@ -1,0 +1,54 @@
+{
+  "metrics": {
+    "apply_mw_p99_ns": {
+      "value": 105270.0,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "apply_mw_throughput": {
+      "value": 64346.836311380874,
+      "tolerance_pct": 5.0,
+      "direction": "maximize"
+    },
+    "apply_p99_ns": {
+      "value": 4070.0,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "apply_sw_batch_throughput": {
+      "value": 612571.7800126098,
+      "tolerance_pct": 5.0,
+      "direction": "maximize"
+    },
+    "apply_throughput": {
+      "value": 21320.198703697595,
+      "tolerance_pct": 5.0,
+      "direction": "maximize"
+    },
+    "checkpoint_ms": {
+      "value": 32.735829,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "read_p99_under_load_ns": {
+      "value": 780.0,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "restore_install_ms": {
+      "value": 28.954121,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "snapshot_freeze_p99_us": {
+      "value": 1.711,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "snapshot_stream_ms": {
+      "value": 51.647205,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    }
+  }
+}

@@ -20,6 +20,44 @@ pub const OPS_PER_ITER: usize = 1_000;
 pub const FIELD_SIZE: usize = 100;
 pub const ZIPFIAN_CONSTANT: f64 = 0.99;
 
+/// Base directory for on-disk bench artifacts (WAL, LSM/SST files).
+///
+/// Defaults to the system temp dir. On hosts where `/tmp` is a tmpfs
+/// (RAM-backed) — common on CI/sandbox VMs — that silently makes every
+/// "on-disk" engine in-memory and its fsyncs free, defeating an on-disk
+/// comparison. Set `ULTIMA_BENCH_DIR` to a real disk-backed path to force
+/// genuine disk I/O for all engines uniformly.
+pub fn bench_disk_dir() -> std::path::PathBuf {
+    match std::env::var_os("ULTIMA_BENCH_DIR") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::temp_dir(),
+    }
+}
+
+/// Durability tier for the competitor comparison, selected by the
+/// `ULTIMA_BENCH_DURABILITY` env var. Every engine commits **per operation**,
+/// so the durability level is the only variable that changes across tiers.
+///
+/// - unset / anything but `strict` → [`BenchDurability::NonDurable`]: writes
+///   reach the OS page cache but no engine blocks a commit on `fsync`
+///   (UltimaDB `Eventual`, RocksDB WAL-on + sync-off, ReDB `Durability::None`,
+///   Fjall `PersistMode::Buffer`).
+/// - `strict` → [`BenchDurability::Strict`]: every engine `fsync`s on each
+///   commit (UltimaDB `Consistent`, RocksDB `sync(true)`, ReDB
+///   `Durability::Immediate`, Fjall `PersistMode::SyncAll`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BenchDurability {
+    NonDurable,
+    Strict,
+}
+
+pub fn bench_durability() -> BenchDurability {
+    match std::env::var("ULTIMA_BENCH_DURABILITY").ok().as_deref() {
+        Some("strict") => BenchDurability::Strict,
+        _ => BenchDurability::NonDurable,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Record type — 10 fields × 100 bytes ≈ 1 KB, matching YCSB spec
 // ---------------------------------------------------------------------------

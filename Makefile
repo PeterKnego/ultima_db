@@ -54,14 +54,34 @@ bench/ycsb/rocksdb:
 bench/ycsb/redb:
 	cargo bench -p compare-benches --bench ycsb_redb_bench
 
-# Run all YCSB suites with named baselines and compare side-by-side
+# Run all YCSB suites across both durability tiers (non-durable + strict) with
+# named baselines and compare side-by-side per tier.
+#
+# Requires ULTIMA_BENCH_DIR to point at a REAL disk-backed dir: on hosts where
+# /tmp is a tmpfs (RAM), the default temp dir makes every "on-disk" engine
+# in-memory with free fsyncs, silently invalidating the comparison. All engines
+# commit per-op; ULTIMA_BENCH_DURABILITY selects the tier.
 bench/ycsb/compare:
 	$(call check_cmd,critcmp)
-	cargo bench --bench ycsb_bench -- --save-baseline ultima
-	cargo bench -p compare-benches --bench ycsb_fjall_bench -- --save-baseline fjall
-	cargo bench -p compare-benches --bench ycsb_rocksdb_bench -- --save-baseline rocksdb
-	cargo bench -p compare-benches --bench ycsb_redb_bench -- --save-baseline redb
-	critcmp -g '(.+)/[^/]+' ultima fjall rocksdb redb
+	@if [ -z "$(ULTIMA_BENCH_DIR)" ]; then \
+	  echo "ERROR: ULTIMA_BENCH_DIR is not set — refusing to run."; \
+	  echo "  Point it at a real disk-backed dir (NOT a tmpfs like /tmp):"; \
+	  echo "    make bench/ycsb/compare ULTIMA_BENCH_DIR=\$$HOME/bench-disk"; \
+	  echo "  Check with: df -T \$$ULTIMA_BENCH_DIR  (want ext4/xfs/etc, not tmpfs)."; \
+	  exit 1; \
+	fi
+	@mkdir -p "$(ULTIMA_BENCH_DIR)"
+	@for tier in nondurable strict; do \
+	  echo "===== YCSB tier: $$tier ====="; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench --bench ycsb_bench -- --save-baseline ultima_$$tier || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_fjall_bench -- --save-baseline fjall_$$tier || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_rocksdb_bench -- --save-baseline rocksdb_$$tier || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_redb_bench -- --save-baseline redb_$$tier || exit 1; \
+	done
+	@echo "===== non-durable tier (WAL written, no fsync) ====="
+	critcmp -g '(.+)/[^/]+' ultima_nondurable fjall_nondurable rocksdb_nondurable redb_nondurable
+	@echo "===== strict tier (fsync per commit) ====="
+	critcmp -g '(.+)/[^/]+' ultima_strict fjall_strict rocksdb_strict redb_strict
 
 # Multi-writer contention benchmarks
 # Use bench/multiwriter/clean to remove stale criterion data before comparing

@@ -4,7 +4,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ultima_db::{Store, StoreConfig};
+use ultima_db::{Durability, Persistence, Store, StoreConfig, WalWrite};
 
 use ultima_bench_workloads::ycsb::*;
 
@@ -14,16 +14,34 @@ use ultima_bench_workloads::ycsb::*;
 
 struct UltimaEngine {
     store: Store,
+    // Held so the WAL/checkpoint dir lives as long as the engine.
+    _tmpdir: tempfile::TempDir,
 }
 
 impl UltimaEngine {
     fn preload() -> Self {
+        // On-disk under `bench_disk_dir()` (real disk, not tmpfs). Durability
+        // tier is selected by `ULTIMA_BENCH_DURABILITY`: NonDurable = `Eventual`
+        // (async fsync, matching the competitors' no-fsync write path), Strict =
+        // `Consistent` (commit blocks until fsync). `Coalesced` in both so the
+        // only variable across tiers is the fsync semantics.
+        let tmpdir = tempfile::tempdir_in(bench_disk_dir()).expect("failed to create temp dir");
+        let durability = match bench_durability() {
+            BenchDurability::NonDurable => Durability::Eventual,
+            BenchDurability::Strict => Durability::Consistent,
+        };
         let store = Store::new(StoreConfig {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
+            persistence: Persistence::Standalone {
+                dir: tmpdir.path().to_path_buf(),
+                durability,
+                wal_write: WalWrite::Coalesced,
+            },
             ..StoreConfig::default()
         })
         .unwrap();
+        store.register_table::<YcsbRecord>("ycsb").unwrap();
         let mut wtx = store.begin_write(None).unwrap();
         {
             let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
@@ -32,7 +50,10 @@ impl UltimaEngine {
             }
         }
         wtx.commit().unwrap();
-        UltimaEngine { store }
+        UltimaEngine {
+            store,
+            _tmpdir: tmpdir,
+        }
     }
 }
 

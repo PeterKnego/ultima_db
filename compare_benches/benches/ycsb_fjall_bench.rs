@@ -4,7 +4,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use tempfile::TempDir;
 
 use ultima_bench_workloads::ycsb::*;
@@ -21,14 +21,16 @@ fn encode_key(id: u64) -> [u8; 8] {
 
 struct FjallEngine {
     keyspace: Keyspace,
-    _db: Database,
+    db: Database,
     _tmpdir: TempDir,
     next_id: u64,
+    // Strict tier → `persist(SyncAll)` (fsync the journal) after every write.
+    sync: bool,
 }
 
 impl FjallEngine {
     fn preload() -> Self {
-        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let tmpdir = tempfile::tempdir_in(bench_disk_dir()).expect("failed to create temp dir");
         let db = Database::builder(tmpdir.path())
             .open()
             .expect("failed to open fjall database");
@@ -45,9 +47,21 @@ impl FjallEngine {
 
         FjallEngine {
             keyspace,
-            _db: db,
+            db,
             _tmpdir: tmpdir,
             next_id: NUM_RECORDS + 1,
+            sync: bench_durability() == BenchDurability::Strict,
+        }
+    }
+
+    /// Strict tier: fsync the journal so the just-written op is durable. In the
+    /// non-durable tier `insert` already persisted with `PersistMode::Buffer`
+    /// (OS page cache, no fsync), so this is a no-op.
+    fn sync_if_strict(&self) {
+        if self.sync {
+            self.db
+                .persist(PersistMode::SyncAll)
+                .expect("persist failed");
         }
     }
 }
@@ -70,6 +84,7 @@ impl YcsbEngine for FjallEngine {
                     let value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
                         .expect("serialize failed");
                     self.keyspace.insert(k, value).expect("insert failed");
+                    self.sync_if_strict();
                 }
                 YcsbOp::Insert => {
                     let id = self.next_id;
@@ -79,6 +94,7 @@ impl YcsbEngine for FjallEngine {
                     let value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
                         .expect("serialize failed");
                     self.keyspace.insert(k, value).expect("insert failed");
+                    self.sync_if_strict();
                 }
                 YcsbOp::Scan(start, count) => {
                     let start_key = encode_key(*start);
@@ -99,6 +115,7 @@ impl YcsbEngine for FjallEngine {
                         let new_value = bincode::serde::encode_to_vec(record, BINCODE_CFG)
                             .expect("serialize failed");
                         self.keyspace.insert(k, new_value).expect("insert failed");
+                        self.sync_if_strict();
                     }
                 }
             }

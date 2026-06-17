@@ -1,0 +1,29 @@
+{
+  "metrics": {
+    "mw_commit_p99_ns": {
+      "value": 189481.0,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "mw_commit_throughput": {
+      "value": 21578.3171175944,
+      "tolerance_pct": 5.0,
+      "direction": "maximize"
+    },
+    "mw_conflict_rate": {
+      "value": 0.7311875,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    },
+    "mw_disjoint_throughput": {
+      "value": 21489.585975391186,
+      "tolerance_pct": 5.0,
+      "direction": "maximize"
+    },
+    "read_p99_under_load_ns": {
+      "value": 9990.0,
+      "tolerance_pct": 5.0,
+      "direction": "minimize"
+    }
+  }
+}

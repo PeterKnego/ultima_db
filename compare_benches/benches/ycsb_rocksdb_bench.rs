@@ -23,19 +23,23 @@ struct RocksDbEngine {
     db: DB,
     _tmpdir: TempDir,
     next_id: u64,
+    // Strict tier → fsync the WAL on every write (`set_sync(true)`).
+    sync: bool,
 }
 
 impl RocksDbEngine {
     fn preload() -> Self {
-        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let tmpdir = tempfile::tempdir_in(bench_disk_dir()).expect("failed to create temp dir");
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        // Minimize disk I/O: large write buffer, no WAL, no fsync
+        // Large write buffer + no auto-compaction so the bench window measures
+        // the write/WAL path, not background compaction.
         opts.set_write_buffer_size(256 * 1024 * 1024);
         opts.set_disable_auto_compactions(true);
         let db = DB::open(&opts, tmpdir.path()).expect("failed to open rocksdb");
 
         {
+            // Bulk preload is not measured — skip the WAL for speed.
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
             for i in 1..=NUM_RECORDS {
@@ -50,7 +54,17 @@ impl RocksDbEngine {
             db,
             _tmpdir: tmpdir,
             next_id: NUM_RECORDS + 1,
+            sync: bench_durability() == BenchDurability::Strict,
         }
+    }
+
+    /// Per-write options for the measured path: WAL always on (so the
+    /// non-durable tier still pays the WAL write, matching UltimaDB/Fjall);
+    /// `sync` only in the strict tier.
+    fn write_opts(&self) -> rocksdb::WriteOptions {
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(self.sync);
+        write_opts
     }
 }
 
@@ -60,8 +74,7 @@ impl YcsbEngine for RocksDbEngine {
     }
 
     fn execute(&mut self, ops: &[YcsbOp]) {
-        let mut write_opts = rocksdb::WriteOptions::default();
-        write_opts.disable_wal(true);
+        let write_opts = self.write_opts();
 
         for op in ops {
             match op {
