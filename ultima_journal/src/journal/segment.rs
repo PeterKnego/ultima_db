@@ -334,7 +334,7 @@ impl SegmentFile {
     }
 
     /// Return a dup'd file descriptor for the active segment so the caller can
-    /// `sync_all()` it *without* holding the writer's state lock. The dup shares
+    /// `sync_data()` it *without* holding the writer's state lock. The dup shares
     /// the same open file description (and thus the same in-kernel dirty pages),
     /// so fsyncing the clone is an identical durability barrier over the bytes
     /// written so far. Mirrors the `try_clone()` already used by `scan` /

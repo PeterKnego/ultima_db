@@ -564,7 +564,7 @@ fn flush_run(
 
 fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalError> {
     // Grab a dup'd fd for the active segment under the lock, then DROP the lock
-    // before issuing `sync_all()` — so producers can keep enqueuing (and
+    // before issuing the fsync — so producers can keep enqueuing (and
     // `write_batch` can buffer the next group-commit window) while the fsync
     // syscall is in flight. The dup shares the same open file description, so it
     // is the same durability barrier over the contiguous written prefix.
@@ -582,7 +582,15 @@ fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalEr
         st.segments.last().map(|s| s.fsync_handle()).transpose()?
     };
     if let Some(f) = f {
-        f.sync_all().map_err(JournalError::Io)?;
+        // WAL commit primitive: fdatasync, not full fsync. sync_data flushes
+        // the appended data plus the i_size growth needed to read it back,
+        // and skips only inode timestamps (mtime/atime) — irrelevant to
+        // durability. This preserves Durability::Consistent's power-loss
+        // guarantee while dropping the per-commit timestamp write, lowering
+        // the submitted->persisted P99 tail (task13 §15). Full sync_all is
+        // retained on segment create (segment.rs) where the new directory
+        // entry must be made durable.
+        f.sync_data().map_err(JournalError::Io)?;
     }
     Ok(())
 }
