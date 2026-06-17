@@ -272,7 +272,9 @@ impl SegmentFile {
     }
 
     /// Append one record at end-of-file. Thin wrapper over [`append_records`].
-    /// Returns the byte offset at which the record was written.
+    /// Returns the byte offset at which the record was written. Test-only:
+    /// production code appends in batches via [`append_records`].
+    #[cfg(test)]
     pub fn append_record(
         &mut self,
         seq: u64,

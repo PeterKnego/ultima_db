@@ -107,7 +107,7 @@ impl Journal {
             apply_truncate_to_segments(&config.dir, &mut segs, keep_seq)?;
             segments_with_scan = segs
                 .into_iter()
-                .map(|mut s| {
+                .map(|s| {
                     let scan = s.scan()?;
                     Ok((s, scan))
                 })
@@ -558,7 +558,7 @@ fn apply_truncate_to_segments(
     match segments.iter().rposition(|s| s.base_seq() <= keep_seq) {
         None => {
             // keep_seq is below every segment — drop everything.
-            let removed: Vec<_> = segments.drain(..).collect();
+            let removed = std::mem::take(segments);
             for seg in removed {
                 let _ = std::fs::remove_file(seg.path());
             }
