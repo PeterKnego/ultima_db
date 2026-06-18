@@ -14,7 +14,22 @@ maintenance).
   - `read_p99_under_load_ns` (minimize) — p99 read latency of a concurrent
     reader during the contended write phase.
   - `mw_disjoint_throughput` (maximize) — commits/sec when writers own disjoint
-    id ranges (pure fast-path).
+    id ranges (pure fast-path) at the standard 4-writer width.
+  - `mw_scaling_8x` (**gated**, maximize) — aggregate commits/sec at 8 disjoint
+    writers (`SCALING_WRITERS` in `mw_commit_bench`). Disjoint ids → zero logical
+    conflict, so any ceiling here is the serialized commit-install critical
+    section (`inner.write()` hold time in `commit_multi_writer` Phase 3), not OCC.
+    This is the *scaling* target: a campaign that shortens the serialized install
+    should raise this faster than the 4-writer `mw_disjoint_throughput`. Gated via
+    the baseline (`make perf/check`); on the sandbox it currently sits ~21K/s.
+  - `mw_scaling_efficiency` (**informational, recorded NOT gated**) — ratio of
+    the 8-writer aggregate to the 1-writer aggregate disjoint throughput. 8.0 =
+    perfect linear scaling; <1.0 = adding writers *loses* aggregate throughput.
+    Currently ~0.45 on the sandbox (negative scaling — the known lock-hold-time
+    bottleneck). Goodhart guard: a candidate that raises `mw_scaling_8x` purely
+    by speeding up every commit (not by shortening the serialized section) leaves
+    efficiency flat — inspect before crediting it as a *scaling* win. A wide
+    tolerance keeps it off the gate; it is a diagnostic, not an objective.
   - `mw_conflict_rate` (**informational, recorded NOT gated**) — observed
     conflict ratio under the fixed deterministic key schedule. Goodhart guard:
     the schedule is deterministic, so this should stay roughly constant across

@@ -29,9 +29,17 @@ pub const METRIC_KEYS: &[&str] = &[
     "mw_commit_throughput",
     "mw_commit_p99_ns",
     "mw_disjoint_throughput",
+    "mw_scaling_8x",
+    "mw_scaling_efficiency",
     "mw_conflict_rate",
     "read_p99_under_load_ns",
 ];
+
+/// Writer count for the scaling metric (`mw_scaling_8x`). High enough to expose
+/// the serialized commit-install critical section: with disjoint id ranges there
+/// are no logical conflicts, so any throughput ceiling at this width is the
+/// `inner.write()` hold time during snapshot install, not OCC.
+const SCALING_WRITERS: u64 = 8;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct MwRow {
@@ -50,6 +58,7 @@ impl MwRow {
     }
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub keyspace: u64,
     pub writers: u64,
@@ -207,6 +216,17 @@ fn run_phase_disjoint(cfg: &Config) -> f64 {
     (cfg.writers * cfg.disjoint_rounds) as f64 / secs
 }
 
+/// Run the disjoint phase with the writer count overridden to `writers`.
+/// Used for the scaling metric: aggregate commits/sec at 1 vs SCALING_WRITERS
+/// disjoint writers isolates how well the commit path scales with concurrency.
+fn run_phase_disjoint_n(cfg: &Config, writers: u64) -> f64 {
+    let local = Config {
+        writers,
+        ..cfg.clone()
+    };
+    run_phase_disjoint(&local)
+}
+
 /// One mixed-phase commit's key set for writer `w`, round `r`: keys alternate
 /// between a shared hot key (collision-prone → slow path) and a cold key in the
 /// writer's own stride lane. Pure index arithmetic — deterministic, no rand.
@@ -347,6 +367,19 @@ pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
     // -- Phase A: disjoint writers (fast path) → mw_disjoint_throughput.
     let disjoint_tput = run_phase_disjoint(cfg);
 
+    // -- Scaling probe: aggregate disjoint throughput at 1 vs SCALING_WRITERS.
+    // Disjoint ids → no logical conflict, so the only thing limiting the
+    // wide run is the serialized commit-install critical section. `8x` is the
+    // gated target (maximize); `efficiency` = wide/single is the Goodhart guard
+    // (8.0 = perfect linear scaling; <1 = adding writers loses throughput).
+    let single_tput = run_phase_disjoint_n(cfg, 1);
+    let scaling_tput = run_phase_disjoint_n(cfg, SCALING_WRITERS);
+    let scaling_efficiency = if single_tput > 0.0 {
+        scaling_tput / single_tput
+    } else {
+        0.0
+    };
+
     // -- Phase B: mixed overlap (slow path) on a fresh store, with a
     // concurrent reader thread measuring read latency under load.
     let store = mw_store();
@@ -387,6 +420,8 @@ pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
     m.insert("mw_commit_throughput".into(), commit_tput);
     m.insert("mw_commit_p99_ns".into(), percentile(&mut lat, 99.0));
     m.insert("mw_disjoint_throughput".into(), disjoint_tput);
+    m.insert("mw_scaling_8x".into(), scaling_tput);
+    m.insert("mw_scaling_efficiency".into(), scaling_efficiency);
     m.insert("mw_conflict_rate".into(), conflict_rate);
     m.insert(
         "read_p99_under_load_ns".into(),
