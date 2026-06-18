@@ -219,6 +219,125 @@ fn smr_checkpoint_recovery() {
 }
 
 // ---------------------------------------------------------------------------
+// SMR: checkpoint concurrent with writes (consistent-prefix recovery)
+// ---------------------------------------------------------------------------
+
+/// Stress the SMR checkpoint path while a writer is actively committing, then
+/// verify recovery lands on a consistent committed prefix — never a torn or
+/// partial snapshot.
+///
+/// SMR mode has no WAL: durability is owned by the external consensus log, and
+/// `recover()` restores only the latest *checkpoint*. So unlike the Standalone
+/// concurrent test (`checkpoint_concurrent_with_commits_loses_no_acknowledged_commit`),
+/// commits made after the winning checkpoint are *expected* to be absent after
+/// recovery — in a real deployment the consensus log replays them. What must
+/// always hold is that the recovered snapshot is an exact prefix: if recovery
+/// lands at version V, rows 1..=V are present and correct and nothing exists
+/// above V. With `begin_write(None)` the i-th commit inserts row `i` at version
+/// `i`, so `len() == latest_version()` is the prefix invariant.
+#[test]
+fn smr_checkpoint_concurrent_with_writes_recovers_consistent_prefix() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ROUNDS: usize = 6;
+    const COMMITS: usize = 1000;
+
+    for round in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        let config = smr_config(dir.path());
+
+        {
+            let store = open_store(config.clone());
+
+            // Commit one row before spawning the racer so every checkpoint it
+            // takes captures at least version 1 (no empty-store checkpoint can
+            // win the race and recover to an uninteresting version 0).
+            {
+                let mut wtx = store.begin_write(None).unwrap();
+                wtx.open_table::<User>("users")
+                    .unwrap()
+                    .insert(User {
+                        name: "row1".into(),
+                        age: 1,
+                    })
+                    .unwrap();
+                wtx.commit().unwrap();
+            }
+
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            // SMR commits are pure in-memory (no WAL/fsync), so the writer would
+            // otherwise blast through every commit before this thread is even
+            // scheduled. The `started` gate makes the checkpointer provably loop
+            // before any further commit runs, so the write window genuinely
+            // overlaps an active checkpoint loop.
+            let started = std::sync::Arc::new(AtomicBool::new(false));
+            let ckpt_done = done.clone();
+            let ckpt_started = started.clone();
+            let ckpt_store = store.clone();
+            let checkpointer = std::thread::spawn(move || {
+                let mut count = 0usize;
+                while !ckpt_done.load(Ordering::Acquire) {
+                    // A concurrent checkpoint must never corrupt the snapshot.
+                    // Transient errors are fine; a torn checkpoint is not.
+                    let _ = ckpt_store.checkpoint();
+                    count += 1;
+                    ckpt_started.store(true, Ordering::Release);
+                }
+                count
+            });
+
+            while !started.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+
+            for i in 2..=COMMITS {
+                let mut wtx = store.begin_write(None).unwrap();
+                wtx.open_table::<User>("users")
+                    .unwrap()
+                    .insert(User {
+                        name: format!("row{i}"),
+                        age: i as u32,
+                    })
+                    .unwrap();
+                wtx.commit().unwrap();
+            }
+
+            done.store(true, Ordering::Release);
+            let ckpt_runs = checkpointer.join().unwrap();
+            assert!(ckpt_runs > 0, "round {round}: checkpoint loop never ran");
+        }
+
+        // Recover from whichever checkpoint won the race. SMR has no WAL, so we
+        // land on some committed version V in 1..=COMMITS, and the recovered
+        // snapshot must be an exact prefix of the write sequence.
+        let store = open_store(config);
+        let v = store.latest_version();
+        assert!(
+            (1..=COMMITS as u64).contains(&v),
+            "round {round}: recovered version {v} outside committed range 1..={COMMITS}"
+        );
+        let rtx = store.begin_read(None).unwrap();
+        let users = rtx.open_table::<User>("users").unwrap();
+        assert_eq!(
+            users.len(),
+            v as usize,
+            "round {round}: row count {} != recovered version {v} (torn checkpoint)",
+            users.len()
+        );
+        for i in 1..=v {
+            assert_eq!(
+                users.get(i),
+                Some(&User {
+                    name: format!("row{i}"),
+                    age: i as u32,
+                }),
+                "round {round}: row {i} missing/wrong in recovered prefix (version {v})"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WAL pruning on checkpoint
 // ---------------------------------------------------------------------------
 

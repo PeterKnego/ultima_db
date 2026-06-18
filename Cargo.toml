@@ -63,6 +63,21 @@ harness = false
 required-features = ["persistence"]
 
 [[bench]]
+name = "checkpoint_impact_bench"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
+name = "singlewriter_persistence_bench"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
+name = "commit_scaling_bench"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
 name = "bulk_load_bench"
 harness = false
 

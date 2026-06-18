@@ -165,6 +165,97 @@ fn checkpoint_recover_equality() {
     }
 }
 
+/// Stress the SMR checkpoint path while a writer is actively applying log
+/// entries, then verify recovery lands on a consistent committed *prefix* —
+/// never a torn or half-written snapshot.
+///
+/// SMR mode has no WAL: durability is owned by the external consensus log, and
+/// `recover()` restores only the latest *checkpoint*. So entries applied after
+/// the winning checkpoint are *expected* to be absent after recovery — in a
+/// real deployment the consensus log replays them. The invariant under test is
+/// that whatever version `V` recovery lands on, the state equals exactly
+/// "preload + apply entries 2..=V": every counter's value is the number of
+/// applies that targeted it through `V`, and the total is `V - 1`. A torn
+/// checkpoint (root captured mid-mutation) would violate this.
+#[test]
+fn checkpoint_concurrent_with_apply_recovers_consistent_prefix() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ROUNDS: usize = 6;
+    const ROWS: u64 = 50;
+    const LAST: u64 = 1000; // apply log indices 2..=LAST (version tracks the index)
+
+    for round in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = smr_store(dir.path(), WriterMode::SingleWriter);
+            // preload commits at version 1 *before* the racer spawns, so every
+            // checkpoint it takes captures at least version 1 — no empty-store
+            // checkpoint can win the race.
+            preload(&store, ROWS);
+
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            // SMR applies are pure in-memory (no WAL/fsync), so the writer would
+            // otherwise blast through every entry before this thread is even
+            // scheduled. The `started` gate makes the checkpointer provably loop
+            // before any apply runs, so the apply window genuinely overlaps an
+            // active checkpoint loop.
+            let started = std::sync::Arc::new(AtomicBool::new(false));
+            let ckpt_done = done.clone();
+            let ckpt_started = started.clone();
+            let ckpt_store = store.clone();
+            let checkpointer = std::thread::spawn(move || {
+                let mut count = 0usize;
+                while !ckpt_done.load(Ordering::Acquire) {
+                    // A checkpoint racing live applies must never serialize a
+                    // torn snapshot. Transient errors are fine; corruption is not.
+                    let _ = ckpt_store.checkpoint();
+                    count += 1;
+                    ckpt_started.store(true, Ordering::Release);
+                }
+                count
+            });
+
+            while !started.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+
+            for idx in 2..=LAST {
+                apply(&store, idx, idx % ROWS + 1, 1);
+            }
+
+            done.store(true, Ordering::Release);
+            let runs = checkpointer.join().unwrap();
+            assert!(runs > 0, "round {round}: checkpoint loop never ran");
+        }
+
+        // Recover from whichever checkpoint won the race and assert the state is
+        // an exact prefix of the apply sequence for the recovered version.
+        let store = smr_store(dir.path(), WriterMode::SingleWriter);
+        let v = store.latest_version();
+        assert!(
+            (1..=LAST).contains(&v),
+            "round {round}: recovered version {v} outside applied range 1..={LAST}"
+        );
+        let r = store.begin_read(None).unwrap();
+        let t = r.open_table::<Counter>("counters").unwrap();
+        let total: i64 = (1..=ROWS).map(|id| t.get(id).unwrap().value).sum();
+        assert_eq!(
+            total,
+            (v - 1) as i64,
+            "round {round}: counter sum {total} != applied entries through version {v} (torn checkpoint)"
+        );
+        for id in 1..=ROWS {
+            let expected = (2..=v).filter(|&idx| idx % ROWS + 1 == id).count() as i64;
+            assert_eq!(
+                t.get(id).unwrap().value,
+                expected,
+                "round {round}: row {id} value wrong for recovered prefix version {v}"
+            );
+        }
+    }
+}
+
 #[test]
 fn reads_are_isolated_during_apply() {
     let dir = tempfile::tempdir().unwrap();
