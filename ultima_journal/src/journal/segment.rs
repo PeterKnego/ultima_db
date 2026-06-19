@@ -123,6 +123,14 @@ pub fn decode_record(
     let body_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let total = 4 + body_len + 4;
 
+    if body_len == 0 {
+        // A zero length-prefix marks an unwritten region. Two callers surface
+        // here: the lock-free live reader (length is written atomically AFTER
+        // the body, so 0 = record not yet committed) and a preallocated
+        // segment's zero tail. Both mean "end of records" — stop cleanly
+        // rather than treating the zeros as a corrupt record.
+        return Ok(None);
+    }
     // If body_len is invalid and we don't have enough bytes to confirm corruption,
     // treat it as a torn tail (incomplete/garbage record).
     if body_len < 16 {
@@ -941,5 +949,25 @@ mod tests {
             vec![(2, 200, b"yy".to_vec()), (3, 300, b"zzz".to_vec())]
         );
         assert_eq!(seg.read_window(5, 9).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn decode_zero_length_prefix_is_torn_tail() {
+        // A preallocated tail / not-yet-written record: u32 len-prefix == 0 with
+        // abundant trailing zero bytes must read as end-of-records, NOT corruption.
+        let buf = vec![0u8; 4096];
+        let got = decode_record(&buf, "seg-test", 32).unwrap();
+        assert!(got.is_none(), "zero length-prefix must be torn tail (Ok(None))");
+    }
+
+    #[test]
+    fn decode_nonzero_bad_length_with_trailing_bytes_still_corrupts() {
+        // A non-zero but sub-minimum body_len, with enough bytes to confirm it,
+        // is genuine corruption and must still error — the zero-prefix rule must
+        // not weaken this.
+        let mut buf = vec![0u8; 4096];
+        buf[0..4].copy_from_slice(&5u32.to_le_bytes()); // body_len = 5 (< 16)
+        let err = decode_record(&buf, "seg-test", 32).unwrap_err();
+        assert!(matches!(err, JournalError::Corrupted { .. }));
     }
 }
