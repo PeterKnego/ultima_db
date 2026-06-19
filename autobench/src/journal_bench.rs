@@ -17,6 +17,10 @@ use crate::sampling::{batched_samples_ns, percentile};
 /// `--write-baseline` iterate this list.
 pub const METRIC_KEYS: &[&str] = &[
     "group_commit_throughput",
+    // Same burst loop with `preallocate_segments: true` — the end-to-end
+    // pipeline win from folding preallocation into group-commit (see the
+    // group_commit block in `run`).
+    "group_commit_throughput_prealloc",
     "append_consistent_p99_ns",
     "append_consistent_p99_ns_64b",
     "append_consistent_p99_ns_4k",
@@ -83,14 +87,48 @@ const BURST: u64 = 256;
 const PAYLOAD: usize = 1024;
 
 fn fresh(root: &std::path::Path, durability: Durability) -> (tempfile::TempDir, Journal) {
+    fresh_cfg(root, durability, false)
+}
+
+/// `fresh`, but optionally opens the journal with `preallocate_segments: true`
+/// so the writer appends into zero-filled extents (no per-commit `i_size`
+/// metadata commit). Used to quantify the end-to-end preallocation win.
+fn fresh_prealloc(root: &std::path::Path, durability: Durability) -> (tempfile::TempDir, Journal) {
+    fresh_cfg(root, durability, true)
+}
+
+fn fresh_cfg(
+    root: &std::path::Path,
+    durability: Durability,
+    preallocate: bool,
+) -> (tempfile::TempDir, Journal) {
     // Callers bind `let (_d, j) = fresh(..)`; pattern bindings drop in reverse
     // declaration order, so `j` (the Journal, joining its writer thread) drops
     // before `_d` removes the directory.
     let dir = tempfile::Builder::new().prefix("jb").tempdir_in(root).unwrap();
     let mut cfg = JournalConfig::new(dir.path());
     cfg.durability = durability;
+    cfg.preallocate_segments = preallocate;
     let j = Journal::open(cfg).unwrap();
     (dir, j)
+}
+
+/// 256-entry bursts, waiting only the last notifier per round (the fsync
+/// barrier makes the last seq's batch fsync cover every earlier seq). Returns
+/// entries/sec. Shared by the baseline and preallocated group-commit metrics.
+fn measure_group_commit(j: &Journal, group_rounds: usize, payload: &[u8]) -> f64 {
+    let mut seq = 0u64;
+    let t = Instant::now();
+    for _ in 0..group_rounds {
+        let mut last = None;
+        for _ in 0..BURST {
+            seq += 1;
+            last = Some(j.append(seq, 0, payload).unwrap());
+        }
+        last.unwrap().wait().unwrap();
+    }
+    let total = (group_rounds as u64 * BURST) as f64;
+    total / t.elapsed().as_secs_f64()
 }
 
 pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
@@ -107,18 +145,25 @@ pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
     // only the last notifier implies the whole burst is durable.)
     {
         let (_d, j) = fresh(&root, Durability::Consistent);
-        let mut seq = 0u64;
-        let t = Instant::now();
-        for _ in 0..cfg.group_rounds {
-            let mut last = None;
-            for _ in 0..BURST {
-                seq += 1;
-                last = Some(j.append(seq, 0, &payload).unwrap());
-            }
-            last.unwrap().wait().unwrap();
-        }
-        let total = (cfg.group_rounds as u64 * BURST) as f64;
-        m.insert("group_commit_throughput".into(), total / t.elapsed().as_secs_f64());
+        m.insert(
+            "group_commit_throughput".into(),
+            measure_group_commit(&j, cfg.group_rounds, &payload),
+        );
+    }
+
+    // -- group_commit_throughput_prealloc: identical burst loop, but the
+    // journal is opened with `preallocate_segments: true`, so the writer
+    // appends into zero-filled extents and every group-commit `sync_data`
+    // skips the `i_size`/extent-map metadata commit a size-extending append
+    // forces (the same effect the fsync_prealloc microbench isolates, now
+    // through the full append → group-commit → notifier pipeline). The
+    // prealloc vs baseline ratio is the end-to-end throughput win.
+    {
+        let (_d, j) = fresh_prealloc(&root, Durability::Consistent);
+        m.insert(
+            "group_commit_throughput_prealloc".into(),
+            measure_group_commit(&j, cfg.group_rounds, &payload),
+        );
     }
 
     // -- append_consistent_p99_ns at 64 B / 1 KiB / 4 KiB

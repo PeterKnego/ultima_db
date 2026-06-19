@@ -28,7 +28,7 @@ the cluster's binding constraint (group-commit fsync ceiling).
 ## results.tsv schema
 
 ```
-commit	group_commit_throughput	append_consistent_p99_ns	e2e_p50_ns	e2e_p99_ns	memory_kb	status	description
+commit	group_commit_throughput	append_consistent_p99_ns	e2e_p50_ns	e2e_p99_ns	memory_kb	group_commit_throughput_prealloc	fsync_only_p50_ns	fsync_prealloc_p50_ns	write_only_p50_ns	status	description
 ```
 
 Column notes:
@@ -43,5 +43,18 @@ Column notes:
   before the median-of-N gate rework carry a single-sample p99 here and `0` for
   `e2e_p50_ns`.
 - `memory_kb`: reserved — write `0` until a memory metric exists.
+- `group_commit_throughput_prealloc`: same burst loop with
+  `preallocate_segments: true` — entries/sec; the end-to-end preallocation win.
+  `0` for rows recorded before this metric existed.
+- `fsync_only_p50_ns`: p50 of an isolated `sync_data` barrier after a
+  size-extending append (the per-commit fsync cost). `0` for older rows.
+- `fsync_prealloc_p50_ns`: same, but over a preallocated segment (no `i_size`
+  metadata commit). `fsync_only − fsync_prealloc` is the metadata-commit cost.
+  `0` for older rows.
+- `write_only_p50_ns`: p50 of the page-cache append alone (encode + `write_all`,
+  no fsync). `0` for older rows.
+  (The four columns above are observability only — NOT gated; the gated baseline
+  for all isolated/prealloc metrics lives in `autobench/baselines/journal-commit.json`,
+  which also carries the p99 variants. See `journal_bench.rs`.)
 - `status`: `keep` | `discard` | `crash`.
 - `description`: one-line hypothesis + measured deltas + gate/torture outcome.

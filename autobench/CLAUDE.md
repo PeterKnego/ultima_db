@@ -33,8 +33,11 @@ Results live in `autobench/tasks/<task>/results.tsv` — one row per iteration,
 committed every iteration.
 
 **Columns (journal-commit):**
-`commit | group_commit_throughput | append_consistent_p99_ns | e2e_p50_ns | e2e_p99_ns | memory_kb | status | description`
-(`e2e_p50_ns` is the gated metric — median-of-N; `e2e_p99_ns` is recorded only.)
+`commit | group_commit_throughput | append_consistent_p99_ns | e2e_p50_ns | e2e_p99_ns | memory_kb | group_commit_throughput_prealloc | fsync_only_p50_ns | fsync_prealloc_p50_ns | write_only_p50_ns | status | description`
+(`e2e_p50_ns` is the gated metric — median-of-N; `e2e_p99_ns` is recorded only.
+The four prealloc/stage-isolation columns are observability only — `0` on rows
+predating them; their gated baseline + p99 variants live in
+`autobench/baselines/journal-commit.json`.)
 
 **Columns (smr-apply):**
 `commit | apply_p99_ns | apply_throughput | e2e_p99_ns | memory_kb | status | description`
