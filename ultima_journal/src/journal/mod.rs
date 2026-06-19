@@ -145,9 +145,18 @@ impl Journal {
             })
             .collect();
 
+        let pipeline = if config.preallocate_segments {
+            Some(crate::journal::segment_pipeline::SegmentPipeline::spawn(
+                config.dir.clone(),
+                config.segment_size_bytes,
+            )?)
+        } else {
+            None
+        };
+
         let state = Arc::new(Mutex::new(WriterState {
             dir: config.dir.clone(),
-            pipeline: None,
+            pipeline,
             segment_size: config.segment_size_bytes,
             durability: config.durability,
             segments,
@@ -477,6 +486,12 @@ impl Journal {
                 let _ = h.join();
             }
         }
+        drop(g);
+        // Stop the preallocator thread and remove any unconsumed temp. Done
+        // after the writer is joined so no activation can race the shutdown.
+        if let Some(pipe) = self.state.lock().unwrap().pipeline.take() {
+            pipe.shutdown();
+        }
         Ok(())
     }
 }
@@ -491,6 +506,12 @@ impl Drop for Journal {
             }
         }
         drop(g);
+        // Stop the preallocator thread and remove any unconsumed temp. Done
+        // after the writer is joined so no activation can race the shutdown.
+        // Option::take() leaves None, so close() then Drop is a no-op.
+        if let Some(pipe) = self.state.lock().unwrap().pipeline.take() {
+            pipe.shutdown();
+        }
         // The writer thread is gone and every queued batch has been published.
         // Release any waiter parked on a seq that was never written so it cannot
         // block forever (task28). Idempotent if close() already ran.
@@ -1540,6 +1561,28 @@ mod tests {
             1,
             "watermark advanced past a failed fsync"
         );
+    }
+
+    #[test]
+    #[ignore = "reopen/recovery completed in Task 7; un-ignored there"]
+    fn preallocated_journal_rotates_and_recovers_full_range() {
+        // With the flag on, write across several segments (small segment_size to
+        // force rotations), wait durable, reopen, and confirm the full range.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.preallocate_segments = true;
+        cfg.segment_size_bytes = 64 * 1024; // small, but >> a few records → pipeline keeps up
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=200u64 {
+                j.append(i, i, format!("rec-{i}").as_bytes()).unwrap();
+            }
+            j.wait_durable(200).unwrap();
+            assert_eq!(j.durable_seq(), 200);
+        }
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.first_seq(), Some(1));
+        assert_eq!(j2.last_seq(), Some(200));
     }
 
     #[test]

@@ -513,8 +513,18 @@ fn write_batch(
         if need_new {
             // Flush whatever was accumulated for the now-full segment first.
             flush_run(&mut st, &mut run)?;
-            let path = st.dir.join(format!("seg-{:020}.log", req.seq));
-            st.segments.push(SegmentFile::create(&path, req.seq)?);
+            let final_path = st.dir.join(format!("seg-{:020}.log", req.seq));
+            let seg = match st.pipeline.clone() {
+                Some(pipe) => {
+                    // Take a ready preallocated temp and activate it (header +
+                    // atomic rename). The zero-fill already happened off the
+                    // commit path on the pipeline thread.
+                    let temp = pipe.take_ready()?;
+                    SegmentFile::activate_prealloc_temp(&temp, &final_path, req.seq)?
+                }
+                None => SegmentFile::create(&final_path, req.seq)?,
+            };
+            st.segments.push(seg);
             projected = st.segments.last().unwrap().size()?;
         }
 
