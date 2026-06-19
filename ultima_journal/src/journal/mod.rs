@@ -1688,4 +1688,58 @@ mod tests {
         }
         assert!(j2.read(1000).unwrap().is_none()); // out of range
     }
+
+    #[test]
+    fn consistent_durability_survives_reopen_preallocated() {
+        // The flag-on twin of consistent_durability_survives_reopen: fdatasync into
+        // a preallocated segment must still make every acked record durable.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Consistent;
+        cfg.preallocate_segments = true;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=64u64 {
+                j.append(i, i, format!("rec-{i}").as_bytes()).unwrap();
+            }
+            j.wait_durable(64).unwrap();
+            assert_eq!(j.durable_seq(), 64);
+        }
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.first_seq(), Some(1));
+        assert_eq!(j2.last_seq(), Some(64));
+    }
+
+    #[test]
+    fn preallocated_resume_overwrites_zero_tail_correctly() {
+        // Reopen a preallocated journal and append MORE: the writer must resume at
+        // the logical cursor and overwrite the zero tail, and the combined range
+        // must survive a second reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.preallocate_segments = true;
+        cfg.segment_size_bytes = 64 * 1024;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=20u64 {
+                j.append(i, i, b"a").unwrap();
+            }
+            j.wait_durable(20).unwrap();
+        }
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            assert_eq!(j.last_seq(), Some(20));
+            for i in 21..=40u64 {
+                j.append(i, i, b"b").unwrap();
+            }
+            j.wait_durable(40).unwrap();
+        }
+        let j3 = Journal::open(cfg).unwrap();
+        assert_eq!(j3.first_seq(), Some(1));
+        assert_eq!(j3.last_seq(), Some(40));
+        // Spot-check a record written into the overwritten zero tail.
+        let (m, p) = j3.read(30).unwrap().unwrap();
+        assert_eq!(m, 30);
+        assert_eq!(p, b"b");
+    }
 }
