@@ -219,6 +219,11 @@ fn drain_le(callbacks: &mut Vec<(u64, DurabilityCallback)>, seq: u64) -> Vec<Dur
 
 pub(crate) struct WriterState {
     pub dir: PathBuf,
+    /// Active only when `preallocate_segments` is set. Supplies preallocated
+    /// temp segments for rotation so the zero-fill never hits the commit path.
+    /// Field is wired in Task 6; `None` until then.
+    #[allow(dead_code)]
+    pub pipeline: Option<Arc<crate::journal::segment_pipeline::SegmentPipeline>>,
     pub segment_size: u64,
     pub durability: Durability,
     pub segments: Vec<SegmentFile>,

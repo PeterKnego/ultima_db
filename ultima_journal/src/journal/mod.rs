@@ -16,6 +16,10 @@ pub struct JournalConfig {
     pub dir: std::path::PathBuf,
     pub segment_size_bytes: u64,
     pub durability: crate::Durability,
+    /// Opt-in (default false): preallocate each segment to `segment_size_bytes`
+    /// up front so the per-commit `fdatasync` skips the ext4 metadata commit a
+    /// size-extending append otherwise forces. See task on segment preallocation.
+    pub preallocate_segments: bool,
 }
 
 impl JournalConfig {
@@ -24,6 +28,7 @@ impl JournalConfig {
             dir: dir.into(),
             segment_size_bytes: 64 * 1024 * 1024,
             durability: crate::Durability::Consistent,
+            preallocate_segments: false,
         }
     }
 }
@@ -142,6 +147,7 @@ impl Journal {
 
         let state = Arc::new(Mutex::new(WriterState {
             dir: config.dir.clone(),
+            pipeline: None,
             segment_size: config.segment_size_bytes,
             durability: config.durability,
             segments,
@@ -616,6 +622,13 @@ fn bounds_to_inclusive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_preallocate_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JournalConfig::new(dir.path());
+        assert!(!cfg.preallocate_segments, "preallocation is opt-in (default off)");
+    }
 
     #[test]
     fn open_empty_dir_returns_empty_journal() {
