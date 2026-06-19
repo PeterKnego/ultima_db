@@ -2,6 +2,7 @@
 // Copyright 2026 Peter Knego
 
 pub(crate) mod segment;
+mod segment_pipeline;
 mod writer;
 
 use std::ops::{Bound, RangeBounds};
