@@ -229,7 +229,6 @@ impl SegmentFile {
     /// with real writes, `sync_all`, and fsync the parent dir so the file
     /// survives a crash. Writes NO header — `base_seq` is unknown until the
     /// temp is activated at rotation. See `journal::segment_pipeline`.
-    #[allow(dead_code)]
     pub(crate) fn create_prealloc_temp(path: &Path, total_len: u64) -> Result<(), JournalError> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -256,7 +255,6 @@ impl SegmentFile {
     /// place, and fsync the dir to make the rename durable. The returned
     /// `SegmentFile` has its logical cursor at the header and the preallocated
     /// zero tail intact for appends to overwrite.
-    #[allow(dead_code)]
     pub(crate) fn activate_prealloc_temp(
         temp: &Path,
         final_path: &Path,
@@ -416,7 +414,6 @@ impl SegmentFile {
     /// On-disk file length. Differs from the logical `size` cursor when the
     /// segment is preallocated (physical EOF == segment_size, logical cursor
     /// at the end of written records).
-    #[allow(dead_code)] // Used by later tasks (preallocation recovery); pub(crate) API.
     pub(crate) fn physical_len(&self) -> Result<u64, JournalError> {
         Ok(self.file.metadata()?.len())
     }
@@ -428,7 +425,6 @@ impl SegmentFile {
     /// unwritten extents that re-journal a metadata commit on first
     /// overwrite). Appends then overwrite already-written blocks, so the
     /// per-commit `sync_data` carries no `i_size`/extent-map change.
-    #[allow(dead_code)] // Used by later tasks and bench-support feature; pub(crate) API.
     pub(crate) fn preallocate_to(&mut self, total_len: u64) -> Result<(), JournalError> {
         if total_len <= self.size {
             return Ok(());
@@ -450,7 +446,6 @@ impl SegmentFile {
     /// preallocation recovery to rewind to the last durable record while
     /// preserving the physical zero tail for the writer to overwrite — the
     /// non-truncating counterpart of [`truncate`].
-    #[allow(dead_code)] // Used by later tasks (preallocation recovery); pub(crate) API.
     pub(crate) fn reset_cursor(&mut self, offset: u64) {
         self.size = offset;
         self.index.retain(|(_, off)| *off < offset);

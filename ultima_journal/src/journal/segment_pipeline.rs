@@ -13,7 +13,6 @@ use std::thread::{self, JoinHandle};
 use crate::JournalError;
 use crate::journal::segment::SegmentFile;
 
-#[allow(dead_code)]
 pub(crate) struct SegmentPipeline {
     shared: Arc<Shared>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -35,7 +34,6 @@ struct Slot {
 }
 
 impl SegmentPipeline {
-    #[allow(dead_code)]
     pub(crate) fn spawn(
         dir: PathBuf,
         segment_size: u64,
@@ -73,7 +71,6 @@ impl SegmentPipeline {
     /// Take the ready temp (blocking until one exists), then signal the worker
     /// to prepare the next. Returns the temp's path; the caller renames it into
     /// place via `SegmentFile::activate_prealloc_temp`.
-    #[allow(dead_code)]
     pub(crate) fn take_ready(&self) -> Result<PathBuf, JournalError> {
         let mut slot = self.shared.slot.lock().unwrap();
         loop {
@@ -89,7 +86,6 @@ impl SegmentPipeline {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn shutdown(&self) {
         // Hold the slot lock around the store+notify so the worker cannot
         // evaluate its "slot full" predicate between our store and notify,
