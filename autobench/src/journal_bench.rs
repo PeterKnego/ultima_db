@@ -25,6 +25,16 @@ pub const METRIC_KEYS: &[&str] = &[
     "replay_throughput_entries_s",
     "truncate_purge_p99_ns",
     "reopen_ms",
+    // The two stages of a Consistent commit, isolated (see the
+    // write_only/fsync_only block in `run`).
+    "write_only_p50_ns",
+    "write_only_p99_ns",
+    "fsync_only_p50_ns",
+    "fsync_only_p99_ns",
+    // fsync_only on a pre-written (zero-filled) full segment, so the per-commit
+    // barrier carries no size-extension metadata commit (see the prealloc block).
+    "fsync_prealloc_p50_ns",
+    "fsync_prealloc_p99_ns",
 ];
 
 pub struct Config {
@@ -125,6 +135,81 @@ pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
             j.append(seq, 0, &p).unwrap().wait().unwrap();
         });
         m.insert(key.into(), percentile(&mut s, 99.0));
+    }
+
+    // -- write_only / fsync_only: the two stages of a Consistent commit,
+    // isolated. `append_consistent_p99_ns` above times them coupled (write +
+    // fsync + channel + notifier); here we drive the real segment primitives
+    // on the calling thread so each cost stands alone:
+    //   write_only_*  = encode + one `write_all` into the page cache
+    //                   (`SegmentFile::append_records`) — "time to write a
+    //                   log entry", no fsync.
+    //   fsync_only_*  = the `sync_data` durability barrier over the bytes
+    //                   written so far — "time to fsync", the same commit
+    //                   primitive the writer issues per group-commit.
+    // No channel / notifier / group-commit batching is in either path, so
+    // these isolate the syscall costs the writer pipeline is built around,
+    // not its scheduling. 1 KiB payload matches `append_consistent_p99_ns`.
+    {
+        use ultima_journal::bench_support::BenchSegment;
+        let dir = tempfile::Builder::new().prefix("jb-stage").tempdir_in(&root).unwrap();
+        let mut seg = BenchSegment::create(&dir.path().join("seg.log"), 1).unwrap();
+        let mut seq = 0u64;
+
+        // write_only: one record append (no fsync) per sample.
+        let mut w = batched_samples_ns(cfg.consistent_samples, 1, || {
+            seq += 1;
+            seg.append_one(seq, 0, &payload).unwrap();
+        });
+        m.insert("write_only_p50_ns".into(), percentile(&mut w, 50.0));
+        m.insert("write_only_p99_ns".into(), percentile(&mut w, 99.0));
+
+        // fsync_only: flush the backlog the write_only loop left dirty, then
+        // measure one `sync_data` per freshly-appended record — so each sample
+        // is the barrier cost over a single 1 KiB entry, the real per-commit
+        // fsync, not a one-off flush of the whole accumulated tail.
+        seg.sync_data().unwrap();
+        let mut f = Vec::with_capacity(cfg.consistent_samples);
+        for _ in 0..cfg.consistent_samples {
+            seq += 1;
+            seg.append_one(seq, 0, &payload).unwrap();
+            let t = Instant::now();
+            seg.sync_data().unwrap();
+            f.push(t.elapsed().as_nanos() as f64);
+        }
+        m.insert("fsync_only_p50_ns".into(), percentile(&mut f, 50.0));
+        m.insert("fsync_only_p99_ns".into(), percentile(&mut f, 99.0));
+    }
+
+    // -- fsync_prealloc: identical loop to fsync_only, but the segment is
+    // zero-filled + fsync'd to the full 64 MiB default segment size up front,
+    // so every `append_one` overwrites already-written extents instead of
+    // moving EOF. The per-commit `sync_data` therefore flushes no `i_size` /
+    // extent-map change — on ext4 (data=ordered) that drops the jbd2 journal
+    // transaction commit a size-extending append otherwise forces on top of the
+    // device flush. The fsync_prealloc vs fsync_only delta is exactly that
+    // metadata-commit cost; if it's ~zero, the barrier is the raw device/virt
+    // flush and preallocation buys nothing here. This is the etcd WAL trick.
+    {
+        use ultima_journal::bench_support::BenchSegment;
+        let dir = tempfile::Builder::new().prefix("jb-prealloc").tempdir_in(&root).unwrap();
+        let mut seg = BenchSegment::create(&dir.path().join("seg.log"), 1).unwrap();
+        seg.preallocate(64 * 1024 * 1024).unwrap();
+        let mut seq = 0u64;
+        // Prime one dirty page + flush so the first measured sample is steady-state.
+        seq += 1;
+        seg.append_one(seq, 0, &payload).unwrap();
+        seg.sync_data().unwrap();
+        let mut f = Vec::with_capacity(cfg.consistent_samples);
+        for _ in 0..cfg.consistent_samples {
+            seq += 1;
+            seg.append_one(seq, 0, &payload).unwrap();
+            let t = Instant::now();
+            seg.sync_data().unwrap();
+            f.push(t.elapsed().as_nanos() as f64);
+        }
+        m.insert("fsync_prealloc_p50_ns".into(), percentile(&mut f, 50.0));
+        m.insert("fsync_prealloc_p99_ns".into(), percentile(&mut f, 99.0));
     }
 
     // -- append_eventual_ack_p99_ns (notifier resolution on the write path)

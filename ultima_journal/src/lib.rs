@@ -3,6 +3,9 @@
 
 //! `ultima_journal` — segmented append journal + StableValue primitive.
 
+#[cfg(feature = "bench-support")]
+#[doc(hidden)]
+pub mod bench_support;
 pub mod durability;
 pub mod error;
 pub mod journal;

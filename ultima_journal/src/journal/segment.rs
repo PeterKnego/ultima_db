@@ -345,6 +345,52 @@ impl SegmentFile {
         Ok(self.file.try_clone()?)
     }
 
+    /// Bench-only: issue the `sync_data` durability barrier directly on the
+    /// segment file. This is the exact commit primitive the writer pipeline
+    /// runs per group-commit (`writer::fsync_active_segment`), minus the fd
+    /// dup that only exists there to release the state lock across the
+    /// syscall. Isolating it lets the journal microbench measure the pure
+    /// fsync cost (`fsync_only_*`) separately from the page-cache write
+    /// (`append_records` → `write_only_*`).
+    #[cfg(feature = "bench-support")]
+    pub(crate) fn sync_data_for_bench(&self) -> Result<(), JournalError> {
+        self.file.sync_data().map_err(JournalError::Io)
+    }
+
+    /// Bench-only: physically zero-fill the segment out to `total_len` bytes
+    /// and `sync_all` once, *without* advancing the logical write cursor
+    /// (`size`). This forces the filesystem to allocate the blocks and mark
+    /// the extents *written* up front — a real write, NOT a sparse
+    /// `set_len`/`fallocate`, which on ext4 leaves *unwritten* extents that
+    /// convert (and re-journal a metadata commit) on the first overwrite.
+    /// Subsequent `append_records` then overwrite already-written blocks at the
+    /// logical cursor, so the per-commit `sync_data` carries no `i_size` or
+    /// extent-map change and degenerates to a pure data barrier. Mirrors the
+    /// etcd WAL preallocation trick; used by the microbench's `fsync_prealloc_*`
+    /// variant to isolate the ext4 journal-commit cost of a size-extending
+    /// append from the raw device flush.
+    #[cfg(feature = "bench-support")]
+    pub(crate) fn preallocate_zerofill_for_bench(
+        &mut self,
+        total_len: u64,
+    ) -> Result<(), JournalError> {
+        if total_len <= self.size {
+            return Ok(());
+        }
+        let zeros = vec![0u8; 1024 * 1024];
+        self.file.seek(SeekFrom::Start(self.size))?;
+        let mut remaining = total_len - self.size;
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            self.file.write_all(&zeros[..n])?;
+            remaining -= n as u64;
+        }
+        self.file.sync_all()?;
+        // `self.size` is deliberately left untouched: appends still start at the
+        // logical cursor and overwrite the zeroed region rather than moving EOF.
+        Ok(())
+    }
+
     /// Read the entire body (after header) and decode all records.
     /// Tolerant of torn tail. Builds a fresh sparse index.
     pub fn scan(&self) -> Result<ScanResult, JournalError> {
