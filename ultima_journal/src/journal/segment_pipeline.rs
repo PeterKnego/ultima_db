@@ -91,8 +91,14 @@ impl SegmentPipeline {
 
     #[allow(dead_code)]
     pub(crate) fn shutdown(&self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.cv.notify_all();
+        // Hold the slot lock around the store+notify so the worker cannot
+        // evaluate its "slot full" predicate between our store and notify,
+        // which would cause a lost wakeup and a deadlocked join().
+        {
+            let _slot = self.shared.slot.lock().unwrap();
+            self.shared.shutdown.store(true, Ordering::Release);
+            self.shared.cv.notify_all();
+        }
         if let Some(h) = self.handle.lock().unwrap().take() {
             let _ = h.join();
         }
@@ -101,6 +107,15 @@ impl SegmentPipeline {
         if let Some(path) = slot.ready.take() {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+impl Drop for SegmentPipeline {
+    fn drop(&mut self) {
+        // shutdown() is idempotent: the second call (after an explicit
+        // shutdown()) re-acquires the lock, stores true again harmlessly,
+        // finds no join handle, and finds no ready temp.
+        self.shutdown();
     }
 }
 
