@@ -353,6 +353,49 @@ impl SegmentFile {
         Ok(self.file.try_clone()?)
     }
 
+    /// On-disk file length. Differs from the logical `size` cursor when the
+    /// segment is preallocated (physical EOF == segment_size, logical cursor
+    /// at the end of written records).
+    #[allow(dead_code)] // Used by later tasks (preallocation recovery); pub(crate) API.
+    pub(crate) fn physical_len(&self) -> Result<u64, JournalError> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    /// Physically zero-fill from the logical cursor `self.size` out to
+    /// `total_len` and `sync_all` once, WITHOUT advancing the cursor. Forces
+    /// the filesystem to allocate and mark the extents *written* up front (a
+    /// real write, not a sparse `set_len`/`fallocate`, which on ext4 leaves
+    /// unwritten extents that re-journal a metadata commit on first
+    /// overwrite). Appends then overwrite already-written blocks, so the
+    /// per-commit `sync_data` carries no `i_size`/extent-map change.
+    #[allow(dead_code)] // Used by later tasks and bench-support feature; pub(crate) API.
+    pub(crate) fn preallocate_to(&mut self, total_len: u64) -> Result<(), JournalError> {
+        if total_len <= self.size {
+            return Ok(());
+        }
+        let zeros = vec![0u8; 1024 * 1024];
+        self.file.seek(SeekFrom::Start(self.size))?;
+        let mut remaining = total_len - self.size;
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            self.file.write_all(&zeros[..n])?;
+            remaining -= n as u64;
+        }
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Reset the logical write cursor to `offset` and drop index entries at or
+    /// past it, WITHOUT touching the file (no `set_len`, no fsync). Used by
+    /// preallocation recovery to rewind to the last durable record while
+    /// preserving the physical zero tail for the writer to overwrite — the
+    /// non-truncating counterpart of [`truncate`].
+    #[allow(dead_code)] // Used by later tasks (preallocation recovery); pub(crate) API.
+    pub(crate) fn reset_cursor(&mut self, offset: u64) {
+        self.size = offset;
+        self.index.retain(|(_, off)| *off < offset);
+    }
+
     /// Bench-only: issue the `sync_data` durability barrier directly on the
     /// segment file. This is the exact commit primitive the writer pipeline
     /// runs per group-commit (`writer::fsync_active_segment`), minus the fd
@@ -382,21 +425,7 @@ impl SegmentFile {
         &mut self,
         total_len: u64,
     ) -> Result<(), JournalError> {
-        if total_len <= self.size {
-            return Ok(());
-        }
-        let zeros = vec![0u8; 1024 * 1024];
-        self.file.seek(SeekFrom::Start(self.size))?;
-        let mut remaining = total_len - self.size;
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            self.file.write_all(&zeros[..n])?;
-            remaining -= n as u64;
-        }
-        self.file.sync_all()?;
-        // `self.size` is deliberately left untouched: appends still start at the
-        // logical cursor and overwrite the zeroed region rather than moving EOF.
-        Ok(())
+        self.preallocate_to(total_len)
     }
 
     /// Read the entire body (after header) and decode all records.
@@ -969,5 +998,30 @@ mod tests {
         buf[0..4].copy_from_slice(&5u32.to_le_bytes()); // body_len = 5 (< 16)
         let err = decode_record(&buf, "seg-test", 32).unwrap_err();
         assert!(matches!(err, JournalError::Corrupted { .. }));
+    }
+
+    #[test]
+    fn preallocate_to_extends_physical_without_moving_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-test.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        let logical_before = seg.size().unwrap();
+        seg.preallocate_to(1 * 1024 * 1024).unwrap();
+        assert_eq!(seg.size().unwrap(), logical_before, "logical cursor unchanged");
+        assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "physical extended");
+    }
+
+    #[test]
+    fn reset_cursor_sets_logical_size_without_truncating_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg-test.log");
+        let mut seg = SegmentFile::create(&path, 1).unwrap();
+        seg.preallocate_to(1 * 1024 * 1024).unwrap();
+        seg.append_records(&[(1, 0, b"hello")]).unwrap();
+        let after_append = seg.size().unwrap();
+        seg.reset_cursor(SEGMENT_HEADER_SIZE as u64);
+        assert_eq!(seg.size().unwrap(), SEGMENT_HEADER_SIZE as u64, "cursor reset");
+        assert!(after_append > SEGMENT_HEADER_SIZE as u64);
+        assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "physical preserved");
     }
 }
