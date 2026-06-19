@@ -43,6 +43,20 @@ pub struct Journal {
 impl Journal {
     pub fn open(config: JournalConfig) -> Result<Self, JournalError> {
         std::fs::create_dir_all(&config.dir)?;
+        // Remove orphan preallocation temps (a crash between temp-create and
+        // activation rename). They hold zero committed records — never
+        // referenced until their atomic rename to seg-{seq}.log.
+        if config.preallocate_segments
+            && let Ok(rd) = std::fs::read_dir(&config.dir)
+        {
+            for ent in rd.filter_map(|e| e.ok()) {
+                let n = ent.file_name();
+                let s = n.to_string_lossy();
+                if s.starts_with("seg-prealloc.") && s.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(ent.path());
+                }
+            }
+        }
         let mut entries: Vec<_> = std::fs::read_dir(&config.dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -58,11 +72,19 @@ impl Journal {
         for ent in entries {
             let mut seg = segment::SegmentFile::open_for_read(&ent.path())?;
             let scan = seg.scan()?;
-            if scan.had_torn_tail {
-                seg.truncate(scan.last_durable_offset)?;
-            }
             let scan = if scan.had_torn_tail {
-                seg.scan()?
+                if config.preallocate_segments {
+                    // Preserve the physical zero tail; only rewind the logical
+                    // cursor to the last durable record. The writer resumes
+                    // appending into preallocated space (no truncate-then-refill
+                    // churn). The first scan's records/index already exclude the
+                    // torn tail, so reuse it directly.
+                    seg.reset_cursor(scan.last_durable_offset);
+                    scan
+                } else {
+                    seg.truncate(scan.last_durable_offset)?;
+                    seg.scan()?
+                }
             } else {
                 scan
             };
@@ -137,13 +159,23 @@ impl Journal {
 
         // Install each segment's sparse index from the scan we already performed
         // above, so point reads can use the windowed `read_record` path.
-        let segments: Vec<segment::SegmentFile> = segments_with_scan
+        let mut segments: Vec<segment::SegmentFile> = segments_with_scan
             .into_iter()
             .map(|(mut seg, scan)| {
                 seg.set_index(scan.index);
                 seg
             })
             .collect();
+
+        // Re-preallocate the active segment so steady-state preallocation is in
+        // effect immediately after restart — covers a segment written before
+        // the flag was enabled, or one a prior recovery physically truncated.
+        if config.preallocate_segments
+            && let Some(active) = segments.last_mut()
+            && active.physical_len()? < config.segment_size_bytes
+        {
+            active.preallocate_to(config.segment_size_bytes)?;
+        }
 
         let pipeline = if config.preallocate_segments {
             Some(crate::journal::segment_pipeline::SegmentPipeline::spawn(
@@ -1564,18 +1596,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reopen/recovery completed in Task 7; un-ignored there"]
     fn preallocated_journal_rotates_and_recovers_full_range() {
         // With the flag on, write across several segments (small segment_size to
         // force rotations), wait durable, reopen, and confirm the full range.
+        // Uses 512-byte payloads × 200 records ≈ 110 KiB > 64 KiB → forces ≥2 segments.
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = JournalConfig::new(dir.path());
         cfg.preallocate_segments = true;
-        cfg.segment_size_bytes = 64 * 1024; // small, but >> a few records → pipeline keeps up
+        cfg.segment_size_bytes = 64 * 1024;
+        let payload = vec![b'x'; 512];
         {
             let j = Journal::open(cfg.clone()).unwrap();
             for i in 1..=200u64 {
-                j.append(i, i, format!("rec-{i}").as_bytes()).unwrap();
+                j.append(i, i, &payload).unwrap();
             }
             j.wait_durable(200).unwrap();
             assert_eq!(j.durable_seq(), 200);
@@ -1583,6 +1616,51 @@ mod tests {
         let j2 = Journal::open(cfg).unwrap();
         assert_eq!(j2.first_seq(), Some(1));
         assert_eq!(j2.last_seq(), Some(200));
+        // Confirm at least two segments were created (real rotation happened).
+        let nseg = j2.state.lock().unwrap().segments.len();
+        assert!(nseg >= 2, "expected ≥2 segments after rotation, got {nseg}");
+    }
+
+    #[test]
+    fn open_removes_orphan_prealloc_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        // Plant an orphan temp as if a crash hit between create and rename.
+        std::fs::write(dir.path().join("seg-prealloc.9.tmp"), vec![0u8; 4096]).unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.preallocate_segments = true;
+        cfg.segment_size_bytes = 64 * 1024;
+        let _j = Journal::open(cfg).unwrap();
+        assert!(
+            !dir.path().join("seg-prealloc.9.tmp").exists(),
+            "orphan temp cleaned at open"
+        );
+    }
+
+    #[test]
+    fn reopen_preallocated_active_segment_keeps_zero_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.preallocate_segments = true;
+        cfg.segment_size_bytes = 64 * 1024;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=10u64 {
+                j.append(i, i, b"x").unwrap();
+            }
+            j.wait_durable(10).unwrap();
+        }
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.first_seq(), Some(1));
+        assert_eq!(j2.last_seq(), Some(10));
+        // Active segment must be physically re-preallocated to segment_size, not
+        // truncated to the logical end.
+        let st = j2.state.lock().unwrap();
+        let active = st.segments.last().unwrap();
+        assert_eq!(
+            active.physical_len().unwrap(),
+            64 * 1024,
+            "active segment re-preallocated after recovery"
+        );
     }
 
     #[test]
