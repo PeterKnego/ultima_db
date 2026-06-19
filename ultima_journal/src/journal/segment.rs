@@ -225,6 +225,66 @@ impl SegmentFile {
         })
     }
 
+    /// Create a NEW preallocated temp segment file: zero-fill `[0, total_len)`
+    /// with real writes, `sync_all`, and fsync the parent dir so the file
+    /// survives a crash. Writes NO header — `base_seq` is unknown until the
+    /// temp is activated at rotation. See `journal::segment_pipeline`.
+    #[allow(dead_code)]
+    pub(crate) fn create_prealloc_temp(path: &Path, total_len: u64) -> Result<(), JournalError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let zeros = vec![0u8; 1024 * 1024];
+        let mut remaining = total_len;
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..n])?;
+            remaining -= n as u64;
+        }
+        file.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Activate a preallocated temp into the live segment `final_path`: write
+    /// the real header (overwriting the zeroed first block — already allocated,
+    /// so no `i_size` change), `sync_data`, atomically rename the temp into
+    /// place, and fsync the dir to make the rename durable. The returned
+    /// `SegmentFile` has its logical cursor at the header and the preallocated
+    /// zero tail intact for appends to overwrite.
+    #[allow(dead_code)]
+    pub(crate) fn activate_prealloc_temp(
+        temp: &Path,
+        final_path: &Path,
+        base_seq: u64,
+    ) -> Result<SegmentFile, JournalError> {
+        let mut file = OpenOptions::new().read(true).write(true).open(temp)?;
+        let header = SegmentHeader {
+            format_ver: SEGMENT_FORMAT_V,
+            base_seq,
+            created_at: now_nanos(),
+        };
+        let bytes = encode_header(&header);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+        std::fs::rename(temp, final_path)?;
+        if let Some(parent) = final_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(SegmentFile {
+            path: final_path.to_path_buf(),
+            file,
+            size: SEGMENT_HEADER_SIZE as u64,
+            base_seq,
+            index: Vec::new(),
+        })
+    }
+
     pub fn open_for_read(path: &Path) -> Result<Self, JournalError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut hdr_bytes = [0u8; SEGMENT_HEADER_SIZE];
@@ -1009,6 +1069,30 @@ mod tests {
         seg.preallocate_to(1 * 1024 * 1024).unwrap();
         assert_eq!(seg.size().unwrap(), logical_before, "logical cursor unchanged");
         assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "physical extended");
+    }
+
+    #[test]
+    fn prealloc_temp_create_then_activate_yields_usable_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("seg-prealloc.0.tmp");
+        let final_path = dir.path().join("seg-00000000000000000007.log");
+
+        SegmentFile::create_prealloc_temp(&temp, 1 * 1024 * 1024).unwrap();
+        assert!(temp.exists());
+
+        let mut seg = SegmentFile::activate_prealloc_temp(&temp, &final_path, 7).unwrap();
+        assert!(!temp.exists(), "temp renamed away");
+        assert!(final_path.exists());
+        assert_eq!(seg.base_seq(), 7);
+        assert_eq!(seg.size().unwrap(), SEGMENT_HEADER_SIZE as u64, "logical cursor at header");
+        assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "preallocated tail preserved");
+
+        // The activated segment is a normal append target.
+        seg.append_records(&[(7, 0, b"first")]).unwrap();
+        let scan = seg.scan().unwrap();
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].seq, 7);
+        assert!(scan.had_torn_tail, "zero tail after the record reads as torn tail");
     }
 
     #[test]
