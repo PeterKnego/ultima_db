@@ -90,8 +90,59 @@ per-commit barrier degenerates to a pure `fdatasync`. This mirrors
 `ultima_journal`'s segment-preallocation win (the etcd WAL trick) ported to the
 single-file store WAL.
 
-**Competitive implication (directional, pending same-run head-to-head):** the
-2026-06-17 baseline put UltimaDB *last* on strict write-heavy A/F (554/512 ms,
-behind ReDB's 275/272 ms). Prealloc-on (240/229 ms) would now edge ahead of
-those ReDB figures — but the ReDB numbers are from a different capture, so a
-same-run head-to-head against the competitor engines is required to claim it.
+**Competitive implication:** the 2026-06-17 baseline put UltimaDB *last* on strict
+write-heavy A/F (behind ReDB), concluding "durable per-op writes are not
+UltimaDB's strong suit." The same-run head-to-head below overturns that with
+preallocation on.
+
+## Head-to-head — strict tier, same run/host/disk
+
+ReDB, Fjall, and RocksDB run on the **same host, same boot, same ext4 disk**, same
+`ULTIMA_BENCH_DURABILITY=strict`, same per-op commit granularity, immediately
+after the UltimaDB baselines above. RocksDB built with system clang/libclang.
+
+```bash
+export ULTIMA_BENCH_DIR=$HOME/ultima-benchdisk
+export ULTIMA_BENCH_DURABILITY=strict
+cargo bench -p compare-benches --bench ycsb_redb_bench    -- --save-baseline redb_strict
+cargo bench -p compare-benches --bench ycsb_fjall_bench   -- --save-baseline fjall_strict
+cargo bench -p compare-benches --bench ycsb_rocksdb_bench -- --save-baseline rocksdb_strict
+critcmp strict_noprealloc strict_prealloc redb_strict fjall_strict rocksdb_strict
+```
+
+### Latency (median ± from critcmp; **bold = fastest in row**)
+
+| Workload | UltimaDB **prealloc** | UltimaDB no-prealloc | ReDB | Fjall | RocksDB |
+|---|---|---|---|---|---|
+| A update-heavy   | **240.2 ± 16.2 ms** | 550.7 ± 76.7 ms | 283.8 ± 56.2 ms | 448.5 ± 53.0 ms | 478.3 ± 56.1 ms |
+| B read-mostly    | **25.2 ± 1.3 ms**   | 58.0 ± 7.3 ms   | 32.6 ± 7.1 ms   | 38.6 ± 8.8 ms   | 55.3 ± 8.3 ms   |
+| C read-only      | 132.5 ± 1.3 µs · **129.9 µs** (no-pre) | — | 719.4 ± 13.7 µs | 566.3 ± 7.3 µs | 657.1 ± 13.5 µs |
+| D read-latest    | **25.4 ± 1.8 ms**   | 55.6 ± 6.6 ms   | 46.3 ± 8.0 ms   | 52.3 ± 7.5 ms   | 51.4 ± 5.8 ms   |
+| E short-ranges   | **25.8 ± 2.9 ms**   | 52.5 ± 10.5 ms  | 69.6 ± 4.6 ms   | 109.2 ± 6.3 ms  | 101.9 ± 6.5 ms  |
+| F read-modify-write | **229.6 ± 26.1 ms** | 512.6 ± 69.4 ms | 279.1 ± 48.3 ms | 421.8 ± 90.8 ms | 472.8 ± 71.2 ms |
+
+### Throughput — tx/s (1 transaction per operation; **bold = fastest in row**)
+
+| Workload | UltimaDB **prealloc** | UltimaDB no-prealloc | ReDB | Fjall | RocksDB |
+|---|---|---|---|---|---|
+| A update-heavy   | **4,163**     | 1,816     | 3,524     | 2,230     | 2,091     |
+| B read-mostly    | **39,683**    | 17,241    | 30,675    | 25,907    | 18,083    |
+| C read-only      | 7,547,000 · **7,698,000** (no-pre) | — | 1,390,000 | 1,766,000 | 1,522,000 |
+| D read-latest    | **39,370**    | 17,986    | 21,598    | 19,120    | 19,455    |
+| E short-ranges   | **38,760**    | 19,048    | 14,368    | 9,158     | 9,814     |
+| F read-modify-write | **4,355**  | 1,951     | 3,583     | 2,371     | 2,115     |
+
+### Reading
+
+- **Prealloc-on UltimaDB is the fastest engine on all six strict workloads.** Without
+  prealloc it is last on A and F — reproducing the 2026-06-17 finding. Preallocation
+  roughly **doubles durable tx/s** on every fsync-bound workload.
+- **Robust (beyond noise):** the prealloc self-improvement (~2.0–2.3×), and the B/D/E
+  leads over all competitors. C (reads) is 4–5× ahead regardless of tier — unchanged
+  by prealloc, since reads never fsync.
+- **Directional (within noise):** on the two closest workloads A and F, prealloc-on
+  UltimaDB (240/230 ms) edges ReDB (284/279 ms) by ~15–20%, but the error bars overlap
+  (ReDB ±56/±48 ms vs UltimaDB ±16/±26 ms). Fair claim: UltimaDB now **at least matches,
+  likely edges** ReDB on durable write-heavy — no longer trailing it.
+- Competitor absolute numbers, like UltimaDB's, are host-bound; only this same-run
+  ordering is meaningful. A bench-host re-run is still wanted for portable magnitudes.
