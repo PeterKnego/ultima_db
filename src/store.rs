@@ -344,12 +344,30 @@ impl Store {
                         crate::wal::WalSinkKind::CoalescedPrealloc
                     }
                 };
-                Some(crate::wal::WalHandle::with_sink_kind(
-                    dir,
-                    consistent,
-                    Arc::clone(&wal_poison),
-                    kind,
-                )?)
+                // SPIKE (inline-fsync): for SingleWriter + Consistent, serial
+                // commits never batch, so the WAL bg-thread handoff is pure tax.
+                // Opt in via ULTIMA_WAL_INLINE to append+fsync inline on the
+                // committing thread (no thread, no channel, no epoch wait).
+                // Default path (env unset) is completely unchanged.
+                let inline = consistent
+                    && matches!(config.writer_mode, WriterMode::SingleWriter)
+                    && std::env::var_os("ULTIMA_WAL_INLINE").is_some();
+                let handle = if inline {
+                    crate::wal::WalHandle::with_sink_kind_inline(
+                        dir,
+                        consistent,
+                        Arc::clone(&wal_poison),
+                        kind,
+                    )?
+                } else {
+                    crate::wal::WalHandle::with_sink_kind(
+                        dir,
+                        consistent,
+                        Arc::clone(&wal_poison),
+                        kind,
+                    )?
+                };
+                Some(handle)
             }
             _ => None,
         };
