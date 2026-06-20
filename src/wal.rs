@@ -645,6 +645,76 @@ impl WalSink for BufferedFileSink {
 }
 
 // ---------------------------------------------------------------------------
+// PreallocFileSink — production preallocating WAL sink
+// ---------------------------------------------------------------------------
+
+/// Default grow quantum for the preallocating WAL sink.
+const WAL_PREALLOC_CHUNK: u64 = 16 * 1024 * 1024;
+
+/// Production preallocating sink: positioned writes into a physically
+/// zero-filled region of `wal.bin`, grown inline in `chunk`-byte steps.
+/// `sync_all` only on extend (size change); `sync_data` steady-state. See
+/// design doc 2026-06-20-wal-preallocation-design.md.
+struct PreallocFileSink {
+    file: File,
+    path: std::path::PathBuf,
+    buf: Vec<u8>,
+    write_head: u64,
+    capacity: u64,
+    chunk: u64,
+}
+
+impl PreallocFileSink {
+    fn open(dir: &Path) -> Result<Self> {
+        Self::open_with_chunk(dir, WAL_PREALLOC_CHUNK)
+    }
+
+    pub(crate) fn open_with_chunk(dir: &Path, chunk: u64) -> Result<Self> {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+        let path = dir.join(WAL_FILENAME);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        sync_dir(dir)?;
+        // Reconstruct the write head from the tolerant scan; a torn tail into
+        // preallocated zeros is end-of-log, not corruption.
+        let (_entries, write_head) = scan_wal(&path, true)?;
+        let capacity = file.metadata().map_err(|e| Error::Persistence(e.to_string()))?.len();
+        Ok(PreallocFileSink { file, path, buf: Vec::new(), write_head, capacity, chunk })
+    }
+}
+
+impl WalSink for PreallocFileSink {
+    fn append(&mut self, entry: &WalEntry) -> Result<()> {
+        self.buf.extend_from_slice(&frame_entry(entry)?);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if !self.buf.is_empty() {
+            let need = self.write_head + self.buf.len() as u64;
+            if need > self.capacity {
+                // Extend by whole chunks to cover `need`; sync_all (size change).
+                let new_cap = need.div_ceil(self.chunk) * self.chunk;
+                preallocate_to(&mut self.file, self.capacity, new_cap)?;
+                self.capacity = new_cap;
+            }
+            self.file.seek(SeekFrom::Start(self.write_head)).map_err(|e| Error::Persistence(e.to_string()))?;
+            self.file.write_all(&self.buf).map_err(|e| Error::Persistence(e.to_string()))?;
+            self.write_head += self.buf.len() as u64;
+            self.buf.clear();
+        }
+        // Steady-state barrier: size unchanged, so fdatasync suffices.
+        self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MmapSink — experimental mmap-based WAL sink (bench-only, feature-gated)
 // ---------------------------------------------------------------------------
 
@@ -2494,6 +2564,52 @@ mod tests {
             poison.is_poisoned(),
             "Eventual-mode fsync failure must poison the latch"
         );
+    }
+
+    #[test]
+    fn prealloc_sink_roundtrips_like_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = PreallocFileSink::open(dir.path()).unwrap();
+        sink.append(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        sink.append(&WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
+        sink.sync().unwrap();
+        let entries = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].version, 1);
+        assert_eq!(entries[1].version, 2);
+    }
+
+    #[test]
+    fn prealloc_sink_extends_in_chunks_and_holds_invariant() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny 256-byte chunk so a couple of entries force an extend.
+        let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 256).unwrap();
+        let physical = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+        let path = dir.path().join(WAL_FILENAME);
+
+        for v in 1..=20u64 {
+            sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("table-{v}") }] }).unwrap();
+            sink.sync().unwrap();
+            // Invariant: write_head <= capacity <= physical_len, capacity chunk-aligned.
+            assert!(sink.write_head <= sink.capacity);
+            assert!(sink.capacity <= physical(&path));
+            assert_eq!(sink.capacity % 256, 0, "capacity grows in whole chunks");
+        }
+        assert_eq!(read_wal(&path).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn prealloc_sink_steady_state_does_not_grow_physical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 1 << 20).unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        sink.append(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        sink.sync().unwrap();
+        let after_first = std::fs::metadata(&path).unwrap().len();
+        // A second small batch fits in the existing chunk: no physical growth.
+        sink.append(&WalEntry { version: 2, ops: vec![WalOp::CreateTable { name: "u".into() }] }).unwrap();
+        sink.sync().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), after_first);
     }
 
     #[test]
