@@ -276,18 +276,11 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
+    // Standard CRC-32/ISO-HDLC (IEEE 802.3), hardware-accelerated via `crc32fast`
+    // (already used by `snapshot_stream`). Byte-identical to the previous
+    // hand-rolled bitwise loop — guarded by `crc32_equivalent_to_reference_bitwise_and_standard`
+    // — so existing WAL and checkpoint files keep verifying.
+    crc32fast::hash(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,6 +1872,48 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].version, 1);
         assert_eq!(entries[1].version, 2);
+    }
+
+    #[test]
+    fn crc32_equivalent_to_reference_bitwise_and_standard() {
+        // Reference: the textbook reflected CRC-32/ISO-HDLC (IEEE 802.3) — the
+        // exact algorithm the WAL/checkpoint format was written with. The crate's
+        // `crc32()` must stay byte-identical to this for every existing WAL and
+        // checkpoint file to keep verifying, regardless of the implementation.
+        fn reference(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for &byte in data {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    if crc & 1 != 0 {
+                        crc = (crc >> 1) ^ 0xEDB8_8320;
+                    } else {
+                        crc >>= 1;
+                    }
+                }
+            }
+            !crc
+        }
+        // Standard CRC-32 check value: crc32("123456789") == 0xCBF4_3926. Anchors
+        // both `crc32()` and the reference to the IEEE standard absolutely.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(reference(b"123456789"), 0xCBF4_3926);
+        // Equivalence across a spread of inputs: empty, every single byte value,
+        // ascending sequences, text, and a large buffer.
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0u8],
+            vec![0xFFu8],
+            b"hello world".to_vec(),
+            (0u8..=255).collect(),
+            (0u8..=255).cycle().take(4096).collect(),
+        ];
+        for b in 0u16..256 {
+            cases.push(vec![b as u8]);
+        }
+        for c in &cases {
+            assert_eq!(crc32(c), reference(c), "crc32 mismatch for {}-byte input", c.len());
+        }
     }
 
     #[test]
