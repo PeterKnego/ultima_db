@@ -62,3 +62,9 @@ pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamErro
 pub use store::{IsolationLevel, Readable, Store, StoreConfig, WriterMode};
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};
+
+#[cfg(feature = "persistence")]
+#[doc(hidden)]
+pub fn wal_durable_len_for_test(path: &std::path::Path) -> u64 {
+    crate::wal::scan_wal(path, true).unwrap().1
+}

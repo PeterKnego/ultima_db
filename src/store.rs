@@ -730,7 +730,13 @@ impl Store {
             let inner = self.inner.read().unwrap();
             if matches!(inner.config.persistence, Persistence::Standalone { .. }) {
                 let wal_path_buf = crate::wal::wal_path(&dir);
-                let entries = crate::wal::read_wal(&wal_path_buf)?;
+                let tolerant = matches!(
+                    inner.config.persistence,
+                    Persistence::Standalone {
+                        wal_write: crate::persistence::WalWrite::CoalescedPrealloc, ..
+                    }
+                );
+                let entries = crate::wal::scan_wal(&wal_path_buf, tolerant)?.0;
                 let base_version = inner.latest_version;
                 drop(inner);
 
