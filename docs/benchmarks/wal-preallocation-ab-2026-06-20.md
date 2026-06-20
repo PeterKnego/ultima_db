@@ -146,3 +146,67 @@ critcmp strict_noprealloc strict_prealloc redb_strict fjall_strict rocksdb_stric
   likely edges** ReDB on durable write-heavy — no longer trailing it.
 - Competitor absolute numbers, like UltimaDB's, are host-bound; only this same-run
   ordering is meaningful. A bench-host re-run is still wanted for portable magnitudes.
+
+---
+
+# Real-hardware validation — AWS NVMe (2026-06-20)
+
+Closes the "portable magnitude" item above. Run on **one node of the AWS bench
+fleet** (`../ultima_cluster/bench-infra`): `c6id.4xlarge`, 16 vCPU, kernel
+6.17.0-1017-aws, rustc 1.96.0, with `ULTIMA_BENCH_DIR` on the node's **local NVMe
+instance store** (`/dev/nvme1n1`, ext4, 885 GB) — *not* the rig's `make bench`
+parity sweep, a standalone single-node store-WAL A/B. This is real, fast,
+dedicated disk: the portable counterpart to the noisy-sandbox numbers above.
+
+## `wal_bench` — Consistent commit, median latency (µs)
+
+| size | `coalesced` (no prealloc) | `mmap` (sparse set_len) | `coalesced_prealloc` (real fill) | prealloc speedup |
+|---|---|---|---|---|
+| 1 KiB  | 185.7 | 208.6 | 134.7 | 1.38× |
+| 2 KiB  | 188.9 | 208.5 | 122.3 | 1.54× |
+| 4 KiB  | 196.6 | 222.0 | 124.2 | 1.58× |
+| 8 KiB  | 222.5 | 239.0 | 170.3 | 1.31× |
+| 16 KiB | 243.2 | 272.7 | 162.9 | 1.49× |
+
+Real-zero-fill prealloc is fastest at every size (~1.3–1.6×); sparse `mmap` is no
+better than (slightly worse than) plain `coalesced` — confirming again that the
+win is the *real* fill, not pre-sizing. Caveat: the `coalesced_prealloc`
+single-commit measurements are noisy here (wide CIs, e.g. 1 KiB spans 99–174 µs)
+because each iteration times a single warmed commit; the application-level YCSB
+numbers below are far more stable.
+
+## `ycsb_bench` — strict tier (`Durability::Consistent`), prealloc OFF vs ON
+
+Criterion's own OFF→ON comparison (p-values from the back-to-back runs):
+
+| workload | OFF | ON | change | thrpt gain |
+|---|---|---|---|---|
+| A update-heavy   | 89.9 ms · 11.1 K tx/s | 36.2 ms · 27.6 K tx/s | **−59.7%** (p<0.05) | +148% |
+| B read-mostly    | 9.31 ms · 107 K tx/s  | 3.91 ms · 256 K tx/s  | **−57.2%** (p<0.05) | +134% |
+| C read-only      | 184.0 µs · 5.44 M tx/s| 185.5 µs · 5.39 M tx/s| +0.9% (flat ✓)      | — |
+| D read-latest    | 9.25 ms · 108 K tx/s  | 3.98 ms · 251 K tx/s  | **−56.6%** (p<0.05) | +131% |
+| E short-ranges   | 9.85 ms · 101 K tx/s  | 4.32 ms · 231 K tx/s  | **−55.4%** (p<0.05) | +124% |
+| F read-modify-write | 93.0 ms · 10.8 K tx/s | 36.3 ms · 27.6 K tx/s | **−61.0%** (p<0.05) | +156% |
+
+Every fsync-bound workload: **~2.3–2.6× throughput, statistically significant
+(p<0.05)**; read-only flat. This is the headline portable result — and it holds
+the sandbox's ~2× directional finding on real NVMe, now with significance.
+
+## Sandbox vs NVMe
+
+- NVMe is a far faster device: strict workload A dropped from ~550 ms (sandbox) to
+  ~90 ms (NVMe, prealloc off) — ~6× faster disk.
+- The **preallocation ratio survives the faster device**: even when each device
+  flush is cheap, removing the per-commit ext4 metadata-journal commit still buys
+  ~2.3–2.6× on the YCSB strict path (p<0.05). The microbench ratio is smaller
+  (~1.4×) and noisier, but directionally identical.
+- **Eventual tier:** unchanged / slightly worse at the µs scale (prealloc adds a
+  little positioned-write bookkeeping to the fire-and-forget enqueue, off the
+  fsync path) — as expected, the feature targets `Consistent` only.
+
+## Verdict
+
+The win is **confirmed on real hardware**: ~2.3–2.6× durable-commit throughput on
+AWS NVMe, statistically significant, controls (read-only, Eventual) flat. The
+feature remains opt-in / default-off (`WalWrite::PerEntry`); this validates the
+magnitude, it does not change the default.

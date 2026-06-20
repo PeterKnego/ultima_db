@@ -205,15 +205,28 @@ The A/B is driven by the `ULTIMA_BENCH_PREALLOC` toggle in `benches/ycsb_bench.r
 `standalone_consistent_coalesced_prealloc` in `benches/singlewriter_persistence_bench.rs`
 is an equivalent pair. The ~2× clears the sandbox noise floor (±15% error bars) decisively.
 
-### Still pending: bench-host confirmation
+### Confirmed on real hardware — AWS NVMe (2026-06-20)
 
-Sandbox **absolute magnitudes are not portable** (±2× run-to-run; see
-`docs/tasks/task35_autobench_perf_harness.md` and the `bench-A/B methodology` memory note).
-Re-run on the real bench machine (worktree + shared `CARGO_TARGET_DIR`, re-record
-`make perf/baseline`) to capture a portable number before relying on it for gating.
+Re-run on one node of the AWS bench fleet (`c6id.4xlarge`, local NVMe instance store,
+ext4) — full tables in `docs/benchmarks/wal-preallocation-ab-2026-06-20.md`. The YCSB
+strict A/B shows **~2.3–2.6× durable-commit throughput, statistically significant
+(p<0.05)** on every fsync-bound workload, read-only and Eventual flat (the controls):
 
-**Feature stays opt-in/off** (`WalWrite::PerEntry` remains the default) regardless — the
-sandbox A/B confirms direction and rough size, not a production default flip.
+| Strict workload | OFF | ON | change |
+|---|---|---|---|
+| A update-heavy | 89.9 ms | 36.2 ms | −59.7% (p<0.05) |
+| B read-mostly | 9.31 ms | 3.91 ms | −57.2% (p<0.05) |
+| D read-latest | 9.25 ms | 3.98 ms | −56.6% (p<0.05) |
+| E short-ranges | 9.85 ms | 4.32 ms | −55.4% (p<0.05) |
+| F read-modify-write | 93.0 ms | 36.3 ms | −61.0% (p<0.05) |
+| C read-only | 184 µs | 185 µs | flat ✓ |
+
+The win survives the faster device (NVMe flush is ~6× cheaper than the sandbox disk,
+yet removing the per-commit ext4 metadata-journal commit still buys ~2.5×). The
+`wal_bench` microbench corroborates (~1.3–1.6×, noisier single-commit measurement).
+
+**Feature stays opt-in/off** (`WalWrite::PerEntry` remains the default) — the validation
+confirms the magnitude; flipping the default would be a separate decision.
 
 ---
 
