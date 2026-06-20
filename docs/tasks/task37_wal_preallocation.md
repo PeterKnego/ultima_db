@@ -212,4 +212,4 @@ recorded and the feature remains opt-in — mirroring the journal's pending clou
 | `src/lib.rs` | Re-export `WalWrite::CoalescedPrealloc` |
 | `benches/singlewriter_persistence_bench.rs` | `standalone_consistent_coalesced_prealloc` bench arm (A/B pair) |
 | `docs/tasks/task37_wal_preallocation.md` | This file |
-| `docs/superpowers/specs/2026-06-20-wal-preallocation-design.md` | Full design spec (retained as design-history record) |
+| `docs/superpowers/specs/2026-06-20-wal-preallocation-design.md` | Retained design history (prior task); not changed by bench task |

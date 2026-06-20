@@ -324,7 +324,7 @@ fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
     if to <= from {
         return Ok(());
     }
-    let zeros = [0u8; 1024 * 1024];
+    let zeros = [0u8; 64 * 1024];
     file.seek(SeekFrom::Start(from)).map_err(|e| Error::Persistence(e.to_string()))?;
     let mut remaining = to - from;
     while remaining > 0 {
@@ -444,9 +444,14 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<bool> {
 /// file is already preallocated. Returns `Some((write_head, capacity))` after a
 /// rewrite, or `None` if nothing needed pruning. Crash-atomic via tmp+rename:
 /// a crash leaves either the complete old WAL or the complete new one.
+/// Prune a preallocated WAL file, using a tolerant scan consistent with the
+/// prealloc recovery model: a torn record in the zero tail is end-of-log, not
+/// corruption. This mirrors `PreallocFileSink::open` which also uses
+/// `scan_wal(path, true)`. Entries past the first bad CRC were never durable
+/// (they are in the zero tail), so stopping there is correct.
 fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Option<(u64, u64)>> {
     use std::io::{Seek, SeekFrom, Write};
-    let entries = read_wal(path)?;
+    let (entries, _) = scan_wal(path, true)?;
     let remaining: Vec<&WalEntry> = entries.iter().filter(|e| e.version > up_to_version).collect();
     if remaining.len() == entries.len() {
         return Ok(None); // nothing to prune
@@ -561,8 +566,9 @@ pub(crate) trait WalSink: Send {
 }
 
 /// Selects which `WalSink` implementation a `WalHandle` uses. `FsWrite` (the
-/// default) and `Coalesced` are production-safe; the remaining variants are
-/// experimental and bench-only.
+/// default), `Coalesced`, and `CoalescedPrealloc` are production-safe; the
+/// remaining variants (`BufferedFile`, `Mmap`, `IoUring`) are experimental and
+/// bench-only.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalSinkKind {
@@ -761,8 +767,11 @@ impl WalSink for PreallocFileSink {
     fn prune(&mut self, up_to_version: u64) -> Result<()> {
         if let Some((write_head, capacity)) = prune_wal_prealloc(&self.path, up_to_version, self.chunk)? {
             // Reopen the renamed (new) inode and adopt the recomputed cursors.
+            // create(false): the rename guarantees the file exists; ENOENT here
+            // means the rename failed, and we want a loud error, not a silent
+            // empty-WAL creation.
             self.file = OpenOptions::new()
-                .read(true).write(true).create(true).truncate(false)
+                .read(true).write(true).create(false).truncate(false)
                 .open(&self.path)
                 .map_err(|e| Error::Persistence(e.to_string()))?;
             self.write_head = write_head;

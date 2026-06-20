@@ -88,6 +88,51 @@ fn prealloc_every_acked_commit_survives_recovery() {
     }
 }
 
+/// Regression test for Fix 1: after recovery through a torn tail,
+/// `checkpoint()` with no intervening commit must succeed (not return
+/// `WalCorrupted`). Before the fix, `prune_wal_prealloc` called strict
+/// `read_wal`, which errored on the unoverwritten torn record.
+#[test]
+fn prealloc_checkpoint_after_torn_tail_recovery_succeeds() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    // Write some Consistent commits.
+    {
+        let store = Store::new(cfg(dir.path())).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+        for v in 1..=5u64 {
+            let mut wtx = store.begin_write(None).unwrap();
+            { let mut t = wtx.open_table::<Row>("rows").unwrap(); t.insert(Row { v }).unwrap(); }
+            wtx.commit().unwrap();
+        }
+    }
+    // Append a bad-CRC record into the preallocated zero tail to simulate a torn write.
+    let wal = dir.path().join("wal.bin");
+    let durable = ultima_db::wal_durable_len_for_test(&wal);
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&wal).unwrap();
+    f.seek(SeekFrom::Start(durable)).unwrap();
+    f.write_all(&[16u8, 0, 0, 0]).unwrap(); // len=16
+    f.write_all(&[0xABu8; 16]).unwrap();     // junk body (CRC will mismatch)
+    f.write_all(&[0u8, 0, 0, 0]).unwrap();   // wrong CRC
+    f.sync_all().unwrap();
+    drop(f);
+
+    // Reopen and recover — tolerant scan stops at the torn record.
+    let store = Store::new(cfg(dir.path())).unwrap();
+    store.register_table::<Row>("rows").unwrap();
+    store.recover().unwrap(); // must NOT error
+
+    // checkpoint() with NO intervening commit: before Fix 1 this returned WalCorrupted.
+    store.checkpoint().expect("checkpoint after torn-tail recovery must succeed");
+
+    // All originally-committed rows must still be readable.
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<Row>("rows").unwrap();
+    for v in 1..=5u64 {
+        assert_eq!(t.get(v).map(|r| r.v), Some(v), "row {v} missing after checkpoint");
+    }
+}
+
 #[test]
 fn prealloc_checkpoint_prunes_and_recovers() {
     let dir = tempfile::tempdir().unwrap();

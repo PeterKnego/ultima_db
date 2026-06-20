@@ -19,12 +19,13 @@
 //! Measured (2026-06-18, Claude sandbox — noisy/virtualized, re-run on the real
 //! bench host for authoritative numbers; 1 writer × 200 sequential commits):
 //!
-//! | config                  | throughput     | vs smr         |
-//! |-------------------------|----------------|----------------|
-//! | `inmemory`              | ~1.11 Melem/s  | ~equal         |
-//! | `smr`                   | ~1.11 Melem/s  | baseline       |
-//! | `standalone_eventual`   | ~0.65 Melem/s  | smr ~1.7× faster |
-//! | `standalone_consistent` | ~25.5 Kelem/s  | smr ~43× faster  |
+//! | config                                    | throughput     | vs smr           |
+//! |-------------------------------------------|----------------|------------------|
+//! | `inmemory`                                | ~1.11 Melem/s  | ~equal           |
+//! | `smr`                                     | ~1.11 Melem/s  | baseline         |
+//! | `standalone_eventual`                     | ~0.65 Melem/s  | smr ~1.7× faster |
+//! | `standalone_consistent`                   | ~25.5 Kelem/s  | smr ~43× faster  |
+//! | `standalone_consistent_coalesced_prealloc`| real-disk A/B  | sandbox noise ±2× makes sandbox results uninformative; run on bench host |
 //!
 //! Takeaway: serially, SMR is again indistinguishable from in-memory, and the
 //! Consistent gap blows out to ~40×+ (vs ~6× under the multi-writer bench)
