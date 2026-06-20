@@ -61,6 +61,13 @@ pub enum WalWrite {
     /// durability as `PerEntry` (full fsync); fewer syscalls per batch — better
     /// group-commit throughput under Eventual / high-concurrency loads.
     Coalesced,
+    /// Coalesced batch write into a **preallocated** WAL file: positioned
+    /// writes overwrite a physically zero-filled region, so each Consistent
+    /// commit's fsync carries no ext4 metadata commit. Steady-state uses
+    /// `sync_data`; the file grows in 16 MiB chunks and is re-preallocated on
+    /// prune. Opt-in; recovery uses a tail-tolerant scan. See
+    /// docs/superpowers/specs/2026-06-20-wal-preallocation-design.md.
+    CoalescedPrealloc,
 }
 
 // ---------------------------------------------------------------------------

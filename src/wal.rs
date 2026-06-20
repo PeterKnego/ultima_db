@@ -572,6 +572,8 @@ pub enum WalSinkKind {
     Coalesced,
     /// Coalesced single `write` per batch + `sync_data` (fdatasync). Bench comparison only.
     BufferedFile,
+    /// Preallocating coalesced sink (`PreallocFileSink`). Production opt-in.
+    CoalescedPrealloc,
     /// Pre-sized mmap sink (experimental, bench-only). memcpy into the mapped
     /// region; msync on flush; truncate to logical length on Drop.
     #[cfg(feature = "bench-internals")]
@@ -1223,6 +1225,9 @@ impl WalHandle {
             }
             WalSinkKind::BufferedFile => {
                 Ok(Self::with_sink(BufferedFileSink::open(dir, true)?, consistent, poison))
+            }
+            WalSinkKind::CoalescedPrealloc => {
+                Ok(Self::with_sink(PreallocFileSink::open(dir)?, consistent, poison))
             }
             #[cfg(feature = "bench-internals")]
             WalSinkKind::Mmap => Ok(Self::with_sink(MmapSink::open(dir)?, consistent, poison)),

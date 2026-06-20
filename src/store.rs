@@ -340,6 +340,9 @@ impl Store {
                 let kind = match wal_write {
                     crate::persistence::WalWrite::PerEntry => crate::wal::WalSinkKind::FsWrite,
                     crate::persistence::WalWrite::Coalesced => crate::wal::WalSinkKind::Coalesced,
+                    crate::persistence::WalWrite::CoalescedPrealloc => {
+                        crate::wal::WalSinkKind::CoalescedPrealloc
+                    }
                 };
                 Some(crate::wal::WalHandle::with_sink_kind(
                     dir,
