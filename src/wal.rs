@@ -314,6 +314,28 @@ fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
         .map_err(|e| Error::Persistence(e.to_string()))
 }
 
+/// Physically zero-fill `[from, to)` with real writes (NOT sparse `set_len`,
+/// so ext4 marks the extents *written*), then `sync_all` once so the size and
+/// allocation are durable before any record is written into the region. The
+/// WAL counterpart of `ultima_journal`'s `SegmentFile::preallocate_to`. No-op
+/// when `to <= from`.
+fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    if to <= from {
+        return Ok(());
+    }
+    let zeros = [0u8; 1024 * 1024];
+    file.seek(SeekFrom::Start(from)).map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut remaining = to - from;
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..n]).map_err(|e| Error::Persistence(e.to_string()))?;
+        remaining -= n as u64;
+    }
+    file.sync_all().map_err(|e| Error::Persistence(e.to_string()))?;
+    Ok(())
+}
+
 /// Scan framed WAL records. Returns the decoded entries and the byte offset
 /// where scanning stopped (end of the last good record = the durable write
 /// head). A zero len-prefix and a truncated tail are always end-of-log. When
@@ -2472,5 +2494,27 @@ mod tests {
             poison.is_poisoned(),
             "Eventual-mode fsync failure must poison the latch"
         );
+    }
+
+    #[test]
+    fn preallocate_to_zero_fills_and_is_durable() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.bin");
+        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        preallocate_to(&mut f, 0, 8192).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), 8192, "physically extended");
+        // All zeros.
+        let mut buf = Vec::new();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_to_end(&mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        // A positioned overwrite within the region does not change the size.
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[7u8; 16]).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), 8192);
+        // No-op when to <= from.
+        preallocate_to(&mut f, 8192, 4096).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), 8192);
     }
 }
