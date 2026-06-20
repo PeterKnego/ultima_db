@@ -438,6 +438,49 @@ pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<bool> {
     Ok(true)
 }
 
+/// Preallocating prune (design §6, strategy P2): rewrite the live entries
+/// (version > `up_to_version`) into a tmp that is first zero-filled to
+/// `live_bytes + chunk`, then atomically rename it over `path`. The renamed
+/// file is already preallocated. Returns `Some((write_head, capacity))` after a
+/// rewrite, or `None` if nothing needed pruning. Crash-atomic via tmp+rename:
+/// a crash leaves either the complete old WAL or the complete new one.
+fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Option<(u64, u64)>> {
+    use std::io::{Seek, SeekFrom, Write};
+    let entries = read_wal(path)?;
+    let remaining: Vec<&WalEntry> = entries.iter().filter(|e| e.version > up_to_version).collect();
+    if remaining.len() == entries.len() {
+        return Ok(None); // nothing to prune
+    }
+
+    let mut live = Vec::new();
+    for e in &remaining {
+        live.extend_from_slice(&frame_entry(e)?);
+    }
+    let write_head = live.len() as u64;
+    let capacity = (write_head + chunk).div_ceil(chunk) * chunk;
+
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut tmp = OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true)
+        .open(&tmp_path)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    // Pre-size to capacity with real zeros (single sync_all), then overwrite the
+    // front with the live entries.
+    preallocate_to(&mut tmp, 0, capacity)?;
+    tmp.seek(SeekFrom::Start(0)).map_err(|e| Error::Persistence(e.to_string()))?;
+    tmp.write_all(&live).map_err(|e| Error::Persistence(e.to_string()))?;
+    tmp.sync_all().map_err(|e| Error::Persistence(e.to_string()))?;
+    drop(tmp);
+    std::fs::rename(&tmp_path, path).map_err(|e| Error::Persistence(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(Some((write_head, capacity)))
+}
+
 // ---------------------------------------------------------------------------
 // Epoch-based sync state — shared between WalHandle and SyncWaiter
 // ---------------------------------------------------------------------------
@@ -711,6 +754,20 @@ impl WalSink for PreallocFileSink {
         }
         // Steady-state barrier: size unchanged, so fdatasync suffices.
         self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))
+    }
+
+    fn prune(&mut self, up_to_version: u64) -> Result<()> {
+        if let Some((write_head, capacity)) = prune_wal_prealloc(&self.path, up_to_version, self.chunk)? {
+            // Reopen the renamed (new) inode and adopt the recomputed cursors.
+            self.file = OpenOptions::new()
+                .read(true).write(true).create(true).truncate(false)
+                .open(&self.path)
+                .map_err(|e| Error::Persistence(e.to_string()))?;
+            self.write_head = write_head;
+            self.capacity = capacity;
+            self.buf.clear();
+        }
+        Ok(())
     }
 }
 
@@ -2610,6 +2667,56 @@ mod tests {
         sink.append(&WalEntry { version: 2, ops: vec![WalOp::CreateTable { name: "u".into() }] }).unwrap();
         sink.sync().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), after_first);
+    }
+
+    #[test]
+    fn prune_wal_prealloc_compacts_and_presizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
+        for v in 1..=5u64 {
+            sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap();
+            sink.sync().unwrap();
+        }
+        // Prune everything <= version 3.
+        sink.prune(3).unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        let entries = read_wal(&path).unwrap();
+        assert_eq!(entries.iter().map(|e| e.version).collect::<Vec<_>>(), vec![4, 5]);
+        // File is preallocated: physical_len == write_head rounded up + at least one chunk of zeros.
+        let physical = std::fs::metadata(&path).unwrap().len();
+        assert!(sink.capacity <= physical);
+        assert!(sink.capacity >= sink.write_head + 4096, "a fresh chunk of zero tail exists");
+        assert_eq!(sink.capacity % 4096, 0);
+    }
+
+    #[test]
+    fn prune_then_append_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
+            for v in 1..=4u64 {
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap();
+                sink.sync().unwrap();
+            }
+            sink.prune(2).unwrap();
+            sink.append(&WalEntry { version: 5, ops: vec![WalOp::CreateTable { name: "t5".into() }] }).unwrap();
+            sink.sync().unwrap();
+        } // drop = simulated crash (no clean truncation)
+        // Reopen and confirm the post-prune appends survive with no gap.
+        let sink2 = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
+        let entries = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
+        assert_eq!(entries.iter().map(|e| e.version).collect::<Vec<_>>(), vec![3, 4, 5]);
+        assert_eq!(sink2.write_head, entries.iter().map(|e| frame_entry(e).unwrap().len() as u64).sum::<u64>());
+    }
+
+    #[test]
+    fn prune_wal_prealloc_noop_when_nothing_to_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
+        sink.append(&WalEntry { version: 9, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        sink.sync().unwrap();
+        // up_to_version below the only entry's version: nothing removed.
+        assert!(prune_wal_prealloc(&dir.path().join(WAL_FILENAME), 1, 4096).unwrap().is_none());
     }
 
     #[test]
