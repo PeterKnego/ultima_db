@@ -68,10 +68,14 @@ fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Sto
     };
     if let Some(dir) = tmpdir {
         config.persistence = match persistence {
-            Persistence::Standalone { durability, .. } => Persistence::Standalone {
+            Persistence::Standalone {
+                durability,
+                wal_write,
+                ..
+            } => Persistence::Standalone {
                 dir: dir.to_path_buf(),
                 durability,
-                wal_write: WalWrite::PerEntry,
+                wal_write,
             },
             Persistence::Smr { .. } => Persistence::Smr {
                 dir: dir.to_path_buf(),
@@ -157,6 +161,33 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent", |b| {
+            b.iter(|| {
+                run_serial_commits(&store);
+                black_box(());
+            });
+        });
+    }
+
+    // Standalone Consistent + prealloc (A/B pair with standalone_consistent above)
+    //
+    // Identical durability/workload; only wal_write differs.  On real disk,
+    // CoalescedPrealloc should convert per-fsync metadata-journal cost into a
+    // pure data barrier (sync_data) for steady-state batches.
+    //
+    // NOTE: the real-disk delta must be measured on the bench host with the
+    // worktree+shared-CARGO_TARGET_DIR A/B protocol (sandbox noise floors reach
+    // ±2×).  Until that run is complete the feature stays opt-in/off.
+    {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = make_store(
+            Persistence::Standalone {
+                dir: std::path::PathBuf::new(),
+                durability: ultima_db::Durability::Consistent,
+                wal_write: WalWrite::CoalescedPrealloc,
+            },
+            Some(tmpdir.path()),
+        );
+        group.bench_function("standalone_consistent_coalesced_prealloc", |b| {
             b.iter(|| {
                 run_serial_commits(&store);
                 black_box(());
