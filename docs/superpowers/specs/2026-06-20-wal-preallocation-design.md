@@ -81,15 +81,15 @@ No background thread, no temp segment files, therefore **no orphan-temp cleanup 
 - **P1 — discard + re-preallocate** (compact tmp + rename, then a separate zero-fill chunk). Correct but does a redundant extend P2 avoids.
 - **P3 — in-place compaction** (slide live entries to the front of the existing preallocated file, reuse all zero blocks). Highest raw efficiency but a crash mid-compaction corrupts the *only* WAL copy; requires a generation/double-buffer scheme. The saving (re-zeroing one chunk per checkpoint) is dwarfed by the checkpoint it rides — not worth trading away single-file crash-atomicity.
 
-## 7. Recovery
+## 7. Recovery (and the torn-tail subtlety preallocation introduces)
 
-Free, by construction:
+The clean-tail case is free: a zero len-prefix already means end-of-log (`read_wal`, `src/wal.rs:336`). `PreallocFileSink::open` reruns the scan to set `write_head` (last durable offset) and reads `physical_len` into `capacity`; the first append positions at `write_head` and overwrites the zero tail.
 
-1. `Store::recover()` calls `read_wal`, which scans framed records and stops at the first zero len-prefix (the preallocated tail) — unchanged.
-2. `PreallocFileSink::open` reruns that scan to set `write_head` (last durable offset) and reads `physical_len` into `capacity`.
-3. First post-recovery append positions at `write_head` and overwrites the zero tail — no gap, no lost records.
+**But the torn-tail case changes and must be handled.** Today `read_wal` treats a CRC mismatch as a hard `Error::WalCorrupted` (`src/wal.rs:354`). That is safe *only* in the append model: a torn tail record always extends past physical EOF and hits the "truncated → break" branch (`src/wal.rs:343`), so a CRC mismatch can only mean genuine mid-file corruption. **Preallocation breaks that assumption** — a partially-written record sits in front of durable zeros, so it *looks complete* (len + data + crc bytes are all "present," backed by the zero fill) and its CRC fails. Under the current rule that would abort recovery with `WalCorrupted` when it is really just an unacknowledged torn tail.
 
-A torn final record (partial write before a crash) decodes as "no more records" exactly as today; `write_head` lands at the last *intact* record, and the torn bytes are overwritten on the next append. CRC still guards accidental corruption of intact records.
+**Resolution — tail-tolerant scan for the prealloc path only.** Introduce `scan_wal(path, tail_tolerant: bool) -> (Vec<WalEntry>, u64)` returning the entries and the durable byte offset (the `write_head`). `read_wal` becomes a thin wrapper calling `scan_wal(path, false)` — strict, unchanged corruption detection for every existing caller. The preallocated path calls `scan_wal(path, true)`: a CRC mismatch (or any undecodable frame) is treated as **end-of-log** — stop at the last good offset rather than erroring. This is the standard WAL "valid up to the last record whose CRC checks" rule (etcd/RocksDB). `Store::recover()` selects the mode from config: `WalWrite::CoalescedPrealloc` → tolerant, all others → strict.
+
+**Trade-off (documented, accepted):** the prealloc path can no longer distinguish a torn tail from corruption *at the tail*; it stops at the first bad frame either way. Intact records before that point are still CRC-checked, so mid-WAL corruption ahead of the tail is still caught. This is the conventional WAL durability/robustness posture and the price of the zero tail.
 
 ## 8. Durability semantics
 
@@ -99,11 +99,11 @@ A torn final record (partial write before a crash) decodes as "no more records" 
 
 ## 9. Configuration
 
-Opt-in, default **off**, mirroring `JournalConfig.preallocate_segments`:
+Opt-in, default **off**, mirroring `JournalConfig.preallocate_segments`. Implemented as a **new `WalWrite` variant**, `WalWrite::CoalescedPrealloc`, rather than a `bool` field on `Persistence::Standalone`:
 
-- Add a flag on `Persistence::Standalone` — `preallocate: bool` (v1). A future `preallocate_chunk_bytes: Option<u64>` can expose the quantum; v1 hardcodes 16 MiB.
-- When `preallocate: true` **and** `wal_write: WalWrite::Coalesced`, the store constructs `PreallocFileSink` instead of `BufferedFileSink`. Any other `wal_write` value ignores the flag (documented; no silent behavior change to PerEntry/mmap/io_uring).
-- Default-off means existing deployments are byte-for-byte unchanged until they opt in.
+- **Why a variant, not a `bool`:** preallocation in v1 only applies to the Coalesced write strategy, so an orthogonal `bool` would be illusory (the only valid combination is `Coalesced + true`). A variant slots into the existing `match wal_write` (`src/store.rs:340`) and `WalSinkKind` enum exactly as `Coalesced` did, requires **zero changes to existing `Persistence::Standalone { .. }` literals** (no struct-shape break across benches/tests/examples), and `Store::recover()` already reads `wal_write` — so the tolerant-scan selection (§7) is driven by the same value with no extra plumbing. A future `preallocate_chunk_bytes` knob can be added later if needed; v1 hardcodes the 16 MiB quantum.
+- `WalWrite::CoalescedPrealloc` → `WalSinkKind::CoalescedPrealloc` → `PreallocFileSink`. `PerEntry` and `Coalesced` are unchanged; mmap/io_uring untouched.
+- Default remains `WalWrite::PerEntry`, so existing deployments are byte-for-byte unchanged until they opt in.
 
 ## 10. Out of scope
 
@@ -115,7 +115,8 @@ Opt-in, default **off**, mirroring `JournalConfig.preallocate_segments`:
 ## 11. Testing strategy
 
 - **Unit (PreallocFileSink):** append-then-read round-trips identical to `BufferedFileSink`; `write_head`/`capacity` invariants hold across extend boundaries; extend triggers exactly when a batch overruns `capacity`.
-- **Recovery / crash-resume:** write N batches, simulate crash (drop without clean close) leaving a zero tail and a torn final record; reopen → `read_wal` returns exactly the durable records, `write_head` lands at the last intact record, next append overwrites the tail with no gap.
+- **Recovery / crash-resume:** write N batches, simulate crash (drop without clean close) leaving a zero tail and a torn final record; reopen → the tolerant scan returns exactly the durable records, `write_head` lands at the last intact record, next append overwrites the tail with no gap.
+- **Torn-tail-looks-complete (the §7 case):** hand-craft a preallocated file ending in a record whose CRC is wrong, followed by zeros (simulating a torn write into preallocated space). Assert `scan_wal(path, true)` *stops* at the prior good record (no error), while `scan_wal(path, false)` still returns `WalCorrupted` — proving the strict path's corruption detection is preserved for existing callers.
 - **Prune-resume (P2):** checkpoint → prune → verify the rewritten file is preallocated (physical_len = live + chunk), `write_head` correct, recovery after a post-prune crash returns the right records.
 - **Durability equivalence:** under `Durability::Consistent`, a kill-after-ack test shows every acked commit survives recovery (same guarantee as the non-prealloc path) — preallocation must not weaken durability.
 - **Parity:** a property/fuzz test asserting `read_wal` output is identical whether records were written by `BufferedFileSink` or `PreallocFileSink` for the same input (format byte-identity).
