@@ -11,3 +11,6 @@ perf.data.old
 
 # Stray local Claude settings sometimes copied to repo root (the real one lives under .claude/)
 /settings.local.json
+
+# SDD scratch (briefs, reports, ledger, diffs)
+.superpowers/
