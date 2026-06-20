@@ -314,11 +314,17 @@ fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
         .map_err(|e| Error::Persistence(e.to_string()))
 }
 
-/// Read all WAL entries from a file. Stops at EOF or first corrupted entry.
-pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
+/// Scan framed WAL records. Returns the decoded entries and the byte offset
+/// where scanning stopped (end of the last good record = the durable write
+/// head). A zero len-prefix and a truncated tail are always end-of-log. When
+/// `tail_tolerant`, a CRC mismatch or undecodable frame is *also* treated as
+/// end-of-log (a torn write into preallocated zero space looks complete); when
+/// not, a CRC mismatch is a hard `WalCorrupted` error (strict corruption
+/// detection for the non-preallocated path).
+pub(crate) fn scan_wal(path: &Path, tail_tolerant: bool) -> Result<(Vec<WalEntry>, u64)> {
     let mut file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(Error::Persistence(e.to_string())),
     };
     let mut all_bytes = Vec::new();
@@ -326,42 +332,45 @@ pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
         .map_err(|e| Error::Persistence(e.to_string()))?;
 
     let mut entries = Vec::new();
-    let mut offset = 0;
+    let mut offset = 0usize;
 
     while offset + 4 <= all_bytes.len() {
-        // Read length
         let len = u32::from_le_bytes(all_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-
         if len == 0 {
-            // Clean end-of-log: a pre-sized (mmap) file leaves a zero tail after
-            // a crash, and a torn zero-length write is not a real record (every
-            // valid record frames a non-empty payload). Stop, do not error.
-            break;
+            break; // zero len-prefix: clean end-of-log / preallocated tail
         }
-
-        if offset + len + 4 > all_bytes.len() {
-            // Truncated entry at end of file — stop (crash during write).
-            break;
+        if offset + 4 + len + 4 > all_bytes.len() {
+            break; // truncated tail (crash during write)
         }
-
-        let data = &all_bytes[offset..offset + len];
-        offset += len;
-
-        let stored_crc = u32::from_le_bytes(all_bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
+        let data = &all_bytes[offset + 4..offset + 4 + len];
+        let stored_crc =
+            u32::from_le_bytes(all_bytes[offset + 4 + len..offset + 8 + len].try_into().unwrap());
         if crc32(data) != stored_crc {
+            if tail_tolerant {
+                break; // torn write into preallocated space: stop at last good record
+            }
             return Err(Error::WalCorrupted(format!(
-                "CRC mismatch at entry starting at byte {}",
-                offset - len - 8
+                "CRC mismatch at entry starting at byte {offset}"
             )));
         }
-
-        entries.push(deserialize_entry(data)?);
+        match deserialize_entry(data) {
+            Ok(entry) => entries.push(entry),
+            Err(e) if tail_tolerant => {
+                let _ = e;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        offset += 4 + len + 4;
     }
 
-    Ok(entries)
+    Ok((entries, offset as u64))
+}
+
+/// Read all WAL entries from a file. Strict: stops at EOF / zero tail, errors
+/// on CRC mismatch. Unchanged behavior for all existing callers.
+pub fn read_wal(path: &Path) -> Result<Vec<WalEntry>> {
+    Ok(scan_wal(path, false)?.0)
 }
 
 /// Rewrite the WAL file, removing all entries with version <= `up_to_version`.
@@ -1483,6 +1492,50 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::Store;
+
+    #[test]
+    fn scan_wal_returns_durable_offset_and_strict_wrapper_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        // Two framed entries written back-to-back.
+        let e1 = WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] };
+        let e2 = WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] };
+        let mut bytes = frame_entry(&e1).unwrap();
+        let f1_len = bytes.len() as u64;
+        bytes.extend_from_slice(&frame_entry(&e2).unwrap());
+        let total = bytes.len() as u64;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (entries, offset) = scan_wal(&path, false).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(offset, total, "offset is end of last good record");
+        assert!(f1_len > 0);
+        // Strict wrapper returns the same entries.
+        assert_eq!(read_wal(&path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scan_wal_tolerant_stops_at_crc_mismatch_strict_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        let good = WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] };
+        let mut bytes = frame_entry(&good).unwrap();
+        let good_len = bytes.len() as u64;
+        // A second frame with a corrupted CRC, then a zero tail (preallocated space).
+        let mut torn = frame_entry(&WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
+        let last = torn.len() - 1;
+        torn[last] ^= 0xFF; // flip a CRC byte
+        bytes.extend_from_slice(&torn);
+        bytes.extend_from_slice(&[0u8; 4096]); // durable zeros after the torn record
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Tolerant: stop at the good record, no error, offset = end of good record.
+        let (entries, offset) = scan_wal(&path, true).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(offset, good_len);
+        // Strict: still flags corruption.
+        assert!(matches!(scan_wal(&path, false), Err(Error::WalCorrupted(_))));
+    }
 
     #[test]
     fn frame_entry_concatenation_reads_back_via_read_wal() {
