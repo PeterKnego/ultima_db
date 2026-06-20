@@ -1,6 +1,6 @@
 # autobench
 
-Claude-Code-driven autoresearch loop for ultima_db / ultima_journal performance.
+Claude-Code-driven autoresearch loop for ultima_db performance.
 Karpathy/autoresearch shape: Claude Code proposes code changes, the `run-iter`
 harness measures them, and the loop commits wins / reverts losses indefinitely
 until the human presses Ctrl-C.
@@ -15,14 +15,17 @@ wrong code.
 Open Claude Code in the primary `ultima_db/` checkout and prompt:
 
 ```
-Run the autobench loop for task journal-commit per autobench/program.md.
-```
-
-or for the SMR task:
-
-```
 Run the autobench loop for task smr-apply per autobench/program.md.
 ```
+
+or for the multiwriter-commit task:
+
+```
+Run the autobench loop for task multiwriter-commit per autobench/program.md.
+```
+
+> The `journal-commit` task moved to `ultima_cluster/uc_autobench` alongside the
+> `ultima_journal` crate; run it from there.
 
 That's the entire invocation. The loop reads `program.md`, creates a branch,
 and runs indefinitely. Interrupt with Ctrl-C when satisfied.
@@ -31,13 +34,6 @@ and runs indefinitely. Interrupt with Ctrl-C when satisfied.
 
 Results live in `autobench/tasks/<task>/results.tsv` — one row per iteration,
 committed every iteration.
-
-**Columns (journal-commit):**
-`commit | group_commit_throughput | append_consistent_p99_ns | e2e_p50_ns | e2e_p99_ns | memory_kb | group_commit_throughput_prealloc | fsync_only_p50_ns | fsync_prealloc_p50_ns | write_only_p50_ns | status | description`
-(`e2e_p50_ns` is the gated metric — median-of-N; `e2e_p99_ns` is recorded only.
-The four prealloc/stage-isolation columns are observability only — `0` on rows
-predating them; their gated baseline + p99 variants live in
-`autobench/baselines/journal-commit.json`.)
 
 **Columns (smr-apply):**
 `commit | apply_p99_ns | apply_throughput | e2e_p99_ns | memory_kb | status | description`
@@ -53,14 +49,14 @@ row and read `description`; cross-reference the matching commit in `git log`.
 
 ```
 cargo run -p ultima-autobench --bin run-iter --release -- \
-  --task journal-commit \
+  --task smr-apply \
   --json \
   --baseline-primary <champion_primary> \
   --baseline-gate-ns <champion_gate_p50_ns>
 ```
 
 Flags:
-- `--task`: `journal-commit` or `smr-apply`
+- `--task`: `smr-apply` or `multiwriter-commit`
 - `--json`: required; emits one JSON object on stdout (exit 0 even on failure)
 - `--baseline-primary`: champion's primary-metric value; omit on first iter
 - `--baseline-gate-ns`: champion's Gate B e2e **p50** median (`gate.e2e_p50_ns`

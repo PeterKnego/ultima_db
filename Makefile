@@ -22,10 +22,6 @@ coverage/vector:
 	cargo llvm-cov -p ultima-vector --features persistence --html --output-dir target/llvm-cov/vector
 	@echo "Report: target/llvm-cov/vector/html/index.html"
 
-coverage/journal:
-	cargo llvm-cov -p ultima-journal --html --output-dir target/llvm-cov/journal
-	@echo "Report: target/llvm-cov/journal/html/index.html"
-
 clean:
 	cargo clean
 
@@ -142,8 +138,6 @@ bench/compare-engines:
 
 # Perf regression gate (fitness binaries in --check mode, ~3-6 min total)
 perf/check:
-	cargo run -p ultima-autobench --bin journal-microbench --release -- \
-		--json --check --baseline autobench/baselines/journal-commit.json > /dev/null
 	cargo run -p ultima-autobench --bin smr-apply-microbench --release -- \
 		--json --check --baseline autobench/baselines/smr-apply.json > /dev/null
 	cargo run -p ultima-autobench --bin mw-commit-microbench --release -- \
@@ -151,8 +145,6 @@ perf/check:
 
 # Re-record perf baselines (run only after a deliberate perf change lands)
 perf/baseline:
-	cargo run -p ultima-autobench --bin journal-microbench --release -- \
-		--json --write-baseline autobench/baselines/journal-commit.json > /dev/null
 	cargo run -p ultima-autobench --bin smr-apply-microbench --release -- \
 		--json --write-baseline autobench/baselines/smr-apply.json > /dev/null
 	cargo run -p ultima-autobench --bin mw-commit-microbench --release -- \

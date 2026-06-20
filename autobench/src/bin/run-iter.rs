@@ -60,7 +60,7 @@ fn gate_passed(regress_pct: f64) -> bool {
 #[derive(Parser, Debug)]
 #[command(name = "run-iter")]
 struct Args {
-    /// journal-commit | smr-apply
+    /// smr-apply | multiwriter-commit
     #[arg(long)]
     task: String,
     #[arg(long)]
@@ -279,7 +279,7 @@ fn main() {
             status: "unknown_task".into(),
             stage: "setup".into(),
             stderr_tail: Some(format!(
-                "unknown task {:?}; known: journal-commit, smr-apply",
+                "unknown task {:?}; known: smr-apply, multiwriter-commit",
                 args.task
             )),
             ..Default::default()
@@ -373,21 +373,19 @@ fn main() {
         emit_and_exit(&out);
     }
 
-    // 4: Gate A — full test suites (workspace verification rule)
+    // 4: Gate A — full test suite (workspace verification rule)
     if !args.skip_tests {
-        for cmd_args in [
-            vec!["test", "--features", "persistence"],
-            vec!["test", "-p", "ultima-journal"],
-        ] {
-            let r = run_stage(cargo(&cmd_args), Duration::from_secs(900));
-            out.duration_s.tests += r.duration_s;
-            if r.timed_out || !r.exit_ok {
-                fail(&mut out, "tests_failed", "tests", &r);
-            }
+        let r = run_stage(
+            cargo(&["test", "--features", "persistence"]),
+            Duration::from_secs(900),
+        );
+        out.duration_s.tests += r.duration_s;
+        if r.timed_out || !r.exit_ok {
+            fail(&mut out, "tests_failed", "tests", &r);
         }
     }
 
-    // 5: Gate B — cluster e2e (shmem-e2e drives journal + store via path deps)
+    // 5: Gate B — cluster e2e (shmem-e2e drives the store via path deps)
     if !spec.cluster_gate || !args.cluster_dir.join("Cargo.toml").exists() {
         out.gate = Gate {
             ran: false,

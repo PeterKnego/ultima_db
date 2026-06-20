@@ -3,15 +3,13 @@ name = "ultima-autobench"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Autoresearch-style perf harness for ultima-db / ultima-journal"
+description = "Autoresearch-style perf harness for ultima-db"
 license = "Apache-2.0"
 
 [dependencies]
 ultima-db = { path = "..", features = ["persistence"] }
-ultima-journal = { path = "../../ultima_cluster/ultima_journal", features = ["bench-support"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 wait-timeout = "0.2"
 tempfile = "3"
-crc32fast = "1"

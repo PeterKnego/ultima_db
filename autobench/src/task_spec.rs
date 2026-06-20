@@ -23,15 +23,9 @@ pub struct TaskSpec {
 }
 
 pub fn task_spec(task: &str) -> Option<TaskSpec> {
+    // The `journal-commit` task moved to ultima_cluster/uc_autobench with the
+    // ultima_journal crate.
     match task {
-        "journal-commit" => Some(TaskSpec {
-            task: "journal-commit",
-            microbench_bin: "journal-microbench",
-            primary_metric: "group_commit_throughput",
-            direction: Direction::Maximize,
-            torture_test: "journal_torture",
-            cluster_gate: true,
-        }),
         "smr-apply" => Some(TaskSpec {
             task: "smr-apply",
             microbench_bin: "smr-apply-microbench",
@@ -58,10 +52,6 @@ mod tests {
 
     #[test]
     fn known_tasks_resolve() {
-        let j = task_spec("journal-commit").unwrap();
-        assert_eq!(j.microbench_bin, "journal-microbench");
-        assert_eq!(j.primary_metric, "group_commit_throughput");
-        assert_eq!(j.direction, Direction::Maximize);
         let s = task_spec("smr-apply").unwrap();
         assert_eq!(s.torture_test, "smr_apply_torture");
         assert_eq!(s.direction, Direction::Minimize);
