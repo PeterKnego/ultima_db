@@ -1,6 +1,6 @@
 # Task 36 — Journal Segment Preallocation
 
-**Status:** implemented on branch `feat/segment-preallocation` (unmerged). Local correctness gates green; authoritative perf validation (operator cloud A/B on prod NVMe) PENDING.
+**Status:** SHIPPED + merged (ultima_db main; `ultima-journal`). Cloud A/B DONE (3 platforms, 2026-06-20). **Enabled by default in `ultima_cluster`** (uc_node `UC_JOURNAL_PREALLOC` defaults on; PR #2). Library `JournalConfig::new()` stays opt-in default-off; the cluster opts in. See §7.
 
 **Design spec:** `docs/superpowers/specs/2026-06-19-segment-preallocation-design.md`
 **Implementation plan:** `docs/superpowers/plans/2026-06-19-segment-preallocation.md`
@@ -64,11 +64,23 @@ The `fsync_prealloc_*` autobench variant (`autobench/src/journal_bench.rs`; the 
 
 ## 6. Cross-repo wiring (pending, NOT done in this task)
 
-`ultima_cluster` constructs `JournalConfig { … }` as a struct literal at `uc_node/src/raft/log_storage.rs:75`. Adding the `preallocate_segments` field is source-breaking there. **When this branch merges to `ultima_db` main, `ultima_cluster` must add `preallocate_segments: false` to that literal** (keep it false — opt-out — until the cloud A/B justifies flipping it). The gate run above used a temporary `preallocate_segments: true` edit, reverted; nothing was committed to `ultima_cluster`.
+`ultima_cluster` constructs `JournalConfig { … }` as a struct literal at `uc_node/src/raft/log_storage.rs`. DONE: it now sets `preallocate_segments: journal_prealloc_from_env()`, reading `UC_JOURNAL_PREALLOC` — **default ON** post-A/B (set `=0` to roll back). The bench fleet threads it via the `uc_journal_prealloc` ansible group var (default 1). A/B cleanly flips it on the same binary. (Earlier interim state was default-OFF; flipped to default-on when the cloud A/B landed — §7.)
 
-## 7. Pending — authoritative validation
+## 7. Cloud A/B — DONE (2026-06-20, 3 platforms) → enabled by default
 
-Local microbench + gates establish correctness and the mechanism. The authoritative perf signal is the operator **cloud A/B on prod NVMe** (`submitted→persisted` p50/p99 + `uc_throughput_msgs`, flag flipped on the same binary), same harness as the fdatasync A/B (task13 §16). On prod NVMe with a power-loss-protected write cache both fsync numbers fall and the metadata-commit delta may shrink — but the jbd2 mechanism is filesystem-level, not host-specific, so the direction holds. Flip `preallocate_segments` to default-on only after that A/B confirms the win.
+Ran the interleaved A/B (Consistent, rate 200/s, inflight 8; `UC_JOURNAL_PREALLOC=0` vs `1` on the same binary) on three fleets via the `runtime-stats` instrument (`RAFT_RUNTIME_STATS` scraped from node0). `submitted→persisted` (leader journal append+fsync), prealloc OFF→ON:
+
+| platform | storage | fsync floor (P1, off→on) | P50 | body P1–P10 | P99 | end-to-end |
+|---|---|---|---|---|---|---|
+| Hetzner ccx13 | local NVMe | ~876µs | 1531→1095 (**−28%**) | −~50% | flat | NULL |
+| AWS c7i.4xlarge | **EBS (network)** | 2566→2566µs | 2910→2866 (−1.5%) | ~0% | flat | NULL |
+| AWS c6id.4xlarge | **local NVMe** | 155→75µs | 261→194 (**−26%**) | **−43..53%** | flat (~6.5ms) | NULL |
+
+**Mechanism confirmed (not inferred):** on local NVMe the per-commit fsync floor *halves* (155→75µs on c6id) — the ext4 jbd2 metadata commit preallocation removes is ~half a fast-NVMe fsync. On EBS the ~2.5ms network-flush floor swamps it (identical floor on/off → NULL). The win is real and reproducible on two independent local-NVMe platforms (−26..28% P50, −~50% body), NULL on network storage.
+
+**But it does not reach end-to-end** on any platform: commit latency is unchanged (5ms `api_batch_linger` + replication dominate — structurally the same NULL as the fdatasync A/B, task13 §16). The P99 *tail* of the journal stage is also flat (batching/scheduling-bound at this rate, not jbd2-bound).
+
+**Decision: enabled by default** (maintainer call, 2026-06-20). The strict gate (submitted→persisted P99 + an end-to-end effect) was *not* met, but the journal-median win is real, free, correctness-proven (lincheck + hard-crash green with prealloc on), and shows **no regression on any storage** — so default-on with `UC_JOURNAL_PREALLOC=0` rollback. Caveat: on network storage (EBS) the win is nil and the background 64 MB zero-fill is wasted I/O (off the commit path, so harmless to latency); set `UC_JOURNAL_PREALLOC=0` for EBS-backed deployments if the zero-fill I/O is unwanted.
 
 ## 8. Future extension (out of scope): O_DIRECT / O_DSYNC
 
