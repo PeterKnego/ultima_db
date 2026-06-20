@@ -182,24 +182,38 @@ if needed; v1 hardcodes the 16 MiB quantum.
 
 ---
 
-## 10. Pending: real-disk A/B validation
+## 10. A/B validation
 
-The bench arm `standalone_consistent_coalesced_prealloc` in
-`benches/singlewriter_persistence_bench.rs` provides a direct A/B pair against the existing
-`standalone_consistent` arm (same `Durability::Consistent`, same workload, only `wal_write`
-differs).
+### Sandbox A/B (2026-06-20) — strong directional confirmation
 
-**This A/B must be run on the bench host, not in the sandbox.**  Sandbox noise floors reach
-±2× (see `docs/tasks/task35_autobench_perf_harness.md` and the project's
-`bench-A/B methodology` memory note); a sandbox result cannot confirm or deny the win.
-The real-disk protocol is: worktree + shared `CARGO_TARGET_DIR`, re-record `make perf/baseline`
-on the bench machine before trusting `make perf/check`.
+A same-host YCSB A/B on **real ext4** (not tmpfs) shows preallocation makes every
+fsync-bound strict-tier workload **~2.0–2.3× faster**, with read-only and the whole
+nondurable tier flat (the controls). Full tables, methodology, and caveats:
+`docs/benchmarks/wal-preallocation-ab-2026-06-20.md`.
 
-**Feature stays opt-in/off** (`WalWrite::PerEntry` remains the default) until the real-disk
-A/B shows a statistically clear `Consistent`-commit throughput improvement with no
-recovery/durability regressions.  If the delta is within real-disk noise, the result is
-recorded and the feature remains opt-in — mirroring the journal's pending cloud A/B posture
-(see `docs/tasks/task36_segment_preallocation.md`).
+| Strict workload | OFF | ON | speedup |
+|---|---|---|---|
+| A update-heavy | 550.7 ms | 240.2 ms | 2.29× |
+| B read-mostly | 58.0 ms | 25.2 ms | 2.30× |
+| D read-latest | 55.6 ms | 25.4 ms | 2.19× |
+| E short-ranges | 52.5 ms | 25.8 ms | 2.04× |
+| F read-modify-write | 512.6 ms | 229.6 ms | 2.23× |
+| C read-only | 129.9 µs | 132.5 µs | flat ✓ |
+
+The A/B is driven by the `ULTIMA_BENCH_PREALLOC` toggle in `benches/ycsb_bench.rs`
+(`Coalesced` → `CoalescedPrealloc`); the bench arm
+`standalone_consistent_coalesced_prealloc` in `benches/singlewriter_persistence_bench.rs`
+is an equivalent pair. The ~2× clears the sandbox noise floor (±15% error bars) decisively.
+
+### Still pending: bench-host confirmation
+
+Sandbox **absolute magnitudes are not portable** (±2× run-to-run; see
+`docs/tasks/task35_autobench_perf_harness.md` and the `bench-A/B methodology` memory note).
+Re-run on the real bench machine (worktree + shared `CARGO_TARGET_DIR`, re-record
+`make perf/baseline`) to capture a portable number before relying on it for gating.
+
+**Feature stays opt-in/off** (`WalWrite::PerEntry` remains the default) regardless — the
+sandbox A/B confirms direction and rough size, not a production default flip.
 
 ---
 

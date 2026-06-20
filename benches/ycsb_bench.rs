@@ -30,13 +30,20 @@ impl UltimaEngine {
             BenchDurability::NonDurable => Durability::Eventual,
             BenchDurability::Strict => Durability::Consistent,
         };
+        // A/B toggle: `ULTIMA_BENCH_PREALLOC` (any non-empty value) selects the
+        // preallocating WAL sink, so prealloc-on vs prealloc-off is the only
+        // variable. Default stays `Coalesced` to match the committed baseline.
+        let wal_write = match std::env::var_os("ULTIMA_BENCH_PREALLOC") {
+            Some(v) if !v.is_empty() => WalWrite::CoalescedPrealloc,
+            _ => WalWrite::Coalesced,
+        };
         let store = Store::new(StoreConfig {
             num_snapshots_retained: 2,
             auto_snapshot_gc: true,
             persistence: Persistence::Standalone {
                 dir: tmpdir.path().to_path_buf(),
                 durability,
-                wal_write: WalWrite::Coalesced,
+                wal_write,
             },
             ..StoreConfig::default()
         })
