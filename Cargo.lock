@@ -1367,7 +1367,6 @@ dependencies = [
  "bincode",
  "crc32fast",
  "serde",
- "tempfile",
  "thiserror",
 ]
 
