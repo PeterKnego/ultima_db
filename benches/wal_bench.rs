@@ -2,8 +2,14 @@
 // of the store so we can measure the cost of a durable commit and compare write
 // backends (sinks) across record sizes.
 //
-// Dimensions: sink {fswrite[,buffered,mmap,iouring]} x size {1,2,4,8,16 KiB} x
-// view {consistent single, eventual single, eventual batch}.
+// Dimensions: sink {fswrite,coalesced,buffered,mmap,coalesced_prealloc[,iouring]} x
+// size {1,2,4,8,16 KiB} x view {consistent single, eventual single, eventual batch}.
+//
+// Three points on the preallocation axis are directly comparable here:
+//   coalesced          — no preallocation (size-extending append + fsync per commit)
+//   mmap               — *sparse* set_len pre-size (ext4 leaves unwritten extents)
+//   coalesced_prealloc — *real* zero-fill preallocation (extents written; per-commit
+//                        fsync degenerates to a metadata-free fdatasync)
 //
 // IMPORTANT: fsync on tmpfs is a no-op, which would make every number here
 // meaningless. The WAL dir is pinned to `target/wal-bench` (real disk); the
@@ -31,6 +37,7 @@ const KINDS: &[(&str, WalSinkKind)] = &[
     ("coalesced", WalSinkKind::Coalesced),
     ("buffered", WalSinkKind::BufferedFile),
     ("mmap", WalSinkKind::Mmap),
+    ("coalesced_prealloc", WalSinkKind::CoalescedPrealloc),
     ("iouring", WalSinkKind::IoUring),
 ];
 #[cfg(not(all(target_os = "linux", feature = "wal-iouring")))]
@@ -39,6 +46,7 @@ const KINDS: &[(&str, WalSinkKind)] = &[
     ("coalesced", WalSinkKind::Coalesced),
     ("buffered", WalSinkKind::BufferedFile),
     ("mmap", WalSinkKind::Mmap),
+    ("coalesced_prealloc", WalSinkKind::CoalescedPrealloc),
 ];
 
 /// Build a single-op WAL entry whose payload is `payload` bytes.
@@ -106,7 +114,19 @@ fn wal_benches(c: &mut Criterion) {
                 g.throughput(Throughput::Bytes(size as u64));
                 g.bench_function(BenchmarkId::new(kind_name, label(size)), |b| {
                     b.iter_batched(
-                        || new_wal(&root, true, kind),
+                        || {
+                            let (dir, wal) = new_wal(&root, true, kind);
+                            // Warm the preallocating sink off-clock: its one-time
+                            // chunk zero-fill is a setup cost, not a per-commit
+                            // cost. Without this, the measured commit would pay the
+                            // 16 MiB fill and compare prealloc's cold start against
+                            // the other sinks' steady state. Other sinks have no
+                            // warm-up cost, so this fires only for prealloc.
+                            if matches!(kind, WalSinkKind::CoalescedPrealloc) {
+                                wal.commit_consistent(make_entry(0, size)).unwrap();
+                            }
+                            (dir, wal)
+                        },
                         |(dir, wal)| {
                             wal.commit_consistent(make_entry(1, size)).unwrap();
                             (dir, wal)
@@ -121,6 +141,9 @@ fn wal_benches(c: &mut Criterion) {
 
     // --- Eventual: caller-visible latency of one fire-and-forget commit (no
     // drain). The fsync runs on the bg thread and is forced off-clock at teardown.
+    // For `coalesced_prealloc` the one-time chunk fill also happens on the bg
+    // thread, so it does not inflate this caller-visible latency (no warm-up
+    // needed here, unlike the Consistent group above).
     {
         let mut g = c.benchmark_group("wal_commit_eventual");
         for &(kind_name, kind) in KINDS {
@@ -142,6 +165,10 @@ fn wal_benches(c: &mut Criterion) {
     }
 
     // --- Eventual batched: fire-and-forget batch + single drain (group commit). -
+    // Caveat: `coalesced_prealloc` here pays its one-time 16 MiB chunk fill inside
+    // the measured drain (amortized over EVENTUAL_BATCH commits) — most visible at
+    // small record sizes. The steady-state per-commit win is the warmed Consistent
+    // group above; this group shows the batched-Eventual path including cold start.
     {
         let mut g = c.benchmark_group("wal_eventual_batch");
         g.sample_size(20);
