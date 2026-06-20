@@ -65,3 +65,54 @@ fn prealloc_store_commits_and_recovers() {
     let t = rtx.open_table::<Row>("rows").unwrap();
     assert_eq!(t.get(1).map(|r| r.v), Some(42));
 }
+
+#[test]
+fn prealloc_every_acked_commit_survives_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::new(cfg(dir.path())).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+        for v in 1..=50u64 {
+            let mut wtx = store.begin_write(None).unwrap();
+            { let mut t = wtx.open_table::<Row>("rows").unwrap(); t.insert(Row { v }).unwrap(); }
+            wtx.commit().unwrap(); // Consistent: returns only after durable
+        }
+    } // drop without clean shutdown
+    let store = Store::new(cfg(dir.path())).unwrap();
+    store.register_table::<Row>("rows").unwrap();
+    store.recover().unwrap();
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<Row>("rows").unwrap();
+    for v in 1..=50u64 {
+        assert_eq!(t.get(v).map(|r| r.v), Some(v), "acked commit {v} lost");
+    }
+}
+
+#[test]
+fn prealloc_checkpoint_prunes_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::new(cfg(dir.path())).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+        for v in 1..=10u64 {
+            let mut wtx = store.begin_write(None).unwrap();
+            { let mut t = wtx.open_table::<Row>("rows").unwrap(); t.insert(Row { v }).unwrap(); }
+            wtx.commit().unwrap();
+        }
+        store.checkpoint().unwrap(); // writes checkpoint + prunes the preallocated WAL
+        // More commits after the checkpoint/prune.
+        for v in 11..=15u64 {
+            let mut wtx = store.begin_write(None).unwrap();
+            { let mut t = wtx.open_table::<Row>("rows").unwrap(); t.insert(Row { v }).unwrap(); }
+            wtx.commit().unwrap();
+        }
+    }
+    let store = Store::new(cfg(dir.path())).unwrap();
+    store.register_table::<Row>("rows").unwrap();
+    store.recover().unwrap();
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<Row>("rows").unwrap();
+    for v in 1..=15u64 {
+        assert_eq!(t.get(v).map(|r| r.v), Some(v), "row {v} missing after checkpoint+prune");
+    }
+}
