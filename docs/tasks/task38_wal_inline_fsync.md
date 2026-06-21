@@ -1,6 +1,6 @@
 # task38: WAL Inline Fsync (`Durability::ConsistentInline`)
 
-**Status:** Implemented; real-disk A/B validation pending on bench host (NVMe fleet torn down).
+**Status:** Implemented and validated on real NVMe (AWS c6id.4xlarge, 2026-06-21) — inline+prealloc 40.6 µs/commit vs async-PerEntry 153.5 µs (3.78×); see §6.
 **Related:**
 - `docs/superpowers/specs/2026-06-21-wal-inline-fsync-config-design.md` (full design spec)
 - `docs/tasks/task37_wal_preallocation.md` (preallocation, which made the handoff the dominant cost on fast disk)
@@ -156,13 +156,34 @@ no concurrent writer (SingleWriter).
 All measurements are serial (SingleWriter), 200 commits/iteration, from
 `singlewriter_persistence_bench`.
 
-**Bench-host A/B (real NVMe):** pending.  The NVMe fleet was torn down before the
-inline bench arm could be run.  The tmpfs differential (~32 µs handoff isolated) is
-mechanistic evidence independent of device speed; the projected NVMe win (~1.9×) follows
-directly from the preallocation data (task37) which characterized fsync cost at ~35 µs.
+### Bench-host A/B — real NVMe (2026-06-21, confirmed)
 
-A `standalone_consistent_inline` bench arm has been added to
-`benches/singlewriter_persistence_bench.rs` as the A/B pair for `standalone_consistent`.
+Run on one AWS `c6id.4xlarge` node, local NVMe instance store (ext4), 16 vCPU,
+`singlewriter_persistence_bench`, 200 serial commits/iteration, `TMPDIR` on NVMe:
+
+| config | µs/commit | vs old default |
+|---|---|---|
+| `Consistent` async, `PerEntry` (old default) | 153.5 | 1.0× |
+| `Consistent` async, `CoalescedPrealloc` | 61.2 | 2.5× |
+| `ConsistentInline`, `PerEntry` | 130.8 | 1.17× |
+| **`ConsistentInline`, `CoalescedPrealloc`** | **40.6** | **3.78×** |
+| (reference: `inmemory` 1.70 µs/commit; `Eventual` 2.48 µs/commit) | | |
+
+**Inline removes a fixed ~21 µs/commit handoff** (153.5→130.8 on PerEntry;
+61.2→40.6 on prealloc). Its *relative* impact scales inversely with fsync cost:
+only ~15% on `PerEntry` (whose ~150 µs `sync_all` dominates), but **1.51×** on the
+prealloc path (61.2→40.6, the measured number landing on the design's ~38 µs
+projection). Stacked with preallocation, **3.78×** vs the old async-`PerEntry`
+default. Statistically clean (p<0.05); `inmemory`/`Eventual` flat as controls.
+
+The earlier ~1.9× projection assumed a ~72 µs async baseline; the measured
+singlewriter async-prealloc baseline is 61 µs, so the inline-on-prealloc win is
+~1.51× — the same fixed ~21 µs handoff removal, validated on real hardware.
+
+The `standalone_consistent_inline` bench arm (`benches/singlewriter_persistence_bench.rs`)
+uses `PerEntry`; for the inline+prealloc number above its `wal_write` was switched
+to `CoalescedPrealloc` for the run. Consider adding a dedicated inline+prealloc arm
+if this becomes a tracked metric.
 
 ---
 
