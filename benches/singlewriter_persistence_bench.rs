@@ -9,7 +9,8 @@
 //! concurrency there is nothing to overlap fsyncs against, so the Standalone
 //! tiers pay their per-commit I/O cost in full.
 //!
-//! Configurations: inmemory, smr, standalone_consistent, standalone_consistent_inline, standalone_eventual.
+//! Configurations: inmemory, smr, standalone_consistent, standalone_consistent_inline,
+//! standalone_consistent_inline_prealloc, standalone_consistent_coalesced_prealloc, standalone_eventual.
 //!
 //! `smr` (`Persistence::Smr`) is checkpoint-only: `commit()` does no per-commit
 //! disk I/O (durability is delegated to an external consensus log), so its
@@ -25,8 +26,9 @@
 //! | `smr`                                     | ~1.11 Melem/s  | baseline         |
 //! | `standalone_eventual`                     | ~0.65 Melem/s  | smr ~1.7× faster |
 //! | `standalone_consistent`                   | ~25.5 Kelem/s  | smr ~43× faster  |
-//! | `standalone_consistent_inline`            | real-disk A/B  | tmpfs: ~3 µs/commit (handoff eliminated); bench-host NVMe pending |
-//! | `standalone_consistent_coalesced_prealloc`| real-disk A/B  | sandbox noise ±2× makes sandbox results uninformative; run on bench host |
+//! | `standalone_consistent_inline`            | real-disk A/B  | NVMe (c6id, PerEntry): 130.8 µs/commit vs async 153.5 (1.17×) |
+//! | `standalone_consistent_inline_prealloc`   | real-disk A/B  | NVMe (c6id): 40.6 µs/commit — 1.51× vs async-prealloc, 3.78× vs old default |
+//! | `standalone_consistent_coalesced_prealloc`| real-disk A/B  | NVMe (c6id): 61.2 µs/commit (2.5× vs async-PerEntry). Sandbox noise ±2×. |
 //!
 //! Takeaway: serially, SMR is again indistinguishable from in-memory, and the
 //! Consistent gap blows out to ~40×+ (vs ~6× under the multi-writer bench)
@@ -218,6 +220,28 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent_inline", |b| {
+            b.iter(|| {
+                run_serial_commits(&store);
+                black_box(());
+            });
+        });
+    }
+
+    // Inline-fsync + preallocation (both optimizations stacked) — the fastest
+    // durable config. Real NVMe (AWS c6id, 2026-06-21): 40.6 µs/commit vs
+    // async-prealloc 61.2 µs (1.51×) and async-PerEntry 153.5 µs (3.78×).
+    // See docs/tasks/task38_wal_inline_fsync.md §6.
+    {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = make_store(
+            Persistence::Standalone {
+                dir: std::path::PathBuf::new(),
+                durability: ultima_db::Durability::ConsistentInline,
+                wal_write: WalWrite::CoalescedPrealloc,
+            },
+            Some(tmpdir.path()),
+        );
+        group.bench_function("standalone_consistent_inline_prealloc", |b| {
             b.iter(|| {
                 run_serial_commits(&store);
                 black_box(());
