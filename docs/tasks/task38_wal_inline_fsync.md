@@ -70,6 +70,19 @@ struct shape.
 `wal_write` applies independently: `PerEntry`, `Coalesced`, and `CoalescedPrealloc` all
 work with `ConsistentInline` — the write strategy and the fsync mechanism are orthogonal.
 
+### Recommended preset
+
+`Persistence::standalone_fast(dir)` bundles the fastest durable single-writer config
+(`ConsistentInline` + `CoalescedPrealloc` — 40.6 µs/commit on NVMe, §6):
+
+```rust
+StoreConfig { persistence: Persistence::standalone_fast(dir), ..Default::default() }
+```
+
+It is a convenience constructor, not a default change — existing configs are untouched,
+and it inherits the SingleWriter-only restriction (`Store::new` errors under MultiWriter).
+For MultiWriter, use `Standalone { durability: Durability::Consistent, .. }`.
+
 ---
 
 ## 3. SingleWriter restriction

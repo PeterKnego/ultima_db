@@ -20,6 +20,61 @@ fn cfg(dir: &std::path::Path, wm: WriterMode) -> StoreConfig {
 }
 
 #[test]
+fn standalone_fast_preset_is_inline_plus_prealloc() {
+    let p = Persistence::standalone_fast("/tmp/x");
+    match p {
+        Persistence::Standalone { durability, wal_write, .. } => {
+            assert_eq!(durability, Durability::ConsistentInline);
+            assert_eq!(wal_write, WalWrite::CoalescedPrealloc);
+        }
+        _ => panic!("standalone_fast must produce Standalone"),
+    }
+}
+
+#[test]
+fn standalone_fast_preset_commits_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = || StoreConfig {
+        persistence: Persistence::standalone_fast(dir.path()),
+        ..StoreConfig::default() // SingleWriter by default
+    };
+    {
+        let store = Store::new(mk()).unwrap();
+        store.register_table::<Row>("rows").unwrap();
+        for v in 1..=15u64 {
+            let mut wtx = store.begin_write(None).unwrap();
+            { let mut t = wtx.open_table::<Row>("rows").unwrap(); t.insert(Row { v }).unwrap(); }
+            wtx.commit().unwrap();
+        }
+    } // drop = crash
+    let store = Store::new(mk()).unwrap();
+    store.register_table::<Row>("rows").unwrap();
+    store.recover().unwrap();
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table::<Row>("rows").unwrap();
+    for v in 1..=15u64 {
+        assert_eq!(t.get(v).map(|r| r.v), Some(v), "preset commit {v} lost");
+    }
+}
+
+#[test]
+fn standalone_fast_preset_rejects_multiwriter() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig {
+        writer_mode: WriterMode::MultiWriter,
+        persistence: Persistence::standalone_fast(dir.path()),
+        ..StoreConfig::default()
+    };
+    match Store::new(cfg) {
+        Err(e) => assert!(
+            e.to_string().contains("requires WriterMode::SingleWriter"),
+            "got: {e}"
+        ),
+        Ok(_) => panic!("standalone_fast + MultiWriter must error"),
+    }
+}
+
+#[test]
 fn inline_singlewriter_commits_and_recovers() {
     let dir = tempfile::tempdir().unwrap();
     {

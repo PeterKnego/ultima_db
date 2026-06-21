@@ -104,3 +104,24 @@ pub enum Persistence {
         dir: PathBuf,
     },
 }
+
+impl Persistence {
+    /// Recommended fast durable config for a **single-writer** store: inline-fsync
+    /// ([`Durability::ConsistentInline`]) + preallocation ([`WalWrite::CoalescedPrealloc`])
+    /// — the lowest durable-commit latency (validated ~3.8× vs the `PerEntry` default
+    /// on NVMe; see `docs/tasks/task38_wal_inline_fsync.md`).
+    ///
+    /// Same durability guarantee as [`Durability::Consistent`] (commit blocks until
+    /// fsynced; no data loss on crash). **SingleWriter only** — building a store with
+    /// this and [`WriterMode::MultiWriter`](crate::WriterMode::MultiWriter) returns an
+    /// error from [`Store::new`](crate::Store::new) (inline cannot guarantee WAL-append
+    /// order under concurrent writers). For MultiWriter, construct
+    /// [`Persistence::Standalone`] with [`Durability::Consistent`].
+    pub fn standalone_fast(dir: impl Into<PathBuf>) -> Self {
+        Persistence::Standalone {
+            dir: dir.into(),
+            durability: Durability::ConsistentInline,
+            wal_write: WalWrite::CoalescedPrealloc,
+        }
+    }
+}
