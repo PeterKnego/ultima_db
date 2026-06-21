@@ -9,7 +9,7 @@
 //! concurrency there is nothing to overlap fsyncs against, so the Standalone
 //! tiers pay their per-commit I/O cost in full.
 //!
-//! Configurations: inmemory, smr, standalone_consistent, standalone_eventual.
+//! Configurations: inmemory, smr, standalone_consistent, standalone_consistent_inline, standalone_eventual.
 //!
 //! `smr` (`Persistence::Smr`) is checkpoint-only: `commit()` does no per-commit
 //! disk I/O (durability is delegated to an external consensus log), so its
@@ -189,6 +189,34 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent_coalesced_prealloc", |b| {
+            b.iter(|| {
+                run_serial_commits(&store);
+                black_box(());
+            });
+        });
+    }
+
+    // Standalone Consistent Inline (off-lock inline fsync, no bg-thread handoff)
+    //
+    // A/B pair with `standalone_consistent` above: identical durability guarantee,
+    // identical workload; only the fsync mechanism differs.  The committing thread
+    // performs the fsync itself (off-lock), eliminating the ~20–35 µs cross-thread
+    // handoff that otherwise dominates serial durable-commit cost on fast disk.
+    //
+    // Measured on tmpfs (fsync ≈ 0): handoff ≈ 32 µs/commit removed → ~3 µs/commit.
+    // Projected NVMe: ~72 µs → ~38 µs (~1.9×).  Real bench-host A/B still pending
+    // (NVMe fleet was torn down).  See docs/tasks/task38_wal_inline_fsync.md.
+    {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = make_store(
+            Persistence::Standalone {
+                dir: std::path::PathBuf::new(),
+                durability: ultima_db::Durability::ConsistentInline,
+                wal_write: WalWrite::PerEntry,
+            },
+            Some(tmpdir.path()),
+        );
+        group.bench_function("standalone_consistent_inline", |b| {
             b.iter(|| {
                 run_serial_commits(&store);
                 black_box(());
