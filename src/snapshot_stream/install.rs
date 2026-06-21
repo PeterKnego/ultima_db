@@ -129,7 +129,7 @@ impl crate::store::Store {
         // `base_snapshot` still reflects the pre-commit state, silently
         // dropping any indexes added in the interim.
         let (registry, base_snapshot, base_version) = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             let v = inner.latest_version;
             let snap = inner.snapshots.get(&v).cloned();
             (Arc::clone(&inner.registry), snap, v)

@@ -22,7 +22,8 @@
 //! committing — same release path).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use parking_lot::{Condvar, Mutex};
 
 use dashmap::DashMap;
 
@@ -46,21 +47,21 @@ impl IntentWaiter {
     /// Wake every thread blocked in `wait()`. Idempotent: calling twice is
     /// harmless (the flag latches true).
     pub(crate) fn signal_done(&self) {
-        let mut d = self.done.lock().unwrap();
+        let mut d = self.done.lock();
         *d = true;
         self.cvar.notify_all();
     }
 
     pub(crate) fn wait(&self) {
-        let mut d = self.done.lock().unwrap();
+        let mut d = self.done.lock();
         while !*d {
-            d = self.cvar.wait(d).unwrap();
+            self.cvar.wait(&mut d);
         }
     }
 
     #[cfg(test)]
     pub(crate) fn is_signaled(&self) -> bool {
-        *self.done.lock().unwrap()
+        *self.done.lock()
     }
 }
 

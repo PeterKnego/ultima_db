@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::Arc;
+use parking_lot::{ArcMutexGuard, Condvar, Mutex, RwLock};
 
 use dashmap::DashMap;
 
@@ -183,39 +184,39 @@ struct ReadSetEntry {
 /// (without promoting) so later writers don't park forever.
 struct PromoteGate {
     turn: Mutex<u64>,
-    cv: std::sync::Condvar,
+    cv: Condvar,
 }
 
 impl PromoteGate {
     fn new() -> Self {
         Self {
             turn: Mutex::new(0),
-            cv: std::sync::Condvar::new(),
+            cv: Condvar::new(),
         }
     }
 
     /// Returns true if it is `ticket`'s turn to promote (non-blocking).
     fn is_turn(&self, ticket: u64) -> bool {
-        *self.turn.lock().unwrap() == ticket
+        *self.turn.lock() == ticket
     }
 
     /// The ticket currently allowed to promote. Equal to the store's
     /// `next_ticket` exactly when no ticketed commit is in flight.
     fn current_turn(&self) -> u64 {
-        *self.turn.lock().unwrap()
+        *self.turn.lock()
     }
 
     /// Blocks until it is `ticket`'s turn to promote.
     fn wait_turn(&self, ticket: u64) {
-        let mut turn = self.turn.lock().unwrap();
+        let mut turn = self.turn.lock();
         while *turn != ticket {
-            turn = self.cv.wait(turn).unwrap();
+            self.cv.wait(&mut turn);
         }
     }
 
     /// Advances past `ticket`, waking the next waiter.
     fn advance(&self) {
-        let mut turn = self.turn.lock().unwrap();
+        let mut turn = self.turn.lock();
         *turn += 1;
         self.cv.notify_all();
     }
@@ -431,14 +432,14 @@ impl Store {
 
     /// The version number of the most recently committed snapshot.
     pub fn latest_version(&self) -> u64 {
-        self.inner.read().unwrap().latest_version
+        self.inner.read().latest_version
     }
 
     /// Open a read transaction at `version` (latest if `None`).
     ///
     /// Returns [`Error::VersionNotFound`] if the requested version does not exist.
     pub fn begin_read(&self, version: Option<u64>) -> Result<ReadTx> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let v = version.unwrap_or(inner.latest_version);
         let snapshot = inner
             .snapshots
@@ -463,7 +464,7 @@ impl Store {
     /// The base snapshot for the transaction is always the latest committed
     /// snapshot, regardless of the assigned commit version.
     pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         #[cfg(feature = "persistence")]
         inner.wal_poison.check()?;
@@ -556,13 +557,13 @@ impl Store {
     /// snapshot held by an active [`ReadTx`]. The latest snapshot is always kept
     /// even if `num_snapshots_retained` is 0.
     pub fn gc(&self) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         gc_inner(&mut inner);
     }
 
     /// Returns a point-in-time snapshot of all store and table metrics.
     pub fn metrics(&self) -> crate::metrics::MetricsSnapshot {
-        self.inner.read().unwrap().metrics.snapshot()
+        self.inner.read().metrics.snapshot()
     }
 
     // --- Persistence methods (feature-gated) ---
@@ -571,7 +572,7 @@ impl Store {
     /// Only meaningful in Eventual durability mode; returns 0 otherwise.
     #[cfg(feature = "persistence")]
     pub fn pending_wal_writes(&self) -> u64 {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.wal_handle.as_ref().map_or(0, |h| h.pending_writes())
     }
 
@@ -583,7 +584,7 @@ impl Store {
     /// durability is provided elsewhere) this returns 0.
     #[cfg(feature = "persistence")]
     pub fn durable_version(&self) -> u64 {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.wal_handle.as_ref().map_or(0, |h| h.durable_version())
     }
 
@@ -598,7 +599,7 @@ impl Store {
     #[cfg(feature = "persistence")]
     pub fn wait_durable(&self, version: u64) -> Result<()> {
         let durability = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             inner.wal_handle.as_ref().map(|h| h.durability())
         };
         match durability {
@@ -621,7 +622,7 @@ impl Store {
         F: FnOnce(Result<()>) + Send + 'static,
     {
         let durability = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             inner.wal_handle.as_ref().map(|h| h.durability())
         };
         match durability {
@@ -635,7 +636,7 @@ impl Store {
     /// [`Store::checkpoint`].
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         Arc::get_mut(&mut inner.registry)
             .ok_or_else(|| {
                 Error::Persistence(
@@ -660,10 +661,10 @@ impl Store {
     pub fn checkpoint(&self) -> Result<u64> {
         // Serialize whole checkpoints: an interleaved slower checkpoint
         // could otherwise prune/cleanup state only the faster one covers.
-        let _serialize = self.checkpoint_lock.lock().unwrap();
+        let _serialize = self.checkpoint_lock.lock();
 
         let (dir, snap, registry) = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
                 crate::persistence::Persistence::Standalone { dir, .. }
@@ -685,7 +686,7 @@ impl Store {
         // thread (serialized with appends). Only the brief request is made
         // under the store lock; the wait happens with no lock held.
         let prune_rx = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             match (&inner.config.persistence, &inner.wal_handle) {
                 (crate::persistence::Persistence::Standalone { .. }, Some(wal)) => {
                     Some(wal.request_prune(version)?)
@@ -699,7 +700,7 @@ impl Store {
                 Err(_) => {
                     // WAL thread stopped before pruning: poisoned (surface
                     // that error) or shutting down.
-                    self.inner.read().unwrap().wal_poison.check()?;
+                    self.inner.read().wal_poison.check()?;
                     return Err(Error::Persistence(
                         "WAL writer stopped before prune completed".into(),
                     ));
@@ -727,7 +728,7 @@ impl Store {
         use crate::persistence::Persistence;
 
         let dir = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             match &inner.config.persistence {
                 Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
                 Persistence::None => return Ok(()),
@@ -737,12 +738,12 @@ impl Store {
         // Load latest checkpoint if present.
         if let Some(cp_path) = crate::checkpoint::find_latest_checkpoint(&dir)? {
             let registry = {
-                let inner = self.inner.read().unwrap();
+                let inner = self.inner.read();
                 Arc::clone(&inner.registry)
             };
             let snapshot = crate::checkpoint::load_checkpoint(&cp_path, &registry)?;
 
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write();
             let v = snapshot.version;
             inner.snapshots.insert(v, Arc::new(snapshot));
             inner.latest_version = v;
@@ -753,7 +754,7 @@ impl Store {
 
         // Replay WAL entries (Standalone mode only).
         {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             if matches!(inner.config.persistence, Persistence::Standalone { .. }) {
                 let wal_path_buf = crate::wal::wal_path(&dir);
                 let tolerant = matches!(
@@ -772,7 +773,7 @@ impl Store {
                     .collect();
 
                 if !to_replay.is_empty() {
-                    let mut inner = self.inner.write().unwrap();
+                    let mut inner = self.inner.write();
                     // Build a new table map with sole ownership of each Arc.
                     // We re-wrap each table in a fresh Arc so Arc::get_mut succeeds during replay.
                     let base_snap = &inner.snapshots[&inner.latest_version];
@@ -903,7 +904,7 @@ impl Store {
         crate::snapshot_stream::SnapshotStreamError,
     > {
         let (snap, registry) = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             let v = version.unwrap_or(inner.latest_version);
             let snap = inner
                 .snapshots
@@ -930,7 +931,7 @@ impl Store {
         use crate::persistence::Persistence;
 
         let dir = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             match &inner.config.persistence {
                 Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
                 Persistence::None => return Ok(Vec::new()),
@@ -982,7 +983,7 @@ impl Store {
         use crate::snapshot_stream::SnapshotStreamError;
 
         let (dir, registry) = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             let dir = match &inner.config.persistence {
                 Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
                 Persistence::None => {
@@ -1008,12 +1009,12 @@ impl Store {
 
     #[cfg(test)]
     fn snapshot_count(&self) -> usize {
-        self.inner.read().unwrap().snapshots.len()
+        self.inner.read().snapshots.len()
     }
 
     #[cfg(test)]
     fn has_snapshot(&self, version: u64) -> bool {
-        self.inner.read().unwrap().snapshots.contains_key(&version)
+        self.inner.read().snapshots.contains_key(&version)
     }
 
     /// Number of committed write sets retained in the OCC log.
@@ -1022,7 +1023,7 @@ impl Store {
     /// when no `WriteTx` instances are active.
     #[doc(hidden)]
     pub fn committed_write_set_count(&self) -> usize {
-        self.inner.read().unwrap().committed_write_sets.len()
+        self.inner.read().committed_write_sets.len()
     }
 
     // -----------------------------------------------------------------------
@@ -1074,7 +1075,7 @@ impl Store {
 
                 // 1. Capture base snapshot + version.
                 let (base_snapshot, base_version) = {
-                    let inner = self.inner.read().unwrap();
+                    let inner = self.inner.read();
                     (
                         inner.snapshots[&inner.latest_version].clone(),
                         inner.latest_version,
@@ -1149,7 +1150,7 @@ impl Store {
         {
             use crate::persistence::Persistence;
             let is_persistent = {
-                let inner = self.inner.read().unwrap();
+                let inner = self.inner.read();
                 matches!(
                     inner.config.persistence,
                     Persistence::Standalone { .. } | Persistence::Smr { .. },
@@ -1196,7 +1197,7 @@ impl Store {
 
         // 2. Snapshot to read existing index defs (if any).
         let base_snapshot = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             inner.snapshots[&inner.latest_version].clone()
         };
 
@@ -1255,7 +1256,7 @@ impl Store {
             !pending.is_empty(),
             "install_batch called with empty pending"
         );
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         // SingleWriter has no commit-time OCC: an active writer's eventual
         // commit installs its dirty tables wholesale and cannot detect this
@@ -1388,61 +1389,31 @@ impl Store {
 }
 
 /// RAII owner of a set of per-table commit locks acquired in canonical
-/// order. Stores each `Arc<Mutex<()>>` alongside a `MutexGuard` borrowed
-/// from it; the guard is dropped before the Arc (via explicit
-/// `ManuallyDrop`), so the borrow never outlives its source.
+/// (sorted-by-name) order to prevent deadlock. Each `ArcMutexGuard` owns
+/// both the lock and an `Arc` reference to the `Mutex`, so the guard is
+/// `'static` by construction — no lifetime workaround is needed.
 ///
-/// The `'static` lifetime on the stored guards is a pure bookkeeping
-/// trick — the actual lifetime is tied to the paired `Arc<Mutex<()>>` in
-/// the same entry. Safety relies on dropping guards before Arcs, which
-/// `Drop::drop` enforces explicitly below.
+/// Locks are released when this struct is dropped; `Vec` drops elements
+/// in forward (acquisition) order. For independent per-table mutexes
+/// release order does not affect correctness — no lock is held while
+/// acquiring another at release time — so forward drop is equivalent to
+/// the reverse-order `pop()` used previously. This relies on these being
+/// side-effect-free leaf locks (`Mutex<()>` whose `Drop` does no work and
+/// touches no other lock); keep them that way or revisit the drop order.
 struct TableLockGuards {
-    slots: Vec<LockSlot>,
-}
-
-struct LockSlot {
-    // `arc` keeps the Mutex alive for the lifetime of the stored guard;
-    // it is "read" only via the borrow carried inside the guard.
+    // Held for drop side-effects (lock release) only; never read.
     #[allow(dead_code)]
-    arc: Arc<Mutex<()>>,
-    guard: std::mem::ManuallyDrop<MutexGuard<'static, ()>>,
+    guards: Vec<ArcMutexGuard<parking_lot::RawMutex, ()>>,
 }
 
 impl TableLockGuards {
     fn empty() -> Self {
-        Self { slots: Vec::new() }
+        Self { guards: Vec::new() }
     }
 
     fn acquire(arcs: Vec<Arc<Mutex<()>>>) -> Self {
-        let mut slots = Vec::with_capacity(arcs.len());
-        for arc in arcs {
-            // SAFETY: the MutexGuard borrows from the Mutex inside this
-            // Arc. We store both in the same `LockSlot`, and `Drop for
-            // TableLockGuards` drops the guard before dropping the Arc
-            // (via `ManuallyDrop::drop` followed by struct-field drop).
-            // The Arc keeps the Mutex alive for at least as long as the
-            // guard, so the extended `'static` lifetime is sound.
-            let guard: MutexGuard<'_, ()> = arc.lock().unwrap();
-            let guard: MutexGuard<'static, ()> = unsafe { std::mem::transmute(guard) };
-            slots.push(LockSlot {
-                arc,
-                guard: std::mem::ManuallyDrop::new(guard),
-            });
-        }
-        Self { slots }
-    }
-}
-
-impl Drop for TableLockGuards {
-    fn drop(&mut self) {
-        // Drop guards first (reverse acquisition order), then the Arcs
-        // fall out of scope when `slots` is dropped.
-        while let Some(mut slot) = self.slots.pop() {
-            // SAFETY: the guard is only dropped here, and the paired Arc
-            // is still alive in `slot.arc` until this method returns.
-            unsafe { std::mem::ManuallyDrop::drop(&mut slot.guard) };
-            // `slot.arc` drops normally when `slot` goes out of scope.
-        }
+        let guards = arcs.into_iter().map(|arc| arc.lock_arc()).collect();
+        Self { guards }
     }
 }
 
@@ -2432,7 +2403,7 @@ impl WriteTx {
     /// promoted, so `begin_write` refuses a second writer for the entire
     /// commit, including the fsync wait.
     fn commit_single_writer(mut self) -> Result<u64> {
-        let inner = self.store_inner.write().unwrap();
+        let inner = self.store_inner.write();
 
         // WAL submit under lock (preserves ordering with snapshot promote).
         #[cfg(feature = "persistence")]
@@ -2495,7 +2466,7 @@ impl WriteTx {
                     w.wait()?;
                 }
             }
-            self.store_inner.write().unwrap()
+            self.store_inner.write()
         } else {
             inner
         };
@@ -2561,7 +2532,7 @@ impl WriteTx {
         // lock, so a single OCC pass under the read lock is sufficient.
         let t1 = Instant::now();
         let (latest_tables_ref, concurrent_flags) = {
-            let inner = self.store_inner.read().unwrap();
+            let inner = self.store_inner.read();
 
             if let Some(conflict) = self.validate_write_set(&inner) {
                 self.metrics.inc_write_conflict();
@@ -2640,7 +2611,7 @@ impl WriteTx {
 
         // --- Phase 3: WAL submission + bookkeeping under brief write lock ---
         let t3 = Instant::now();
-        let mut inner = self.store_inner.write().unwrap();
+        let mut inner = self.store_inner.write();
 
         // Commit-time version bump (auto-version only). Versions must be
         // strictly monotonic in WAL-submission order, not just greater than
@@ -2770,7 +2741,7 @@ impl WriteTx {
                 gate.advance();
                 return Err(e);
             }
-            self.store_inner.write().unwrap()
+            self.store_inner.write()
         } else if let Some((gate, ticket)) = &gate {
             if gate.is_turn(*ticket) {
                 // Ticket was taken under this same continuous lock hold, so
@@ -2783,7 +2754,7 @@ impl WriteTx {
                 // latest that lacks its data.
                 drop(inner);
                 gate.wait_turn(*ticket);
-                self.store_inner.write().unwrap()
+                self.store_inner.write()
             }
         } else {
             // Common case (Eventual durability / no WAL): commits never
@@ -3053,7 +3024,7 @@ impl Drop for WriteTx {
     fn drop(&mut self) {
         if self.needs_cleanup {
             self.metrics.inc_rollback();
-            let mut inner = self.store_inner.write().unwrap();
+            let mut inner = self.store_inner.write();
             inner.active_writer_count -= 1;
             if matches!(self.writer_mode, WriterMode::MultiWriter) {
                 remove_active_writer(&mut inner, self.base.version);
@@ -3086,6 +3057,16 @@ const fn _assert_store_is_thread_safe() {
 }
 
 #[cfg(test)]
+impl Store {
+    /// Test-only: take the `inner` write lock and panic while holding it,
+    /// to exercise the lock's panic-while-held behavior.
+    fn panic_with_inner_write_held(&self) {
+        let _guard = self.inner.write();
+        panic!("injected panic while holding inner write lock");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3095,6 +3076,22 @@ mod tests {
     fn new_store_has_version_zero() {
         let store = Store::default();
         assert_eq!(store.latest_version(), 0);
+    }
+
+    #[test]
+    fn panic_holding_inner_lock_does_not_brick_store() {
+        let store = Store::default();
+        // A panic while `inner` is held must NOT poison the lock.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.panic_with_inner_write_held();
+        }));
+        assert!(result.is_err(), "the injected panic should have unwound");
+
+        // The store must still serve traffic. On std these `.read()/.write()`
+        // calls panic (PoisonError); on parking_lot they succeed.
+        let _read = store.begin_read(None).expect("begin_read after panic");
+        let wtx = store.begin_write(None).expect("begin_write after panic");
+        wtx.commit().expect("commit after panic");
     }
 
     #[test]
@@ -4206,7 +4203,7 @@ mod tests {
     fn store_with_mock_wal() -> (Store, std::sync::Arc<crate::wal::MockWal>) {
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(StoreConfig::default()).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
         (store, mock)
     }
 
@@ -4256,7 +4253,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(store_config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Two concurrent writers on different tables (avoids auto-increment ID collision).
         let ss1 = store.clone();
@@ -4312,12 +4309,12 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Preload so both writers modify the same key.
         {
             // Temporarily remove mock so this commit doesn't block.
-            store.inner.write().unwrap().mock_wal = None;
+            store.inner.write().mock_wal = None;
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<Item>("items")
                 .unwrap()
@@ -4326,7 +4323,7 @@ mod tests {
                 })
                 .unwrap();
             wtx.commit().unwrap();
-            store.inner.write().unwrap().mock_wal = Some(mock.clone());
+            store.inner.write().mock_wal = Some(mock.clone());
         }
 
         // T2 must begin_write BEFORE T1 commits, so T2 is an active writer
@@ -4385,7 +4382,7 @@ mod tests {
         let (store, mock) = store_with_mock_wal();
 
         // Commit version 1 without mock (so it's immediately visible).
-        store.inner.write().unwrap().mock_wal = None;
+        store.inner.write().mock_wal = None;
         {
             let mut wtx = store.begin_write(None).unwrap();
             wtx.open_table::<Item>("items")
@@ -4396,7 +4393,7 @@ mod tests {
                 .unwrap();
             wtx.commit().unwrap();
         }
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Start a write that blocks on WAL flush.
         let ss = store.clone();
@@ -4440,7 +4437,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Writer A on table_a, writer B on table_b (no key conflict).
         let ss_a = store.clone();
@@ -4546,7 +4543,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         let ss_a = store.clone();
         let t_a = std::thread::spawn(move || {
@@ -4604,7 +4601,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Writer parks in the fsync wait.
         let ss = store.clone();
@@ -4643,7 +4640,7 @@ mod tests {
 
         // And with no parked commit, the same load succeeds.
         let rows: Vec<(u64, Item)> = vec![(1, Item { name: "bulk".into() })];
-        store.inner.write().unwrap().mock_wal = None;
+        store.inner.write().mock_wal = None;
         store
             .bulk_load::<Item>(
                 "bulk_t",
@@ -4718,7 +4715,7 @@ mod tests {
         let latest_before = store.latest_version();
         assert!(latest_before >= 2, "fillers must outpace A's and B's versions");
 
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
         barrier.wait(); // release A and B into commit
 
         // Both park in the fsync wait, both with stale versions to bump.
@@ -4754,7 +4751,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         let flag_1 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag_2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4826,7 +4823,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Writer 1 blocks in phase 2.
         let ss1 = store.clone();
@@ -4929,7 +4926,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Writer 1 will panic during phase 2 wait.
         let ss1 = store.clone();
@@ -4957,10 +4954,10 @@ mod tests {
         t1.join().unwrap();
 
         // Now disable mock for subsequent commits (they should work normally).
-        store.inner.write().unwrap().mock_wal = None;
+        store.inner.write().mock_wal = None;
 
         // Store must remain usable: active_writer_count should be 0.
-        let inner = store.inner.read().unwrap();
+        let inner = store.inner.read();
         assert_eq!(inner.active_writer_count, 0, "writer count should be zero");
         drop(inner);
 
@@ -4993,7 +4990,7 @@ mod tests {
         };
         let mock = std::sync::Arc::new(crate::wal::MockWal::new());
         let store = Store::new(config).unwrap();
-        store.inner.write().unwrap().mock_wal = Some(mock.clone());
+        store.inner.write().mock_wal = Some(mock.clone());
 
         // Writer A and B on different tables.
         let ss_a = store.clone();
@@ -5051,7 +5048,7 @@ mod tests {
     fn poisoned_commit_returns_err_and_is_not_visible() {
         let (store, mock) = store_with_mock_wal();
         // Share the mock's poison with the store so begin_write sees it too.
-        store.inner.write().unwrap().wal_poison = mock.poison();
+        store.inner.write().wal_poison = mock.poison();
 
         let ss = store.clone();
         let t = std::thread::spawn(move || {
@@ -5076,7 +5073,7 @@ mod tests {
     #[cfg(feature = "persistence")]
     fn begin_write_fails_after_poison() {
         let (store, mock) = store_with_mock_wal();
-        store.inner.write().unwrap().wal_poison = mock.poison();
+        store.inner.write().wal_poison = mock.poison();
         mock.fail();
         assert!(matches!(store.begin_write(None), Err(Error::Poisoned(_))));
     }
@@ -5292,7 +5289,7 @@ mod tests {
         // Insert a fresh snapshot at the new version that mirrors the prior
         // snapshot's tables, so begin_read at the new tip would still work.
         {
-            let mut inner = store.inner.write().unwrap();
+            let mut inner = store.inner.write();
             let prev = inner.snapshots[&inner.latest_version].clone();
             let new_version = inner.latest_version + 1;
             let fake = Arc::new(Snapshot {
