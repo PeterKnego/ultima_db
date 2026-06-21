@@ -3,11 +3,9 @@
 
 //! HNSW tuning parameters supplied at collection creation time.
 
-#[cfg(feature = "persistence")]
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HnswParams {
     /// Embedding dimensionality. Every inserted vector must have this length.
     pub dim: usize,

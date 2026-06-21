@@ -8,7 +8,7 @@ license = "Apache-2.0"
 
 [features]
 default = []
-persistence = ["ultima-db/persistence", "dep:serde"]
+persistence = ["ultima-db/persistence"]
 
 [dependencies]
 ultima-db = { path = ".." }
@@ -16,7 +16,7 @@ smallvec = "1"
 roaring = "0.11"
 rand = "0.10"
 thiserror = "2"
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"] }
 pulp = "0.22"
 
 [dev-dependencies]
