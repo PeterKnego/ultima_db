@@ -45,5 +45,14 @@ fn inline_singlewriter_commits_and_recovers() {
 fn inline_multiwriter_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let err = Store::new(cfg(dir.path(), WriterMode::MultiWriter));
-    assert!(err.is_err(), "ConsistentInline + MultiWriter must error");
+    match err {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("requires WriterMode::SingleWriter"),
+                "expected SingleWriter-required error, got: {msg}"
+            );
+        }
+        Ok(_) => panic!("ConsistentInline + MultiWriter must error"),
+    }
 }
