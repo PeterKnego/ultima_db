@@ -15,9 +15,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
+
+use parking_lot::{Condvar, Mutex};
 
 use crate::{Error, Result};
 
@@ -45,7 +46,7 @@ impl WalPoison {
 
     /// Record the failure cause (first cause wins) and set the latch.
     pub(crate) fn poison(&self, msg: String) {
-        let mut c = self.cause.lock().unwrap();
+        let mut c = self.cause.lock();
         if c.is_none() {
             *c = Some(msg);
         }
@@ -66,7 +67,7 @@ impl WalPoison {
     }
 
     pub(crate) fn error(&self) -> Error {
-        let c = self.cause.lock().unwrap();
+        let c = self.cause.lock();
         Error::Poisoned(c.clone().unwrap_or_else(|| "WAL poisoned".into()))
     }
 }
@@ -488,8 +489,8 @@ fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Opt
 pub(crate) struct WalSyncState {
     pub(crate) next_epoch: std::sync::atomic::AtomicU64,
     fsynced_epoch: std::sync::atomic::AtomicU64,
-    condvar: std::sync::Condvar,
-    mu: std::sync::Mutex<()>,
+    condvar: Condvar,
+    mu: Mutex<()>,
 }
 
 /// Returned by `WalHandle::write()`. Consistent callers block on `wait()`;
@@ -507,7 +508,7 @@ pub(crate) enum SyncWaiter {
     /// Inline-fsync (no bg thread): the committing thread performs the
     /// append+fsync in `wait()`, off the store lock. Durable on `Ok`.
     InlineSync {
-        sink: Arc<std::sync::Mutex<Box<dyn WalSink>>>,
+        sink: Arc<Mutex<Box<dyn WalSink>>>,
         entry: WalEntry,
         durability: Arc<WalDurability>,
         poison: Arc<WalPoison>,
@@ -524,7 +525,7 @@ impl SyncWaiter {
         match self {
             SyncWaiter::Done => Ok(()),
             SyncWaiter::WaitForEpoch { epoch, state, poison } => {
-                let mut guard = state.mu.lock().unwrap();
+                let mut guard = state.mu.lock();
                 loop {
                     if state.fsynced_epoch.load(std::sync::atomic::Ordering::Acquire) >= epoch {
                         return Ok(());
@@ -532,13 +533,13 @@ impl SyncWaiter {
                     if poison.is_poisoned() {
                         return Err(poison.error());
                     }
-                    guard = state.condvar.wait(guard).unwrap();
+                    state.condvar.wait(&mut guard);
                 }
             }
             SyncWaiter::InlineSync { sink, entry, durability, poison } => {
                 poison.check()?;
                 let version = entry.version;
-                let mut s = sink.lock().unwrap();
+                let mut s = sink.lock();
                 let res: Result<()> = (|| {
                     s.append(&entry)?;
                     s.sync()
@@ -1042,8 +1043,8 @@ pub(crate) struct WalDurability {
     /// Set when the background thread is gone; releases parked waiters so they
     /// cannot block forever on a version that will never be reached.
     closed: std::sync::atomic::AtomicBool,
-    inner: std::sync::Mutex<DurabilityWaiters>,
-    condvar: std::sync::Condvar,
+    inner: Mutex<DurabilityWaiters>,
+    condvar: Condvar,
 }
 
 #[derive(Default)]
@@ -1061,8 +1062,8 @@ impl WalDurability {
         Arc::new(Self {
             durable_version: std::sync::atomic::AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
-            inner: std::sync::Mutex::new(DurabilityWaiters::default()),
-            condvar: std::sync::Condvar::new(),
+            inner: Mutex::new(DurabilityWaiters::default()),
+            condvar: Condvar::new(),
         })
     }
 
@@ -1077,7 +1078,7 @@ impl WalDurability {
     fn publish(&self, version: u64) {
         use std::sync::atomic::Ordering;
         let ready = {
-            let mut w = self.inner.lock().unwrap();
+            let mut w = self.inner.lock();
             let new = self.durable_version.load(Ordering::Acquire).max(version);
             // Store under the mutex so a concurrent `wait`/`on_complete` cannot
             // observe the old watermark and then miss the notify (lost wakeup).
@@ -1094,7 +1095,7 @@ impl WalDurability {
     /// below `version` resolve to `Err`; the watermark is NOT advanced.
     fn publish_error(&self, version: u64, msg: String) {
         let ready = {
-            let mut w = self.inner.lock().unwrap();
+            let mut w = self.inner.lock();
             match &w.last_error {
                 Some((ev, _)) if *ev >= version => {}
                 _ => w.last_error = Some((version, msg.clone())),
@@ -1111,7 +1112,7 @@ impl WalDurability {
     fn close(&self) {
         use std::sync::atomic::Ordering;
         let ready = {
-            let mut w = self.inner.lock().unwrap();
+            let mut w = self.inner.lock();
             self.closed.store(true, Ordering::Release);
             self.condvar.notify_all();
             std::mem::take(&mut w.callbacks)
@@ -1127,7 +1128,7 @@ impl WalDurability {
     /// failed or the WAL closed first.
     pub(crate) fn wait(&self, version: u64) -> Result<()> {
         use std::sync::atomic::Ordering;
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         loop {
             if self.durable_version.load(Ordering::Acquire) >= version {
                 return Ok(());
@@ -1142,7 +1143,7 @@ impl WalDurability {
                     "WAL closed before version became durable".into(),
                 ));
             }
-            guard = self.condvar.wait(guard).unwrap();
+            self.condvar.wait(&mut guard);
         }
     }
 
@@ -1150,7 +1151,7 @@ impl WalDurability {
     /// calling thread) if already durable, already errored, or already closed.
     pub(crate) fn on_complete(&self, version: u64, cb: DurabilityCallback) {
         use std::sync::atomic::Ordering;
-        let mut w = self.inner.lock().unwrap();
+        let mut w = self.inner.lock();
         if self.durable_version.load(Ordering::Acquire) >= version {
             drop(w);
             cb(Ok(()));
@@ -1231,7 +1232,7 @@ pub(crate) struct WalHandle {
     /// (~20–35µs/commit) that only pays off when commits can batch. Wired for
     /// `SingleWriter + Consistent` (serial commits never batch). See
     /// `docs/tasks/task38_wal_inline_fsync.md`.
-    sync_sink: Option<Arc<std::sync::Mutex<Box<dyn WalSink>>>>,
+    sync_sink: Option<Arc<Mutex<Box<dyn WalSink>>>>,
 }
 
 impl WalHandle {
@@ -1280,8 +1281,8 @@ impl WalHandle {
             Some(Arc::new(WalSyncState {
                 next_epoch: std::sync::atomic::AtomicU64::new(1),
                 fsynced_epoch: std::sync::atomic::AtomicU64::new(0),
-                condvar: std::sync::Condvar::new(),
-                mu: std::sync::Mutex::new(()),
+                condvar: Condvar::new(),
+                mu: Mutex::new(()),
             }))
         } else {
             None
@@ -1332,7 +1333,7 @@ impl WalHandle {
             poison,
             durability: WalDurability::new(),
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            sync_sink: Some(Arc::new(std::sync::Mutex::new(Box::new(sink)))),
+            sync_sink: Some(Arc::new(Mutex::new(Box::new(sink)))),
         }
     }
 
@@ -1412,7 +1413,7 @@ impl WalHandle {
         // the API shape (caller waits on the channel) is unchanged.
         if let Some(sink) = &self.sync_sink {
             let (done, rx) = mpsc::channel();
-            let res = sink.lock().unwrap().prune(up_to_version);
+            let res = sink.lock().prune(up_to_version);
             let _ = done.send(res);
             return Ok(rx);
         }
@@ -1511,7 +1512,7 @@ fn spawn_wal_thread<S: WalSink + 'static>(
                 Ok(()) => {
                     // Batch is durable — release Consistent epoch waiters...
                     if let Some(state) = &sync_state {
-                        let _guard = state.mu.lock().unwrap();
+                        let _guard = state.mu.lock();
                         state
                             .fsynced_epoch
                             .fetch_add(count, std::sync::atomic::Ordering::Release);
@@ -1536,7 +1537,7 @@ fn spawn_wal_thread<S: WalSink + 'static>(
                     let msg = format!("WAL durability failure: {e}");
                     poison.poison(msg.clone());
                     if let Some(state) = &sync_state {
-                        let _guard = state.mu.lock().unwrap();
+                        let _guard = state.mu.lock();
                         state.condvar.notify_all();
                     }
                     durability.publish_error(hwm, msg);
@@ -1628,7 +1629,7 @@ impl BenchWal {
 
 #[cfg(test)]
 pub(crate) struct MockWal {
-    pub(crate) entries: std::sync::Mutex<Vec<WalEntry>>,
+    pub(crate) entries: Mutex<Vec<WalEntry>>,
     sync_state: Arc<WalSyncState>,
     poison: Arc<WalPoison>,
 }
@@ -1637,12 +1638,12 @@ pub(crate) struct MockWal {
 impl MockWal {
     pub fn new() -> Self {
         Self {
-            entries: std::sync::Mutex::new(Vec::new()),
+            entries: Mutex::new(Vec::new()),
             sync_state: Arc::new(WalSyncState {
                 next_epoch: std::sync::atomic::AtomicU64::new(1),
                 fsynced_epoch: std::sync::atomic::AtomicU64::new(0),
-                condvar: std::sync::Condvar::new(),
-                mu: std::sync::Mutex::new(()),
+                condvar: Condvar::new(),
+                mu: Mutex::new(()),
             }),
             poison: Arc::new(WalPoison::new()),
         }
@@ -1657,14 +1658,14 @@ impl MockWal {
     /// Simulate a WAL fsync failure: poison and wake all blocked waiters.
     pub fn fail(&self) {
         self.poison.poison("mock WAL failure".into());
-        let _guard = self.sync_state.mu.lock().unwrap();
+        let _guard = self.sync_state.mu.lock();
         self.sync_state.condvar.notify_all();
     }
 
     /// Submit a WAL entry. Returns a SyncWaiter that blocks until `flush()` or
     /// `fail()`.
     pub fn write(&self, entry: WalEntry) -> SyncWaiter {
-        self.entries.lock().unwrap().push(entry);
+        self.entries.lock().push(entry);
         let epoch = self
             .sync_state
             .next_epoch
@@ -1686,7 +1687,7 @@ impl MockWal {
         self.sync_state
             .fsynced_epoch
             .store(current_next - 1, std::sync::atomic::Ordering::Release);
-        let _guard = self.sync_state.mu.lock().unwrap();
+        let _guard = self.sync_state.mu.lock();
         self.sync_state.condvar.notify_all();
     }
 
@@ -1695,7 +1696,7 @@ impl MockWal {
         self.sync_state
             .fsynced_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let _guard = self.sync_state.mu.lock().unwrap();
+        let _guard = self.sync_state.mu.lock();
         self.sync_state.condvar.notify_all();
     }
 
