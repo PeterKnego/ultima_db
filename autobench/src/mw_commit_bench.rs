@@ -87,10 +87,16 @@ impl Config {
     pub fn quick() -> Self {
         Self {
             keyspace: 2_000,
-            writers: 2,
+            // 4 writers contending on a small shared hot set make a
+            // zero-conflict run statistically impossible across `rounds`
+            // (the mixed-phase conflict rate is timing-dependent: a writer
+            // only conflicts if it stages a hot key while another holds that
+            // key's intent). 2 writers / 50 rounds was too thin and the smoke
+            // test's `mw_conflict_rate > 0` assertion flaked ~40% of the time.
+            writers: 4,
             keys_per_commit: 2,
-            rounds: 50,
-            disjoint_rounds: 50,
+            rounds: 250,
+            disjoint_rounds: 250,
             warmup_rounds: 5,
             conflict_stride: 13,
         }
