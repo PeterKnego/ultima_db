@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
+use parking_lot::{ArcMutexGuard, Condvar, Mutex, RwLock};
 
 use dashmap::DashMap;
 
@@ -1389,61 +1389,29 @@ impl Store {
 }
 
 /// RAII owner of a set of per-table commit locks acquired in canonical
-/// order. Stores each `Arc<Mutex<()>>` alongside a `MutexGuard` borrowed
-/// from it; the guard is dropped before the Arc (via explicit
-/// `ManuallyDrop`), so the borrow never outlives its source.
+/// (sorted-by-name) order to prevent deadlock. Each `ArcMutexGuard` owns
+/// both the lock and an `Arc` reference to the `Mutex`, so the guard is
+/// `'static` by construction — no transmute or `ManuallyDrop` needed.
 ///
-/// The `'static` lifetime on the stored guards is a pure bookkeeping
-/// trick — the actual lifetime is tied to the paired `Arc<Mutex<()>>` in
-/// the same entry. Safety relies on dropping guards before Arcs, which
-/// `Drop::drop` enforces explicitly below.
+/// Locks are released when this struct is dropped; `Vec` drops elements
+/// in forward (acquisition) order. For independent per-table mutexes
+/// release order does not affect correctness — no lock is held while
+/// acquiring another at release time — so forward drop is equivalent to
+/// the reverse-order `pop()` used previously.
 struct TableLockGuards {
-    slots: Vec<LockSlot>,
-}
-
-struct LockSlot {
-    // `arc` keeps the Mutex alive for the lifetime of the stored guard;
-    // it is "read" only via the borrow carried inside the guard.
+    // Held for drop side-effects (lock release) only; never read.
     #[allow(dead_code)]
-    arc: Arc<Mutex<()>>,
-    guard: std::mem::ManuallyDrop<MutexGuard<'static, ()>>,
+    guards: Vec<ArcMutexGuard<parking_lot::RawMutex, ()>>,
 }
 
 impl TableLockGuards {
     fn empty() -> Self {
-        Self { slots: Vec::new() }
+        Self { guards: Vec::new() }
     }
 
     fn acquire(arcs: Vec<Arc<Mutex<()>>>) -> Self {
-        let mut slots = Vec::with_capacity(arcs.len());
-        for arc in arcs {
-            // SAFETY: the MutexGuard borrows from the Mutex inside this
-            // Arc. We store both in the same `LockSlot`, and `Drop for
-            // TableLockGuards` drops the guard before dropping the Arc
-            // (via `ManuallyDrop::drop` followed by struct-field drop).
-            // The Arc keeps the Mutex alive for at least as long as the
-            // guard, so the extended `'static` lifetime is sound.
-            let guard: MutexGuard<'_, ()> = arc.lock();
-            let guard: MutexGuard<'static, ()> = unsafe { std::mem::transmute(guard) };
-            slots.push(LockSlot {
-                arc,
-                guard: std::mem::ManuallyDrop::new(guard),
-            });
-        }
-        Self { slots }
-    }
-}
-
-impl Drop for TableLockGuards {
-    fn drop(&mut self) {
-        // Drop guards first (reverse acquisition order), then the Arcs
-        // fall out of scope when `slots` is dropped.
-        while let Some(mut slot) = self.slots.pop() {
-            // SAFETY: the guard is only dropped here, and the paired Arc
-            // is still alive in `slot.arc` until this method returns.
-            unsafe { std::mem::ManuallyDrop::drop(&mut slot.guard) };
-            // `slot.arc` drops normally when `slot` goes out of scope.
-        }
+        let guards = arcs.into_iter().map(|arc| arc.lock_arc()).collect();
+        Self { guards }
     }
 }
 
