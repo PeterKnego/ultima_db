@@ -7,7 +7,7 @@
 //! operations, along with snapshot types for reading the current values.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -149,7 +149,6 @@ impl TableMetrics {
         let indexes = self
             .indexes
             .read()
-            .unwrap()
             .iter()
             .map(|(name, m)| (name.clone(), m.snapshot()))
             .collect();
@@ -228,10 +227,10 @@ impl StoreMetrics {
     /// on hot paths cache the handle so increments are a single relaxed
     /// `fetch_add` with no lock or string hash.
     pub(crate) fn register_table(&self, name: &str) -> std::sync::Arc<TableMetrics> {
-        if let Some(t) = self.tables.read().unwrap().get(name) {
+        if let Some(t) = self.tables.read().get(name) {
             return std::sync::Arc::clone(t);
         }
-        let mut tables = self.tables.write().unwrap();
+        let mut tables = self.tables.write();
         std::sync::Arc::clone(
             tables
                 .entry(name.to_string())
@@ -240,9 +239,9 @@ impl StoreMetrics {
     }
 
     pub(crate) fn register_index(&self, table: &str, index: &str) {
-        let tables = self.tables.read().unwrap();
+        let tables = self.tables.read();
         if let Some(table_metrics) = tables.get(table) {
-            let mut indexes = table_metrics.indexes.write().unwrap();
+            let mut indexes = table_metrics.indexes.write();
             indexes
                 .entry(index.to_string())
                 .or_insert_with(IndexMetrics::new);
@@ -290,9 +289,9 @@ impl StoreMetrics {
     // --- Index-level increments ---------------------------------------------
 
     pub(crate) fn inc_index_reads(&self, table: &str, index: &str) {
-        let tables = self.tables.read().unwrap();
+        let tables = self.tables.read();
         if let Some(t) = tables.get(table) {
-            let indexes = t.indexes.read().unwrap();
+            let indexes = t.indexes.read();
             if let Some(idx) = indexes.get(index) {
                 idx.reads.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "metrics")]
@@ -306,9 +305,9 @@ impl StoreMetrics {
     }
 
     pub(crate) fn inc_index_range_scans(&self, table: &str, index: &str) {
-        let tables = self.tables.read().unwrap();
+        let tables = self.tables.read();
         if let Some(t) = tables.get(table) {
-            let indexes = t.indexes.read().unwrap();
+            let indexes = t.indexes.read();
             if let Some(idx) = indexes.get(index) {
                 idx.range_scans.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "metrics")]
@@ -327,7 +326,6 @@ impl StoreMetrics {
         let tables = self
             .tables
             .read()
-            .unwrap()
             .iter()
             .map(|(name, m)| (name.clone(), m.snapshot()))
             .collect();
