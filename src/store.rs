@@ -1397,7 +1397,9 @@ impl Store {
 /// in forward (acquisition) order. For independent per-table mutexes
 /// release order does not affect correctness — no lock is held while
 /// acquiring another at release time — so forward drop is equivalent to
-/// the reverse-order `pop()` used previously.
+/// the reverse-order `pop()` used previously. This relies on these being
+/// side-effect-free leaf locks (`Mutex<()>` whose `Drop` does no work and
+/// touches no other lock); keep them that way or revisit the drop order.
 struct TableLockGuards {
     // Held for drop side-effects (lock release) only; never read.
     #[allow(dead_code)]
