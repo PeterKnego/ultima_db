@@ -14,8 +14,7 @@ use ultima_vector::filter::{RoaringTreemap, from_id_record_pairs};
 use ultima_vector::row::VectorRow;
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct DocMeta {
     title: String,
     category: String,

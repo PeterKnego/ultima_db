@@ -15,8 +15,7 @@ use rand::rngs::StdRng;
 use ultima_db::{Store, StoreConfig};
 use ultima_vector::{Cosine, HnswParams, VectorCollection};
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct AuditRow {
     actor: String,
     action: String,

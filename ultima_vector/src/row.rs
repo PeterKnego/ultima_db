@@ -7,7 +7,6 @@
 //! is the per-node graph state denormalized into the row. `EntryPoint` is
 //! the singleton row of the auxiliary entry-point table.
 
-#[cfg(feature = "persistence")]
 use serde::{Deserialize, Serialize};
 
 /// User-facing row stored in `Table<VectorRow<Meta>>`.
@@ -15,8 +14,13 @@ use serde::{Deserialize, Serialize};
 /// Holds the embedding, the user's metadata, and the HNSW node state. The
 /// HNSW state is conceptually private — users should mutate rows only via
 /// `VectorCollection`'s API, never by editing `hnsw` directly.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
+///
+/// Serde derives are unconditional (not gated on `persistence`): the row is a
+/// `Table` record, and `ultima_db`'s `Record` bound requires `Serialize +
+/// DeserializeOwned` whenever `ultima-db/persistence` is enabled — which can
+/// happen via workspace feature unification even when this crate's own
+/// `persistence` feature is off. Gating the derive on our feature would skew.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorRow<Meta> {
     pub embedding: Vec<f32>,
     pub meta: Meta,
@@ -26,8 +30,7 @@ pub struct VectorRow<Meta> {
 /// Per-node HNSW graph state. `layers[0]` is the base layer; `layers[i]`
 /// for `i > 0` is the corresponding upper layer. A node at `level = L`
 /// has `L + 1` layer entries (layers `0..=L`).
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HnswState {
     level: u8,
     tombstoned: bool,
@@ -87,8 +90,7 @@ impl HnswState {
 /// Singleton row in the entry-point auxiliary table. Holds the node id of
 /// the HNSW entry point (the node sitting at the highest layer of the
 /// graph) and the current global maximum level.
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EntryPoint {
     pub node_id: Option<u64>,
     pub max_level: u8,
@@ -97,6 +99,22 @@ pub struct EntryPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression guard: the row/param types must be serde-serializable in the
+    // DEFAULT (no-feature) build, not only under `persistence`. Otherwise a
+    // workspace build that unifies `ultima-db/persistence` ON (via a sibling
+    // bench crate) while `ultima_vector/persistence` stays OFF fails to satisfy
+    // `VectorRow<Meta>: Record`. This compiles only if the derives are
+    // unconditional.
+    fn assert_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+
+    #[test]
+    fn row_types_are_serde_without_persistence_feature() {
+        assert_serde::<VectorRow<u32>>();
+        assert_serde::<HnswState>();
+        assert_serde::<EntryPoint>();
+        assert_serde::<crate::hnsw::params::HnswParams>();
+    }
 
     #[test]
     fn empty_state_at_level_has_layer_count() {
