@@ -25,6 +25,7 @@
 //! | `smr`                                     | ~1.11 Melem/s  | baseline         |
 //! | `standalone_eventual`                     | ~0.65 Melem/s  | smr ~1.7× faster |
 //! | `standalone_consistent`                   | ~25.5 Kelem/s  | smr ~43× faster  |
+//! | `standalone_consistent_inline`            | real-disk A/B  | tmpfs: ~3 µs/commit (handoff eliminated); bench-host NVMe pending |
 //! | `standalone_consistent_coalesced_prealloc`| real-disk A/B  | sandbox noise ±2× makes sandbox results uninformative; run on bench host |
 //!
 //! Takeaway: serially, SMR is again indistinguishable from in-memory, and the

@@ -124,9 +124,10 @@ Readers (`begin_read`, which takes the read lock) never block on the flush.
 
 `Store::bulk_load` in Standalone mode writes a `WalOp::BulkLoad` marker.  With the async
 path this marker is handed off to the background thread like any other entry.  With
-`ConsistentInline` there is no background thread, so `inline_write_and_sync` is called
-directly to drive the marker's waiter — the same `append + sync` sequence as a normal
-commit, just invoked synchronously on the calling thread.  Recovery is unaffected.
+`ConsistentInline` there is no background thread, so the marker's `SyncWaiter::InlineSync`
+is driven via `wait()` directly to drive the marker's waiter — the same `append + sync`
+sequence as a normal commit, just invoked synchronously on the calling thread.  Recovery
+is unaffected.
 
 ---
 

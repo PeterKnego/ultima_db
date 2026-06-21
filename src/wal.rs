@@ -1224,13 +1224,13 @@ pub(crate) struct WalHandle {
     durability: Arc<WalDurability>,
     /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
-    /// SPIKE (inline-fsync): when `Some`, this handle has NO background thread —
+    /// When `Some`, this handle has NO background thread —
     /// `write()` stages an `InlineSync` waiter (no I/O yet); the caller drives
     /// the actual append+fsync by calling `wait()` off the store lock. This
     /// eliminates the enqueue→wake-writer→fsync→wake-waiter handoff
     /// (~20–35µs/commit) that only pays off when commits can batch. Wired for
     /// `SingleWriter + Consistent` (serial commits never batch). See
-    /// `docs/...` / the inline-fsync spike branch.
+    /// `docs/tasks/task38_wal_inline_fsync.md`.
     sync_sink: Option<Arc<std::sync::Mutex<Box<dyn WalSink>>>>,
 }
 
@@ -1316,7 +1316,7 @@ impl WalHandle {
         }
     }
 
-    /// SPIKE (inline-fsync): build a handle with NO background thread. `write()`
+    /// Build a handle with NO background thread. `write()`
     /// appends + fsyncs on the caller's thread (see `sync_sink`). `consistent`
     /// is accepted for symmetry but the path is always synchronous-durable.
     pub(crate) fn with_sink_inline<S: WalSink + 'static>(
@@ -1336,7 +1336,7 @@ impl WalHandle {
         }
     }
 
-    /// SPIKE: inline counterpart of [`with_sink_kind`].
+    /// Inline counterpart of [`with_sink_kind`].
     pub(crate) fn with_sink_kind_inline(
         dir: &Path,
         consistent: bool,
@@ -1408,7 +1408,7 @@ impl WalHandle {
     /// thread stopped (poisoned or shutting down) before pruning.
     pub fn request_prune(&self, up_to_version: u64) -> Result<mpsc::Receiver<Result<()>>> {
         self.poison.check()?;
-        // SPIKE (inline-fsync): prune on this thread; return a ready receiver so
+        // Prune on this thread; return a ready receiver so
         // the API shape (caller waits on the channel) is unchanged.
         if let Some(sink) = &self.sync_sink {
             let (done, rx) = mpsc::channel();
