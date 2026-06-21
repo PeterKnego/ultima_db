@@ -1225,8 +1225,9 @@ pub(crate) struct WalHandle {
     /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
     /// SPIKE (inline-fsync): when `Some`, this handle has NO background thread —
-    /// `write()` appends + fsyncs the entry on the calling thread and returns
-    /// `Done`, eliminating the enqueue→wake-writer→fsync→wake-waiter handoff
+    /// `write()` stages an `InlineSync` waiter (no I/O yet); the caller drives
+    /// the actual append+fsync by calling `wait()` off the store lock. This
+    /// eliminates the enqueue→wake-writer→fsync→wake-waiter handoff
     /// (~20–35µs/commit) that only pays off when commits can batch. Wired for
     /// `SingleWriter + Consistent` (serial commits never batch). See
     /// `docs/...` / the inline-fsync spike branch.

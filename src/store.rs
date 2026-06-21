@@ -1329,19 +1329,33 @@ impl Store {
 
         // Record the load in the WAL (marker only — the data itself is not
         // WAL-logged). Recovery uses it to refuse replaying commits that
-        // were made on top of a load no checkpoint covers. No fsync wait:
-        // WAL entries become durable in order, so any later commit that is
-        // acknowledged durable implies the marker is durable too. Submitted
-        // before any state mutation so a WAL error leaves the store
-        // unchanged.
+        // were made on top of a load no checkpoint covers. Submitted before
+        // any state mutation so a WAL error leaves the store unchanged.
+        //
+        // Async backend: WAL entries become durable in-order, so any later
+        // commit that is acknowledged durable implies the marker is durable
+        // too — waiter discarded.
+        //
+        // Inline backend (ConsistentInline): there is NO background thread.
+        // `write()` only stages an `InlineSync` waiter; the append+fsync
+        // happen in `wait()`. If we discard the waiter the marker is never
+        // written, silently defeating the BulkLoadNotCheckpointed guard.
+        // Drive it here — bulk_load is a rare, non-hot path so doing the
+        // inline fsync under the store lock is acceptable.
         #[cfg(feature = "persistence")]
         if let Some(wal) = &inner.wal_handle {
-            let _ = wal.write(crate::wal::WalEntry {
+            let waiter = wal.write(crate::wal::WalEntry {
                 version: new_version,
                 ops: vec![crate::wal::WalOp::BulkLoad {
                     tables: replaced.iter().cloned().collect(),
                 }],
             })?;
+            // For the inline backend the marker is only persisted when its
+            // waiter is driven; the async path relies on in-order bg-thread
+            // writes and can safely discard the waiter.
+            if matches!(waiter, crate::wal::SyncWaiter::InlineSync { .. }) {
+                waiter.wait()?;
+            }
         }
 
         for p in pending {
