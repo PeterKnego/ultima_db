@@ -1391,7 +1391,7 @@ impl Store {
 /// RAII owner of a set of per-table commit locks acquired in canonical
 /// (sorted-by-name) order to prevent deadlock. Each `ArcMutexGuard` owns
 /// both the lock and an `Arc` reference to the `Mutex`, so the guard is
-/// `'static` by construction — no transmute or `ManuallyDrop` needed.
+/// `'static` by construction — no lifetime workaround is needed.
 ///
 /// Locks are released when this struct is dropped; `Vec` drops elements
 /// in forward (acquisition) order. For independent per-table mutexes
