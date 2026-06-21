@@ -42,6 +42,13 @@ pub enum Durability {
     /// `commit()` blocks until the WAL entry is written and fsynced.
     /// No data loss on crash.
     Consistent,
+    /// Same guarantee as [`Consistent`](Durability::Consistent) (commit blocks
+    /// until the entry is fsynced; no data loss on crash). Differs only in
+    /// mechanism: the committing thread performs the fsync itself — no WAL
+    /// background thread, no cross-thread handoff. **SingleWriter only**
+    /// (`Store::new` errors otherwise). Best for serial durable commits on fast
+    /// disk, where the bg-thread handoff (~20-35µs) dominates a cheap fsync.
+    ConsistentInline,
 }
 
 // ---------------------------------------------------------------------------

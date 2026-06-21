@@ -336,7 +336,21 @@ impl Store {
         #[cfg(feature = "persistence")]
         let wal_handle = match &config.persistence {
             crate::persistence::Persistence::Standalone { dir, durability, wal_write } => {
-                let consistent = matches!(durability, crate::persistence::Durability::Consistent);
+                use crate::persistence::Durability;
+                // ConsistentInline appends inline in lock-acquisition order, which
+                // only equals version order under a single writer. MultiWriter
+                // relies on the bg-thread/epoch path for that ordering, so reject.
+                if matches!(durability, Durability::ConsistentInline)
+                    && matches!(config.writer_mode, WriterMode::MultiWriter)
+                {
+                    return Err(Error::Persistence(
+                        "Durability::ConsistentInline requires WriterMode::SingleWriter".into(),
+                    ));
+                }
+                let consistent = matches!(
+                    durability,
+                    Durability::Consistent | Durability::ConsistentInline
+                );
                 let kind = match wal_write {
                     crate::persistence::WalWrite::PerEntry => crate::wal::WalSinkKind::FsWrite,
                     crate::persistence::WalWrite::Coalesced => crate::wal::WalSinkKind::Coalesced,
@@ -344,14 +358,7 @@ impl Store {
                         crate::wal::WalSinkKind::CoalescedPrealloc
                     }
                 };
-                // SPIKE (inline-fsync): for SingleWriter + Consistent, serial
-                // commits never batch, so the WAL bg-thread handoff is pure tax.
-                // Opt in via ULTIMA_WAL_INLINE to append+fsync inline on the
-                // committing thread (no thread, no channel, no epoch wait).
-                // Default path (env unset) is completely unchanged.
-                let inline = consistent
-                    && matches!(config.writer_mode, WriterMode::SingleWriter)
-                    && std::env::var_os("ULTIMA_WAL_INLINE").is_some();
+                let inline = matches!(durability, Durability::ConsistentInline);
                 let handle = if inline {
                     crate::wal::WalHandle::with_sink_kind_inline(
                         dir,
@@ -376,7 +383,8 @@ impl Store {
         let wal_consistent = matches!(
             &config.persistence,
             crate::persistence::Persistence::Standalone {
-                durability: crate::persistence::Durability::Consistent,
+                durability: crate::persistence::Durability::Consistent
+                    | crate::persistence::Durability::ConsistentInline,
                 ..
             }
         );
