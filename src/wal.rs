@@ -504,6 +504,14 @@ pub(crate) enum SyncWaiter {
         state: Arc<WalSyncState>,
         poison: Arc<WalPoison>,
     },
+    /// Inline-fsync (no bg thread): the committing thread performs the
+    /// append+fsync in `wait()`, off the store lock. Durable on `Ok`.
+    InlineSync {
+        sink: Arc<std::sync::Mutex<Box<dyn WalSink>>>,
+        entry: WalEntry,
+        durability: Arc<WalDurability>,
+        poison: Arc<WalPoison>,
+    },
 }
 
 impl SyncWaiter {
@@ -513,28 +521,42 @@ impl SyncWaiter {
     /// entry's batch reached disk. An entry whose batch fsynced *before* a
     /// later failure still returns `Ok`.
     pub fn wait(self) -> Result<()> {
-        if let SyncWaiter::WaitForEpoch {
-            epoch,
-            state,
-            poison,
-        } = self
-        {
-            let mut guard = state.mu.lock().unwrap();
-            loop {
-                if state
-                    .fsynced_epoch
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    >= epoch
-                {
-                    return Ok(());
+        match self {
+            SyncWaiter::Done => Ok(()),
+            SyncWaiter::WaitForEpoch { epoch, state, poison } => {
+                let mut guard = state.mu.lock().unwrap();
+                loop {
+                    if state.fsynced_epoch.load(std::sync::atomic::Ordering::Acquire) >= epoch {
+                        return Ok(());
+                    }
+                    if poison.is_poisoned() {
+                        return Err(poison.error());
+                    }
+                    guard = state.condvar.wait(guard).unwrap();
                 }
-                if poison.is_poisoned() {
-                    return Err(poison.error());
+            }
+            SyncWaiter::InlineSync { sink, entry, durability, poison } => {
+                poison.check()?;
+                let version = entry.version;
+                let mut s = sink.lock().unwrap();
+                let res: Result<()> = (|| {
+                    s.append(&entry)?;
+                    s.sync()
+                })();
+                match res {
+                    Ok(()) => {
+                        durability.publish(version);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let msg = format!("WAL durability failure: {e}");
+                        poison.poison(msg.clone());
+                        durability.publish_error(version, msg);
+                        Err(e)
+                    }
                 }
-                guard = state.condvar.wait(guard).unwrap();
             }
         }
-        Ok(())
     }
 }
 
@@ -1208,7 +1230,7 @@ pub(crate) struct WalHandle {
     /// (~20–35µs/commit) that only pays off when commits can batch. Wired for
     /// `SingleWriter + Consistent` (serial commits never batch). See
     /// `docs/...` / the inline-fsync spike branch.
-    sync_sink: Option<std::sync::Mutex<Box<dyn WalSink>>>,
+    sync_sink: Option<Arc<std::sync::Mutex<Box<dyn WalSink>>>>,
 }
 
 impl WalHandle {
@@ -1309,7 +1331,7 @@ impl WalHandle {
             poison,
             durability: WalDurability::new(),
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            sync_sink: Some(std::sync::Mutex::new(Box::new(sink))),
+            sync_sink: Some(Arc::new(std::sync::Mutex::new(Box::new(sink)))),
         }
     }
 
@@ -1344,29 +1366,16 @@ impl WalHandle {
     ///   call `wait()` outside the store lock to block until fsync.
     /// - **Eventual**: returns `SyncWaiter::Done` — no wait needed.
     pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
-        // SPIKE (inline-fsync): append + fsync on this thread; no handoff.
+        // Inline (no bg thread): do NO I/O here (this runs under store_inner).
+        // Return a waiter; the committer does append+fsync off-lock in wait().
         if let Some(sink) = &self.sync_sink {
             self.poison.check()?;
-            let version = entry.version;
-            let mut s = sink.lock().unwrap();
-            let res: Result<()> = (|| {
-                s.append(&entry)?;
-                s.sync()
-            })();
-            return match res {
-                Ok(()) => {
-                    // Already durable on return — advance the version watermark
-                    // (task28) and report Done so commit() skips the off-lock wait.
-                    self.durability.publish(version);
-                    Ok(SyncWaiter::Done)
-                }
-                Err(e) => {
-                    let msg = format!("WAL durability failure: {e}");
-                    self.poison.poison(msg.clone());
-                    self.durability.publish_error(version, msg);
-                    Err(e)
-                }
-            };
+            return Ok(SyncWaiter::InlineSync {
+                sink: Arc::clone(sink),
+                entry,
+                durability: Arc::clone(&self.durability),
+                poison: Arc::clone(&self.poison),
+            });
         }
         let sender = self.sender.as_ref().expect("WalHandle used after drop");
         self.in_flight
@@ -1961,8 +1970,8 @@ mod tests {
 
     #[test]
     fn inline_write_is_durable_and_recoverable() {
-        // SPIKE: the inline (no-bg-thread) handle must produce a byte-identical,
-        // recoverable WAL — write() returns Done and the data is already on disk.
+        // Off-lock inline: write() returns InlineSync (no I/O yet); wait() does
+        // the append+fsync and makes it durable.
         let dir = tempfile::tempdir().unwrap();
         let poison = Arc::new(WalPoison::new());
         {
@@ -1975,12 +1984,11 @@ mod tests {
                 let w = wal
                     .write(WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] })
                     .unwrap();
-                // Inline path is synchronously durable: no epoch wait.
-                assert!(matches!(w, SyncWaiter::Done));
+                assert!(matches!(w, SyncWaiter::InlineSync { .. }), "inline write returns InlineSync");
+                w.wait().unwrap(); // performs the append+fsync off-lock
             }
             assert_eq!(wal.durable_version(), 5);
-        } // drop = no thread to join
-        // Reopen and confirm every entry is durable.
+        }
         let entries = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
         assert_eq!(entries.iter().map(|e| e.version).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
     }

@@ -2448,7 +2448,11 @@ impl WriteTx {
         #[cfg(feature = "persistence")]
         let needs_wal_wait = {
             #[allow(unused_mut)]
-            let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
+            let mut w = matches!(
+                &waiter,
+                Some(crate::wal::SyncWaiter::WaitForEpoch { .. })
+                    | Some(crate::wal::SyncWaiter::InlineSync { .. })
+            );
             #[cfg(test)]
             {
                 w = w || mock_waiter.is_some();
@@ -2705,7 +2709,11 @@ impl WriteTx {
         #[cfg(feature = "persistence")]
         let needs_wal_wait = {
             #[allow(unused_mut)]
-            let mut w = matches!(&waiter, Some(crate::wal::SyncWaiter::WaitForEpoch { .. }));
+            let mut w = matches!(
+                &waiter,
+                Some(crate::wal::SyncWaiter::WaitForEpoch { .. })
+                    | Some(crate::wal::SyncWaiter::InlineSync { .. })
+            );
             #[cfg(test)]
             {
                 w = w || mock_waiter.is_some();
