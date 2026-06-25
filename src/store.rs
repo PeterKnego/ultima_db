@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use parking_lot::{ArcMutexGuard, Condvar, Mutex, RwLock};
 
@@ -317,7 +317,7 @@ pub struct Store {
     /// dirty sets don't serialize — they proceed through merge in
     /// parallel and only briefly share the global `inner` write lock at
     /// install time.
-    pub(crate) table_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    pub(crate) table_locks: Arc<TableLockTable>,
     /// Serializes [`Store::checkpoint`] against itself. Two interleaved
     /// checkpoints could otherwise prune the WAL past a version whose
     /// only covering checkpoint the slower one then deletes.
@@ -424,7 +424,7 @@ impl Store {
             })),
             intents: Arc::new(IntentMap::default()),
             next_writer_id: Arc::new(AtomicU64::new(1)),
-            table_locks: Arc::new(DashMap::new()),
+            table_locks: Arc::new(TableLockTable::new()),
             #[cfg(feature = "persistence")]
             checkpoint_lock: Arc::new(Mutex::new(())),
         })
@@ -1388,6 +1388,78 @@ impl Store {
     }
 }
 
+/// Floor below which [`TableLockTable`] is never swept: most stores have far
+/// fewer tables than this, so they pay zero GC cost.
+const TABLE_LOCK_SWEEP_FLOOR: usize = 64;
+
+/// Per-table commit-lock table (MultiWriter mode) with bounded growth.
+///
+/// Maps a table name to the `Arc<Mutex<()>>` that serializes concurrent commits
+/// touching that table. Entries are created lazily on [`acquire`](Self::acquire)
+/// and reclaimed by [`sweep`](Self::sweep): an entry whose `Arc::strong_count`
+/// is 1 is referenced only by this map — no in-flight committer holds it — so it
+/// can be dropped and lazily recreated on the next commit with no effect on
+/// mutual exclusion (the lock only needs to be shared among *concurrent*
+/// committers, and there are none).
+///
+/// The removal is race-free: `DashMap::retain` runs its predicate under the
+/// per-shard lock, which serializes against `entry()`. So while `retain` holds
+/// the shard, no thread can clone the entry from the map, and any thread that
+/// already holds a clone keeps the count `>= 2` — meaning a `strong_count == 1`
+/// reading is stable for the duration of the removal.
+pub(crate) struct TableLockTable {
+    locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Sweep once `locks.len()` reaches this. Reset after each sweep to
+    /// `max(FLOOR, 2 * survivors)`, so a fixed table set never sweeps and churn
+    /// keeps the map ~O(in-flight) at amortized O(1) per acquire.
+    sweep_threshold: AtomicUsize,
+}
+
+impl TableLockTable {
+    fn new() -> Self {
+        Self {
+            locks: DashMap::new(),
+            sweep_threshold: AtomicUsize::new(TABLE_LOCK_SWEEP_FLOOR),
+        }
+    }
+
+    /// Acquire (creating lazily) the `Arc<Mutex<()>>` for each name. The
+    /// returned clones keep their entries alive (`strong_count >= 2`), so a
+    /// concurrent [`sweep`](Self::sweep) cannot reclaim them.
+    fn acquire(&self, names: &[String]) -> Vec<Arc<Mutex<()>>> {
+        names
+            .iter()
+            .map(|n| {
+                self.locks
+                    .entry(n.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Reclaim every entry referenced only by this map (no in-flight holder),
+    /// then re-arm the threshold relative to what survived.
+    fn sweep(&self) {
+        self.locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+        let next = (self.locks.len() * 2).max(TABLE_LOCK_SWEEP_FLOOR);
+        self.sweep_threshold.store(next, Ordering::Relaxed);
+    }
+
+    /// Sweep only once the map has grown to the current threshold.
+    fn maybe_sweep(&self) {
+        if self.locks.len() >= self.sweep_threshold.load(Ordering::Relaxed) {
+            self.sweep();
+        }
+    }
+
+    /// Number of live entries (test/diagnostic).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.locks.len()
+    }
+}
+
 /// RAII owner of a set of per-table commit locks acquired in canonical
 /// (sorted-by-name) order to prevent deadlock. Each `ArcMutexGuard` owns
 /// both the lock and an `Arc` reference to the `Mutex`, so the guard is
@@ -1615,7 +1687,7 @@ pub struct WriteTx {
     /// Per-table commit mutex registry (MultiWriter only). `commit`
     /// acquires an `Arc<Mutex<()>>` from this map for each dirty table in
     /// canonical order before doing merge + install.
-    table_locks: Option<Arc<DashMap<String, Arc<Mutex<()>>>>>,
+    table_locks: Option<Arc<TableLockTable>>,
     /// WAL operations accumulated during this transaction (persistence only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_ops: Vec<crate::wal::WalOp>,
@@ -2872,16 +2944,14 @@ impl WriteTx {
             return TableLockGuards::empty();
         }
 
-        // Snapshot the `Arc<Mutex<()>>` for each name (creating lazily).
-        let arcs: Vec<Arc<Mutex<()>>> = names
-            .iter()
-            .map(|n| {
-                locks
-                    .entry(n.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            })
-            .collect();
+        // Snapshot the `Arc<Mutex<()>>` for each name (creating lazily). These
+        // clones keep our entries alive (`strong_count >= 2`), so the sweep
+        // below cannot reclaim them.
+        let arcs = locks.acquire(&names);
+
+        // Reclaim idle entries (no in-flight holder) once the table has grown
+        // past its amortized threshold — bounds growth under table-name churn.
+        locks.maybe_sweep();
 
         TableLockGuards::acquire(arcs)
     }
@@ -3787,6 +3857,66 @@ mod tests {
             })
         ));
         wtx_a.commit().unwrap();
+    }
+
+    /// Churning many uniquely-named tables must not grow `table_locks`
+    /// without bound: a per-table commit lock with no in-flight holder is
+    /// reclaimed and lazily recreated on the next commit.
+    #[test]
+    fn multi_writer_table_locks_do_not_grow_unbounded() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        const N: usize = 600;
+        for i in 0..N {
+            let name = format!("t_{i}");
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>(name.as_str())
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        // Each commit touches a distinct table, so without GC `table_locks`
+        // holds one entry per churned table (== N). With GC it stays bounded.
+        let len = store.table_locks.len();
+        assert!(
+            len < 200,
+            "table_locks grew unbounded: {len} entries after churning {N} tables"
+        );
+    }
+
+    /// A sweep reclaims map-only entries but must keep any held by an in-flight
+    /// committer, and re-acquiring a survivor returns the same mutex instance
+    /// (mutual exclusion is preserved across a sweep).
+    #[test]
+    fn table_lock_table_sweep_keeps_held_entries() {
+        let t = TableLockTable::new();
+        let names: Vec<String> = (0..100).map(|i| format!("k{i}")).collect();
+        let arcs = t.acquire(&names);
+        assert_eq!(t.len(), 100);
+
+        // One in-flight committer still holds "k0"; everyone else is done.
+        let held = arcs[0].clone();
+        drop(arcs);
+
+        // k0 has an outside holder (strong_count == 2); the other 99 are
+        // map-only (strong_count == 1) and must be reclaimed.
+        t.sweep();
+        assert_eq!(t.len(), 1, "sweep must keep exactly the held entry");
+
+        // Re-acquiring the survivor returns the SAME Arc — concurrent committers
+        // never split across two mutex instances for one table.
+        let re = t.acquire(std::slice::from_ref(&names[0]));
+        assert!(Arc::ptr_eq(&held, &re[0]), "survivor must be the same Arc");
+
+        // Once no holder remains, the next sweep reclaims it too.
+        drop(held);
+        drop(re);
+        t.sweep();
+        assert_eq!(t.len(), 0);
     }
 
     /// `update_batch` records all keys in the write set — conflict
