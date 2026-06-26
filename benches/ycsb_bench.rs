@@ -28,7 +28,14 @@ impl UltimaEngine {
         let tmpdir = tempfile::tempdir_in(bench_disk_dir()).expect("failed to create temp dir");
         let durability = match bench_durability() {
             BenchDurability::NonDurable => Durability::Eventual,
-            BenchDurability::Strict => Durability::Consistent,
+            // A/B toggle: `ULTIMA_BENCH_INLINE` (any non-empty value) selects
+            // `standalone_fast`'s off-lock inline fsync (no bg-thread handoff;
+            // SingleWriter-only — the YCSB bench is single-writer). Pair with
+            // `ULTIMA_BENCH_PREALLOC=1` for the full `standalone_fast` preset.
+            BenchDurability::Strict => match std::env::var_os("ULTIMA_BENCH_INLINE") {
+                Some(v) if !v.is_empty() => Durability::ConsistentInline,
+                _ => Durability::Consistent,
+            },
         };
         // A/B toggle: `ULTIMA_BENCH_PREALLOC` (any non-empty value) selects the
         // preallocating WAL sink, so prealloc-on vs prealloc-off is the only
