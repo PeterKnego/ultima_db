@@ -10,6 +10,9 @@ pub enum Error {
     #[error("vector dim mismatch: expected {expected}, got {got}")]
     DimMismatch { expected: usize, got: usize },
 
+    #[error("non-finite value ({value}) at index {index} in vector")]
+    NonFinite { index: usize, value: f32 },
+
     #[error("node id {0} not found")]
     NodeNotFound(u64),
 
