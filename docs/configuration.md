@@ -21,11 +21,15 @@ what it does, when to use it, its default, and which settings can/can't be combi
 | `require_explicit_version` | `bool` | **`false`** | If `true`, `begin_write(None)` errors (`ExplicitVersionRequired`) — you must pass `Some(v)`. For SMR (§6). |
 | `persistence` | `Persistence` | **`None`** (in-memory) | Durability mode (§4); requires the `persistence` cargo feature. |
 
+`StoreConfig` is `#[non_exhaustive]`; construct it with the builder (fields keep
+their `Default` unless set):
+
 ```rust
-let store = Store::new(StoreConfig {
-    persistence: Persistence::standalone_fast(dir),  // override one field
-    ..StoreConfig::default()
-})?;
+let store = Store::new(
+    StoreConfig::builder()
+        .persistence(Persistence::standalone_fast(dir))  // override one field
+        .build(),
+)?;
 ```
 
 ---
