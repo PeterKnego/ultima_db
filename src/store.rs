@@ -128,6 +128,67 @@ impl Default for StoreConfig {
     }
 }
 
+impl StoreConfig {
+    /// Start building a [`StoreConfig`]. Chain the setters you need, then
+    /// call [`StoreConfigBuilder::build`]. Unset fields take their
+    /// [`Default`] values.
+    ///
+    /// ```
+    /// use ultima_db::{StoreConfig, WriterMode};
+    /// let config = StoreConfig::builder()
+    ///     .writer_mode(WriterMode::MultiWriter)
+    ///     .num_snapshots_retained(5)
+    ///     .build();
+    /// ```
+    pub fn builder() -> StoreConfigBuilder {
+        StoreConfigBuilder::default()
+    }
+}
+
+/// Builder for [`StoreConfig`]. Obtain via [`StoreConfig::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct StoreConfigBuilder {
+    config: StoreConfig,
+}
+
+impl StoreConfigBuilder {
+    /// See [`StoreConfig::num_snapshots_retained`].
+    pub fn num_snapshots_retained(mut self, n: usize) -> Self {
+        self.config.num_snapshots_retained = n;
+        self
+    }
+    /// See [`StoreConfig::auto_snapshot_gc`].
+    pub fn auto_snapshot_gc(mut self, enabled: bool) -> Self {
+        self.config.auto_snapshot_gc = enabled;
+        self
+    }
+    /// See [`StoreConfig::writer_mode`].
+    pub fn writer_mode(mut self, mode: WriterMode) -> Self {
+        self.config.writer_mode = mode;
+        self
+    }
+    /// See [`StoreConfig::isolation_level`].
+    pub fn isolation_level(mut self, level: IsolationLevel) -> Self {
+        self.config.isolation_level = level;
+        self
+    }
+    /// See [`StoreConfig::require_explicit_version`].
+    pub fn require_explicit_version(mut self, required: bool) -> Self {
+        self.config.require_explicit_version = required;
+        self
+    }
+    /// See [`StoreConfig::persistence`].
+    #[cfg(feature = "persistence")]
+    pub fn persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
+        self.config.persistence = persistence;
+        self
+    }
+    /// Finalize the configuration.
+    pub fn build(self) -> StoreConfig {
+        self.config
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CommittedWriteSet — records which keys a committed transaction modified
 // ---------------------------------------------------------------------------
@@ -3185,6 +3246,35 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Config builder tests ---
+
+    #[test]
+    fn builder_matches_literal_all_fields() {
+        let built = StoreConfig::builder()
+            .num_snapshots_retained(3)
+            .auto_snapshot_gc(false)
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(IsolationLevel::Serializable)
+            .require_explicit_version(true)
+            .build();
+        assert_eq!(built.num_snapshots_retained, 3);
+        assert!(!built.auto_snapshot_gc);
+        assert_eq!(built.writer_mode, WriterMode::MultiWriter);
+        assert_eq!(built.isolation_level, IsolationLevel::Serializable);
+        assert!(built.require_explicit_version);
+    }
+
+    #[test]
+    fn builder_default_equals_config_default() {
+        let built = StoreConfig::builder().build();
+        let def = StoreConfig::default();
+        assert_eq!(built.num_snapshots_retained, def.num_snapshots_retained);
+        assert_eq!(built.auto_snapshot_gc, def.auto_snapshot_gc);
+        assert_eq!(built.writer_mode, def.writer_mode);
+        assert_eq!(built.isolation_level, def.isolation_level);
+        assert_eq!(built.require_explicit_version, def.require_explicit_version);
+    }
 
     // --- Store tests ---
 

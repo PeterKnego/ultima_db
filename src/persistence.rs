@@ -124,4 +124,54 @@ impl Persistence {
             wal_write: WalWrite::CoalescedPrealloc,
         }
     }
+
+    /// Construct a [`Persistence::Standalone`] config: UltimaDB owns
+    /// durability via WAL + checkpoints in `dir`.
+    pub fn standalone(
+        dir: impl Into<PathBuf>,
+        durability: Durability,
+        wal_write: WalWrite,
+    ) -> Self {
+        Persistence::Standalone {
+            dir: dir.into(),
+            durability,
+            wal_write,
+        }
+    }
+
+    /// Construct a [`Persistence::Smr`] config: checkpoint-only, for
+    /// deployments where a consensus log provides durability.
+    pub fn smr(dir: impl Into<PathBuf>) -> Self {
+        Persistence::Smr { dir: dir.into() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_constructor_matches_literal() {
+        let c = Persistence::standalone("/tmp/x", Durability::Consistent, WalWrite::Coalesced);
+        match c {
+            Persistence::Standalone {
+                dir,
+                durability,
+                wal_write,
+            } => {
+                assert_eq!(dir, PathBuf::from("/tmp/x"));
+                assert_eq!(durability, Durability::Consistent);
+                assert_eq!(wal_write, WalWrite::Coalesced);
+            }
+            _ => panic!("expected Standalone"),
+        }
+    }
+
+    #[test]
+    fn smr_constructor_matches_literal() {
+        match Persistence::smr("/tmp/y") {
+            Persistence::Smr { dir } => assert_eq!(dir, PathBuf::from("/tmp/y")),
+            _ => panic!("expected Smr"),
+        }
+    }
 }
