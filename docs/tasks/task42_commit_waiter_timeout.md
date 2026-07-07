@@ -4,8 +4,9 @@
 no timeout; intent-queue liveness relies on a documented convention (drop tx
 before waiting)."
 
-(Note: two prior features both took the number task41 — the index-DDL conflict
-fix and the Elle consistency harness. This work is numbered task42.)
+(Numbering note: task41 is the index-DDL conflict fix; the Elle consistency
+harness, developed in parallel, briefly shared task41 and was renumbered to
+task45. This work is task42.)
 
 ## What changed
 

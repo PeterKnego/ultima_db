@@ -147,7 +147,7 @@ bench/compare-engines:
 	cargo bench -p compare-benches
 
 # Transactional consistency check (Elle list-append via vendored elle-cli,
-# needs java) — opt-in tier, not part of `make test`. Tune via ELLE_ARGS. See task41.
+# needs java) — opt-in tier, not part of `make test`. Tune via ELLE_ARGS. See task45.
 # Two passes: point reads (SSI point read-set), then a scan-heavy pass
 # (SSI coarse table_scan read-set). Both must satisfy their isolation claim.
 ELLE_DIR ?= /tmp/ultima-elle

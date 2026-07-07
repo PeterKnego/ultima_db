@@ -1,4 +1,8 @@
-# Task 41: Elle Consistency Harness
+# Task 45: Elle Consistency Harness
+
+> Renumbered from task41 (numbering collided with the index-DDL conflict fix,
+> which is the canonical task41); the Elle harness is task45.
+
 
 Black-box verification of UltimaDB's transactional isolation claims using
 [Elle](https://github.com/jepsen-io/elle) (Jepsen's transactional-safety

@@ -1,4 +1,4 @@
-# Elle Consistency Harness (task41) — Design
+# Elle Consistency Harness (task45) — Design
 
 **Date:** 2026-07-07
 **Status:** Approved (user delegated recommended options; autonomous session)
@@ -146,7 +146,7 @@ defaults: ≲2 min generation + ≲1 min checking.
 
 ### 4. Docs
 
-`docs/tasks/task41_elle_consistency_harness.md`: what Elle checks, how the
+`docs/tasks/task45_elle_consistency_harness.md`: what Elle checks, how the
 mapping works (pre-seeded keys, get+update appends, fresh-values-on-retry,
 :fail semantics), how to run, how to read a failure (elle-cli `--directory` dumps
 anomaly explanations + SVG cycle plots), and known limitations (below).

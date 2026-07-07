@@ -6,7 +6,7 @@ Serializable (SSI) as opt-in — are now verified by
 behind the Jepsen analyses, running against real concurrent MultiWriter
 histories. Both claims hold. The check is a repeatable, opt-in tier:
 `make consistency/elle` (~2–3 min, needs Java). Landed on `main` @ `cfd3153`;
-technical details in `docs/tasks/task41_elle_consistency_harness.md`.
+technical details in `docs/tasks/task45_elle_consistency_harness.md`.
 
 ## What was done
 

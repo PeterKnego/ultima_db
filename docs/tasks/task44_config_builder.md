@@ -4,9 +4,9 @@
 `StoreConfig`/`Persistence` was blocked by the `..Default::default()`
 struct-literal construction style; it needed a builder first.
 
-(Numbering: task41 is used twice on main — index-DDL conflict fix and the Elle
-consistency harness; 42 = CommitWaiter timeout, 43 = Unicode tokenizer. This is
-task44.)
+(Numbering note: task41 = index-DDL conflict fix (the Elle harness that briefly
+shared task41 is now task45); 42 = CommitWaiter timeout, 43 = Unicode tokenizer.
+This is task44.)
 
 ## What changed
 

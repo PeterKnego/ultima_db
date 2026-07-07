@@ -1,6 +1,6 @@
 //! elle-history: generate Elle list-append histories against UltimaDB
 //! MultiWriter transactions (SI or Serializable), for checking with the
-//! vendored elle-cli. See docs/tasks/task41_elle_consistency_harness.md.
+//! vendored elle-cli. See docs/tasks/task45_elle_consistency_harness.md.
 
 use clap::Parser;
 use std::fmt::Write as _;

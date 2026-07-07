@@ -3,8 +3,8 @@
 **Origin:** 2026-06 deep-review deferred backlog — "Fulltext tokenizer splits
 only on ASCII punctuation (Unicode text under-matches)."
 
-(Numbering: task41 is used twice on main — index-DDL conflict fix and the Elle
-consistency harness; task42 is the CommitWaiter timeout. This is task43.)
+(Numbering note: task41 = index-DDL conflict fix (the Elle harness that briefly
+shared task41 is now task45); task42 = CommitWaiter timeout. This is task43.)
 
 ## What changed
 

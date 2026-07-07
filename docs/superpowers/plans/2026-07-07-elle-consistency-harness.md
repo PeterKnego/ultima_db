@@ -56,7 +56,7 @@ Standalone CLI for Jepsen's Elle transactional-safety checker.
 - sha256(elle-cli-0.1.9-standalone.jar): <fill with actual `sha256sum` output>
 - Requires: Java 11+ (repo toolchain: Temurin 21)
 - Used by: `scripts/elle_check.sh` via `make consistency/elle`
-  (see `docs/tasks/task41_elle_consistency_harness.md`)
+  (see `docs/tasks/task45_elle_consistency_harness.md`)
 
 `fixtures/known_bad.edn` is a hand-written list-append history containing a
 lost update; the check script requires elle-cli to reject it before trusting
@@ -219,7 +219,7 @@ Full contents of `autobench/src/bin/elle-history.rs` (above the test module):
 ```rust
 //! elle-history: generate Elle list-append histories against UltimaDB
 //! MultiWriter transactions (SI or Serializable), for checking with the
-//! vendored elle-cli. See docs/tasks/task41_elle_consistency_harness.md.
+//! vendored elle-cli. See docs/tasks/task45_elle_consistency_harness.md.
 
 use clap::Parser;
 use std::fmt::Write as _;
@@ -716,7 +716,7 @@ git commit -m "feat: make consistency/elle — Elle check pipeline (task41)"
 ### Task 4: Documentation
 
 **Files:**
-- Create: `docs/tasks/task41_elle_consistency_harness.md`
+- Create: `docs/tasks/task45_elle_consistency_harness.md`
 - Modify: `CLAUDE.md` (autobench bullet, ~line 41)
 
 **Interfaces:**
@@ -724,7 +724,7 @@ git commit -m "feat: make consistency/elle — Elle check pipeline (task41)"
 
 - [ ] **Step 1: Write the task doc**
 
-`docs/tasks/task41_elle_consistency_harness.md` covering (write real prose, not an outline):
+`docs/tasks/task45_elle_consistency_harness.md` covering (write real prose, not an outline):
 
 - What is checked: MultiWriter+SI history must satisfy Elle's `snapshot-isolation` model; MultiWriter+SSI history must satisfy `serializable`; SI history checked against `serializable` is expected-invalid (write skew) as a contention sanity signal (WARN if valid).
 - How the mapping works: pre-seeded keyspace (no public insert-at-key; `update` requires existing key), append = `get`+clone+push+`update` (the `get` registers the SSI point read), globally unique append values from one `AtomicU64`, `:fail` only for `WriteConflict`/`SerializationFailure` (both guarantee no commit), failed attempts are not retried — the next attempt is a fresh transaction with fresh values, `:info` retires the process.
@@ -737,13 +737,13 @@ git commit -m "feat: make consistency/elle — Elle check pipeline (task41)"
 In the `autobench/` bullet, append one sentence:
 
 ```
-Also hosts the `elle-history` bin: `make consistency/elle` generates Elle list-append histories under MultiWriter SI/SSI and checks them with the vendored elle-cli (`tools/elle-cli/`, needs java) — see `docs/tasks/task41_elle_consistency_harness.md`.
+Also hosts the `elle-history` bin: `make consistency/elle` generates Elle list-append histories under MultiWriter SI/SSI and checks them with the vendored elle-cli (`tools/elle-cli/`, needs java) — see `docs/tasks/task45_elle_consistency_harness.md`.
 ```
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add docs/tasks/task41_elle_consistency_harness.md CLAUDE.md
+git add docs/tasks/task45_elle_consistency_harness.md CLAUDE.md
 git commit -m "docs: task41 Elle consistency harness"
 ```
 
