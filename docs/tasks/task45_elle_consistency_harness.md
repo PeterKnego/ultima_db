@@ -12,6 +12,11 @@ checker) on list-append histories, wired up as an opt-in conformance tier:
 make consistency/elle          # needs java (repo toolchain: Temurin 21)
 ```
 
+> **Extended in task47** (`docs/tasks/task47_elle_anomaly_and_mutation.md`): the
+> checks now assert the exact anomaly set (SI ⊆ `{G2-item}`, SSI = ∅), and
+> `make consistency/elle-mutation` injects commit-path bugs to prove the harness
+> catches them.
+
 Design history: `docs/superpowers/specs/2026-07-07-elle-consistency-harness-design.md`,
 `docs/superpowers/plans/2026-07-07-elle-consistency-harness.md`.
 
