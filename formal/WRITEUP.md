@@ -12,6 +12,8 @@ Along the way we built a compile-feedback harness for **Leanstral** (Mistral's s
 
 Final integrity check: `#print axioms` on the top-level theorem reports only `propext`, `Classical.choice`, `Quot.sound` — Lean's three standard axioms. No `sorry` anywhere in the chain.
 
+*A third session (also 2026-07-07) extended this to the full mutating API: **`remove` is now machine-checked to behave exactly as a map deletion** (invariant preservation + `get k = none` + frame), with two findings that make deletion the more interesting story — the proof forced a strictly stronger invariant because the naive theorem is literally false, and the rebalancing turned out to be provably "flatten-invariant." See Part IV (§5).*
+
 ---
 
 ## 1. Context: why formally verify UltimaDB's B-tree?
@@ -171,9 +173,41 @@ Wall-clock: pipeline + warm-ups in one session (~half a day of elapsed time, mos
 
 ---
 
-## 5. Significance
+## 5. Part IV — Extending to deletion (session 3)
 
-### 5.1 For UltimaDB
+With insertion fully verified, the natural next target was the code the roadmap called "the hairiest in `btree.rs`": `remove` and its rebalancing. Completing it gives **complete functional correctness of the mutating B-tree API**. It landed — `remove_inv` + `remove_get` + `remove_frame`, sorry-free, same three axioms — and turned out to be *larger than the entire insert effort* (~5,400 lines of proof across seven files vs ~1,600). Four things are worth an article.
+
+### 5.1 Porting the rebalancers: pure-functional surgery + a new translation trap
+
+`remove` descends to a leaf, deletes, and repairs underflow on the way up by borrowing from a sibling (rotate), merging two children with their separator, or collapsing the root. The real code mutates the parent in place (`fix_underfull_child(&mut entries, &mut children, idx)`); the port renders each rebalancer as a **pure function returning the repaired `(entries, children)`** — observationally identical for a persistent structure, and it keeps the algorithm line-for-line recognizable. `remove` returns `Option<BTree>` (`None` = the `Err(KeyNotFound)` arm). A second differential test (3,000 inserts + 8,000 interleaved insert/remove ops + a full drain to empty vs `std::BTreeMap`) anchors the port.
+
+**New subset gotcha — "Could not match the contexts."** Aeneas's symbolic borrow-checker rejected the first port with this error on `rotate_*` and `delete_from_node`. The cause: a *nested* reborrow — `child_at(&left.children, …)` where `left` is itself `child_at(children, …)`, a reborrow of the parent — sitting inside *one branch* of an `if`. The same nested read used *unconditionally* (as in the merge helpers) translates fine; the asymmetry across the branch join is what the context-matcher can't reconcile. Fix: make the function body branch-free by pushing the leaf/internal split into `child_at`-shaped recursive helpers (`drop_last_child`, `last_child_singleton`), and hoist the underflow join into a small helper taking owned arguments. A clean addition to the subset-limitations catalog: *reborrow depth is fine; reborrow depth that differs across an `if`-join is not.*
+
+### 5.2 The proof forced a stronger invariant — the naive theorem is FALSE
+
+The headline. `NodeInv`/`Aligned` encode sortedness, child-interval alignment, and arity ≤ 63 — but **not height-uniformity**. Nothing in them forbids a parent whose children have *mixed* leaf/internal status. `merge` on such a pair (a leaf sibling + an internal sibling) concatenates their child lists and yields a node with `#children ≠ #entries + 1` — malformed. So the obvious statement, `remove_inv : BTreeInv t → BTreeInv (remove t k)`, is **not a theorem**: there exist trees satisfying `BTreeInv` on which remove produces a broken tree.
+
+Real, insert-built trees are never height-mixed — but the *invariant admits them*, and the proof cannot proceed until they're excluded. This is exactly the kind of gap testing never surfaces (no insert sequence ever builds such a tree) and a proof cannot paper over. The fix is an additive height-uniformity predicate `HeightInv` (a mutual inductive with `ChildrenHeight`, `BalancedInvariant.lean`) carried alongside `NodeInv` through every remove lemma; `merge`'s surgery lemma now *requires* both children at the same height. It doesn't touch the insert proofs. Discovering that the invariant you've been carrying is too weak to even *state* your next theorem is the verification dividend in miniature — and it was surfaced by the orchestrator reading the existing lemmas before dispatching the surgery work, not after a failed proof.
+
+### 5.3 Honest scoping: conditional on success, not total
+
+Even with `HeightInv`, `NodeInv ∧ HeightInv` still admit a *degenerate* case: a 0-entry internal node (one child, no separator). `fix_underfull_child` on such a parent indexes an empty entry vector and the kernel legitimately **fails** (`Result.fail`). So — unlike the insert theorems, which are total WP triples that double as no-panic proofs — the remove theorems are stated **conditional on the kernel returning `ok`**: *whenever remove succeeds, the result is well-formed and behaves as a deletion.* Proving remove *total* (never fails on a well-formed tree) needs the full B-tree balance invariant — the MIN_KEYS lower bound (every non-root node ≥ T−1 entries) — threaded through the rebalancers, which is the clean next increment. Neatly, the nonempty precondition the rebalance lemmas need is *derived from* the success hypothesis rather than assumed (`fix_underfull_child_ok_pos`: every reachable branch indexes `entries`, so `ok` ⇒ nonempty).
+
+### 5.4 The elegant part: rebalancers are flatten-invariant
+
+`remove_get` (deleted key gone) and `remove_frame` (other keys untouched) look daunting because rotation and merge *reshuffle keys across the tree*. The move that collapses them: characterize `get` by an **in-order flatten**. Prove (a) for a valid tree, `get_in_node node k` equals a lookup in `flatten node` (the in-order key/value list), and (b) *every rebalancer preserves `flatten`* — rotation and merge move structure but not the in-order sequence. Then delete's only effect on lookups is "drop the one entry keyed `k`," and both theorems fall out: `remove_get` from "`k ∉ flatten n'`," `remove_frame` from "`flatten n' = (flatten n).filter (·.key ≠ k)`, which doesn't change the lookup of any `k' ≠ k`." A rebalancer-heavy proof becomes a handful of pure list lemmas over a flatten-invariance backbone (`RemoveFlatten.lean`).
+
+### 5.5 Orchestration: a staged pipeline, and a model-agnostic handoff
+
+Where insert used a *parallel* proof factory (five independent lemma agents at once), remove is a *dependency chain* — helper specs → rebalance surgery → invariant induction → get/frame — so it ran as a **staged pipeline**, each stage's verified signatures feeding the next agent's brief. Two invariant preconditions in the orchestrator's original plan were *corrected by the surgery agent from below*: the 0-entry no-sibling failure case (§5.3), and that the underfull `< MIN_KEYS` bound is needed for *merge arity* (sibling + separator + underflowing child ≤ 63), not merely to select the branch — design-level judgment surfacing during the proof, not the plan.
+
+One operational note underlines the trust model: the campaign ran across a **model switch mid-flight** (the hardest surgery stages on one frontier model until it hit an account spend limit, the remaining theorems on another) with *zero* change to the acceptance criterion — every stage still had to pass `lake build` and a clean `#print axioms`. The kernel does not care which model wrote the proof, and neither does the reviewer. That is the entire point.
+
+---
+
+## 6. Significance
+
+### 6.1 For UltimaDB
 
 This is the **first machine-checked correctness result about UltimaDB's core algorithm**. Concretely, the theorem rules out — for the translated kernel, and by the fidelity argument for `btree.rs` — the entire class of bugs where insertion corrupts the search-tree discipline: median off-by-ones, children mis-slotted after splits, bound violations across promoted keys, sorted-order breakage on replace. It additionally proves the insert path panic-free and overflow-free for every tree satisfying the invariant (which the arity bound makes self-sustaining).
 
@@ -181,11 +215,13 @@ The honest caveat is the **twin-code gap**: we verified a port with five documen
 
 **Update (day 2, continued):** get-after-insert is now also proved — `BTree.insert_get`: after `insert k v`, `get k` returns `ok (some v)` (864 further lines; `GetPost` handles the subtle case where the inserted pair becomes a promoted split median; navigation rests on `find_pos` completeness + uniqueness from sortedness). Axiom check identical. One process lesson worth an article aside: a `grep -c … && python-edit` chain silently skipped two edits (grep -c exits nonzero on zero matches), producing an illusory "compiled first try" on the unmodified file — caught only by the end-of-run `#print axioms` discipline, which is precisely the point of doing verification this way.
 
-**Update (day 2, final):** the frame property is also proved — `BTree.insert_frame`: `insert k v` leaves `get k'` unchanged for every `k' ≠ k` (1,200 further lines incl. bracket-transport lemmas for median insertion). Together, `insert_inv` + `insert_get` + `insert_frame` constitute **complete functional correctness of insertion**: the translated B-tree insert behaves exactly as a map update, machine-checked. Cumulative verified Lean: ~4,900 hand-written lines, ~85 theorems, across three sessions-worth of work in two days.
+**Update (day 2, final):** the frame property is also proved — `BTree.insert_frame`: `insert k v` leaves `get k'` unchanged for every `k' ≠ k` (1,200 further lines incl. bracket-transport lemmas for median insertion). Together, `insert_inv` + `insert_get` + `insert_frame` constitute **complete functional correctness of insertion**: the translated B-tree insert behaves exactly as a map update, machine-checked.
 
-What this does *not* cover (roadmap, in value order): the `remove`/rebalancing path (the hairiest code in `btree.rs`, unported); range iterators; and everything concurrent — the MultiWriter OCC merge protocol, commit-version promotion ordering, WAL recovery. Those last three are out of Aeneas's scope (its unsafe/concurrency support is future work) and need hand-written protocol models — where the model-fidelity gap returns and the payoff is arguably even higher.
+**Update (session 3):** the same three-part completeness now holds for **deletion** — `remove_inv` + `remove_get` + `remove_frame` (Part IV, §5). So both mutating operations of the B-tree are machine-checked to behave as the corresponding map operations. Cumulative verified Lean: ~10,000 hand-written lines, ~240 theorems (the deletion half alone is ~5,400 lines / ~150 theorems — larger than all of insertion).
 
-### 5.2 For the "AI + formal methods" story
+What this does *not* cover (roadmap, in value order): **totality of `remove`** (the theorems are conditional on the kernel returning `ok`; making remove provably non-failing needs the MIN_KEYS balance invariant — §5.3); range iterators; and everything concurrent — the MultiWriter OCC merge protocol, commit-version promotion ordering, WAL recovery. Those last three are out of Aeneas's scope (its unsafe/concurrency support is future work) and need hand-written protocol models — where the model-fidelity gap returns and the payoff is arguably even higher.
+
+### 6.2 For the "AI + formal methods" story
 
 1. **The economics have flipped.** Aeneas's comparable betree case study was a research-paper-scale effort by verification experts. Here, a database side-project got a nontrivial invariant proof in ~2 days of AI-assisted work, ~$0 in specialized-model costs, with the human role reduced to direction-setting. The bottleneck is no longer proof labor; it's deciding what's worth proving and designing invariants.
 2. **Verification is the ideal AI workload** because the trust story doesn't depend on the AI. Every step — Leanstral's attempts, subagent output, the orchestrator's own proofs — passes through the Lean kernel. A proof that compiles is correct no matter which model wrote it, how many hallucinated lemma names preceded it, or whether the process was reviewable. The anti-cheat guards (no `sorry`/`axiom`, statements verbatim) plus a final `#print axioms` make the acceptance criterion fully mechanical. This is the inverse of most AI coding, where plausible-but-wrong survives review.
@@ -193,13 +229,13 @@ What this does *not* cover (roadmap, in value order): the `remove`/rebalancing p
 4. **The parallel proof factory pattern worked on the first try.** Decompose the theorem into an independent lemma stack; freeze exact statements up front (merges become mechanical); give each agent a worked example and an idiom cheat-sheet; let the compiler adjudicate; integrate in one context that owns the invariant design. Five out of five agents returned complete proofs. The pattern generalizes to any goal with a stable spec boundary.
 5. **Mechanical translation is the fidelity unlock.** Hand-written models drift; Aeneas-translated code can't (modulo the subset deltas). The practical recipe for Rust projects: extract algorithmic kernels into dependency-free crates written in the supported subset, differential-test them against the originals, translate, prove. The subset limitations we hit (no `Arc`, no recursive-through-`Vec`, no mutually recursive derived impls, no closures) all had local workarounds — none blocked the project.
 
-### 5.3 One-paragraph version (for the article lede)
+### 6.3 One-paragraph version (for the article lede)
 
 We took the copy-on-write B-tree at the heart of UltimaDB, mechanically translated its insertion algorithm from Rust into Lean 4 with the Aeneas toolchain, and produced a kernel-checked proof — no `sorry`, no extra axioms — that insertion preserves the full B-tree ordering invariant, median splits included, and can never panic or overflow along the way. The proof was built in about two days by a frontier LLM orchestrating five parallel proof agents, with the Lean compiler as the only authority; a purpose-built Lean prover (Mistral's freshly-released Leanstral) was evaluated in the same loop and, through a naive harness, designed the right proofs but couldn't land them — a result that says less about the model than about where the real leverage in AI-assisted verification lies: in the harness, the invariant design, and the decomposition.
 
 ---
 
-## 6. Appendix: artifact inventory & reproduction
+## 7. Appendix: artifact inventory & reproduction
 
 ```
 formal/.toolchain/                   # prebuilt aeneas + charon + Lean backend library
@@ -218,6 +254,14 @@ formal/proofs/                       # lake package: everything below
     BtreeInsertInv.lean              # maybe_split_spec, insert_into_node_inv, BTree.insert_inv
     BtreeInsertGet.lean              # navigation lemmas, insert_get_same, BTree.insert_get
     BtreeInsertFrame.lean            # GetR, frame lemmas, insert_frame, BTree.insert_frame
+    # --- deletion (Part IV) ---
+    BalancedInvariant.lean           # HeightInv/ChildrenHeight (height-uniformity)
+    RemoveSpecs.lean                 # specs for the delete helper functions
+    RemoveRebalance.lean             # rotate/merge surgery preserving NodeInv ∧ HeightInv
+    RemoveInv.lean                   # delete_from_node_inv, remove_leftmost_spec, BTree.remove_inv
+    RemoveFlatten.lean               # in-order flatten + get_flatten + rebalancer flatten-invariance
+    RemoveGet.lean                   # BTree.remove_get
+    RemoveFrame.lean                 # delete_from_node_flatten, BTree.remove_frame
 ~/ultima/leanstral-demo/             # Leanstral experiments incl. drive.py harness (outside repo)
 ```
 (The `Agent*.lean` names in the narrative above were the working names of the
@@ -234,22 +278,36 @@ cp BtreeKernel.lean ../proofs/
 cd ../proofs && lake build                        # checks every theorem
 ```
 
-Integrity check:
+Integrity check (all six top-level theorems report the same three axioms):
 ```lean
-import BtreeInsertInv
-#print axioms btree_kernel.BTree.insert_inv
--- 'btree_kernel.BTree.insert_inv' depends on axioms: [propext, Classical.choice, Quot.sound]
+import BtreeInsertInv; import BtreeInsertGet; import BtreeInsertFrame
+import RemoveInv;      import RemoveGet;      import RemoveFrame
+#print axioms btree_kernel.BTree.insert_inv    -- insert_get, insert_frame
+#print axioms btree_kernel.BTree.remove_inv    -- remove_get, remove_frame
+-- each: depends on axioms: [propext, Classical.choice, Quot.sound]
 ```
 
 Key theorem statements (verbatim):
 ```lean
-theorem insert_into_node_inv (fuel : Nat) {lo hi : Option Nat}
-    (node : Node) (k v : Std.U64)
-    (hfuel : Node.size node ≤ fuel)
-    (hinv : NodeInv lo hi node) (hk : InB lo hi k.val) :
-    insert_into_node node k v ⦃ r => InsPost lo hi r ⦄
-
 theorem BTree.insert_inv (t : BTree) (k v : Std.U64)
     (hinv : BTreeInv t) (hcap : t.len.val < Std.Usize.max) :
     BTree.insert t k v ⦃ t' => BTreeInv t' ⦄
+
+-- Deletion (Part IV). BTreeBalanced t := ∃ h, HeightInv h t.root.
+-- Conditional on success: the invariant admits pathological trees on which
+-- delete legitimately fails (§5.3).
+theorem BTree.remove_inv (t : BTree) (key : Std.U64) (t' : BTree)
+    (hinv : BTreeInv t) (hbal : BTreeBalanced t)
+    (hok : BTree.remove t key = ok (some t')) :
+    BTreeInv t' ∧ BTreeBalanced t'
+
+theorem BTree.remove_get (t t' : BTree) (key : Std.U64)
+    (hinv : BTreeInv t) (hbal : BTreeBalanced t)
+    (hok : BTree.remove t key = ok (some t')) :
+    t'.get key = ok none
+
+theorem BTree.remove_frame (t t' : BTree) (key k' : Std.U64) (hne : k'.val ≠ key.val)
+    (hinv : BTreeInv t) (hbal : BTreeBalanced t)
+    (hok : BTree.remove t key = ok (some t')) :
+    t'.get k' = t.get k'
 ```
