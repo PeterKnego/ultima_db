@@ -262,6 +262,7 @@ where
                 got: query.len(),
             });
         }
+        crate::validate::ensure_finite(query)?;
         let ef = ef.unwrap_or(self.params.ef_search_default);
         hnsw_search::search::<Meta, D>(
             tx,
@@ -561,6 +562,21 @@ mod tests {
         // Tx was dropped without commit, so the first row is also gone.
         let res = coll.search(&[1.0, 0.0], 3, None, None).unwrap();
         assert!(res.is_empty(), "failed bulk_insert must roll back");
+    }
+
+    #[test]
+    fn search_rejects_non_finite_query() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        coll.upsert(vec![1.0, 0.0], 1u64).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = coll.search(&[bad, 0.0], 5, None, None).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::NonFinite { index: 0, .. }),
+                "expected NonFinite at index 0, got {err:?}"
+            );
+        }
     }
 
     #[test]
