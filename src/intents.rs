@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 use dashmap::DashMap;
@@ -59,6 +60,25 @@ impl IntentWaiter {
         }
     }
 
+    /// Block until signaled or until `timeout` elapses. Returns `true` if
+    /// the writer signaled done (safe to retry), `false` on timeout.
+    ///
+    /// The deadline is computed once so a spurious wakeup re-waits against
+    /// the same instant rather than restarting the full timeout — total
+    /// wall-time stays bounded by `timeout` regardless of spurious wakes.
+    pub(crate) fn wait_timeout_inner(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut d = self.done.lock();
+        while !*d {
+            if self.cvar.wait_until(&mut d, deadline).timed_out() {
+                // On deadline, return the latched flag: a signal that lands
+                // exactly at the deadline still reports true.
+                return *d;
+            }
+        }
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn is_signaled(&self) -> bool {
         *self.done.lock()
@@ -76,6 +96,16 @@ impl CommitWaiter {
     /// immediately if that already happened.
     pub fn wait(&self) {
         self.0.wait();
+    }
+
+    /// Block until the conflicting writer commits or aborts, or until
+    /// `timeout` elapses. Returns `true` if the writer finished (safe to
+    /// rebase and retry), `false` on timeout — in which case the holder is
+    /// still live: you likely violated the "drop your WriteTx before
+    /// waiting" convention, or the holder is wedged. Returns immediately if
+    /// the writer already finished.
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        self.0.wait_timeout_inner(timeout)
     }
 }
 
@@ -219,6 +249,87 @@ impl IntentMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+
+    #[test]
+    fn wait_timeout_returns_true_when_signaled_before_deadline() {
+        let w = IntentWaiter::new();
+        let w2 = Arc::clone(&w);
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            w2.signal_done();
+        });
+        let start = Instant::now();
+        let signaled = w.wait_timeout_inner(Duration::from_secs(5));
+        assert!(signaled, "should observe the signal");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should return promptly after signal, took {:?}",
+            start.elapsed()
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn wait_timeout_returns_false_on_timeout_and_is_bounded() {
+        let w = IntentWaiter::new();
+        let start = Instant::now();
+        let signaled = w.wait_timeout_inner(Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(!signaled, "unsignaled waiter must time out");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "must not return before the timeout, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not hang, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn wait_timeout_wakes_early_when_signaled_mid_wait() {
+        let w = IntentWaiter::new();
+        let w2 = Arc::clone(&w);
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            w2.signal_done();
+        });
+        let start = Instant::now();
+        let signaled = w.wait_timeout_inner(Duration::from_secs(10));
+        assert!(signaled);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "woke on signal, not deadline: {:?}",
+            start.elapsed()
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn wait_timeout_already_signaled_returns_immediately() {
+        let w = IntentWaiter::new();
+        w.signal_done();
+        let start = Instant::now();
+        let signaled = w.wait_timeout_inner(Duration::from_millis(0));
+        assert!(signaled, "already-signaled waiter returns true");
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn commit_waiter_wait_timeout_wraps_inner() {
+        let w = IntentWaiter::new();
+        let cw = CommitWaiter(Arc::clone(&w));
+        assert!(
+            !cw.wait_timeout(Duration::from_millis(20)),
+            "not signaled → false"
+        );
+        w.signal_done();
+        assert!(
+            cw.wait_timeout(Duration::from_millis(20)),
+            "signaled → true"
+        );
+    }
 
     #[test]
     fn acquire_twice_by_same_writer_is_ok() {
