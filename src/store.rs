@@ -3580,6 +3580,119 @@ mod tests {
     }
 
     #[test]
+    fn mw_ddl_with_concurrent_commit_on_other_table_ok() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        let mut ddl_tx = store.begin_write(None).unwrap();
+        {
+            let mut t = ddl_tx.open_table::<String>("a").unwrap();
+            t.define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
+            t.insert("alpha".to_string()).unwrap();
+        }
+        // Concurrent commit on a DIFFERENT table.
+        {
+            let mut other = store.begin_write(None).unwrap();
+            let mut t = other.open_table::<String>("b").unwrap();
+            t.insert("beta".to_string()).unwrap();
+            other.commit().unwrap();
+        }
+        ddl_tx.commit().unwrap();
+
+        let mut check = store.begin_write(None).unwrap();
+        let t = check.open_table::<String>("a").unwrap();
+        let hit = t.get_unique("by_val", &"alpha".to_string()).unwrap();
+        assert!(hit.is_some(), "index must be installed and queryable");
+    }
+
+    #[test]
+    fn mw_ddl_fast_path_installs_index() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        let mut ddl_tx = store.begin_write(None).unwrap();
+        {
+            let mut t = ddl_tx.open_table::<String>("t").unwrap();
+            t.define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
+            t.insert("alpha".to_string()).unwrap();
+        }
+        ddl_tx.commit().unwrap();
+
+        let mut check = store.begin_write(None).unwrap();
+        let t = check.open_table::<String>("t").unwrap();
+        let hit = t.get_unique("by_val", &"alpha".to_string()).unwrap();
+        assert!(hit.is_some());
+    }
+
+    #[test]
+    fn single_writer_ddl_unaffected() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("alpha".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
+        }
+        wtx.commit().unwrap();
+
+        let mut check = store.begin_write(None).unwrap();
+        let t = check.open_table::<String>("t").unwrap();
+        let hit = t.get_unique("by_val", &"alpha".to_string()).unwrap();
+        assert!(hit.is_some());
+    }
+
+    #[test]
+    fn mw_failed_ddl_does_not_taint_commit() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        // Commit an index so a later re-define with a different kind fails.
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
+            t.insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            // Kind mismatch → the DDL fails and must NOT mark the table.
+            assert!(
+                t.define_index("by_val", IndexKind::NonUnique, |s: &String| s.clone())
+                    .is_err()
+            );
+            t.insert("mine".to_string()).unwrap();
+        }
+        // Concurrent commit on a disjoint key of the same table forces the
+        // slow path (update of key 1; wtx inserted key 2).
+        {
+            let mut other = store.begin_write(None).unwrap();
+            let mut t = other.open_table::<String>("t").unwrap();
+            t.update(1, "theirs".to_string()).unwrap();
+            other.commit().unwrap();
+        }
+        // Slow-path key merge must succeed — no IndexDdlConflict.
+        wtx.commit().unwrap();
+    }
+
+    #[test]
     fn ssi_read_set_records_index_range_as_table_scan() {
         let store = Store::new(StoreConfig {
             writer_mode: WriterMode::MultiWriter,
