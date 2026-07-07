@@ -189,22 +189,22 @@ impl<'a> WithSimd for CosineWithQNormKernel<'a> {
 // ---------------- Public dispatch wrappers ----------------
 
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+    assert_eq!(a.len(), b.len(), "vector dim mismatch");
     arch().dispatch(DotKernel { a, b })
 }
 
 pub(crate) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+    assert_eq!(a.len(), b.len(), "vector dim mismatch");
     arch().dispatch(L2Kernel { a, b })
 }
 
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+    assert_eq!(a.len(), b.len(), "vector dim mismatch");
     arch().dispatch(CosineKernel { a, b })
 }
 
 pub(crate) fn cosine_with_query_norm(q: &[f32], t: &[f32], q_norm_sq: f32) -> f32 {
-    debug_assert_eq!(q.len(), t.len(), "vector dim mismatch");
+    assert_eq!(q.len(), t.len(), "vector dim mismatch");
     arch().dispatch(CosineWithQNormKernel { q, t, q_norm_sq })
 }
 
