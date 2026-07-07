@@ -284,12 +284,15 @@ the project's edition).
   against a concurrent `delete_table`/create.
 - **Index DDL is invisible to SSI and OCC.** `define_index` /
   `define_custom_index` inside a transaction record nothing: the full-table
-  backfill read is not tracked as a scan, the DDL participates in no
-  conflict detection, and on the MultiWriter merge slow path (a concurrent
-  commit touched the same table) the new index definition is silently
-  dropped — only write-set *keys* are replayed onto the latest table.
-  Define indexes in their own transaction, with no concurrent writers on
-  the table.
+  backfill read is not tracked as a scan, and the DDL participates in no
+  conflict detection. On the MultiWriter merge slow path (a concurrent
+  commit touched the same table) the new index definition cannot be carried
+  over — only write-set *keys* are replayed onto the latest table.
+  Since task41 the drop is no longer silent: commit fails with
+  `Error::IndexDdlConflict` when a DDL'd table saw a concurrent commit.
+  The backfill read is still not SSI-tracked and DDL still generates no
+  conflicts for other writers. Define indexes in their own transaction and
+  retry on `IndexDdlConflict`.
 - **No support for serializable read-only transactions.** `ReadTx`
   doesn't track reads at all. Read-only transactions can't write-skew,
   so this is fine for the SSI guarantee, but a "snapshot isolation
