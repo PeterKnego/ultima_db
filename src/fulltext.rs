@@ -180,9 +180,16 @@ impl<R: Record> CustomIndex<R> for FullTextIndex<R> {
     }
 }
 
+/// Split `text` into lowercased tokens on Unicode-aware non-alphanumeric
+/// boundaries. `char::is_alphanumeric` covers all scripts, so Unicode
+/// punctuation/symbols/whitespace all split tokens (not just ASCII).
+///
+/// Known limitations (see `docs/tasks/task43_unicode_tokenizer.md`):
+/// CJK runs have no spaces and stay a single token; NFD combining marks are
+/// treated as boundaries, so NFC-normalized input is recommended.
 fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
-        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
@@ -215,6 +222,61 @@ mod tests {
     fn tokenize_punctuation() {
         assert_eq!(tokenize("it's a test."), vec!["it", "s", "a", "test"]);
         assert_eq!(tokenize("key=value;other"), vec!["key", "value", "other"]);
+    }
+
+    #[test]
+    fn tokenize_unicode_punctuation_splits() {
+        // Em-dash, guillemets, ideographic comma/full-stop, ellipsis.
+        assert_eq!(tokenize("café—bar"), vec!["café", "bar"]);
+        assert_eq!(tokenize("«Rust»,Go"), vec!["rust", "go"]);
+        assert_eq!(tokenize("a、b。c"), vec!["a", "b", "c"]);
+        assert_eq!(tokenize("one…two"), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn tokenize_preserves_accented_word_nfc() {
+        // Precomposed (NFC) accented letters are alphanumeric — one token.
+        assert_eq!(tokenize("Café"), vec!["café"]);
+        assert_eq!(tokenize("naïve GARÇON"), vec!["naïve", "garçon"]);
+    }
+
+    #[test]
+    fn tokenize_non_latin_scripts() {
+        // Cyrillic and Greek words are alphanumeric; split on spaces.
+        assert_eq!(tokenize("Привет мир"), vec!["привет", "мир"]);
+        assert_eq!(tokenize("Ελληνικά"), vec!["ελληνικά"]);
+    }
+
+    #[test]
+    fn tokenize_cjk_stays_single_run() {
+        // Documented limitation: CJK has no spaces and ideographs are
+        // alphanumeric, so a run stays one token (still under-matches).
+        assert_eq!(tokenize("東京都"), vec!["東京都"]);
+    }
+
+    #[test]
+    fn cyrillic_document_round_trips_through_search() {
+        let mut idx = make_index();
+        idx.on_insert(
+            1,
+            &Article {
+                title: "Привет".into(),
+                body: "Это тест на русском языке.".into(),
+            },
+        )
+        .unwrap();
+        idx.on_insert(
+            2,
+            &Article {
+                title: "Hello".into(),
+                body: "An English article.".into(),
+            },
+        )
+        .unwrap();
+
+        let results = idx.search("русском");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 1);
     }
 
     #[test]
