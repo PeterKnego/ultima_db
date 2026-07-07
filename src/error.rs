@@ -35,6 +35,17 @@ pub enum Error {
     /// writer has already finished.
     #[error("serialization failure on table '{table}' (conflicting version {version})")]
     SerializationFailure { table: String, version: u64 },
+    /// Returned when a MultiWriter commit contained index DDL
+    /// (`define_index` / `define_custom_index`) on a table that a concurrent
+    /// transaction committed to since this transaction's base snapshot. The
+    /// merge slow path replays only write-set keys, so the new index
+    /// definition cannot be carried over — the commit is refused instead of
+    /// silently dropping the DDL (see task41).
+    #[error(
+        "index DDL on table '{table}' conflicts with a concurrent commit; \
+         retry the DDL in its own transaction when the table is quiet"
+    )]
+    IndexDdlConflict { table: String },
     /// Returned when `begin_write` is called while another write transaction
     /// is active in [`WriterMode::SingleWriter`](crate::WriterMode::SingleWriter) mode.
     #[error("another write transaction is active (SingleWriter mode)")]
@@ -122,6 +133,18 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "write conflict on table 'users', keys [1, 2] (conflicting version 3)"
+        );
+    }
+
+    #[test]
+    fn index_ddl_conflict_display() {
+        let e = Error::IndexDdlConflict {
+            table: "users".to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "index DDL on table 'users' conflicts with a concurrent commit; \
+             retry the DDL in its own transaction when the table is quiet"
         );
     }
 
