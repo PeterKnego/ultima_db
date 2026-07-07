@@ -20,6 +20,30 @@
 //! Intents are released on commit (signal waiters, let successors retry
 //! against the new snapshot) or on drop (WriteTx rolled back without
 //! committing — same release path).
+//!
+//! [`CommitWaiter::wait`] blocks unbounded — correct only under the
+//! drop-before-wait convention above. When a caller can't guarantee it
+//! released its own intents first (or wants to survive a wedged holder),
+//! use [`CommitWaiter::wait_timeout`] instead: it returns `true` when the
+//! holder finished (rebase and retry) and `false` on timeout, so a violated
+//! convention surfaces as a recoverable error rather than a hang. Sketch:
+//!
+//! ```ignore
+//! loop {
+//!     match do_write(&store) {
+//!         Ok(v) => break v,
+//!         Err(Error::WriteConflict { wait_for: Some(w), .. }) => {
+//!             // WriteTx already dropped by `do_write` returning Err.
+//!             if !w.wait_timeout(Duration::from_secs(5)) {
+//!                 return Err(/* gave up: conflicting writer still live */);
+//!             }
+//!             // holder finished — retry against a fresh base
+//!         }
+//!         Err(Error::WriteConflict { wait_for: None, .. }) => { /* retry */ }
+//!         Err(e) => return Err(e),
+//!     }
+//! }
+//! ```
 
 use std::collections::VecDeque;
 use std::sync::Arc;
