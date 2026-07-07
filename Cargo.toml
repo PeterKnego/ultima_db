@@ -6,9 +6,11 @@ exclude = ["formal/kernel"]
 name = "ultima-db"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Embedded in-memory B-tree store with MVCC"
 authors = ["Peter Knego"]
 license = "Apache-2.0"
+repository = "https://github.com/PeterKnego/ultima_db"
 readme = "README.md"
 
 [features]
