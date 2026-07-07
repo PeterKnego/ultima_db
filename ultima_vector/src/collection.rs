@@ -182,6 +182,7 @@ where
                     got: row.embedding.len(),
                 });
             }
+            crate::validate::ensure_finite(&row.embedding)?;
             let level = row.hnsw.level();
             let layers = row.hnsw.layers_len();
             if layers != usize::from(level) + 1 {
