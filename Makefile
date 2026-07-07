@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle
 
 build:
 	cargo build
@@ -135,6 +135,16 @@ bench/flamegraph:
 # Competitor baseline tier (RocksDB/Fjall/ReDB) — not part of `make bench`
 bench/compare-engines:
 	cargo bench -p compare-benches
+
+# Transactional consistency check (Elle list-append via vendored elle-cli,
+# needs java) — opt-in tier, not part of `make test`. Tune via ELLE_ARGS. See task41.
+ELLE_DIR ?= /tmp/ultima-elle
+consistency/elle:
+	cargo run --release -p ultima-autobench --bin elle-history -- \
+		--isolation si $(ELLE_ARGS) --out $(ELLE_DIR)/si/history.edn
+	cargo run --release -p ultima-autobench --bin elle-history -- \
+		--isolation serializable $(ELLE_ARGS) --out $(ELLE_DIR)/ser/history.edn
+	scripts/elle_check.sh $(ELLE_DIR)/si/history.edn $(ELLE_DIR)/ser/history.edn
 
 # Perf regression gate (fitness binaries in --check mode, ~3-6 min total)
 perf/check:
