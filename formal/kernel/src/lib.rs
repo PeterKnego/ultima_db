@@ -16,10 +16,17 @@
 //!   `Vec<(u64, u64)>` (non-recursive, fine).
 //! - `binary_search_by` replaced by `find_pos` (no closures, no early return
 //!   from a loop); `Vec::insert`/slice `to_vec` replaced by loop helpers.
-//! - insert/get only; delete-with-rebalancing to be ported later.
+//! - the in-place rebalancers (`fix_underfull_child`, `rotate_*`, `merge_*`)
+//!   take `&mut Vec` in the real code; here they are pure functions returning
+//!   the repaired `(entries, children)` — the same algorithm without mutation,
+//!   which the persistent structure makes observationally identical.
+//! - `remove` returns `Option<BTree>` (`None` == the `Err(KeyNotFound)` arm)
+//!   since the kernel has no `Error` type.
 
 pub const T: usize = 32;
 pub const MAX_KEYS: usize = 2 * T - 1;
+/// Minimum entries in a non-root node (mirror of `src/btree.rs`).
+pub const MIN_KEYS: usize = T - 1;
 
 pub enum Children {
     Nil,
@@ -375,6 +382,341 @@ impl BTree {
             }
         }
     }
+
+    /// Remove `key`. Returns the new tree, or `None` if the key was absent
+    /// (the `Err(KeyNotFound)` arm of `src/btree.rs`). (Mirror of `remove`.)
+    pub fn remove(&self, key: u64) -> Option<BTree> {
+        match delete_from_node(&self.root, key) {
+            DeleteResult::NotFound => None,
+            DeleteResult::Removed { node: new_root, .. } => {
+                // If the root became an entryless internal node, collapse a level.
+                let actual_root = if new_root.entries.len() == 0 && children_len(&new_root.children) != 0 {
+                    Box::new(clone_node(child_at(&new_root.children, 0)))
+                } else {
+                    new_root
+                };
+                Some(BTree {
+                    root: actual_root,
+                    len: self.len - 1,
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delete with rebalancing (mirrors src/btree.rs delete_from_node & friends)
+// ---------------------------------------------------------------------------
+
+pub enum DeleteResult {
+    NotFound,
+    Removed { node: Box<Node>, underfull: bool },
+}
+
+/// Copy of `v` with the entry at `pos` removed. (Replaces `Vec::remove`.)
+fn remove_entry_at(v: &Vec<(u64, u64)>, pos: usize) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut i: usize = 0;
+    while i < v.len() {
+        if i != pos {
+            out.push(v[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `left ++ [sep] ++ right`. (Replaces the merge entry concatenation.)
+fn merge_entries(left: &Vec<(u64, u64)>, sep: (u64, u64), right: &Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut i: usize = 0;
+    while i < left.len() {
+        out.push(left[i]);
+        i += 1;
+    }
+    out.push(sep);
+    let mut j: usize = 0;
+    while j < right.len() {
+        out.push(right[j]);
+        j += 1;
+    }
+    out
+}
+
+/// Copy of `c` with the child at `pos` removed. (Replaces `Vec::remove` on children.)
+fn remove_child_at(c: &Children, pos: usize) -> Children {
+    match c {
+        Children::Nil => Children::Nil,
+        Children::Cons(n, rest) => {
+            if pos == 0 {
+                clone_children(rest)
+            } else {
+                Children::Cons(Box::new(clone_node(n)), Box::new(remove_child_at(rest, pos - 1)))
+            }
+        }
+    }
+}
+
+/// `a ++ b` as children. (Replaces `merged_children.extend(...)`.)
+fn concat_children(a: &Children, b: &Children) -> Children {
+    match a {
+        Children::Nil => clone_children(b),
+        Children::Cons(n, rest) => {
+            Children::Cons(Box::new(clone_node(n)), Box::new(concat_children(rest, b)))
+        }
+    }
+}
+
+/// The last child of `c` as a singleton list, or `Nil` if `c` is empty.
+/// (`child_at`-shaped recursion so the branch never mixes with an outer
+/// reborrow, which Aeneas's context matcher rejects.)
+fn last_child_singleton(c: &Children) -> Children {
+    match c {
+        Children::Nil => Children::Nil,
+        Children::Cons(n, rest) => {
+            if children_len(rest) == 0 {
+                Children::Cons(Box::new(clone_node(n)), Box::new(Children::Nil))
+            } else {
+                last_child_singleton(rest)
+            }
+        }
+    }
+}
+
+/// Copy of `c` without its last child (`Nil` if `c` has 0 or 1 children).
+fn drop_last_child(c: &Children) -> Children {
+    match c {
+        Children::Nil => Children::Nil,
+        Children::Cons(n, rest) => {
+            if children_len(rest) == 0 {
+                Children::Nil
+            } else {
+                Children::Cons(Box::new(clone_node(n)), Box::new(drop_last_child(rest)))
+            }
+        }
+    }
+}
+
+/// Rotate an entry from the left sibling (at `idx-1`) into the child at `idx`.
+/// Returns the parent's repaired `(entries, children)`. (Mirror of `rotate_right`.)
+fn rotate_right(entries: &Vec<(u64, u64)>, children: &Children, idx: usize) -> (Vec<(u64, u64)>, Children) {
+    let left = child_at(children, idx - 1);
+    let right = child_at(children, idx);
+    let ll = left.entries.len();
+
+    // Steal the last entry of the left sibling; the separator descends right.
+    let stolen = left.entries[ll - 1];
+    let separator = entries[idx - 1];
+    let new_entries = replace_entry(entries, idx - 1, stolen);
+
+    let new_left_entries = entries_prefix(&left.entries, ll - 1);
+    let new_right_entries = insert_entry_at(&right.entries, 0, separator);
+
+    // Move left's last child (if internal) to the front of right's children.
+    let new_left_children = drop_last_child(&left.children);
+    let moved = last_child_singleton(&left.children);
+    let new_right_children = concat_children(&moved, &right.children);
+
+    let new_left = Box::new(Node {
+        entries: new_left_entries,
+        children: new_left_children,
+    });
+    let new_right = Box::new(Node {
+        entries: new_right_entries,
+        children: new_right_children,
+    });
+    let children1 = replace_child(children, idx - 1, new_left);
+    let children2 = replace_child(&children1, idx, new_right);
+    (new_entries, children2)
+}
+
+/// Rotate an entry from the right sibling (at `idx+1`) into the child at `idx`.
+/// Returns the parent's repaired `(entries, children)`. (Mirror of `rotate_left`.)
+fn rotate_left(entries: &Vec<(u64, u64)>, children: &Children, idx: usize) -> (Vec<(u64, u64)>, Children) {
+    let left = child_at(children, idx);
+    let right = child_at(children, idx + 1);
+
+    let stolen = right.entries[0];
+    let separator = entries[idx];
+    let new_entries = replace_entry(entries, idx, stolen);
+
+    let new_right_entries = entries_suffix(&right.entries, 1);
+    let new_left_entries = insert_entry_at(&left.entries, left.entries.len(), separator);
+
+    // Move right's first child (if internal) to the end of left's children.
+    let moved = children_prefix(&right.children, 1);
+    let new_left_children = concat_children(&left.children, &moved);
+    let new_right_children = children_suffix(&right.children, 1);
+
+    let new_left = Box::new(Node {
+        entries: new_left_entries,
+        children: new_left_children,
+    });
+    let new_right = Box::new(Node {
+        entries: new_right_entries,
+        children: new_right_children,
+    });
+    let children1 = replace_child(children, idx, new_left);
+    let children2 = replace_child(&children1, idx + 1, new_right);
+    (new_entries, children2)
+}
+
+/// Merge the child at `idx` into its left sibling (`idx-1`), pulling the
+/// separator down between them. (Mirror of `merge_with_left`.)
+fn merge_with_left(entries: &Vec<(u64, u64)>, children: &Children, idx: usize) -> (Vec<(u64, u64)>, Children) {
+    let separator = entries[idx - 1];
+    let left = child_at(children, idx - 1);
+    let right = child_at(children, idx);
+
+    let merged_entries = merge_entries(&left.entries, separator, &right.entries);
+    let merged_children = concat_children(&left.children, &right.children);
+    let merged = Box::new(Node {
+        entries: merged_entries,
+        children: merged_children,
+    });
+
+    let new_entries = remove_entry_at(entries, idx - 1);
+    let children1 = replace_child(children, idx - 1, merged);
+    let children2 = remove_child_at(&children1, idx);
+    (new_entries, children2)
+}
+
+/// Merge the child at `idx` into its right sibling (`idx+1`). (Mirror of `merge_with_right`.)
+fn merge_with_right(entries: &Vec<(u64, u64)>, children: &Children, idx: usize) -> (Vec<(u64, u64)>, Children) {
+    let separator = entries[idx];
+    let left = child_at(children, idx);
+    let right = child_at(children, idx + 1);
+
+    let merged_entries = merge_entries(&left.entries, separator, &right.entries);
+    let merged_children = concat_children(&left.children, &right.children);
+    let merged = Box::new(Node {
+        entries: merged_entries,
+        children: merged_children,
+    });
+
+    let new_entries = remove_entry_at(entries, idx);
+    let children1 = replace_child(children, idx, merged);
+    let children2 = remove_child_at(&children1, idx + 1);
+    (new_entries, children2)
+}
+
+/// Rebalance an underfull child at `idx` by rotating from a sibling with a
+/// spare entry, else merging. Returns the parent's repaired `(entries, children)`.
+/// (Mirror of `fix_underfull_child`.)
+fn fix_underfull_child(entries: &Vec<(u64, u64)>, children: &Children, idx: usize) -> (Vec<(u64, u64)>, Children) {
+    let n = children_len(children);
+    if idx > 0 && child_at(children, idx - 1).entries.len() > MIN_KEYS {
+        rotate_right(entries, children, idx)
+    } else if idx + 1 < n && child_at(children, idx + 1).entries.len() > MIN_KEYS {
+        rotate_left(entries, children, idx)
+    } else if idx > 0 {
+        merge_with_left(entries, children, idx)
+    } else {
+        merge_with_right(entries, children, idx)
+    }
+}
+
+/// Apply `fix_underfull_child` at `idx` iff `underfull`, else pass the parent
+/// through unchanged. Hoisted from the call sites so the borrow context stays
+/// local to one small function (the equivalent inline `if` defeats Aeneas's
+/// context matcher when the parent came from a recursive `match` arm).
+fn maybe_fix(entries: Vec<(u64, u64)>, children: Children, idx: usize, underfull: bool) -> (Vec<(u64, u64)>, Children) {
+    if underfull {
+        fix_underfull_child(&entries, &children, idx)
+    } else {
+        (entries, children)
+    }
+}
+
+/// Remove and return the leftmost (minimum-key) entry of the subtree, plus the
+/// rebuilt node and whether it is now underfull. (Mirror of `remove_leftmost`.)
+fn remove_leftmost(node: &Node) -> ((u64, u64), Box<Node>, bool) {
+    if children_len(&node.children) == 0 {
+        let first = node.entries[0];
+        let new_entries = remove_entry_at(&node.entries, 0);
+        let underfull = new_entries.len() < MIN_KEYS;
+        (
+            first,
+            Box::new(Node {
+                entries: new_entries,
+                children: Children::Nil,
+            }),
+            underfull,
+        )
+    } else {
+        let (entry, new_first_child, child_underfull) = remove_leftmost(child_at(&node.children, 0));
+        let entries0 = node.entries.clone();
+        let children0 = replace_child(&node.children, 0, new_first_child);
+        let (entries1, children1) = maybe_fix(entries0, children0, 0, child_underfull);
+        let underfull = entries1.len() < MIN_KEYS;
+        (
+            entry,
+            Box::new(Node {
+                entries: entries1,
+                children: children1,
+            }),
+            underfull,
+        )
+    }
+}
+
+/// Recursively delete `key` from `node`, rebalancing on the way up.
+/// (Mirror of `delete_from_node`.)
+pub fn delete_from_node(node: &Node, key: u64) -> DeleteResult {
+    let (hit, pos) = find_pos(&node.entries, key);
+
+    if children_len(&node.children) == 0 {
+        // Leaf.
+        if !hit {
+            DeleteResult::NotFound
+        } else {
+            let entries = remove_entry_at(&node.entries, pos);
+            let underfull = entries.len() < MIN_KEYS;
+            DeleteResult::Removed {
+                node: Box::new(Node {
+                    entries,
+                    children: Children::Nil,
+                }),
+                underfull,
+            }
+        }
+    } else if hit {
+        // Internal, key is here: replace with in-order successor (leftmost of
+        // children[pos+1]) and delete that successor.
+        let (succ, new_right, right_underfull) = remove_leftmost(child_at(&node.children, pos + 1));
+        let entries0 = replace_entry(&node.entries, pos, succ);
+        let children0 = replace_child(&node.children, pos + 1, new_right);
+        let (entries1, children1) = maybe_fix(entries0, children0, pos + 1, right_underfull);
+        let underfull = entries1.len() < MIN_KEYS;
+        DeleteResult::Removed {
+            node: Box::new(Node {
+                entries: entries1,
+                children: children1,
+            }),
+            underfull,
+        }
+    } else {
+        // Internal, key is in child[pos].
+        match delete_from_node(child_at(&node.children, pos), key) {
+            DeleteResult::NotFound => DeleteResult::NotFound,
+            DeleteResult::Removed {
+                node: new_child,
+                underfull,
+            } => {
+                let entries0 = node.entries.clone();
+                let children0 = replace_child(&node.children, pos, new_child);
+                let (entries1, children1) = maybe_fix(entries0, children0, pos, underfull);
+                let node_underfull = entries1.len() < MIN_KEYS;
+                DeleteResult::Removed {
+                    node: Box::new(Node {
+                        entries: entries1,
+                        children: children1,
+                    }),
+                    underfull: node_underfull,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -400,5 +742,68 @@ mod tests {
         for k in 0..512 {
             assert_eq!(tree.get(k), model.get(&k).copied(), "key {k}");
         }
+    }
+
+    // Deterministic LCG (no rand dep, no Date/random primitives).
+    fn lcg(x: u64) -> u64 {
+        x.wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+    }
+
+    #[test]
+    fn remove_matches_std_btreemap() {
+        let mut model = BTreeMap::new();
+        let mut tree = BTree::new();
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+
+        // Build a tree tall enough to have several internal levels.
+        for _ in 0..3000 {
+            x = lcg(x);
+            let k = x % 800;
+            let v = x >> 32;
+            tree = tree.insert(k, v);
+            model.insert(k, v);
+        }
+        assert_eq!(tree.len, model.len());
+
+        // Interleave inserts and removes to exercise rotation and merge paths.
+        for _ in 0..8000 {
+            x = lcg(x);
+            let k = x % 800;
+            if x & 1 == 0 {
+                x = lcg(x);
+                let v = x >> 32;
+                tree = tree.insert(k, v);
+                model.insert(k, v);
+            } else {
+                let had = model.remove(&k);
+                match tree.remove(k) {
+                    Some(t) => {
+                        assert!(had.is_some(), "tree removed absent key {k}");
+                        tree = t;
+                    }
+                    None => assert!(had.is_none(), "tree missed present key {k}"),
+                }
+            }
+            assert_eq!(tree.len, model.len());
+        }
+
+        for k in 0..800 {
+            assert_eq!(tree.get(k), model.get(&k).copied(), "after churn, key {k}");
+        }
+
+        // Drain every remaining key: exercises repeated merges up to root collapse.
+        let keys: Vec<u64> = model.keys().copied().collect();
+        for k in keys {
+            tree = tree.remove(k).expect("present key must remove");
+            model.remove(&k);
+            assert_eq!(tree.len, model.len());
+        }
+        assert_eq!(tree.len, 0);
+        for k in 0..800 {
+            assert_eq!(tree.get(k), None, "empty tree, key {k}");
+        }
+        // Removing from an empty tree is a no-op miss.
+        assert!(tree.remove(42).is_none());
     }
 }

@@ -15,21 +15,26 @@ set_option maxRecDepth 2048
 namespace btree_kernel
 
 /-- [btree_kernel::T]
-    Source: 'src/lib.rs', lines 21:0-21:24
+    Source: 'src/lib.rs', lines 26:0-26:24
     Visibility: public -/
 @[global_simps, irreducible] def T : Std.Usize := 32#usize
 
 /-- [btree_kernel::MAX_KEYS]
-    Source: 'src/lib.rs', lines 22:0-22:38
+    Source: 'src/lib.rs', lines 27:0-27:38
     Visibility: public -/
 @[global_simps, irreducible]
 def MAX_KEYS : Result Std.Usize := do let i ← 2#usize * T
                                       i - 1#usize
 
+/-- [btree_kernel::MIN_KEYS]
+    Source: 'src/lib.rs', lines 29:0-29:34
+    Visibility: public -/
+@[global_simps, irreducible] def MIN_KEYS : Result Std.Usize := T - 1#usize
+
 mutual
 
 /-- [btree_kernel::Children]
-    Source: 'src/lib.rs', lines 24:0-27:1
+    Source: 'src/lib.rs', lines 31:0-34:1
     Visibility: public -/
 @[discriminant isize]
 inductive Children where
@@ -37,7 +42,7 @@ inductive Children where
 | Cons : Node → Children → Children
 
 /-- [btree_kernel::Node]
-    Source: 'src/lib.rs', lines 29:0-34:1
+    Source: 'src/lib.rs', lines 36:0-41:1
     Visibility: public -/
 inductive Node where
 | mk : alloc.vec.Vec (Std.U64 × Std.U64) → Children → Node
@@ -59,14 +64,14 @@ theorem Node.children._simpLemma_ (entries : alloc.vec.Vec (Std.U64 ×
   (Node.mk entries children).children = children := by rfl
 
 /-- [btree_kernel::BTree]
-    Source: 'src/lib.rs', lines 36:0-39:1
+    Source: 'src/lib.rs', lines 43:0-46:1
     Visibility: public -/
 structure BTree where
   root : Node
   len : Std.Usize
 
 /-- [btree_kernel::InsertResult]
-    Source: 'src/lib.rs', lines 41:0-49:1
+    Source: 'src/lib.rs', lines 48:0-56:1
     Visibility: public -/
 @[discriminant isize]
 inductive InsertResult where
@@ -74,7 +79,7 @@ inductive InsertResult where
 | Split : Node → (Std.U64 × Std.U64) → Node → Bool → InsertResult
 
 /-- [btree_kernel::find_pos]: loop body 0:
-    Source: 'src/lib.rs', lines 1:0-74:5 -/
+    Source: 'src/lib.rs', lines 1:0-81:5 -/
 @[rust_loop_body]
 def find_pos_loop.body
   (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (key : Std.U64)
@@ -103,7 +108,7 @@ def find_pos_loop.body
   else ok (done (lo, found, pos))
 
 /-- [btree_kernel::find_pos]: loop 0:
-    Source: 'src/lib.rs', lines 1:0-74:5 -/
+    Source: 'src/lib.rs', lines 1:0-81:5 -/
 @[rust_loop]
 def find_pos_loop
   (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (key : Std.U64)
@@ -116,7 +121,7 @@ def find_pos_loop
     (lo, hi, found, pos)
 
 /-- [btree_kernel::find_pos]:
-    Source: 'src/lib.rs', lines 58:0-80:1 -/
+    Source: 'src/lib.rs', lines 65:0-87:1 -/
 def find_pos
   (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (key : Std.U64) :
   Result (Bool × Std.Usize)
@@ -128,7 +133,7 @@ def find_pos
   else ok (false, lo)
 
 /-- [btree_kernel::insert_entry_at]: loop body 0:
-    Source: 'src/lib.rs', lines 86:4-89:5 -/
+    Source: 'src/lib.rs', lines 93:4-96:5 -/
 @[rust_loop_body]
 def insert_entry_at_loop0.body
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
@@ -147,7 +152,7 @@ def insert_entry_at_loop0.body
   else ok (done (out, i))
 
 /-- [btree_kernel::insert_entry_at]: loop 0:
-    Source: 'src/lib.rs', lines 86:4-89:5 -/
+    Source: 'src/lib.rs', lines 93:4-96:5 -/
 @[rust_loop]
 def insert_entry_at_loop0
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
@@ -159,7 +164,7 @@ def insert_entry_at_loop0
     (out, i)
 
 /-- [btree_kernel::insert_entry_at]: loop body 1:
-    Source: 'src/lib.rs', lines 91:4-94:5 -/
+    Source: 'src/lib.rs', lines 98:4-101:5 -/
 @[rust_loop_body]
 def insert_entry_at_loop1.body
   (v : alloc.vec.Vec (Std.U64 × Std.U64))
@@ -179,7 +184,7 @@ def insert_entry_at_loop1.body
   else ok (done out)
 
 /-- [btree_kernel::insert_entry_at]: loop 1:
-    Source: 'src/lib.rs', lines 91:4-94:5 -/
+    Source: 'src/lib.rs', lines 98:4-101:5 -/
 @[rust_loop]
 def insert_entry_at_loop1
   (v : alloc.vec.Vec (Std.U64 × Std.U64))
@@ -191,7 +196,7 @@ def insert_entry_at_loop1
     (out, i)
 
 /-- [btree_kernel::insert_entry_at]:
-    Source: 'src/lib.rs', lines 83:0-96:1 -/
+    Source: 'src/lib.rs', lines 90:0-103:1 -/
 def insert_entry_at
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
   (x : (Std.U64 × Std.U64)) :
@@ -204,7 +209,7 @@ def insert_entry_at
   insert_entry_at_loop1 v out1 i
 
 /-- [btree_kernel::replace_entry]: loop body 0:
-    Source: 'src/lib.rs', lines 102:4-109:5 -/
+    Source: 'src/lib.rs', lines 109:4-116:5 -/
 @[rust_loop_body]
 def replace_entry_loop.body
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
@@ -230,7 +235,7 @@ def replace_entry_loop.body
   else ok (done out)
 
 /-- [btree_kernel::replace_entry]: loop 0:
-    Source: 'src/lib.rs', lines 102:4-109:5 -/
+    Source: 'src/lib.rs', lines 109:4-116:5 -/
 @[rust_loop]
 def replace_entry_loop
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
@@ -243,7 +248,7 @@ def replace_entry_loop
     (out, i)
 
 /-- [btree_kernel::replace_entry]:
-    Source: 'src/lib.rs', lines 99:0-111:1 -/
+    Source: 'src/lib.rs', lines 106:0-118:1 -/
 @[reducible]
 def replace_entry
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
@@ -253,7 +258,7 @@ def replace_entry
   replace_entry_loop v pos x (alloc.vec.Vec.new (Std.U64 × Std.U64)) 0#usize
 
 /-- [btree_kernel::entries_prefix]: loop body 0:
-    Source: 'src/lib.rs', lines 117:4-120:5 -/
+    Source: 'src/lib.rs', lines 124:4-127:5 -/
 @[rust_loop_body]
 def entries_prefix_loop.body
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (n : Std.Usize)
@@ -272,7 +277,7 @@ def entries_prefix_loop.body
   else ok (done out)
 
 /-- [btree_kernel::entries_prefix]: loop 0:
-    Source: 'src/lib.rs', lines 117:4-120:5 -/
+    Source: 'src/lib.rs', lines 124:4-127:5 -/
 @[rust_loop]
 def entries_prefix_loop
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (n : Std.Usize)
@@ -284,7 +289,7 @@ def entries_prefix_loop
     (out, i)
 
 /-- [btree_kernel::entries_prefix]:
-    Source: 'src/lib.rs', lines 114:0-122:1 -/
+    Source: 'src/lib.rs', lines 121:0-129:1 -/
 @[reducible]
 def entries_prefix
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (n : Std.Usize) :
@@ -293,7 +298,7 @@ def entries_prefix
   entries_prefix_loop v n (alloc.vec.Vec.new (Std.U64 × Std.U64)) 0#usize
 
 /-- [btree_kernel::entries_suffix]: loop body 0:
-    Source: 'src/lib.rs', lines 128:4-131:5 -/
+    Source: 'src/lib.rs', lines 135:4-138:5 -/
 @[rust_loop_body]
 def entries_suffix_loop.body
   (v : alloc.vec.Vec (Std.U64 × Std.U64))
@@ -313,7 +318,7 @@ def entries_suffix_loop.body
   else ok (done out)
 
 /-- [btree_kernel::entries_suffix]: loop 0:
-    Source: 'src/lib.rs', lines 128:4-131:5 -/
+    Source: 'src/lib.rs', lines 135:4-138:5 -/
 @[rust_loop]
 def entries_suffix_loop
   (v : alloc.vec.Vec (Std.U64 × Std.U64))
@@ -325,7 +330,7 @@ def entries_suffix_loop
     (out, i)
 
 /-- [btree_kernel::entries_suffix]:
-    Source: 'src/lib.rs', lines 125:0-133:1 -/
+    Source: 'src/lib.rs', lines 132:0-140:1 -/
 @[reducible]
 def entries_suffix
   (v : alloc.vec.Vec (Std.U64 × Std.U64)) (n : Std.Usize) :
@@ -336,7 +341,7 @@ def entries_suffix
 mutual
 
 /-- [btree_kernel::clone_node]:
-    Source: 'src/lib.rs', lines 142:0-147:1
+    Source: 'src/lib.rs', lines 149:0-154:1
     Visibility: public -/
 def clone_node (n : Node) : Result Node := do
   let v ←
@@ -346,7 +351,7 @@ def clone_node (n : Node) : Result Node := do
 partial_fixpoint
 
 /-- [btree_kernel::clone_children]:
-    Source: 'src/lib.rs', lines 150:0-157:1
+    Source: 'src/lib.rs', lines 157:0-164:1
     Visibility: public -/
 def clone_children (c : Children) : Result Children := do
   match c with
@@ -360,7 +365,7 @@ partial_fixpoint
 end
 
 /-- [btree_kernel::children_len]:
-    Source: 'src/lib.rs', lines 160:0-165:1
+    Source: 'src/lib.rs', lines 167:0-172:1
     Visibility: public -/
 def children_len (c : Children) : Result Std.Usize := do
   match c with
@@ -370,7 +375,7 @@ def children_len (c : Children) : Result Std.Usize := do
 partial_fixpoint
 
 /-- [btree_kernel::child_at]:
-    Source: 'src/lib.rs', lines 169:0-180:1
+    Source: 'src/lib.rs', lines 176:0-187:1
     Visibility: public -/
 def child_at (c : Children) (i : Std.Usize) : Result Node := do
   match c with
@@ -383,7 +388,7 @@ def child_at (c : Children) (i : Std.Usize) : Result Node := do
 partial_fixpoint
 
 /-- [btree_kernel::replace_child]:
-    Source: 'src/lib.rs', lines 184:0-195:1 -/
+    Source: 'src/lib.rs', lines 191:0-202:1 -/
 def replace_child
   (c : Children) (pos : Std.Usize) (x : Node) : Result Children := do
   match c with
@@ -400,7 +405,7 @@ def replace_child
 partial_fixpoint
 
 /-- [btree_kernel::replace_and_insert_child]:
-    Source: 'src/lib.rs', lines 199:0-213:1 -/
+    Source: 'src/lib.rs', lines 206:0-220:1 -/
 def replace_and_insert_child
   (c : Children) (pos : Std.Usize) (l : Node) (r : Node) :
   Result Children
@@ -420,7 +425,7 @@ def replace_and_insert_child
 partial_fixpoint
 
 /-- [btree_kernel::children_prefix]:
-    Source: 'src/lib.rs', lines 216:0-227:1 -/
+    Source: 'src/lib.rs', lines 223:0-234:1 -/
 def children_prefix (c : Children) (n : Std.Usize) : Result Children := do
   if n = 0#usize
   then ok Children.Nil
@@ -435,7 +440,7 @@ def children_prefix (c : Children) (n : Std.Usize) : Result Children := do
 partial_fixpoint
 
 /-- [btree_kernel::children_suffix]:
-    Source: 'src/lib.rs', lines 230:0-239:1 -/
+    Source: 'src/lib.rs', lines 237:0-246:1 -/
 def children_suffix (c : Children) (n : Std.Usize) : Result Children := do
   if n = 0#usize
   then clone_children c
@@ -447,7 +452,7 @@ def children_suffix (c : Children) (n : Std.Usize) : Result Children := do
 partial_fixpoint
 
 /-- [btree_kernel::get_in_node]:
-    Source: 'src/lib.rs', lines 247:0-256:1
+    Source: 'src/lib.rs', lines 254:0-263:1
     Visibility: public -/
 def get_in_node (node : Node) (key : Std.U64) : Result (Option Std.U64) := do
   let (hit, pos) ← find_pos node.entries key
@@ -466,7 +471,7 @@ def get_in_node (node : Node) (key : Std.U64) : Result (Option Std.U64) := do
 partial_fixpoint
 
 /-- [btree_kernel::maybe_split]:
-    Source: 'src/lib.rs', lines 260:0-292:1 -/
+    Source: 'src/lib.rs', lines 267:0-299:1 -/
 def maybe_split
   (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
   (replaced : Bool) :
@@ -498,7 +503,7 @@ def maybe_split
       right_entries right_children) replaced)
 
 /-- [btree_kernel::insert_into_node]:
-    Source: 'src/lib.rs', lines 296:0-327:1
+    Source: 'src/lib.rs', lines 303:0-334:1
     Visibility: public -/
 def insert_into_node
   (node : Node) (key : Std.U64) (val : Std.U64) : Result InsertResult := do
@@ -531,7 +536,7 @@ def insert_into_node
 partial_fixpoint
 
 /-- [btree_kernel::{btree_kernel::BTree}::new]:
-    Source: 'src/lib.rs', lines 331:4-339:5
+    Source: 'src/lib.rs', lines 338:4-346:5
     Visibility: public -/
 def BTree.new : Result BTree := do
   ok
@@ -541,13 +546,13 @@ def BTree.new : Result BTree := do
     }
 
 /-- [btree_kernel::{btree_kernel::BTree}::get]:
-    Source: 'src/lib.rs', lines 342:4-344:5
+    Source: 'src/lib.rs', lines 349:4-351:5
     Visibility: public -/
 def BTree.get (self : BTree) (key : Std.U64) : Result (Option Std.U64) := do
   get_in_node self.root key
 
 /-- [btree_kernel::{btree_kernel::BTree}::insert]:
-    Source: 'src/lib.rs', lines 348:4-377:5
+    Source: 'src/lib.rs', lines 355:4-384:5
     Visibility: public -/
 def BTree.insert
   (self : BTree) (key : Std.U64) (val : Std.U64) : Result BTree := do
@@ -577,5 +582,445 @@ def BTree.insert
             Children.Nil))),
         len := new_len
       }
+
+/-- [btree_kernel::concat_children]:
+    Source: 'src/lib.rs', lines 461:0-468:1 -/
+def concat_children (a : Children) (b : Children) : Result Children := do
+  match a with
+  | Children.Nil => clone_children b
+  | Children.Cons n rest =>
+    let n1 ← clone_node n
+    let c ← concat_children rest b
+    ok (Children.Cons n1 c)
+partial_fixpoint
+
+/-- [btree_kernel::remove_child_at]:
+    Source: 'src/lib.rs', lines 447:0-458:1 -/
+def remove_child_at (c : Children) (pos : Std.Usize) : Result Children := do
+  match c with
+  | Children.Nil => ok Children.Nil
+  | Children.Cons n rest =>
+    if pos = 0#usize
+    then clone_children rest
+    else
+      let n1 ← clone_node n
+      let i ← pos - 1#usize
+      let c1 ← remove_child_at rest i
+      ok (Children.Cons n1 c1)
+partial_fixpoint
+
+/-- [btree_kernel::merge_entries]: loop body 0:
+    Source: 'src/lib.rs', lines 433:4-436:5 -/
+@[rust_loop_body]
+def merge_entries_loop0.body
+  (left : alloc.vec.Vec (Std.U64 × Std.U64))
+  (out : alloc.vec.Vec (Std.U64 × Std.U64)) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec (Std.U64 × Std.U64)) × Std.Usize)
+    (alloc.vec.Vec (Std.U64 × Std.U64)))
+  := do
+  let i1 := alloc.vec.Vec.len left
+  if i < i1
+  then
+    let p ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+        Std.U64)) left i
+    let out1 ← alloc.vec.Vec.push out p
+    let i2 ← i + 1#usize
+    ok (cont (out1, i2))
+  else ok (done out)
+
+/-- [btree_kernel::merge_entries]: loop 0:
+    Source: 'src/lib.rs', lines 433:4-436:5 -/
+@[rust_loop]
+def merge_entries_loop0
+  (left : alloc.vec.Vec (Std.U64 × Std.U64))
+  (out : alloc.vec.Vec (Std.U64 × Std.U64)) (i : Std.Usize) :
+  Result (alloc.vec.Vec (Std.U64 × Std.U64))
+  := do
+  loop
+    (fun (out1, i1) => merge_entries_loop0.body left out1 i1)
+    (out, i)
+
+/-- [btree_kernel::merge_entries]: loop body 1:
+    Source: 'src/lib.rs', lines 439:4-442:5 -/
+@[rust_loop_body]
+def merge_entries_loop1.body
+  (right : alloc.vec.Vec (Std.U64 × Std.U64))
+  (out : alloc.vec.Vec (Std.U64 × Std.U64)) (j : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec (Std.U64 × Std.U64)) × Std.Usize)
+    (alloc.vec.Vec (Std.U64 × Std.U64)))
+  := do
+  let i := alloc.vec.Vec.len right
+  if j < i
+  then
+    let p ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+        Std.U64)) right j
+    let out1 ← alloc.vec.Vec.push out p
+    let j1 ← j + 1#usize
+    ok (cont (out1, j1))
+  else ok (done out)
+
+/-- [btree_kernel::merge_entries]: loop 1:
+    Source: 'src/lib.rs', lines 439:4-442:5 -/
+@[rust_loop]
+def merge_entries_loop1
+  (right : alloc.vec.Vec (Std.U64 × Std.U64))
+  (out : alloc.vec.Vec (Std.U64 × Std.U64)) (j : Std.Usize) :
+  Result (alloc.vec.Vec (Std.U64 × Std.U64))
+  := do
+  loop
+    (fun (out1, j1) => merge_entries_loop1.body right out1 j1)
+    (out, j)
+
+/-- [btree_kernel::merge_entries]:
+    Source: 'src/lib.rs', lines 430:0-444:1 -/
+def merge_entries
+  (left : alloc.vec.Vec (Std.U64 × Std.U64)) (sep : (Std.U64 × Std.U64))
+  (right : alloc.vec.Vec (Std.U64 × Std.U64)) :
+  Result (alloc.vec.Vec (Std.U64 × Std.U64))
+  := do
+  let out ←
+    merge_entries_loop0 left (alloc.vec.Vec.new (Std.U64 × Std.U64)) 0#usize
+  let out1 ← alloc.vec.Vec.push out sep
+  merge_entries_loop1 right out1 0#usize
+
+/-- [btree_kernel::remove_entry_at]: loop body 0:
+    Source: 'src/lib.rs', lines 420:4-425:5 -/
+@[rust_loop_body]
+def remove_entry_at_loop.body
+  (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
+  (out : alloc.vec.Vec (Std.U64 × Std.U64)) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec (Std.U64 × Std.U64)) × Std.Usize)
+    (alloc.vec.Vec (Std.U64 × Std.U64)))
+  := do
+  let i1 := alloc.vec.Vec.len v
+  if i < i1
+  then
+    let out1 ←
+      if i != pos
+      then
+        do
+        let p ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64
+            × Std.U64)) v i
+        alloc.vec.Vec.push out p
+      else ok out
+    let i2 ← i + 1#usize
+    ok (cont (out1, i2))
+  else ok (done out)
+
+/-- [btree_kernel::remove_entry_at]: loop 0:
+    Source: 'src/lib.rs', lines 420:4-425:5 -/
+@[rust_loop]
+def remove_entry_at_loop
+  (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize)
+  (out : alloc.vec.Vec (Std.U64 × Std.U64)) (i : Std.Usize) :
+  Result (alloc.vec.Vec (Std.U64 × Std.U64))
+  := do
+  loop
+    (fun (out1, i1) => remove_entry_at_loop.body v pos out1 i1)
+    (out, i)
+
+/-- [btree_kernel::remove_entry_at]:
+    Source: 'src/lib.rs', lines 417:0-427:1 -/
+@[reducible]
+def remove_entry_at
+  (v : alloc.vec.Vec (Std.U64 × Std.U64)) (pos : Std.Usize) :
+  Result (alloc.vec.Vec (Std.U64 × Std.U64))
+  := do
+  remove_entry_at_loop v pos (alloc.vec.Vec.new (Std.U64 × Std.U64)) 0#usize
+
+/-- [btree_kernel::merge_with_right]:
+    Source: 'src/lib.rs', lines 585:0-601:1 -/
+def merge_with_right
+  (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
+  (idx : Std.Usize) :
+  Result ((alloc.vec.Vec (Std.U64 × Std.U64)) × Children)
+  := do
+  let separator ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+      Std.U64)) entries idx
+  let left ← child_at children idx
+  let i ← idx + 1#usize
+  let right ← child_at children i
+  let merged_entries ← merge_entries left.entries separator right.entries
+  let merged_children ← concat_children left.children right.children
+  let new_entries ← remove_entry_at entries idx
+  let children1 ←
+    replace_child children idx (Node.mk merged_entries merged_children)
+  let children2 ← remove_child_at children1 i
+  ok (new_entries, children2)
+
+/-- [btree_kernel::merge_with_left]:
+    Source: 'src/lib.rs', lines 566:0-582:1 -/
+def merge_with_left
+  (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
+  (idx : Std.Usize) :
+  Result ((alloc.vec.Vec (Std.U64 × Std.U64)) × Children)
+  := do
+  let i ← idx - 1#usize
+  let separator ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+      Std.U64)) entries i
+  let left ← child_at children i
+  let right ← child_at children idx
+  let merged_entries ← merge_entries left.entries separator right.entries
+  let merged_children ← concat_children left.children right.children
+  let new_entries ← remove_entry_at entries i
+  let children1 ←
+    replace_child children i (Node.mk merged_entries merged_children)
+  let children2 ← remove_child_at children1 idx
+  ok (new_entries, children2)
+
+/-- [btree_kernel::rotate_left]:
+    Source: 'src/lib.rs', lines 535:0-562:1 -/
+def rotate_left
+  (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
+  (idx : Std.Usize) :
+  Result ((alloc.vec.Vec (Std.U64 × Std.U64)) × Children)
+  := do
+  let left ← child_at children idx
+  let i ← idx + 1#usize
+  let right ← child_at children i
+  let stolen ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+      Std.U64)) right.entries 0#usize
+  let separator ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+      Std.U64)) entries idx
+  let new_entries ← replace_entry entries idx stolen
+  let new_right_entries ← entries_suffix right.entries 1#usize
+  let i1 := alloc.vec.Vec.len left.entries
+  let new_left_entries ← insert_entry_at left.entries i1 separator
+  let moved ← children_prefix right.children 1#usize
+  let new_left_children ← concat_children left.children moved
+  let new_right_children ← children_suffix right.children 1#usize
+  let children1 ←
+    replace_child children idx (Node.mk new_left_entries new_left_children)
+  let children2 ←
+    replace_child children1 i (Node.mk new_right_entries new_right_children)
+  ok (new_entries, children2)
+
+/-- [btree_kernel::drop_last_child]:
+    Source: 'src/lib.rs', lines 487:0-498:1 -/
+def drop_last_child (c : Children) : Result Children := do
+  match c with
+  | Children.Nil => ok Children.Nil
+  | Children.Cons n rest =>
+    let i ← children_len rest
+    if i = 0#usize
+    then ok Children.Nil
+    else
+      let n1 ← clone_node n
+      let c1 ← drop_last_child rest
+      ok (Children.Cons n1 c1)
+partial_fixpoint
+
+/-- [btree_kernel::last_child_singleton]:
+    Source: 'src/lib.rs', lines 473:0-484:1 -/
+def last_child_singleton (c : Children) : Result Children := do
+  match c with
+  | Children.Nil => ok Children.Nil
+  | Children.Cons n rest =>
+    let i ← children_len rest
+    if i = 0#usize
+    then let n1 ← clone_node n
+         ok (Children.Cons n1 Children.Nil)
+    else last_child_singleton rest
+partial_fixpoint
+
+/-- [btree_kernel::rotate_right]:
+    Source: 'src/lib.rs', lines 502:0-531:1 -/
+def rotate_right
+  (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
+  (idx : Std.Usize) :
+  Result ((alloc.vec.Vec (Std.U64 × Std.U64)) × Children)
+  := do
+  let i ← idx - 1#usize
+  let left ← child_at children i
+  let right ← child_at children idx
+  let ll := alloc.vec.Vec.len left.entries
+  let i1 ← ll - 1#usize
+  let stolen ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+      Std.U64)) left.entries i1
+  let separator ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+      Std.U64)) entries i
+  let new_entries ← replace_entry entries i stolen
+  let new_left_entries ← entries_prefix left.entries i1
+  let new_right_entries ← insert_entry_at right.entries 0#usize separator
+  let new_left_children ← drop_last_child left.children
+  let moved ← last_child_singleton left.children
+  let new_right_children ← concat_children moved right.children
+  let children1 ←
+    replace_child children i (Node.mk new_left_entries new_left_children)
+  let children2 ←
+    replace_child children1 idx (Node.mk new_right_entries new_right_children)
+  ok (new_entries, children2)
+
+/-- [btree_kernel::fix_underfull_child]:
+    Source: 'src/lib.rs', lines 606:0-617:1 -/
+def fix_underfull_child
+  (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
+  (idx : Std.Usize) :
+  Result ((alloc.vec.Vec (Std.U64 × Std.U64)) × Children)
+  := do
+  let n ← children_len children
+  if idx > 0#usize
+  then
+    let i ← idx - 1#usize
+    let n1 ← child_at children i
+    let i1 := alloc.vec.Vec.len n1.entries
+    let i2 ← MIN_KEYS
+    if i1 > i2
+    then rotate_right entries children idx
+    else
+      let i3 ← idx + 1#usize
+      if i3 < n
+      then
+        let n2 ← child_at children i3
+        let i4 := alloc.vec.Vec.len n2.entries
+        if i4 > i2
+        then rotate_left entries children idx
+        else
+          if idx > 0#usize
+          then merge_with_left entries children idx
+          else merge_with_right entries children idx
+      else
+        if idx > 0#usize
+        then merge_with_left entries children idx
+        else merge_with_right entries children idx
+  else
+    let i ← idx + 1#usize
+    if i < n
+    then
+      let n1 ← child_at children i
+      let i1 := alloc.vec.Vec.len n1.entries
+      let i2 ← MIN_KEYS
+      if i1 > i2
+      then rotate_left entries children idx
+      else
+        if idx > 0#usize
+        then merge_with_left entries children idx
+        else merge_with_right entries children idx
+    else
+      if idx > 0#usize
+      then merge_with_left entries children idx
+      else merge_with_right entries children idx
+
+/-- [btree_kernel::maybe_fix]:
+    Source: 'src/lib.rs', lines 623:0-629:1 -/
+def maybe_fix
+  (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
+  (idx : Std.Usize) (underfull : Bool) :
+  Result ((alloc.vec.Vec (Std.U64 × Std.U64)) × Children)
+  := do
+  if underfull
+  then fix_underfull_child entries children idx
+  else ok (entries, children)
+
+/-- [btree_kernel::remove_leftmost]:
+    Source: 'src/lib.rs', lines 633:0-661:1 -/
+def remove_leftmost
+  (node : Node) : Result ((Std.U64 × Std.U64) × Node × Bool) := do
+  let i ← children_len node.children
+  if i = 0#usize
+  then
+    let first ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice (Std.U64 ×
+        Std.U64)) node.entries 0#usize
+    let new_entries ← remove_entry_at node.entries 0#usize
+    let i1 := alloc.vec.Vec.len new_entries
+    let i2 ← MIN_KEYS
+    ok (first, Node.mk new_entries Children.Nil, i1 < i2)
+  else
+    let n ← child_at node.children 0#usize
+    let (entry, new_first_child, child_underfull) ← remove_leftmost n
+    let entries0 ←
+      alloc.vec.CloneVec.clone (BuiltinClone (Std.U64 × Std.U64)) node.entries
+    let children0 ← replace_child node.children 0#usize new_first_child
+    let (entries1, children1) ←
+      maybe_fix entries0 children0 0#usize child_underfull
+    let i1 := alloc.vec.Vec.len entries1
+    let i2 ← MIN_KEYS
+    ok (entry, Node.mk entries1 children1, i1 < i2)
+partial_fixpoint
+
+/-- [btree_kernel::DeleteResult]
+    Source: 'src/lib.rs', lines 411:0-414:1
+    Visibility: public -/
+@[discriminant isize]
+inductive DeleteResult where
+| NotFound : DeleteResult
+| Removed : Node → Bool → DeleteResult
+
+/-- [btree_kernel::delete_from_node]:
+    Source: 'src/lib.rs', lines 665:0-720:1
+    Visibility: public -/
+def delete_from_node (node : Node) (key : Std.U64) : Result DeleteResult := do
+  let (hit, pos) ← find_pos node.entries key
+  let i ← children_len node.children
+  if i = 0#usize
+  then
+    if hit
+    then
+      let entries ← remove_entry_at node.entries pos
+      let i1 := alloc.vec.Vec.len entries
+      let i2 ← MIN_KEYS
+      ok (DeleteResult.Removed (Node.mk entries Children.Nil) (i1 < i2))
+    else ok DeleteResult.NotFound
+  else
+    if hit
+    then
+      let i1 ← pos + 1#usize
+      let n ← child_at node.children i1
+      let (succ, new_right, right_underfull) ← remove_leftmost n
+      let entries0 ← replace_entry node.entries pos succ
+      let children0 ← replace_child node.children i1 new_right
+      let (entries1, children1) ←
+        maybe_fix entries0 children0 i1 right_underfull
+      let i2 := alloc.vec.Vec.len entries1
+      let i3 ← MIN_KEYS
+      ok (DeleteResult.Removed (Node.mk entries1 children1) (i2 < i3))
+    else
+      let n ← child_at node.children pos
+      let dr ← delete_from_node n key
+      match dr with
+      | DeleteResult.NotFound => ok DeleteResult.NotFound
+      | DeleteResult.Removed new_child underfull =>
+        let entries0 ←
+          alloc.vec.CloneVec.clone (BuiltinClone (Std.U64 × Std.U64))
+            node.entries
+        let children0 ← replace_child node.children pos new_child
+        let (entries1, children1) ←
+          maybe_fix entries0 children0 pos underfull
+        let i1 := alloc.vec.Vec.len entries1
+        let i2 ← MIN_KEYS
+        ok (DeleteResult.Removed (Node.mk entries1 children1) (i1 < i2))
+partial_fixpoint
+
+/-- [btree_kernel::{btree_kernel::BTree}::remove]:
+    Source: 'src/lib.rs', lines 388:4-404:5
+    Visibility: public -/
+def BTree.remove (self : BTree) (key : Std.U64) : Result (Option BTree) := do
+  let dr ← delete_from_node self.root key
+  match dr with
+  | DeleteResult.NotFound => ok none
+  | DeleteResult.Removed new_root _ =>
+    let i := alloc.vec.Vec.len new_root.entries
+    let actual_root ←
+      if i = 0#usize
+      then
+        do
+        let i1 ← children_len new_root.children
+        if i1 != 0#usize
+        then let n ← child_at new_root.children 0#usize
+             clone_node n
+        else ok new_root
+      else ok new_root
+    let i1 ← self.len - 1#usize
+    ok (some { root := actual_root, len := i1 })
 
 end btree_kernel
