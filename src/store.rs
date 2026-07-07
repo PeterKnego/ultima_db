@@ -529,6 +529,7 @@ impl Store {
             store_inner: Arc::clone(&self.inner),
             deleted_tables: BTreeSet::new(),
             write_set: BTreeMap::new(),
+            ddl_tables: std::cell::RefCell::new(BTreeSet::new()),
             ever_deleted_tables: BTreeSet::new(),
             writer_mode,
             needs_cleanup: true,
@@ -1666,6 +1667,14 @@ pub struct WriteTx {
     deleted_tables: BTreeSet<String>,
     /// Keys modified during this transaction, per table (MultiWriter only).
     write_set: BTreeMap<String, BTreeSet<u64>>,
+    /// Tables that had index DDL (`define_index` / `define_custom_index`)
+    /// in this transaction. The merge slow path cannot carry a new index
+    /// definition over (only write-set keys are replayed), so commit fails
+    /// with `IndexDdlConflict` if any of these tables saw a concurrent
+    /// commit since our base (task41). `RefCell` for the same reason as
+    /// `read_set`: recorded through a shared reference held by
+    /// `TableWriter`; `WriteTx` is `!Send + !Sync`.
+    ddl_tables: std::cell::RefCell<BTreeSet<String>>,
     /// Tables ever deleted during this tx (not cleared on re-open).
     /// Used for conflict detection in MultiWriter mode.
     ever_deleted_tables: BTreeSet<String>,
@@ -1740,6 +1749,10 @@ pub struct TableWriter<'tx, R: Record> {
     /// (`get`, `iter`, ...) so reads done through a write-mode handle still
     /// participate in SSI tracking.
     read_set: Option<&'tx std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
+    /// `Some` in MultiWriter mode: records tables with index DDL into the
+    /// parent transaction so commit can refuse the un-mergeable DDL
+    /// (task41). `None` in SingleWriter — no concurrent commits exist.
+    ddl_tables: Option<&'tx std::cell::RefCell<BTreeSet<String>>>,
 }
 
 /// Shared intent-table context held by `TableWriter` in MultiWriter mode.
@@ -2033,7 +2046,13 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         extractor: impl Fn(&R) -> K + Send + Sync + 'static,
     ) -> Result<()> {
         self.metrics.register_index(&self.table_name, name);
-        self.table.define_index(name, kind, extractor)
+        self.table.define_index(name, kind, extractor)?;
+        // Only a *successful* DDL taints the commit (task41) — a rejected
+        // define (kind mismatch, name collision) changed nothing.
+        if let Some(ddl) = self.ddl_tables {
+            ddl.borrow_mut().insert(self.table_name.clone());
+        }
+        Ok(())
     }
 
     /// Look up a single record by a unique index.
@@ -2088,7 +2107,12 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         index: I,
     ) -> Result<()> {
         self.metrics.register_index(&self.table_name, name);
-        self.table.define_custom_index(name, index)
+        self.table.define_custom_index(name, index)?;
+        // Only a *successful* DDL taints the commit (task41).
+        if let Some(ddl) = self.ddl_tables {
+            ddl.borrow_mut().insert(self.table_name.clone());
+        }
+        Ok(())
     }
 
     /// Retrieve a reference to a custom index by name, downcast to the concrete type.
@@ -2446,6 +2470,10 @@ impl WriteTx {
             #[cfg(feature = "persistence")]
             wal_ops,
             read_set: self.read_set.as_ref(),
+            ddl_tables: match self.writer_mode {
+                WriterMode::MultiWriter => Some(&self.ddl_tables),
+                WriterMode::SingleWriter => None,
+            },
         })
     }
 
@@ -2634,6 +2662,24 @@ impl WriteTx {
                         (n.clone(), has)
                     })
                     .collect();
+
+            // Index DDL cannot be carried through the merge slow path — the
+            // new definition would be silently dropped (only write-set keys
+            // are replayed onto the latest table). Fail loudly before any
+            // merge or WAL submission instead (task41).
+            let ddl = self.ddl_tables.borrow();
+            if let Some(table) = ddl
+                .iter()
+                .find(|t| flags.get(*t).copied().unwrap_or(false))
+            {
+                let table = table.clone();
+                drop(ddl);
+                drop(inner);
+                self.metrics.add_phase1(t1.elapsed().as_nanos() as u64);
+                return Err(Error::IndexDdlConflict { table });
+            }
+            drop(ddl);
+
             (inner.snapshots[&inner.latest_version].tables.clone(), flags)
         };
         self.metrics.add_phase1(t1.elapsed().as_nanos() as u64);
@@ -3440,6 +3486,96 @@ mod tests {
         assert!(
             rs.get("t").map(|e| e.table_scan).unwrap_or(false),
             "get_unique should set table_scan"
+        );
+    }
+
+    #[test]
+    fn mw_index_ddl_with_concurrent_commit_errors() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        // Seed the table.
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let mut ddl_tx = store.begin_write(None).unwrap();
+        {
+            let mut t = ddl_tx.open_table::<String>("t").unwrap();
+            t.define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
+            t.insert("mine".to_string()).unwrap();
+        }
+
+        // Concurrent writer commits a DISJOINT key to the same table first:
+        // it updates the seed row (key 1) while ddl_tx inserted key 2 — no
+        // key overlap, so plain OCC passes and the DDL check must fire.
+        {
+            let mut other = store.begin_write(None).unwrap();
+            let mut t = other.open_table::<String>("t").unwrap();
+            t.update(1, "theirs".to_string()).unwrap();
+            other.commit().unwrap();
+        }
+
+        let err = ddl_tx.commit().unwrap_err();
+        assert!(
+            matches!(err, Error::IndexDdlConflict { ref table } if table == "t"),
+            "expected IndexDdlConflict, got {err:?}"
+        );
+
+        // No half-installed index on the latest version, and the concurrent
+        // writer's update survived.
+        let mut check = store.begin_write(None).unwrap();
+        let t = check.open_table::<String>("t").unwrap();
+        assert!(matches!(
+            t.get_unique("by_val", &"theirs".to_string()),
+            Err(Error::IndexNotFound(_))
+        ));
+        assert_eq!(t.get(1), Some(&"theirs".to_string()));
+        assert_eq!(t.len(), 1, "only the updated seed row; mine must not be installed");
+    }
+
+    #[test]
+    fn mw_ddl_only_tx_with_concurrent_commit_errors() {
+        // The recommended "DDL in its own transaction" pattern: no row
+        // writes at all. Today this lands in the slow path's wholesale-
+        // discard branch and the index silently vanishes.
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("seed".to_string()).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let mut ddl_tx = store.begin_write(None).unwrap();
+        {
+            let mut t = ddl_tx.open_table::<String>("t").unwrap();
+            t.define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+                .unwrap();
+            // no row writes
+        }
+
+        {
+            let mut other = store.begin_write(None).unwrap();
+            let mut t = other.open_table::<String>("t").unwrap();
+            t.insert("theirs".to_string()).unwrap();
+            other.commit().unwrap();
+        }
+
+        let err = ddl_tx.commit().unwrap_err();
+        assert!(
+            matches!(err, Error::IndexDdlConflict { ref table } if table == "t"),
+            "expected IndexDdlConflict, got {err:?}"
         );
     }
 
