@@ -1,0 +1,6 @@
+{:index 0, :type :invoke, :f :txn, :process 0, :time 0, :value [[:r 1 nil] [:append 2 10]]}
+{:index 1, :type :invoke, :f :txn, :process 1, :time 5, :value [[:r 2 nil] [:append 1 20]]}
+{:index 2, :type :ok, :f :txn, :process 0, :time 10, :value [[:r 1 []] [:append 2 10]]}
+{:index 3, :type :ok, :f :txn, :process 1, :time 15, :value [[:r 2 []] [:append 1 20]]}
+{:index 4, :type :invoke, :f :txn, :process 2, :time 20, :value [[:r 1 nil] [:r 2 nil]]}
+{:index 5, :type :ok, :f :txn, :process 2, :time 25, :value [[:r 1 [20]] [:r 2 [10]]]}
