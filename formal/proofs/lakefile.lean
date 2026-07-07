@@ -23,6 +23,7 @@ lean_lib «RemoveRebalance»
 lean_lib «RemoveInv»
 lean_lib «RemoveFlatten»
 lean_lib «RemoveGet»
+lean_lib «RemoveFrame»
 
 @[default_target]
 lean_lib «BtreeProofs»
