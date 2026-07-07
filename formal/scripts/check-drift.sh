@@ -2,21 +2,21 @@
 # Drift guard between the Rust B-tree and its Aeneas/Lean model.
 #
 # src/btree.rs is the source of truth; formal/kernel/src/lib.rs is a hand-synced
-# port of its insert/get/find_pos/split path, and formal/proofs/ machine-checks
-# that port. Nothing forces the two to stay in step — this guard does, cheaply:
+# port of its insert/get and remove/rebalance paths, and formal/proofs/
+# machine-checks that port. Nothing forces the two to stay in step — this does:
 # if src/btree.rs changed in a diff but nothing under formal/ did, it fails and
 # tells you how to re-sync (or to acknowledge a change that doesn't touch the
 # verified surface).
 #
 # It is a *prompt to re-verify*, not a proof of equivalence. It fires on any
 # btree.rs edit; the author resolves it by either updating + re-checking formal/,
-# or acknowledging that the edit is outside the modeled path (remove/rebalance —
-# not yet modeled — comments, unrelated methods).
+# or acknowledging that the edit is outside the modeled path (range iterators,
+# comments, unrelated methods).
 #
 # Usage:
 #   formal/scripts/check-drift.sh [BASE_REF]
 #     BASE_REF defaults to $BASE, else origin/main, else HEAD~1.
-# Acknowledge a change that does not affect the verified insert/get surface:
+# Acknowledge a change that does not affect the verified insert/get/remove surface:
 #   ACK_NO_FORMAL=1 formal/scripts/check-drift.sh [BASE_REF]
 set -euo pipefail
 
@@ -77,7 +77,7 @@ formal drift-check FAILED
 
   $WATCHED changed, but nothing under $FORMAL_PREFIX did (vs $base).
 
-  The insert / get / find_pos / split path in $WATCHED is mirrored by the
+  The insert/get and remove/rebalance paths in $WATCHED are mirrored by the
   Aeneas/Lean model in formal/ and machine-checked there. Divergence must be
   a deliberate decision, not an accident.
 
@@ -87,8 +87,8 @@ formal drift-check FAILED
     3. re-run  (cd formal/proofs && lake build)  and confirm axioms are clean
        (see formal/README.md)
 
-  If it does NOT (e.g. remove/rebalance — not yet modeled — comments, an
-  unrelated method), acknowledge it:
+  If it does NOT (e.g. range iterators, comments, an unrelated method),
+  acknowledge it:
     ACK_NO_FORMAL=1 $0
 MSG
 exit 1
