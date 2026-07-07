@@ -3077,6 +3077,13 @@ impl WriteTx {
     ///
     /// Returns `Some(WriteConflict)` on the first conflict found, `None` if clean.
     fn validate_write_set(&self, inner: &StoreInner) -> Option<Error> {
+        #[cfg(feature = "mutation-testing")]
+        if matches!(
+            crate::mutation::active(),
+            Some(crate::mutation::Mutation::SkipWriteSetValidation)
+        ) {
+            return None; // BUG(task47): commit-time write-conflict detection disabled → lost update
+        }
         let base_version = self.base.version;
         for cws in &inner.committed_write_sets {
             if cws.version <= base_version {
@@ -3154,6 +3161,13 @@ impl WriteTx {
     /// - `entry.table_scan == false` and concurrent commit modified a key
     ///   we point-read → conflict.
     fn validate_read_set(&self, inner: &StoreInner) -> Option<Error> {
+        #[cfg(feature = "mutation-testing")]
+        if matches!(
+            crate::mutation::active(),
+            Some(crate::mutation::Mutation::SkipReadSetValidation)
+        ) {
+            return None; // BUG(task47): SSI read-set validation disabled → write skew reappears
+        }
         let cell = self.read_set.as_ref()?;
         let rs = cell.borrow();
         let base_version = self.base.version;

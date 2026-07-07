@@ -21,6 +21,9 @@ persistence = ["dep:serde", "dep:bincode"]
 # Exposes internal handles (e.g. BenchWal) for the benches/ crate. Not a public API.
 bench-internals = ["persistence", "dep:memmap2"]
 wal-iouring = ["persistence", "dep:io-uring"]
+# Test-only fault injection for the Elle mutation-testing harness (task47).
+# Off by default; compiled into no normal build. Inert unless ULTIMA_MUTATION is set.
+mutation-testing = []
 
 [dependencies]
 thiserror = "2"
