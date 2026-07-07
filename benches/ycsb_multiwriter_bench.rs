@@ -29,12 +29,13 @@ use ultima_bench_workloads::ycsb::{
 // ---------------------------------------------------------------------------
 
 fn make_store(mode: WriterMode) -> Store {
-    let store = Store::new(StoreConfig {
-        num_snapshots_retained: 2,
-        auto_snapshot_gc: true,
-        writer_mode: mode,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .num_snapshots_retained(2)
+            .auto_snapshot_gc(true)
+            .writer_mode(mode)
+            .build(),
+    )
     .unwrap();
     // Preload table with NUM_RECORDS rows
     let mut wtx = store.begin_write(None).unwrap();
@@ -156,12 +157,13 @@ fn bench_baseline_single_writer(c: &mut Criterion) {
 
 /// No contention: MultiWriter, each writer operates on a different table
 fn bench_no_contention(c: &mut Criterion) {
-    let store = Store::new(StoreConfig {
-        num_snapshots_retained: 2,
-        auto_snapshot_gc: true,
-        writer_mode: WriterMode::MultiWriter,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .num_snapshots_retained(2)
+            .auto_snapshot_gc(true)
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
     .unwrap();
     // Preload each writer's table
     for w in 0..MW_WRITERS {

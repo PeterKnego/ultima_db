@@ -64,26 +64,19 @@ const TOTAL_COMMITS: usize = 200;
 const PRELOAD_ROWS: u64 = 1000;
 
 fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Store {
-    let mut config = StoreConfig {
-        num_snapshots_retained: 2,
-        writer_mode: WriterMode::SingleWriter,
-        persistence: Persistence::None,
-        ..StoreConfig::default()
-    };
+    let mut config = StoreConfig::builder()
+        .num_snapshots_retained(2)
+        .writer_mode(WriterMode::SingleWriter)
+        .persistence(Persistence::None)
+        .build();
     if let Some(dir) = tmpdir {
         config.persistence = match persistence {
             Persistence::Standalone {
                 durability,
                 wal_write,
                 ..
-            } => Persistence::Standalone {
-                dir: dir.to_path_buf(),
-                durability,
-                wal_write,
-            },
-            Persistence::Smr { .. } => Persistence::Smr {
-                dir: dir.to_path_buf(),
-            },
+            } => Persistence::standalone(dir.to_path_buf(), durability, wal_write),
+            Persistence::Smr { .. } => Persistence::smr(dir.to_path_buf()),
             other => other,
         };
     } else {
@@ -140,9 +133,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Smr {
-                dir: std::path::PathBuf::new(),
-            },
+            Persistence::smr(std::path::PathBuf::new()),
             Some(tmpdir.path()),
         );
         group.bench_function("smr", |b| {
@@ -157,11 +148,11 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Consistent,
-                wal_write: WalWrite::PerEntry,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::Consistent,
+                WalWrite::PerEntry,
+            ),
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent", |b| {
@@ -184,11 +175,11 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Consistent,
-                wal_write: WalWrite::CoalescedPrealloc,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::Consistent,
+                WalWrite::CoalescedPrealloc,
+            ),
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent_coalesced_prealloc", |b| {
@@ -212,11 +203,11 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::ConsistentInline,
-                wal_write: WalWrite::PerEntry,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::ConsistentInline,
+                WalWrite::PerEntry,
+            ),
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent_inline", |b| {
@@ -234,11 +225,11 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::ConsistentInline,
-                wal_write: WalWrite::CoalescedPrealloc,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::ConsistentInline,
+                WalWrite::CoalescedPrealloc,
+            ),
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_consistent_inline_prealloc", |b| {
@@ -253,11 +244,11 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Eventual,
-                wal_write: WalWrite::PerEntry,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::Eventual,
+                WalWrite::PerEntry,
+            ),
             Some(tmpdir.path()),
         );
         group.bench_function("standalone_eventual", |b| {

@@ -320,11 +320,8 @@ fn untouched_tables_survive_commit() {
 #[test]
 fn two_overlapping_write_txs_to_different_tables() {
     use ultima_db::{StoreConfig, WriterMode};
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        ..StoreConfig::default()
-    })
-    .unwrap();
+    let store = Store::new(StoreConfig::builder().writer_mode(WriterMode::MultiWriter).build())
+        .unwrap();
 
     // Open both write transactions before either commits — different tables.
     let mut wtx_a = store.begin_write(None).unwrap(); // will be v1
@@ -1812,14 +1809,15 @@ fn readable_trait_generic_access() {
 #[test]
 fn store_new_returns_error_on_bad_wal_path() {
     use ultima_db::{Durability, Persistence, StoreConfig, WalWrite};
-    let result = Store::new(StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: std::path::PathBuf::from("/nonexistent/deeply/nested/path/that/cannot/exist"),
-            durability: Durability::Consistent,
-            wal_write: WalWrite::PerEntry,
-        },
-        ..StoreConfig::default()
-    });
+    let result = Store::new(
+        StoreConfig::builder()
+            .persistence(Persistence::standalone(
+                std::path::PathBuf::from("/nonexistent/deeply/nested/path/that/cannot/exist"),
+                Durability::Consistent,
+                WalWrite::PerEntry,
+            ))
+            .build(),
+    );
     assert!(
         result.is_err(),
         "Store::new should return Err for unwritable WAL directory"
@@ -1829,11 +1827,8 @@ fn store_new_returns_error_on_bad_wal_path() {
 /// Helper: create a store in `MultiWriter` mode with default config.
 fn multi_writer_store() -> Store {
     use ultima_db::{StoreConfig, WriterMode};
-    Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        ..StoreConfig::default()
-    })
-    .unwrap()
+    Store::new(StoreConfig::builder().writer_mode(WriterMode::MultiWriter).build())
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -2632,11 +2627,8 @@ fn commit_waiter_unblocks_on_first_writer_commit() {
     use std::time::{Duration, Instant};
     use ultima_db::{StoreConfig, WriterMode};
 
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        ..StoreConfig::default()
-    })
-    .unwrap();
+    let store = Store::new(StoreConfig::builder().writer_mode(WriterMode::MultiWriter).build())
+        .unwrap();
 
     {
         let mut wtx = store.begin_write(None).unwrap();
@@ -2723,11 +2715,12 @@ fn ssi_prevents_write_skew_via_table_scan() {
     // off-call. Under SI both commit (disjoint key writes); under
     // Serializable, the second commit fails because the first's commit
     // invalidated the second's iter() read.
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        isolation_level: IsolationLevel::Serializable,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(IsolationLevel::Serializable)
+            .build(),
+    )
     .unwrap();
 
     // Seed two doctors (id=1, id=2). Use a String "on" / "off" payload.
@@ -2787,11 +2780,12 @@ fn si_allows_write_skew_table_scan() {
 
     // Same scenario but isolation_level: SnapshotIsolation. Both writers'
     // disjoint-key updates commit; SI does not validate read sets.
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        isolation_level: IsolationLevel::SnapshotIsolation,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(IsolationLevel::SnapshotIsolation)
+            .build(),
+    )
     .unwrap();
 
     {
@@ -2844,11 +2838,12 @@ fn ssi_read_then_write_conflicts_on_concurrent_modify() {
     // Tx B (concurrent, same base) writes key=1.
     // B commits first. A's commit must fail with SerializationFailure
     // because A's read of key=1 was invalidated by B.
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        isolation_level: IsolationLevel::Serializable,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(IsolationLevel::Serializable)
+            .build(),
+    )
     .unwrap();
 
     // Seed: three rows so we have keys 1, 2, 3 to play with.
@@ -2899,11 +2894,12 @@ fn ssi_disjoint_point_reads_dont_conflict() {
     // B writes key=2.
     // A's read set: {t: keys={1}}. B's write set: {t: {2}}.
     // Intersection empty → no SSI conflict, both commit.
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        isolation_level: IsolationLevel::Serializable,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(IsolationLevel::Serializable)
+            .build(),
+    )
     .unwrap();
 
     {
@@ -2948,11 +2944,12 @@ fn ssi_in_single_writer_mode_is_noop() {
     // SingleWriter has no concurrent writers, so Serializable degenerates to
     // SI semantically. Verify a sequential read+write workload completes
     // without any serialization failures and the metric counter stays 0.
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::SingleWriter,
-        isolation_level: IsolationLevel::Serializable,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::SingleWriter)
+            .isolation_level(IsolationLevel::Serializable)
+            .build(),
+    )
     .unwrap();
 
     // Seed.

@@ -46,16 +46,15 @@ impl SmallBankConfig {
     fn standalone_eventual() -> Self {
         Self {
             name: "ultima".into(),
-            store_config: StoreConfig {
-                num_snapshots_retained: 2,
-                auto_snapshot_gc: true,
-                ..StoreConfig::default()
-            },
-            persistence: ultima_db::Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Eventual,
-                wal_write: ultima_db::WalWrite::PerEntry,
-            },
+            store_config: StoreConfig::builder()
+                .num_snapshots_retained(2)
+                .auto_snapshot_gc(true)
+                .build(),
+            persistence: ultima_db::Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::Eventual,
+                ultima_db::WalWrite::PerEntry,
+            ),
         }
     }
 }
@@ -78,14 +77,15 @@ impl UltimaEngine {
             ultima_db::Persistence::None => None,
             ultima_db::Persistence::Standalone { durability, .. } => {
                 let dir = tempfile::tempdir().unwrap();
-                store_config.persistence = ultima_db::Persistence::Standalone {
-                    dir: dir.path().to_path_buf(),
-                    durability: *durability,
-                    wal_write: ultima_db::WalWrite::PerEntry,
-                };
+                store_config.persistence = ultima_db::Persistence::standalone(
+                    dir.path().to_path_buf(),
+                    *durability,
+                    ultima_db::WalWrite::PerEntry,
+                );
                 Some(dir)
             }
             ultima_db::Persistence::Smr { .. } => None,
+            _ => None,
         };
 
         let store = Store::new(store_config).unwrap();

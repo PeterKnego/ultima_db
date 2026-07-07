@@ -46,12 +46,13 @@ const POOL_SIZE: usize = 64;
 // ---------------------------------------------------------------------------
 
 fn ycsb_store() -> Store {
-    let store = Store::new(StoreConfig {
-        num_snapshots_retained: 2,
-        auto_snapshot_gc: true,
-        writer_mode: WriterMode::MultiWriter,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .num_snapshots_retained(2)
+            .auto_snapshot_gc(true)
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
     .unwrap();
     let mut wtx = store.begin_write(None).unwrap();
     {
@@ -160,17 +161,16 @@ fn disjoint_table_name(idx: usize) -> String {
 
 fn disjoint_build_store(max_writers: usize) -> (Store, tempfile::TempDir) {
     let tmpdir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig {
-        num_snapshots_retained: 2,
-        auto_snapshot_gc: true,
-        writer_mode: WriterMode::MultiWriter,
-        persistence: ultima_db::Persistence::Standalone {
-            dir: tmpdir.path().to_path_buf(),
-            durability: ultima_db::Durability::Eventual,
-            wal_write: ultima_db::WalWrite::PerEntry,
-        },
-        ..StoreConfig::default()
-    };
+    let cfg = StoreConfig::builder()
+        .num_snapshots_retained(2)
+        .auto_snapshot_gc(true)
+        .writer_mode(WriterMode::MultiWriter)
+        .persistence(ultima_db::Persistence::standalone(
+            tmpdir.path().to_path_buf(),
+            ultima_db::Durability::Eventual,
+            ultima_db::WalWrite::PerEntry,
+        ))
+        .build();
     let store = Store::new(cfg).unwrap();
     for i in 0..max_writers {
         store

@@ -32,14 +32,13 @@ fn random_unit_vec(rng: &mut StdRng, dim: usize) -> Vec<f32> {
 }
 
 fn config(dir: &std::path::Path) -> StoreConfig {
-    StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: dir.to_path_buf(),
-            durability: Durability::Consistent,
-            wal_write: WalWrite::PerEntry,
-        },
-        ..StoreConfig::default()
-    }
+    StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.to_path_buf(),
+            Durability::Consistent,
+            WalWrite::PerEntry,
+        ))
+        .build()
 }
 
 fn main() {

@@ -303,11 +303,12 @@ fn main() {
         }
     };
 
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        isolation_level: isolation,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(isolation)
+            .build(),
+    )
     .expect("store construction");
 
     // Pre-seed the keyspace: TableWriter has no insert-at-key, and update()
@@ -472,11 +473,12 @@ mod tests {
     /// scan branch of `run_txn` has to preserve.
     #[test]
     fn scan_txn_reads_its_own_appends() {
-        let store = Store::new(StoreConfig {
-            writer_mode: WriterMode::MultiWriter,
-            isolation_level: IsolationLevel::Serializable,
-            ..StoreConfig::default()
-        })
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .isolation_level(IsolationLevel::Serializable)
+                .build(),
+        )
         .unwrap();
         let key = {
             let mut tx = store.begin_write(None).unwrap();

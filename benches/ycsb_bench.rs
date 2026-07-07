@@ -44,16 +44,17 @@ impl UltimaEngine {
             Some(v) if !v.is_empty() => WalWrite::CoalescedPrealloc,
             _ => WalWrite::Coalesced,
         };
-        let store = Store::new(StoreConfig {
-            num_snapshots_retained: 2,
-            auto_snapshot_gc: true,
-            persistence: Persistence::Standalone {
-                dir: tmpdir.path().to_path_buf(),
-                durability,
-                wal_write,
-            },
-            ..StoreConfig::default()
-        })
+        let store = Store::new(
+            StoreConfig::builder()
+                .num_snapshots_retained(2)
+                .auto_snapshot_gc(true)
+                .persistence(Persistence::standalone(
+                    tmpdir.path().to_path_buf(),
+                    durability,
+                    wal_write,
+                ))
+                .build(),
+        )
         .unwrap();
         store.register_table::<YcsbRecord>("ycsb").unwrap();
         let mut wtx = store.begin_write(None).unwrap();

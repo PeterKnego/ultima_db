@@ -22,11 +22,12 @@ struct Row {
 }
 
 fn mw_store() -> Store {
-    Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        persistence: Persistence::None,
-        ..StoreConfig::default()
-    })
+    Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .persistence(Persistence::None)
+            .build(),
+    )
     .unwrap()
 }
 

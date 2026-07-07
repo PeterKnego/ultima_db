@@ -124,24 +124,23 @@ fn commit_one(store: &Store, table: &str, key: u64) {
 fn make_store(tier: Tier, tmpdir: Option<&std::path::Path>, tables: &[(String, u64)]) -> Store {
     let persistence = match (tier, tmpdir) {
         (Tier::Inmem, _) => Persistence::None,
-        (Tier::Smr, Some(d)) => Persistence::Smr {
-            dir: d.to_path_buf(),
-        },
-        (Tier::Consistent, Some(d)) => Persistence::Standalone {
-            dir: d.to_path_buf(),
-            durability: ultima_db::Durability::Consistent,
-            wal_write: WalWrite::PerEntry,
-        },
+        (Tier::Smr, Some(d)) => Persistence::smr(d.to_path_buf()),
+        (Tier::Consistent, Some(d)) => Persistence::standalone(
+            d.to_path_buf(),
+            ultima_db::Durability::Consistent,
+            WalWrite::PerEntry,
+        ),
         _ => Persistence::None,
     };
     let durable = !matches!(persistence, Persistence::None);
 
-    let store = Store::new(StoreConfig {
-        num_snapshots_retained: 2,
-        writer_mode: WriterMode::MultiWriter,
-        persistence,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .num_snapshots_retained(2)
+            .writer_mode(WriterMode::MultiWriter)
+            .persistence(persistence)
+            .build(),
+    )
     .unwrap();
     for (name, _) in tables {
         store.register_table::<Record>(name.as_str()).unwrap();

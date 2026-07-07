@@ -6,14 +6,13 @@ use serde::{Deserialize, Serialize};
 struct Row { v: u64 }
 
 fn cfg(dir: &std::path::Path) -> StoreConfig {
-    StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: dir.to_path_buf(),
-            durability: Durability::Consistent,
-            wal_write: WalWrite::CoalescedPrealloc,
-        },
-        ..StoreConfig::default()
-    }
+    StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.to_path_buf(),
+            Durability::Consistent,
+            WalWrite::CoalescedPrealloc,
+        ))
+        .build()
 }
 
 #[test]

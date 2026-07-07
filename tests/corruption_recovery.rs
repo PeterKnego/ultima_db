@@ -26,14 +26,13 @@ struct User {
 }
 
 fn standalone_config(dir: &Path) -> StoreConfig {
-    StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: dir.to_path_buf(),
-            durability: Durability::Eventual,
-            wal_write: WalWrite::PerEntry,
-        },
-        ..StoreConfig::default()
-    }
+    StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.to_path_buf(),
+            Durability::Eventual,
+            WalWrite::PerEntry,
+        ))
+        .build()
 }
 
 /// Create a store, write `n` commits (one user per commit), and drop it —

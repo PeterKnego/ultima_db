@@ -376,12 +376,9 @@ mod tests {
         use ultima_db::Persistence;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig {
-            persistence: Persistence::Smr {
-                dir: dir.path().to_path_buf(),
-            },
-            ..StoreConfig::default()
-        };
+        let cfg = StoreConfig::builder()
+            .persistence(Persistence::smr(dir.path().to_path_buf()))
+            .build();
         let store = Store::new(cfg).unwrap();
         store.register_table::<Row>("rows").unwrap();
 
@@ -426,12 +423,9 @@ mod tests {
         use ultima_db::snapshot_stream::codec::FILE_MAGIC;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig {
-            persistence: Persistence::Smr {
-                dir: dir.path().to_path_buf(),
-            },
-            ..StoreConfig::default()
-        };
+        let cfg = StoreConfig::builder()
+            .persistence(Persistence::smr(dir.path().to_path_buf()))
+            .build();
         let store = Store::new(cfg).unwrap();
         store.register_table::<Row>("rows").unwrap();
 

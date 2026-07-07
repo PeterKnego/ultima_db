@@ -13,23 +13,19 @@ struct User {
 }
 
 fn standalone_config(dir: &Path, durability: Durability) -> StoreConfig {
-    StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: dir.to_path_buf(),
+    StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.to_path_buf(),
             durability,
-            wal_write: WalWrite::PerEntry,
-        },
-        ..StoreConfig::default()
-    }
+            WalWrite::PerEntry,
+        ))
+        .build()
 }
 
 fn smr_config(dir: &Path) -> StoreConfig {
-    StoreConfig {
-        persistence: Persistence::Smr {
-            dir: dir.to_path_buf(),
-        },
-        ..StoreConfig::default()
-    }
+    StoreConfig::builder()
+        .persistence(Persistence::smr(dir.to_path_buf()))
+        .build()
 }
 
 /// Helper: create store, register User table, recover from disk.
@@ -996,14 +992,13 @@ fn read_only_write_tx_commit_with_persistence_no_wal_entry() {
 #[test]
 fn standalone_wal_recovery_consistent_coalesced() {
     let dir = tempfile::tempdir().unwrap();
-    let config = StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: dir.path().to_path_buf(),
-            durability: Durability::Consistent,
-            wal_write: WalWrite::Coalesced,
-        },
-        ..StoreConfig::default()
-    };
+    let config = StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.path().to_path_buf(),
+            Durability::Consistent,
+            WalWrite::Coalesced,
+        ))
+        .build();
 
     {
         let store = open_store(config.clone());
@@ -1031,14 +1026,13 @@ fn standalone_wal_recovery_consistent_coalesced() {
 #[test]
 fn standalone_wal_recovery_eventual_coalesced() {
     let dir = tempfile::tempdir().unwrap();
-    let config = StoreConfig {
-        persistence: Persistence::Standalone {
-            dir: dir.path().to_path_buf(),
-            durability: Durability::Eventual,
-            wal_write: WalWrite::Coalesced,
-        },
-        ..StoreConfig::default()
-    };
+    let config = StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.path().to_path_buf(),
+            Durability::Eventual,
+            WalWrite::Coalesced,
+        ))
+        .build();
 
     {
         let store = open_store(config.clone());

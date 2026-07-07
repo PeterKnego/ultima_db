@@ -18,10 +18,11 @@ const NUM_THREADS: usize = 8;
 const WRITES_PER_THREAD: u64 = 50;
 
 fn main() {
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
     .unwrap();
 
     // Seed one record per thread so every writer has a key to update.

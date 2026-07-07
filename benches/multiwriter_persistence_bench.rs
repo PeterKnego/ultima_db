@@ -61,22 +61,17 @@ const COMMITS_PER_THREAD: usize = 50;
 const TOTAL_COMMITS: usize = NUM_THREADS * COMMITS_PER_THREAD;
 
 fn make_store(persistence: Persistence, tmpdir: Option<&std::path::Path>) -> Store {
-    let mut config = StoreConfig {
-        num_snapshots_retained: 2,
-        writer_mode: WriterMode::MultiWriter,
-        persistence: Persistence::None,
-        ..StoreConfig::default()
-    };
+    let mut config = StoreConfig::builder()
+        .num_snapshots_retained(2)
+        .writer_mode(WriterMode::MultiWriter)
+        .persistence(Persistence::None)
+        .build();
     if let Some(dir) = tmpdir {
         config.persistence = match persistence {
-            Persistence::Standalone { durability, .. } => Persistence::Standalone {
-                dir: dir.to_path_buf(),
-                durability,
-                wal_write: WalWrite::PerEntry,
-            },
-            Persistence::Smr { .. } => Persistence::Smr {
-                dir: dir.to_path_buf(),
-            },
+            Persistence::Standalone { durability, .. } => {
+                Persistence::standalone(dir.to_path_buf(), durability, WalWrite::PerEntry)
+            }
+            Persistence::Smr { .. } => Persistence::smr(dir.to_path_buf()),
             other => other,
         };
     } else {
@@ -224,9 +219,7 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Smr {
-                dir: std::path::PathBuf::new(),
-            },
+            Persistence::smr(std::path::PathBuf::new()),
             Some(tmpdir.path()),
         );
         let pool = WorkerPool::new(&store);
@@ -243,11 +236,11 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Consistent,
-                wal_write: WalWrite::PerEntry,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::Consistent,
+                WalWrite::PerEntry,
+            ),
             Some(tmpdir.path()),
         );
         let pool = WorkerPool::new(&store);
@@ -264,11 +257,11 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
     {
         let tmpdir = tempfile::tempdir().unwrap();
         let store = make_store(
-            Persistence::Standalone {
-                dir: std::path::PathBuf::new(),
-                durability: ultima_db::Durability::Eventual,
-                wal_write: WalWrite::PerEntry,
-            },
+            Persistence::standalone(
+                std::path::PathBuf::new(),
+                ultima_db::Durability::Eventual,
+                WalWrite::PerEntry,
+            ),
             Some(tmpdir.path()),
         );
         let pool = WorkerPool::new(&store);

@@ -101,13 +101,12 @@ impl Config {
 const APPLY_BATCH: u64 = 1;
 
 fn smr_store(dir: &std::path::Path, mode: WriterMode) -> Store {
-    let store = Store::new(StoreConfig {
-        writer_mode: mode,
-        persistence: Persistence::Smr {
-            dir: dir.to_path_buf(),
-        },
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(mode)
+            .persistence(Persistence::smr(dir.to_path_buf()))
+            .build(),
+    )
     .unwrap();
     store.register_table::<SmrRow>("state").unwrap();
     store.recover().unwrap();

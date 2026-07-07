@@ -56,14 +56,13 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(1);
 /// thread `t` updates keys `(t*KEYS_PER_THREAD + 1)..=((t+1)*KEYS_PER_THREAD)`.
 /// The preloaded rows give `checkpoint()` a non-trivial snapshot to serialize.
 fn make_store(dir: &std::path::Path) -> Store {
-    let store = Store::new(StoreConfig {
-        num_snapshots_retained: 2,
-        writer_mode: WriterMode::MultiWriter,
-        persistence: Persistence::Smr {
-            dir: dir.to_path_buf(),
-        },
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .num_snapshots_retained(2)
+            .writer_mode(WriterMode::MultiWriter)
+            .persistence(Persistence::smr(dir.to_path_buf()))
+            .build(),
+    )
     .unwrap();
     store.register_table::<Record>("data").unwrap();
     store.recover().unwrap();

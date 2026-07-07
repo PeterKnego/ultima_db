@@ -35,6 +35,7 @@ impl<T: Send + Sync + 'static> Record for T {}
 
 /// Controls WAL fsync behavior (Standalone mode only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Durability {
     /// `commit()` returns immediately. A background thread fsyncs the WAL
     /// asynchronously. Data may be lost on crash (last unflushed entries).
@@ -60,6 +61,7 @@ pub enum Durability {
 /// Orthogonal to [`Durability`], which controls *when* `commit()` returns. All
 /// four combinations are valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum WalWrite {
     /// One `write` per entry, then `sync_all` per batch. The original behavior.
     #[default]
@@ -83,12 +85,16 @@ pub enum WalWrite {
 
 /// Persistence mode for a [`Store`](crate::Store).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum Persistence {
     /// In-memory only. No disk I/O. Default.
     #[default]
     None,
     /// UltimaDB owns durability. WAL for transaction durability, checkpoints
     /// for fast recovery. WAL is auto-pruned on checkpoint.
+    ///
+    /// Construct via [`Persistence::standalone`] / [`Persistence::standalone_fast`].
+    #[non_exhaustive]
     Standalone {
         /// Directory for WAL and checkpoint files.
         dir: PathBuf,
@@ -99,6 +105,9 @@ pub enum Persistence {
     },
     /// Consensus log owns durability. Checkpoints only — no WAL.
     /// Used in SMR deployments where the Raft/Paxos log provides durability.
+    ///
+    /// Construct via [`Persistence::smr`].
+    #[non_exhaustive]
     Smr {
         /// Directory for checkpoint files.
         dir: PathBuf,

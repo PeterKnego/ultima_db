@@ -49,6 +49,7 @@ impl Snapshot {
 
 /// Controls how concurrent write transactions are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriterMode {
     /// At most one active [`WriteTx`] at a time. [`Store::begin_write`] returns
     /// [`Error::WriterBusy`] if another is already active. Zero tracking overhead.
@@ -67,6 +68,7 @@ pub enum WriterMode {
 ///
 /// Controls whether [`WriteTx`] tracks read sets and validates them at commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IsolationLevel {
     /// Snapshot Isolation. Reads are not tracked. Prevents dirty/nonrepeatable
     /// reads and phantoms but does *not* prevent write skew. Zero overhead.
@@ -88,6 +90,7 @@ pub enum IsolationLevel {
 
 /// Configuration for [`Store`] behavior.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StoreConfig {
     /// How many most-recent snapshots to retain during [`Store::gc()`]. Default: 10.
     /// The latest snapshot is always retained regardless of this value.

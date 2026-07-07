@@ -844,11 +844,8 @@ mod bulk_load_occ {
     }
 
     fn multi_writer_store() -> Store {
-        Store::new(StoreConfig {
-            writer_mode: WriterMode::MultiWriter,
-            ..StoreConfig::default()
-        })
-        .unwrap()
+        Store::new(StoreConfig::builder().writer_mode(WriterMode::MultiWriter).build())
+            .unwrap()
     }
 
     /// A MultiWriter transaction whose writes were computed against the
@@ -988,11 +985,12 @@ mod bulk_load_occ {
     /// table must fail with SerializationFailure (its reads no longer hold).
     #[test]
     fn serializable_reader_of_replaced_table_fails() {
-        let store = Store::new(StoreConfig {
-            writer_mode: WriterMode::MultiWriter,
-            isolation_level: IsolationLevel::Serializable,
-            ..StoreConfig::default()
-        })
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .isolation_level(IsolationLevel::Serializable)
+                .build(),
+        )
         .unwrap();
         seed(&store, "t", &["seed1"]);
 

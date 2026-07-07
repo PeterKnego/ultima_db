@@ -8,15 +8,14 @@ use serde::{Deserialize, Serialize};
 struct Row { v: u64 }
 
 fn cfg(dir: &std::path::Path, wm: WriterMode) -> StoreConfig {
-    StoreConfig {
-        writer_mode: wm,
-        persistence: Persistence::Standalone {
-            dir: dir.to_path_buf(),
-            durability: Durability::ConsistentInline,
-            wal_write: WalWrite::PerEntry,
-        },
-        ..StoreConfig::default()
-    }
+    StoreConfig::builder()
+        .writer_mode(wm)
+        .persistence(Persistence::standalone(
+            dir.to_path_buf(),
+            Durability::ConsistentInline,
+            WalWrite::PerEntry,
+        ))
+        .build()
 }
 
 #[test]
@@ -34,9 +33,10 @@ fn standalone_fast_preset_is_inline_plus_prealloc() {
 #[test]
 fn standalone_fast_preset_commits_and_recovers() {
     let dir = tempfile::tempdir().unwrap();
-    let mk = || StoreConfig {
-        persistence: Persistence::standalone_fast(dir.path()),
-        ..StoreConfig::default() // SingleWriter by default
+    let mk = || {
+        StoreConfig::builder()
+            .persistence(Persistence::standalone_fast(dir.path())) // SingleWriter by default
+            .build()
     };
     {
         let store = Store::new(mk()).unwrap();
@@ -60,11 +60,10 @@ fn standalone_fast_preset_commits_and_recovers() {
 #[test]
 fn standalone_fast_preset_rejects_multiwriter() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        persistence: Persistence::standalone_fast(dir.path()),
-        ..StoreConfig::default()
-    };
+    let cfg = StoreConfig::builder()
+        .writer_mode(WriterMode::MultiWriter)
+        .persistence(Persistence::standalone_fast(dir.path()))
+        .build();
     match Store::new(cfg) {
         Err(e) => assert!(
             e.to_string().contains("requires WriterMode::SingleWriter"),

@@ -241,11 +241,12 @@ fn run_burst(store: &Store, op_sets: &[Vec<Op>]) -> (u64, u64) {
 }
 
 fn run(label: &str, isolation: IsolationLevel) -> (u64, u64, Duration) {
-    let store = Store::new(StoreConfig {
-        writer_mode: WriterMode::MultiWriter,
-        isolation_level: isolation,
-        ..StoreConfig::default()
-    })
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(isolation)
+            .build(),
+    )
     .unwrap();
 
     // Seed: NUM_ACCOUNTS rows in each table with a unique-by-customer_id index.
