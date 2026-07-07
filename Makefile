@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -163,6 +163,11 @@ consistency/elle:
 	cargo run --release -p ultima-autobench --bin elle-history -- \
 		--isolation serializable --scan-ratio $(ELLE_SCAN_RATIO) $(ELLE_ARGS) --out $(ELLE_DIR)/scan-ser/history.edn
 	scripts/elle_check.sh $(ELLE_DIR)/scan-si/history.edn $(ELLE_DIR)/scan-ser/history.edn
+
+# Mutation test: inject known bugs into the commit path and confirm Elle catches
+# them (opt-in; builds ultima-db with the mutation-testing feature). See task47.
+consistency/elle-mutation:
+	scripts/elle_mutation.sh
 
 # Perf regression gate (fitness binaries in --check mode, ~3-6 min total)
 perf/check:

@@ -13,3 +13,8 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 wait-timeout = "0.2"
 tempfile = "3"
+
+[features]
+# Build ultima-db with commit-path fault injection for scripts/elle_mutation.sh.
+# Opt-in only — perf gates never enable it. See task47.
+elle-mutation = ["ultima-db/mutation-testing"]
