@@ -9,6 +9,7 @@ pub mod error;
 pub mod filter;
 pub mod hnsw;
 pub mod row;
+mod validate;
 
 pub use collection::VectorCollection;
 pub use distance::{

@@ -122,6 +122,31 @@ fn restore_dim_mismatch_errors_before_install() {
 }
 
 #[test]
+fn restore_non_finite_embedding_errors_before_install() {
+    use ultima_vector::error::Error;
+
+    let store = Store::default();
+    let coll = open_coll(store.clone());
+    let v_before = store.latest_version();
+
+    let bad = vec![(
+        1u64,
+        VectorRow {
+            embedding: vec![1.0, f32::NAN, 0.0, 0.0],
+            meta: 1,
+            hnsw: ultima_vector::row::HnswState::empty(0),
+        },
+    )];
+    let res = coll.restore_vec(bad, EntryPoint::default());
+    assert!(matches!(res, Err(Error::NonFinite { index: 1, .. })));
+    assert_eq!(
+        store.latest_version(),
+        v_before,
+        "store must be unchanged on validation failure"
+    );
+}
+
+#[test]
 fn restore_duplicate_ids_errors() {
     use ultima_db::Error as DbError;
     use ultima_vector::error::Error;

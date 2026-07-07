@@ -15,6 +15,13 @@ mod simd;
 /// Implementors must return `0.0` for two identical vectors and otherwise
 /// satisfy `distance(a, b) >= 0` for `Cosine` and `L2`. `DotProduct` returns
 /// the negated inner product so smaller-is-closer holds uniformly.
+///
+/// # Panics
+///
+/// Implementations provided by this crate panic if `a.len() != b.len()`,
+/// and `distance_many` panics if `targets.len() != out.len()` — in all
+/// build profiles, not just debug. Silent prefix-truncation in release
+/// was a garbage-results footgun.
 pub trait Distance: Send + Sync + 'static {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32;
 
@@ -22,7 +29,7 @@ pub trait Distance: Send + Sync + 'static {
     /// Default impl loops `distance`; override on concrete impls when there is
     /// per-query setup that can be amortized (e.g., `‖query‖²` for cosine).
     fn distance_many(&self, query: &[f32], targets: &[&[f32]], out: &mut [f32]) {
-        debug_assert_eq!(targets.len(), out.len());
+        assert_eq!(targets.len(), out.len(), "targets/out length mismatch");
         for (i, t) in targets.iter().enumerate() {
             out[i] = self.distance(query, t);
         }
@@ -47,7 +54,7 @@ impl Distance for Cosine {
     }
 
     fn distance_many(&self, query: &[f32], targets: &[&[f32]], out: &mut [f32]) {
-        debug_assert_eq!(targets.len(), out.len());
+        assert_eq!(targets.len(), out.len(), "targets/out length mismatch");
         let q_norm_sq = simd::norm_squared(query);
         for (i, t) in targets.iter().enumerate() {
             out[i] = simd::cosine_with_query_norm(query, t, q_norm_sq);
@@ -77,7 +84,7 @@ pub struct CosineNormalized;
 
 impl Distance for CosineNormalized {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len(), "vector dim mismatch");
+        assert_eq!(a.len(), b.len(), "vector dim mismatch");
         1.0 - simd::dot(a, b)
     }
 }
@@ -222,6 +229,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "vector dim mismatch")]
+    fn cosine_len_mismatch_panics() {
+        Cosine.distance(&[1.0, 2.0], &[1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector dim mismatch")]
+    fn l2_len_mismatch_panics() {
+        L2.distance(&[1.0, 2.0], &[1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector dim mismatch")]
+    fn dot_product_len_mismatch_panics() {
+        DotProduct.distance(&[1.0, 2.0], &[1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector dim mismatch")]
+    fn cosine_normalized_len_mismatch_panics() {
+        CosineNormalized.distance(&[1.0, 0.0], &[1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "targets/out length mismatch")]
+    fn distance_many_out_len_mismatch_panics() {
+        let t: Vec<&[f32]> = vec![&[1.0, 0.0]];
+        let mut out = vec![0.0; 2];
+        Cosine.distance_many(&[1.0, 0.0], &t, &mut out);
     }
 
     #[test]

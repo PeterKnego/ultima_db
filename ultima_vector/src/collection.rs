@@ -182,6 +182,7 @@ where
                     got: row.embedding.len(),
                 });
             }
+            crate::validate::ensure_finite(&row.embedding)?;
             let level = row.hnsw.level();
             let layers = row.hnsw.layers_len();
             if layers != usize::from(level) + 1 {
@@ -262,6 +263,7 @@ where
                 got: query.len(),
             });
         }
+        crate::validate::ensure_finite(query)?;
         let ef = ef.unwrap_or(self.params.ef_search_default);
         hnsw_search::search::<Meta, D>(
             tx,
@@ -561,6 +563,73 @@ mod tests {
         // Tx was dropped without commit, so the first row is also gone.
         let res = coll.search(&[1.0, 0.0], 3, None, None).unwrap();
         assert!(res.is_empty(), "failed bulk_insert must roll back");
+    }
+
+    #[test]
+    fn search_rejects_non_finite_query() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        coll.upsert(vec![1.0, 0.0], 1u64).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = coll.search(&[bad, 0.0], 5, None, None).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::NonFinite { index: 0, .. }),
+                "expected NonFinite at index 0, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_rejects_non_finite_embedding() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = coll.upsert(vec![1.0, bad], 7u64).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::NonFinite { index: 1, .. }),
+                "expected NonFinite at index 1, got {err:?}"
+            );
+        }
+        // Nothing was inserted.
+        let res = coll.search(&[1.0, 0.0], 5, None, None).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn bulk_insert_non_finite_aborts_whole_batch() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        let items = vec![
+            (vec![1.0, 0.0], 1u64),
+            (vec![f32::NAN, 0.0], 2), // poison row
+        ];
+        let err = coll.bulk_insert(items).unwrap_err();
+        assert!(matches!(err, crate::Error::NonFinite { index: 0, .. }));
+        // Tx was dropped without commit, so the first row is also gone.
+        let res = coll.search(&[1.0, 0.0], 3, None, None).unwrap();
+        assert!(res.is_empty(), "failed bulk_insert must roll back");
+    }
+
+    #[test]
+    fn update_embedding_rejects_non_finite_and_keeps_old() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let coll: VectorCollection<u64, Cosine> =
+            VectorCollection::open(store, "vec", HnswParams::for_dim(2), Cosine).unwrap();
+        let id = coll.upsert(vec![1.0, 0.0], 42u64).unwrap();
+
+        let err = coll
+            .update_embedding(id, vec![f32::NEG_INFINITY, 0.0])
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NonFinite { index: 0, .. }));
+
+        // Old embedding is intact and searchable at its old location.
+        let res = coll.search(&[1.0, 0.0], 1, None, None).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, id);
+        assert!((res[0].1 - 0.0).abs() < 1e-5);
     }
 
     #[test]
