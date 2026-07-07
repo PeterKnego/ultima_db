@@ -8,7 +8,7 @@ Standalone CLI for Jepsen's Elle transactional-safety checker.
 - License: Eclipse Public License 2.0 (see `LICENSE`, copied from upstream)
 - Requires: Java 11+ (repo toolchain: Temurin 21)
 - Used by: `scripts/elle_check.sh` via `make consistency/elle`
-  (see `docs/tasks/task41_elle_consistency_harness.md`)
+  (see `docs/tasks/task45_elle_consistency_harness.md`)
 
 Invocation shape the pipeline relies on:
 

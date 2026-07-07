@@ -1,4 +1,8 @@
-# Task 43: Formal verification of the B-tree insert path (Aeneas + Lean 4)
+# Task 46: Formal verification of the B-tree insert path (Aeneas + Lean 4)
+
+> Renumbered from task43 (numbering collided with the Unicode tokenizer, which
+> is the canonical task43); formal verification is task46.
+
 
 ## Summary
 
