@@ -31,6 +31,12 @@ struct Args {
     /// Probability an op is a read (rest are appends).
     #[arg(long, default_value_t = 0.4)]
     read_ratio: f64,
+    /// Probability a transaction reads via a full table scan (`range`) instead
+    /// of point `get`s. Exercises SSI's coarse `table_scan` read tracking
+    /// (a scan taints the whole table for conflict detection). Default 0.0
+    /// preserves the point-read workload exactly.
+    #[arg(long, default_value_t = 0.0)]
+    scan_ratio: f64,
     /// PRNG seed (per-thread stream: seed + thread index).
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -44,7 +50,7 @@ struct ElleRow {
     list: Vec<u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Op {
     Append { key: u64, value: u64 },
     Read { key: u64, result: Option<Vec<u64>> },
@@ -148,29 +154,52 @@ enum TxnFail {
 }
 
 /// Run one list-append transaction. Returns completed ops (reads filled in)
-/// on commit.
-fn run_txn(store: &Store, ops: &[Op]) -> Result<Vec<Op>, TxnFail> {
+/// on commit. When `scan` is true the transaction reads the whole table once
+/// via `range(..)` (registering the SSI coarse `table_scan` read) and serves
+/// every read and append from a local working copy, preserving
+/// read-your-writes; otherwise each op does a point `get`.
+fn run_txn(store: &Store, ops: &[Op], scan: bool) -> Result<Vec<Op>, TxnFail> {
     let mut tx = store.begin_write(None).map_err(TxnFail::Other)?;
     let mut completed = Vec::with_capacity(ops.len());
     {
         let mut t = tx.open_table::<ElleRow>("elle").map_err(TxnFail::Other)?;
+        // Scan mode reads the table up front; `local` is the transaction's own
+        // working copy so later reads observe earlier appends in this txn.
+        let mut local: std::collections::HashMap<u64, Vec<u64>> = if scan {
+            t.range(..).map(|(id, row)| (id, row.list.clone())).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         for op in ops {
             match op {
                 Op::Read { key, .. } => {
-                    let list = match t.get(*key) {
-                        Some(row) => row.list.clone(),
-                        None => Vec::new(),
+                    let list = if scan {
+                        local.get(key).cloned().unwrap_or_default()
+                    } else {
+                        match t.get(*key) {
+                            Some(row) => row.list.clone(),
+                            None => Vec::new(),
+                        }
                     };
                     completed.push(Op::Read { key: *key, result: Some(list) });
                 }
                 Op::Append { key, value } => {
-                    // get() both fetches the list and registers the SSI point read.
-                    let mut list = match t.get(*key) {
-                        Some(row) => row.list.clone(),
-                        None => Vec::new(),
+                    let next = if scan {
+                        // Read-modify-write against the local working copy; the
+                        // up-front scan already registered the read.
+                        let list = local.entry(*key).or_default();
+                        list.push(*value);
+                        list.clone()
+                    } else {
+                        // get() both fetches the list and registers the SSI point read.
+                        let mut list = match t.get(*key) {
+                            Some(row) => row.list.clone(),
+                            None => Vec::new(),
+                        };
+                        list.push(*value);
+                        list
                     };
-                    list.push(*value);
-                    match t.update(*key, ElleRow { list }) {
+                    match t.update(*key, ElleRow { list: next }) {
                         Ok(()) => completed.push(op.clone()),
                         Err(Error::WriteConflict { wait_for, .. }) => {
                             return Err(TxnFail::Conflict(wait_for));
@@ -195,6 +224,7 @@ struct Stats {
     write_conflict: AtomicU64,
     serialization_failure: AtomicU64,
     info: AtomicU64,
+    scan_txns: AtomicU64,
 }
 
 struct Shared {
@@ -226,8 +256,12 @@ fn worker(shared: &Shared, args: &Args, process: usize) {
             args.read_ratio,
             &shared.values,
         );
+        let scan = rng.chance(args.scan_ratio);
+        if scan {
+            shared.stats.scan_txns.fetch_add(1, Ordering::Relaxed);
+        }
         shared.push(EventType::Invoke, process, ops.clone());
-        match run_txn(&shared.store, &ops) {
+        match run_txn(&shared.store, &ops, scan) {
             Ok(completed) => {
                 shared.stats.ok.fetch_add(1, Ordering::Relaxed);
                 shared.push(EventType::Ok, process, completed);
@@ -319,13 +353,15 @@ fn main() {
 
     let s = &shared.stats;
     eprintln!(
-        "elle-history: isolation={} events={} ok={} write_conflict={} serialization_failure={} info={}",
+        "elle-history: isolation={} scan_ratio={} events={} ok={} write_conflict={} serialization_failure={} info={} scan_txns={}",
         args.isolation,
+        args.scan_ratio,
         history.len(),
         s.ok.load(Ordering::Relaxed),
         s.write_conflict.load(Ordering::Relaxed),
         s.serialization_failure.load(Ordering::Relaxed),
         s.info.load(Ordering::Relaxed),
+        s.scan_txns.load(Ordering::Relaxed),
     );
     if s.info.load(Ordering::Relaxed) > 0 {
         eprintln!("elle-history: degraded run (unexpected errors above)");
@@ -427,5 +463,47 @@ mod tests {
         assert!(gen_ops(&mut rng, &keys, 8, 1.0, &counter)
             .iter()
             .all(|op| matches!(op, Op::Read { .. })));
+    }
+
+    /// A scan-mode transaction reads the table once up front, so it MUST serve
+    /// later reads (and appends) from a local working copy — otherwise a read
+    /// after an append in the same transaction would miss its own write and
+    /// manufacture a false Elle anomaly. This is the correctness invariant the
+    /// scan branch of `run_txn` has to preserve.
+    #[test]
+    fn scan_txn_reads_its_own_appends() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            isolation_level: IsolationLevel::Serializable,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        let key = {
+            let mut tx = store.begin_write(None).unwrap();
+            let id = {
+                let mut t = tx.open_table::<ElleRow>("elle").unwrap();
+                t.insert(ElleRow { list: vec![] }).unwrap()
+            };
+            tx.commit().unwrap();
+            id
+        };
+        let ops = vec![
+            Op::Append { key, value: 100 },
+            Op::Read { key, result: None },
+            Op::Append { key, value: 200 },
+            Op::Read { key, result: None },
+        ];
+        let completed = match run_txn(&store, &ops, true) {
+            Ok(c) => c,
+            Err(_) => panic!("uncontended scan txn should commit"),
+        };
+        match &completed[1] {
+            Op::Read { result: Some(l), .. } => assert_eq!(l, &vec![100]),
+            other => panic!("expected read of [100], got {other:?}"),
+        }
+        match &completed[3] {
+            Op::Read { result: Some(l), .. } => assert_eq!(l, &vec![100, 200]),
+            other => panic!("expected read of [100, 200], got {other:?}"),
+        }
     }
 }

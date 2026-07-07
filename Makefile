@@ -138,13 +138,21 @@ bench/compare-engines:
 
 # Transactional consistency check (Elle list-append via vendored elle-cli,
 # needs java) — opt-in tier, not part of `make test`. Tune via ELLE_ARGS. See task41.
+# Two passes: point reads (SSI point read-set), then a scan-heavy pass
+# (SSI coarse table_scan read-set). Both must satisfy their isolation claim.
 ELLE_DIR ?= /tmp/ultima-elle
+ELLE_SCAN_RATIO ?= 0.5
 consistency/elle:
 	cargo run --release -p ultima-autobench --bin elle-history -- \
-		--isolation si $(ELLE_ARGS) --out $(ELLE_DIR)/si/history.edn
+		--isolation si $(ELLE_ARGS) --out $(ELLE_DIR)/point-si/history.edn
 	cargo run --release -p ultima-autobench --bin elle-history -- \
-		--isolation serializable $(ELLE_ARGS) --out $(ELLE_DIR)/ser/history.edn
-	scripts/elle_check.sh $(ELLE_DIR)/si/history.edn $(ELLE_DIR)/ser/history.edn
+		--isolation serializable $(ELLE_ARGS) --out $(ELLE_DIR)/point-ser/history.edn
+	scripts/elle_check.sh $(ELLE_DIR)/point-si/history.edn $(ELLE_DIR)/point-ser/history.edn
+	cargo run --release -p ultima-autobench --bin elle-history -- \
+		--isolation si --scan-ratio $(ELLE_SCAN_RATIO) $(ELLE_ARGS) --out $(ELLE_DIR)/scan-si/history.edn
+	cargo run --release -p ultima-autobench --bin elle-history -- \
+		--isolation serializable --scan-ratio $(ELLE_SCAN_RATIO) $(ELLE_ARGS) --out $(ELLE_DIR)/scan-ser/history.edn
+	scripts/elle_check.sh $(ELLE_DIR)/scan-si/history.edn $(ELLE_DIR)/scan-ser/history.edn
 
 # Perf regression gate (fitness binaries in --check mode, ~3-6 min total)
 perf/check:

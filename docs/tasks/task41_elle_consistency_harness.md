@@ -13,9 +13,19 @@ Design history: `docs/superpowers/specs/2026-07-07-elle-consistency-harness-desi
 
 ## What is checked
 
-The pipeline generates two histories (MultiWriter, `Persistence::None`, default
-workload: 8 threads × 1500 txns × 4 ops on 16 keys) and runs three assertions
-plus a self-test:
+`make consistency/elle` runs **two passes**, each generating one history per
+isolation level (MultiWriter, `Persistence::None`, default workload: 8 threads
+× 1500 txns × 4 ops on 16 keys):
+
+- **Point pass** (`--scan-ratio 0`): every read is a point `get`, so SSI
+  validates the *per-key* read set.
+- **Scan pass** (`--scan-ratio 0.5`, `ELLE_SCAN_RATIO`): half the transactions
+  read the whole table via `range(..)`, which registers SSI's *coarse
+  `table_scan`* read set (a scan conflicts with any concurrent write to the
+  table). This exercises the `table_scan` branch of `validate_read_set` that
+  the point pass never touches.
+
+Each pass runs the same three assertions plus a self-test:
 
 | # | History | Elle model | Expectation |
 |---|---------|-----------|-------------|
@@ -45,6 +55,15 @@ misconfigured checker silently passes everything.
   push → `update(k, ..)`. The `get` is also what registers the SSI point read
   (`update` alone records no read), so appends participate in read-set
   validation exactly like explicit reads.
+- **Scan mode** (`--scan-ratio`): a scan transaction reads the whole table once
+  via `range(..)` (registering the coarse `table_scan` read), then serves every
+  read *and* append from a per-transaction working copy. Serving from that copy
+  is essential: a read after an append in the same transaction must observe its
+  own write, or the history would show a false anomaly. The unit test
+  `scan_txn_reads_its_own_appends` pins this invariant. Because coarse tracking
+  taints the whole table regardless of the range bounds, scan transactions
+  abort far more often under SSI (that is the path being stressed), but the
+  committed history must still be serializable.
 - **Globally unique append values** from one `AtomicU64` — Elle's list-append
   inference requires each value be appended at most once per key; uniqueness
   across the whole run satisfies it trivially, including across retries.
@@ -79,10 +98,11 @@ misconfigured checker silently passes everything.
   on a `false` verdict, so the script parses the stdout verdict
   (`<file>\t<true|false|unknown>`) instead of trusting exit codes; `unknown`
   (cycle-search timeout / OOM) is always a hard failure.
-- Makefile `consistency/elle` — builds, generates both histories into
-  `$(ELLE_DIR)` (default `/tmp/ultima-elle`; cargo's target dir may be
-  redirected machine-wide, so histories don't go under `target/`), checks.
-  Extra driver flags via `ELLE_ARGS` (e.g.
+- Makefile `consistency/elle` — builds, generates the four histories (point +
+  scan × SI + SSI) into `$(ELLE_DIR)` (default `/tmp/ultima-elle`; cargo's
+  target dir may be redirected machine-wide, so histories don't go under
+  `target/`), and runs `elle_check.sh` once per pass. The scan fraction is
+  `ELLE_SCAN_RATIO` (default 0.5); extra driver flags via `ELLE_ARGS` (e.g.
   `make consistency/elle ELLE_ARGS="--threads 16 --txns-per-thread 5000"`).
 
 ## Reading a failure
@@ -94,24 +114,36 @@ to get per-anomaly explanations and SVG cycle plots:
 
 ```bash
 java -jar tools/elle-cli/elle-cli-0.1.9-standalone.jar --model list-append \
-    --consistency-models serializable --directory out/ /tmp/ultima-elle/ser/history.edn
+    --consistency-models serializable --directory out/ /tmp/ultima-elle/point-ser/history.edn
 ```
+
+Histories live under `$(ELLE_DIR)` (default `/tmp/ultima-elle`) in
+`point-si/`, `point-ser/`, `scan-si/`, `scan-ser/`.
 
 ## Results (2026-07-07, defaults)
 
-Both checks pass on 24,000-event histories per level. SI: 6382 ok / 5618
-write-conflicts; SSI: 5508 ok / 5288 write-conflicts / 1204 serialization
-failures. The SI history is confirmed non-serializable (write skew present),
-and the SSI history is serializable.
+All checks pass on 24,000-event histories per level. Both the SI histories are
+confirmed non-serializable (write skew present) and both SSI histories are
+serializable.
+
+- **Point pass** — SI: ~6386 ok / ~5614 write-conflicts / 0 serialization
+  failures; SSI: ~6026 ok / ~4901 write-conflicts / ~1073 serialization
+  failures.
+- **Scan pass** (`--scan-ratio 0.5`, ~5928 scan txns/level) — SI: ~6358 ok /
+  ~5642 write-conflicts; SSI: ~4727 ok / ~5015 write-conflicts / ~2258
+  serialization failures. The coarse `table_scan` read set roughly doubles the
+  SSI abort count versus the point pass, confirming that branch is exercised;
+  the surviving history is still serializable.
 
 ## Known limitations (v1)
 
 - **In-memory only** (`Persistence::None`): exercises the OCC/SSI commit path,
   not recovery. Crash-durability checking (LazyFS-style fault injection
   against the WAL) is a separate future task.
-- **Point reads only**: SSI's coarse read tracking (index/range reads taint
-  the whole table) is not exercised. A range-read workload variant is a
-  natural v2.
+- **Full-table scans only**: the scan pass registers `table_scan` via
+  `range(..)`; sub-range and secondary-index reads (which also taint the whole
+  table under v1 coarse tracking) are not separately exercised, though the
+  read-set effect is identical.
 - **Histories, not final state**: Elle checks the recorded history; the frozen
   `autobench/tests/mw_commit_torture.rs` floor already covers final-state
   lost-update checking.
