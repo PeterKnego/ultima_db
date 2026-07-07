@@ -60,5 +60,7 @@ std functions, e.g. `Vec::is_empty` — use `len() == 0`).
 - Concurrency (MultiWriter OCC merge, promotion ordering, WAL recovery) is
   out of Aeneas scope — needs hand-written protocol models.
 - Drift discipline: changes to `src/btree.rs` insert logic must be mirrored
-  in the kernel (see formal/README.md ground rules); consider a CI structural
-  check.
+  in the kernel (see formal/README.md ground rules). Enforced by
+  `make formal/drift-check` (`formal/scripts/check-drift.sh`), run on every PR
+  via `.github/workflows/formal.yml`; the same workflow re-verifies the proofs
+  (build + axiom check) weekly.

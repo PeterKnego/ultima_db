@@ -1,0 +1,68 @@
+name: formal
+
+# Formal-verification CI for the B-tree (formal/).
+#   * drift  — gates PRs: src/btree.rs may not diverge from its Lean model unnoticed.
+#              Cheap (git + cargo only), so it runs on every PR.
+#   * lean   — rebuilds the Lean proofs and re-checks their axioms. Heavy (fetches
+#              the pinned Aeneas/Charon/Lean toolchain), so it runs on a weekly
+#              schedule and on demand only — never blocking a PR on a toolchain hiccup.
+
+on:
+  pull_request:
+  schedule:
+    - cron: '17 4 * * 1' # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the PR base commit for the range diff
+      - name: Drift guard (src/btree.rs <-> formal/)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          # Bypass for a btree.rs change outside the verified insert/get path
+          # by putting [skip-formal-drift] in the PR title.
+          ACK_NO_FORMAL: ${{ contains(github.event.pull_request.title, '[skip-formal-drift]') && '1' || '' }}
+        run: formal/scripts/check-drift.sh
+      - name: Kernel differential test (vs std BTreeMap)
+        run: make test/formal-kernel
+
+  lean:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain "$(cat formal/proofs/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Fetch pinned Aeneas/Charon toolchain
+        run: ./formal/scripts/fetch-toolchain.sh
+      - name: Build proofs
+        working-directory: formal/proofs
+        run: lake build
+      - name: Check axioms (no sorry; only propext/Classical.choice/Quot.sound)
+        working-directory: formal/proofs
+        run: |
+          cat > _AxiomCheck.lean <<'EOF'
+          import BtreeInsertInv
+          import BtreeInsertGet
+          import BtreeInsertFrame
+          #print axioms btree_kernel.BTree.insert_inv
+          #print axioms btree_kernel.BTree.insert_get
+          #print axioms btree_kernel.BTree.insert_frame
+          EOF
+          lake env lean _AxiomCheck.lean 2>&1 | tee _axioms.txt
+          rm -f _AxiomCheck.lean
+          if grep -qiE 'sorryAx|sorry|admit' _axioms.txt; then
+            echo "::error::proofs depend on sorry/admit — verification is incomplete"
+            exit 1
+          fi

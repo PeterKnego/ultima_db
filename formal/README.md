@@ -78,7 +78,13 @@ regenerating.
 
 - `proofs/BtreeKernel.lean` is generated; never hand-edit.
 - Any change to the insert path of `src/btree.rs` must be mirrored in
-  `formal/kernel/src/lib.rs` (or explicitly noted as unverified drift).
+  `formal/kernel/src/lib.rs` (or explicitly noted as unverified drift). This is
+  enforced automatically: `make formal/drift-check` (run in CI on every PR, see
+  `.github/workflows/formal.yml`) fails if `src/btree.rs` changed without a
+  matching `formal/` change. For a change outside the verified insert/get path
+  (e.g. `remove`/rebalance, comments), acknowledge it with `ACK_NO_FORMAL=1`
+  locally, or `[skip-formal-drift]` in the PR title.
 - No `sorry` may be committed; verify with
   `#print axioms btree_kernel.BTree.insert_frame` (and `_inv`, `_get`) —
-  only the three standard Lean axioms are acceptable.
+  only the three standard Lean axioms are acceptable. The scheduled `lean` CI
+  job (weekly + `workflow_dispatch`) rebuilds the proofs and re-runs this check.

@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -15,6 +15,11 @@ test/integration:
 # B-tree kernel port (formal/). Lean proofs: see formal/README.md.
 test/formal-kernel:
 	cargo test --manifest-path formal/kernel/Cargo.toml
+
+# Drift guard: fail if src/btree.rs changed without a matching formal/ update.
+# Override for changes outside the verified insert/get path: ACK_NO_FORMAL=1.
+formal/drift-check:
+	formal/scripts/check-drift.sh
 
 lint:
 	cargo clippy -- -D warnings
