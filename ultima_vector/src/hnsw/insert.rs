@@ -45,6 +45,7 @@ where
             got: embedding.len(),
         });
     }
+    crate::validate::ensure_finite(&embedding)?;
 
     let sampler = LevelSampler::new(params.m, params.max_level);
     let new_level = sampler.sample(rng);
@@ -110,6 +111,7 @@ where
             got: embedding.len(),
         });
     }
+    crate::validate::ensure_finite(&embedding)?;
 
     let sampler = LevelSampler::new(params.m, params.max_level);
     let new_level = sampler.sample(rng);
