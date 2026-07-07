@@ -20,6 +20,7 @@ lean_lib «RemoveSpecs»
 lean_lib «TransportLemmas»
 lean_lib «BalancedInvariant»
 lean_lib «RemoveRebalance»
+lean_lib «RemoveInv»
 
 @[default_target]
 lean_lib «BtreeProofs»
