@@ -16,7 +16,10 @@ lean_lib «AlignedLemmas»
 lean_lib «ChildrenSpecs»
 lean_lib «FindPosSpec»
 lean_lib «EntrySpecs»
+lean_lib «RemoveSpecs»
 lean_lib «TransportLemmas»
+lean_lib «BalancedInvariant»
+lean_lib «RemoveRebalance»
 
 @[default_target]
 lean_lib «BtreeProofs»
