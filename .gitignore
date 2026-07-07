@@ -17,3 +17,10 @@ perf.data.old
 
 # Local secrets (e.g. MISTRAL_API_KEY for the Leanstral experiment)
 .env
+
+# Formal verification (formal/): local toolchain + build artifacts
+/formal/.toolchain
+/formal/proofs/.lake
+/formal/kernel/target
+/formal/kernel/*.llbc
+/formal/kernel/BtreeKernel.lean

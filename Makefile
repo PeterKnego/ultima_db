@@ -11,6 +11,11 @@ test/unit:
 test/integration:
 	cargo test --test store_integration
 
+# Formal verification tier (opt-in): differential test of the Lean-verified
+# B-tree kernel port (formal/). Lean proofs: see formal/README.md.
+test/formal-kernel:
+	cargo test --manifest-path formal/kernel/Cargo.toml
+
 lint:
 	cargo clippy -- -D warnings
 
