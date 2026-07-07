@@ -133,10 +133,11 @@ of the two commit-time validation functions:
   under the list-append workload (no table deletes) it isolates to the
   key-overlap OCC path — two concurrent writers to the same key both commit,
   and the second commit's `merge_keys_from` overwrites the first's append, a
-  lost update. The separate eager per-op write-conflict check in `update()`
-  (`src/store.rs` ~L1839) only catches writers whose intents overlap *in
-  time*, so non-overlapping-in-time writers still slip through this
-  mutation and produce the anomaly Elle detects.
+  lost update. The separate eager per-op write-conflict check in
+  `claim_intent` (`src/store.rs:1845`), called from `update()`/`delete()`,
+  only catches writers whose intents overlap *in time*, so
+  non-overlapping-in-time writers still slip through this mutation and
+  produce the anomaly Elle detects.
 - `validate_read_set` (src/store.rs:3163) — SSI's read-set validation. With
   `ULTIMA_MUTATION=skip-readset-validation`, it returns `None`
   unconditionally, so SSI silently degrades to plain SI: write skew, which

@@ -35,8 +35,14 @@ mod tests {
 
     #[test]
     fn parse_maps_known_values() {
-        assert_eq!(parse(Some("skip-readset-validation")), Some(Mutation::SkipReadSetValidation));
-        assert_eq!(parse(Some("skip-writeset-validation")), Some(Mutation::SkipWriteSetValidation));
+        assert_eq!(
+            parse(Some("skip-readset-validation")),
+            Some(Mutation::SkipReadSetValidation)
+        );
+        assert_eq!(
+            parse(Some("skip-writeset-validation")),
+            Some(Mutation::SkipWriteSetValidation)
+        );
         assert_eq!(parse(None), None);
         assert_eq!(parse(Some("")), None);
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check elle-history EDN histories with the vendored elle-cli (task41).
+# Check elle-history EDN histories with the vendored elle-cli (task45).
 # Usage: scripts/elle_check.sh <si-history.edn> <serializable-history.edn>
 set -euo pipefail
 
@@ -78,8 +78,10 @@ case "$si_valid" in
     true)  echo "WARN: SI history unexpectedly serializable — no write skew observed;" \
                 "raise contention (lower --keys, raise --threads/--txns-per-thread)" ;;
     false)
-        if is_subset_of_whitelist "$si_types" "$SI_ALLOWED"; then
-            echo "OK: SI anomalies ⊆ {$SI_ALLOWED} (got: ${si_types:-none}) — write skew only"
+        if [ -z "$si_types" ]; then
+            echo "FAIL: SI history is not serializable but elle-cli reported no anomaly-types" >&2; exit 1
+        elif is_subset_of_whitelist "$si_types" "$SI_ALLOWED"; then
+            echo "OK: SI anomalies ⊆ {$SI_ALLOWED} (got: ${si_types}) — write skew only"
         else
             echo "FAIL: SI exhibits anomalies outside {$SI_ALLOWED}: $si_types" >&2; exit 1
         fi ;;

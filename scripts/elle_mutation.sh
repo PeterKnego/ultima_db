@@ -44,6 +44,8 @@ gen skip-readset-validation serializable "$DIR/mut-readset/history.edn"
 v="$(verdict serializable "$DIR/mut-readset/history.edn")"
 if [ "$v" = "false" ]; then
     echo "OK: CAUGHT — SSI history not serializable with read-set validation disabled"
+elif [ "$v" = "unknown" ]; then
+    echo "FAIL: elle-cli verdict UNDECIDED (unknown) on skip-readset-validation — cannot confirm teeth (bump --cycle-search-timeout?)" >&2; fail=1
 else
     echo "FAIL: skip-readset-validation NOT caught (verdict=$v) — no teeth on the SSI path" >&2; fail=1
 fi
@@ -53,6 +55,8 @@ gen skip-writeset-validation si "$DIR/mut-writeset/history.edn"
 v="$(verdict snapshot-isolation "$DIR/mut-writeset/history.edn")"
 if [ "$v" = "false" ]; then
     echo "OK: CAUGHT — SI history violates snapshot-isolation with write-conflict detection disabled"
+elif [ "$v" = "unknown" ]; then
+    echo "FAIL: elle-cli verdict UNDECIDED (unknown) on skip-writeset-validation — cannot confirm teeth (bump --cycle-search-timeout?)" >&2; fail=1
 else
     echo "FAIL: skip-writeset-validation NOT caught (verdict=$v) — no teeth on the OCC path" >&2; fail=1
 fi

@@ -34,9 +34,9 @@ pub mod error;
 pub mod fulltext;
 pub mod index;
 pub(crate) mod intents;
+pub mod metrics;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
-pub mod metrics;
 pub mod persistence;
 #[cfg(feature = "persistence")]
 pub(crate) mod registry;
