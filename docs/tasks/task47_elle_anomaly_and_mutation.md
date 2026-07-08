@@ -250,9 +250,12 @@ additionally needs a `cargo build --features elle-mutation` of
   maintenance hook) are possible but were left out — the three wired ones
   already exercise conflict detection on both read and write sets plus the
   per-key merge that reconciles disjoint concurrent writers.
-- Mutation testing is manual/opt-in (`make consistency/elle-mutation`), not
-  wired into CI. Introducing CI to this repo at all remains a separate
-  maintainer decision, independent of this feature.
+- Mutation testing runs on the **weekly** `elle-deep` job
+  (`.github/workflows/consistency.yml`, alongside the canonical
+  `make consistency/elle`) and on `workflow_dispatch`, not on every PR — the
+  fault-injection build and extra generations make it too heavy to gate PRs on.
+  PRs are gated by the bounded `elle` job (the plain consistency check). Run it
+  locally any time with `make consistency/elle-mutation`.
 - The anomaly whitelist (`SI_ALLOWED="G2-item"`) is specific to the
   point/scan list-append workload `make consistency/elle` generates; a
   differently-shaped workload (e.g. predicate reads) could legitimately need

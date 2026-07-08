@@ -1,0 +1,60 @@
+name: consistency
+
+# Elle transactional-consistency CI (see docs/tasks/task45 + task47).
+#   * elle       — gates PRs: generates list-append histories under MultiWriter
+#                  SI/SSI (a point-read pass, then a scan-heavy pass) and checks
+#                  them with the vendored elle-cli. Runs with bounded contention
+#                  so it stays fast and elle-cli's cycle-search never degrades
+#                  into an 'unknown' verdict (which the checker treats as a fail).
+#   * elle-deep  — heavier run on a weekly schedule (canonical `make
+#                  consistency/elle` sizing) plus the mutation suite, which proves
+#                  the checks have teeth by injecting known commit-path bugs and
+#                  requiring elle-cli to catch each one. Not a PR blocker.
+# The elle-cli jar is vendored under tools/elle-cli/, so no download is needed.
+# jq ships on ubuntu-latest; java is provisioned per-job (Temurin 21, per task45).
+# workflow_dispatch runs both jobs — a full local-equivalent run on demand.
+
+on:
+  pull_request:
+  schedule:
+    - cron: '41 4 * * 1' # Mondays 04:41 UTC (offset from formal.yml's 04:17)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  elle:
+    # PR gate (and on-demand). Bounded history keeps the run fast and elle-cli's
+    # cycle-search well clear of an 'unknown' verdict while still exercising
+    # enough contention to surface write skew under SI (classification gate).
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Elle consistency (bounded — point + scan passes)
+        env:
+          ELLE_ARGS: --threads 8 --keys 8 --txns-per-thread 800
+        run: make consistency/elle
+
+  elle-deep:
+    # Scheduled deep run (and on-demand): canonical sizing + the mutation
+    # teeth-check. Non-blocking — a cycle-search 'unknown' here is a signal to
+    # bump elle-cli --cycle-search-timeout or shrink the history, not a merge
+    # blocker.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Elle consistency (canonical sizing)
+        run: make consistency/elle
+      - name: Elle mutation testing (proves the checks have teeth)
+        run: make consistency/elle-mutation
