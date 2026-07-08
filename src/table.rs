@@ -371,7 +371,8 @@ impl<R: Record> Table<R> {
         for idx in self.indexes.values_mut() {
             idx.on_delete(id, &old);
         }
-        self.data = self.data.remove(&id)?;
+        let removed = self.data.remove_mut(&id);
+        debug_assert!(removed, "delete: presence checked above");
         Ok(old)
     }
 
@@ -524,12 +525,9 @@ impl<R: Record> Table<R> {
 
         // Phase 1: Remove all records from data BTree.
         for &id in &ids {
-            match self.data.remove(&id) {
-                Ok(new_tree) => self.data = new_tree,
-                Err(e) => {
-                    self.restore(snap);
-                    return Err(e);
-                }
+            if !self.data.remove_mut(&id) {
+                self.restore(snap);
+                return Err(Error::KeyNotFound);
             }
         }
 
