@@ -94,6 +94,52 @@ impl SplitMix64 {
     }
 }
 
+// `Predicate`, `bucket_members`, and `select_predicate` are pure helpers for
+// predicate-read mode; wired into the txn/worker path in Task 3. Silence
+// dead_code until that wiring lands.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Predicate {
+    /// Equality lookup on one bucket (`get_by_index`).
+    Equality(u64),
+    /// Inclusive bucket range (`index_range`), `lo <= hi`.
+    Range(u64, u64),
+}
+
+/// Static bucket membership: `members[b]` = ids at seed positions `i` where
+/// `i % buckets == b`, in seed order. Mirrors `seed`'s assignment exactly.
+#[allow(dead_code)]
+fn bucket_members(ids: &[u64], buckets: usize) -> Vec<Vec<u64>> {
+    let mut m = vec![Vec::new(); buckets];
+    for (i, &id) in ids.iter().enumerate() {
+        m[i % buckets].push(id);
+    }
+    m
+}
+
+/// Deterministically choose an equality or range predicate (50/50) and resolve
+/// its expected key set from static membership. Consumes RNG draws in a fixed
+/// order so a given RNG state always yields the same predicate.
+#[allow(dead_code)]
+fn select_predicate(
+    rng: &mut SplitMix64,
+    buckets: usize,
+    members: &[Vec<u64>],
+) -> (Predicate, Vec<u64>) {
+    if rng.chance(0.5) {
+        let b = rng.below(buckets as u64);
+        (Predicate::Equality(b), members[b as usize].clone())
+    } else {
+        let lo = rng.below(buckets as u64);
+        let hi = lo + rng.below(buckets as u64 - lo); // lo..=hi, within [0, buckets)
+        let mut keys = Vec::new();
+        for b in lo..=hi {
+            keys.extend_from_slice(&members[b as usize]);
+        }
+        (Predicate::Range(lo, hi), keys)
+    }
+}
+
 fn gen_ops(
     rng: &mut SplitMix64,
     keys: &[u64],
@@ -101,6 +147,9 @@ fn gen_ops(
     read_ratio: f64,
     values: &AtomicU64,
 ) -> Vec<Op> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
     (0..ops_per_txn)
         .map(|_| {
             let key = keys[rng.below(keys.len() as u64) as usize];
@@ -551,5 +600,43 @@ mod tests {
         let bucket2: BTreeSet<u64> =
             t.get_by_index("bucket", &2u64).unwrap().iter().map(|(id, _)| *id).collect();
         assert_eq!(bucket2, BTreeSet::from([ids[2], ids[5]]));
+    }
+
+    #[test]
+    fn bucket_members_round_robin() {
+        let ids = vec![10, 20, 30, 40, 50];
+        let m = bucket_members(&ids, 2);
+        assert_eq!(m, vec![vec![10, 30, 50], vec![20, 40]]);
+    }
+
+    #[test]
+    fn select_predicate_equality_and_range_within_bounds() {
+        let ids = vec![10, 20, 30, 40];
+        let members = bucket_members(&ids, 2); // [[10,30],[20,40]]
+        let mut rng = SplitMix64(1);
+        for _ in 0..200 {
+            let (p, keys) = select_predicate(&mut rng, 2, &members);
+            match p {
+                Predicate::Equality(b) => {
+                    assert!(b < 2);
+                    assert_eq!(keys, members[b as usize]);
+                }
+                Predicate::Range(lo, hi) => {
+                    assert!(lo <= hi && hi < 2);
+                    let mut expected = Vec::new();
+                    for b in lo..=hi {
+                        expected.extend_from_slice(&members[b as usize]);
+                    }
+                    assert_eq!(keys, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gen_ops_empty_keys_returns_no_ops() {
+        let counter = AtomicU64::new(0);
+        let mut rng = SplitMix64(7);
+        assert!(gen_ops(&mut rng, &[], 4, 0.4, &counter).is_empty());
     }
 }
