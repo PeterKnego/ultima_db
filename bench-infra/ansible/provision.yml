@@ -14,3 +14,4 @@
       ansible.builtin.setup:
   roles:
     - os_tune
+    - toolchains

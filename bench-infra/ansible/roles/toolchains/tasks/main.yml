@@ -1,0 +1,45 @@
+---
+- name: Install base build dependencies
+  ansible.builtin.apt:
+    name:
+      - git
+      - unzip
+      - curl
+      - build-essential
+      - pkg-config
+      - cmake
+      - clang
+      - libclang-dev   # rocksdb-sys bindgen needs libclang
+    update_cache: true
+    state: present
+
+- name: Install rustup + stable toolchain (idempotent)
+  ansible.builtin.shell: |
+    if ! [ -x "{{ remote_home }}/.cargo/bin/cargo" ]; then
+      curl -sSf https://sh.rustup.rs | CARGO_HOME={{ remote_home }}/.cargo RUSTUP_HOME={{ remote_home }}/.rustup sh -s -- -y --default-toolchain stable --profile minimal
+    fi
+  args:
+    creates: "{{ remote_home }}/.cargo/bin/cargo"
+
+- name: Export cargo on PATH for all shells
+  ansible.builtin.copy:
+    dest: /etc/profile.d/cargo.sh
+    content: "export CARGO_HOME={{ remote_home }}/.cargo\nexport RUSTUP_HOME={{ remote_home }}/.rustup\nexport PATH={{ remote_home }}/.cargo/bin:$PATH\n"
+    mode: "0644"
+
+- name: Install critcmp (required by `make bench/ycsb/compare`)
+  ansible.builtin.command: "{{ remote_home }}/.cargo/bin/cargo install critcmp"
+  args:
+    creates: "{{ remote_home }}/.cargo/bin/critcmp"
+  environment:
+    CARGO_HOME: "{{ remote_home }}/.cargo"
+    RUSTUP_HOME: "{{ remote_home }}/.rustup"
+
+- name: Record rustc version (provenance)
+  ansible.builtin.command: "{{ remote_home }}/.cargo/bin/rustc --version"
+  register: rustc_version
+  changed_when: false
+
+- name: Show toolchain version
+  ansible.builtin.debug:
+    var: rustc_version.stdout
