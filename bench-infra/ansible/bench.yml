@@ -1,0 +1,14 @@
+---
+- name: Run the selected benchmark workload and collect results
+  hosts: cluster
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 120
+    - name: Gather facts
+      ansible.builtin.setup:
+  roles:
+    - run

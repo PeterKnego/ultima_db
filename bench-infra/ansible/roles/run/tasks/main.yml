@@ -1,0 +1,94 @@
+---
+- name: Ensure the NVMe bench data dir exists
+  ansible.builtin.file:
+    path: "{{ bench_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure results dir exists
+  ansible.builtin.file:
+    path: "{{ remote_home }}/results"
+    state: directory
+    mode: "0755"
+
+- name: Sync the local ultima_db working tree to the host (push)
+  ansible.posix.synchronize:
+    src: "{{ ud_local_path }}/"
+    dest: "{{ ud_src_dir }}/"
+    delete: true
+    rsync_opts:
+      - "--exclude=target/"
+      - "--exclude=.git/"
+      - "--exclude=bench-out/"
+      - "--exclude=bench-infra/bench-out/"
+      - "--exclude=.claude/"
+
+- name: Record rustc version (provenance)
+  ansible.builtin.shell: "source /etc/profile.d/cargo.sh && rustc --version"
+  args:
+    executable: /bin/bash
+  register: rustc_version
+  changed_when: false
+
+- name: Record git rev of the synced tree (best-effort)
+  ansible.builtin.command: "git -C {{ ud_src_dir }} rev-parse --short HEAD"
+  register: ud_git_rev
+  changed_when: false
+  failed_when: false
+
+- name: Run competitor YCSB matrix
+  when: bench_target == "competitor"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/ycsb/compare ULTIMA_BENCH_DIR={{ bench_dir }} 2>&1 | tee {{ remote_home }}/results/competitor.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Run WAL/durability A/B sweep
+  when: bench_target == "wal-ab"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/wal-ab ULTIMA_BENCH_DIR={{ bench_dir }} 2>&1 | tee {{ remote_home }}/results/wal-ab.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Run autobench Gate-A microbenches (record baselines)
+  when: bench_target == "autobench"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make perf/baseline 2>&1 | tee {{ remote_home }}/results/autobench.log
+    cp -r autobench/baselines {{ remote_home }}/results/autobench-baselines
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Copy criterion output into results (competitor / wal-ab)
+  when: bench_target in ["competitor", "wal-ab"]
+  ansible.builtin.shell: |
+    set -e
+    if [ -d {{ ud_src_dir }}/target/criterion ]; then
+      cp -r {{ ud_src_dir }}/target/criterion {{ remote_home }}/results/criterion
+    fi
+  changed_when: true
+
+- name: Write provenance manifest
+  ansible.builtin.copy:
+    dest: "{{ remote_home }}/results/manifest.txt"
+    mode: "0644"
+    content: |
+      timestamp={{ ansible_date_time.iso8601 }}
+      bench_target={{ bench_target }}
+      instance_vcpus={{ ansible_processor_vcpus | default('?') }}
+      mem_mb={{ ansible_memtotal_mb | default('?') }}
+      kernel={{ ansible_kernel }}
+      rustc={{ rustc_version.stdout | default('n/a') }}
+      ud_git_rev={{ ud_git_rev.stdout | default('n/a') }}
+      bench_dir={{ bench_dir }}
