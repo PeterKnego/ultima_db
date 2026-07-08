@@ -112,42 +112,49 @@ the published Jepsen analyses of PostgreSQL, MySQL, and CockroachDB, and applied
 to embedded engines like DuckDB. "Isolation levels verified with Elle, and the
 verification proven to catch real bugs" is a checkable statement, not marketing.
 
-## Open lead discovered during this work
+## Bug found and fixed via this harness
 
-While generating scan-pass histories, `elle-history` **intermittently stalled
-for ~18 minutes** in the SSI + scan-read path (blocked in `futex_do_wait`, zero
-CPU), recovering on retry. This looks like a genuine, rare hang in the SSI/scan
-commit interaction rather than harness flakiness — it did not reproduce on
-demand (later runs use `scan_ratio=0`), so it is a **lead to investigate**, not a
-confirmed bug. Worth a dedicated repro attempt before wiring the scan pass into
-any unattended/CI run.
+The scan pass surfaced a real concurrency bug — exactly the kind isolation
+testing is meant to flush out. While generating scan-pass histories,
+`elle-history` **intermittently stalled for many minutes** in the SSI +
+scan-read path (all threads parked in `futex_do_wait`, zero CPU). Root cause: a
+**quiescence deadlock in the write-intent table** (`src/intents.rs`). On
+releasing a contended key, `release_all_for` woke only the head waiter and left
+the rest queued behind a `holder = 0` "transitioning" entry, relying on a
+*future* acquirer to drain them. But queued waiters belong to already-dropped
+transactions (drop-before-wait), so no waiter can be promoted to holder; under
+SSI + scan's high abort churn over a small keyspace, threads pile up as such
+waiters until all are parked, and with no thread left to re-touch the keys the
+queues never drain. Fixed by waking **all** queued waiters on release (they
+re-race on retry) — FIFO single-successor handoff is unachievable here.
+Confirmed with a deterministic `IntentMap`-level regression test and a
+150-iteration SSI+scan stress loop (0 hangs, was ~1-in-4 before). This is the
+harness paying for itself: a rare deadlock in the OCC/SSI intent path, found by
+the scan workload and reproduced deterministically.
 
 ## Next steps
 
-1. **Investigate the SSI + scan stall** (above) — the highest-signal lead;
-   potentially a real deadlock in the commit/merge interaction under coarse
-   read-set validation.
-2. **Crash-durability harness — the other half of the Jepsen methodology.**
+1. **Crash-durability harness — the other half of the Jepsen methodology.**
    Elle checks isolation, not durability. Add a kill-9 / LazyFS-style torture
    that crashes mid-commit and mid-checkpoint across the `Durability` ×
    `WalWrite` matrix (especially `ConsistentInline` + `CoalescedPrealloc`, the
    `standalone_fast` preset) and verifies every acknowledged commit survives
    `Store::recover()`.
-3. **Persistence-enabled Elle run.** Repeat the checks with
+2. **Persistence-enabled Elle run.** Repeat the checks with
    `Persistence::Standalone` (Eventual durability) to cover the WAL-batched
    commit path's visibility ordering, not just the in-memory OCC path.
-4. **A third mutation** — dropping a key in `Table::merge_keys_from` — to cover
+3. **A third mutation** — dropping a key in `Table::merge_keys_from` — to cover
    the per-key merge path alongside the read-set/write-set validation already
    injected.
-5. **CI integration.** A nightly GitHub Actions job (`setup-java`, `jq`,
+4. **CI integration.** A nightly GitHub Actions job (`setup-java`, `jq`,
    `make consistency/elle` + `consistency/elle-mutation`). Everything needed is
-   in-repo; gated on resolving step 1 first (a stall would hang the job).
+   in-repo (the SSI+scan deadlock that would have hung such a job is now fixed).
    *Note: introducing CI to this repo is a maintainer decision — it currently
    has none.*
-6. **Full Jepsen for ultima_cluster** (separate repo). The Raft/SMR deployment
+5. **Full Jepsen for ultima_cluster** (separate repo). The Raft/SMR deployment
    is a genuine distributed system — partitions, leader elections, clock skew —
    which is what the full Jepsen harness was built for; the etcd and redis-raft
    suites are the templates.
-7. **Gate risky changes on it.** Adopt the convention that any PR touching
+6. **Gate risky changes on it.** Adopt the convention that any PR touching
    `src/store.rs` commit/merge logic runs `make consistency/elle` before merge,
    alongside `make perf/check`.
