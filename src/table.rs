@@ -277,7 +277,7 @@ impl<R: Record> Table<R> {
         }
 
         self.next_id += 1;
-        self.data = self.data.insert(id, record);
+        self.data.insert_mut(id, record);
         Ok(id)
     }
 
@@ -314,7 +314,7 @@ impl<R: Record> Table<R> {
             }
         }
 
-        self.data = self.data.insert(id, record);
+        self.data.insert_mut(id, record);
         Ok(())
     }
 
@@ -360,7 +360,7 @@ impl<R: Record> Table<R> {
             }
         }
 
-        self.data = self.data.insert_arc(id, arc);
+        self.data.insert_arc_mut(id, arc);
         Ok(())
     }
 
@@ -421,7 +421,7 @@ impl<R: Record> Table<R> {
         let mut ids = Vec::with_capacity(records.len());
         for record in records {
             let id = self.next_id;
-            self.data = self.data.insert(id, record);
+            self.data.insert_mut(id, record);
             self.next_id += 1;
             ids.push(id);
         }
@@ -478,7 +478,7 @@ impl<R: Record> Table<R> {
         // Phase 1: Mutate data BTree for all updates (in original order so
         // last-value-wins semantics are preserved).
         for (id, record) in updates {
-            self.data = self.data.insert(id, record);
+            self.data.insert_mut(id, record);
         }
 
         // Phase 2: Update each index for all deduplicated records.
@@ -580,7 +580,7 @@ impl<R: Record> Table<R> {
             }
         }
 
-        self.data = self.data.insert(id, record);
+        self.data.insert_mut(id, record);
         if id >= self.next_id {
             self.next_id = id + 1;
         }

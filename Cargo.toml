@@ -93,6 +93,14 @@ name = "wal_bench"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "btree_insert_mut_bench"
+harness = false
+
+[[bench]]
+name = "table_insert_e2e_bench"
+harness = false
+
 [[example]]
 name = "profile_commit"
 required-features = ["persistence"]
