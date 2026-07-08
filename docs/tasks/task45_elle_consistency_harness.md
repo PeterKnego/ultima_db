@@ -113,6 +113,13 @@ misconfigured checker silently passes everything.
   `target/`), and runs `elle_check.sh` once per pass. The scan fraction is
   `ELLE_SCAN_RATIO` (default 0.5); extra driver flags via `ELLE_ARGS` (e.g.
   `make consistency/elle ELLE_ARGS="--threads 16 --txns-per-thread 5000"`).
+- `.github/workflows/consistency.yml` — CI. The `elle` job **gates every PR**
+  with a bounded run (`ELLE_ARGS="--threads 8 --keys 8 --txns-per-thread 800"`,
+  small enough that elle-cli's cycle-search stays clear of an `unknown` verdict,
+  contended enough that SI still shows write skew). A weekly `elle-deep` job
+  re-runs the canonical sizing plus `make consistency/elle-mutation` (task47);
+  `workflow_dispatch` runs both. java is provisioned per-job (Temurin 21); jq
+  ships on the runner; the elle-cli jar is vendored so nothing is downloaded.
 
 ## Reading a failure
 
