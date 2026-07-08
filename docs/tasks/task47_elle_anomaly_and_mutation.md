@@ -257,6 +257,10 @@ additionally needs a `cargo build --features elle-mutation` of
   PRs are gated by the bounded `elle` job (the plain consistency check). Run it
   locally any time with `make consistency/elle-mutation`.
 - The anomaly whitelist (`SI_ALLOWED="G2-item"`) is specific to the
-  point/scan list-append workload `make consistency/elle` generates; a
-  differently-shaped workload (e.g. predicate reads) could legitimately need
-  its own whitelist, hence the human-review requirement on widening it.
+  list-append workload `make consistency/elle` generates. The predicate
+  (index) pass added later shares it unchanged — index reads degrade to the
+  same coarse `table_scan` read as a full scan, so they exhibit the same
+  `{G2-item}` profile (see task45 "Predicate reads"). A genuinely
+  differently-shaped workload (e.g. a domain-invariant predicate-write-skew
+  test) could still legitimately need its own whitelist, hence the
+  human-review requirement on widening it.
