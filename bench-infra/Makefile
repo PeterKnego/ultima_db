@@ -34,7 +34,9 @@ bench/wal-ab: ## WAL/durability A/B sweep (ultima-only) on NVMe
 bench/autobench: ## autobench Gate-A microbenches + baseline record
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=autobench
 
-bench-oneshot: up ## up -> bench (TARGET=competitor|wal-ab|autobench) -> destroy
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench) -> destroy
+	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|autobench"; exit 1; fi
+	$(MAKE) up
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET)
 	$(MAKE) destroy
 

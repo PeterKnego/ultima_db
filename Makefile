@@ -93,7 +93,8 @@ bench/ycsb/compare:
 # NVMe. Baselines: nondurable (Eventual), strict-consistent (bg-thread fsync),
 # strict-inline (off-lock fsync), strict-standalone_fast (inline + prealloc).
 # ycsb_bench reads ULTIMA_BENCH_{DURABILITY,INLINE,PREALLOC} (benches/ycsb_bench.rs).
-# Requires ULTIMA_BENCH_DIR on a REAL disk (refuses tmpfs, like bench/ycsb/compare).
+# Requires ULTIMA_BENCH_DIR set (empty is refused); point it at a real disk-backed
+# dir, not a tmpfs (same guard as bench/ycsb/compare).
 bench/wal-ab:
 	$(call check_cmd,critcmp)
 	@if [ -z "$(ULTIMA_BENCH_DIR)" ]; then \

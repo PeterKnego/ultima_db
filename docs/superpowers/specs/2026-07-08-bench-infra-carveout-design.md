@@ -114,8 +114,8 @@ package installs), and the NVMe mount is established before the run role writes
 benchmark data to `bench_dir`.
 
 **`toolchains` role** — base build deps + rustup stable:
-- apt: `git unzip curl build-essential pkg-config clang protobuf-compiler`
-  (`clang` + `protobuf-compiler` are required by `rocksdb-sys` in the competitor
+- apt: `git unzip curl build-essential pkg-config cmake clang libclang-dev`
+  (`cmake` + `clang`/`libclang-dev` are required by `rocksdb-sys` in the competitor
   tier; `build-essential`/`pkg-config` by the general build).
 - **No JDK** (the parent installs it for Aeron/elle; neither runs here).
 - rustup + stable toolchain (idempotent, `creates:` guard), cargo on PATH via
@@ -127,8 +127,9 @@ benchmark data to `bench_dir`.
   intermittent ~62s sudo/getaddrinfo stall). These run **first**.
 - Install tuning tools (`tuned`, `util-linux`, `e2fsprogs`).
 - Detect the local instance-store NVMe (device model string
-  `Instance Storage`), `mkfs.ext4`, and mount it at `{{ bench_dir }}`
-  (default `/mnt/nvme/bench`). Idempotent; a no-op on non-NVMe hosts.
+  `Instance Storage`), `mkfs.ext4`, and mount it at `{{ remote_home }}`
+  (default `/opt/bench`, with `bench_dir` = `/opt/bench/bench-data`). Idempotent;
+  a no-op on non-NVMe hosts.
 - `bench_dir` is exported to benches as `ULTIMA_BENCH_DIR`.
 
 **`run` role** (new — replaces the parent's Aeron sweep) — parametrized by a
@@ -207,8 +208,8 @@ control machine (laptop)                    AWS c6id.2xlarge (Ubuntu 24.04)
 ─────────────────────────                   ───────────────────────────────
 make up ──► terraform apply ──────────────► VPC/subnet/SG/keypair + NVMe instance
          └► inventory (hosts.yml)
-         └► provision.yml ────────────────► toolchains (rust+clang+protobuf)
-                                            os_tune (sudo/DNS fix; mount NVMe @ /mnt/nvme/bench)
+         └► provision.yml ────────────────► toolchains (rust+cmake+clang)
+                                            os_tune (sudo/DNS fix; mount NVMe @ /opt/bench)
 make bench/<target>
    └► run role: rsync ultima_db tree ─────► ~/ultima_db  (excl target/,.git/)
    └► run role: make bench/<target> ──────► cargo bench on NVMe (ULTIMA_BENCH_DIR)
@@ -226,7 +227,7 @@ Infra, so validation is operational rather than unit-tested:
    `ansible-lint` if available. `shellcheck` on `terraform_to_inventory.sh` and any
    sweep shell.
 3. End-to-end smoke: `make bench-oneshot TARGET=autobench` (cheapest workload) —
-   confirm a node comes up, NVMe mounts at `/mnt/nvme/bench`, the tree syncs,
+   confirm a node comes up, NVMe mounts at `/opt/bench`, the tree syncs,
    `make perf/baseline` runs, results land in `bench-out/dist/<ts>/`, `destroy`
    cleans up.
 4. Reproduce fidelity: a `make bench/competitor` run should produce the same engine

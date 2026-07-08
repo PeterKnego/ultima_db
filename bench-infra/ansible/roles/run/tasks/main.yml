@@ -20,7 +20,7 @@
       - "--exclude=target/"
       - "--exclude=.git/"
       - "--exclude=bench-out/"
-      - "--exclude=bench-infra/bench-out/"
+      - "--exclude=bench-infra/"
       - "--exclude=.claude/"
 
 - name: Record rustc version (provenance)
