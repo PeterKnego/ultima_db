@@ -3,7 +3,8 @@
 **Status:** Implemented and validated. Correctness proven by 4 dedicated unit tests
 (equivalence to the immutable path + snapshot-isolation preservation); the full
 existing suite (382 lib + 80 `store_integration`) passes unchanged; clippy clean.
-Benchmarked: **12–19× faster** on the auto-increment (ascending-id) insert path — see §5.
+A/B benchmarked: **~20–27× faster** end-to-end (`Store → WriteTx → Table`), **8–25× faster**
+at the raw B-tree layer across ascending/random/snapshot-mixed patterns — see §5.
 **Related:**
 - `benches/btree_insert_mut_bench.rs` (micro A/B: immutable vs in-place, 3 access patterns)
 - `benches/table_insert_e2e_bench.rs` (end-to-end through `Store → WriteTx → Table`)
@@ -101,28 +102,57 @@ guarantee as before, same O(1) cost.
 
 ## 5. Benchmarks
 
-`benches/btree_insert_mut_bench.rs`, `insert_ascending` group (build a privately-owned
-tree of N sequential keys), quick pass on the dev sandbox:
+**Methodology.** Every number below is an **A/B ratio** — `immutable` and `in_place`
+timed against each other. Both micro benches are within a single criterion process
+(`insert` and `insert_mut` back to back); the e2e bench uses the revert protocol (save the
+in-place run as baseline `inplace`, revert the six `Table` call sites, re-run against the
+baseline). Because both arms run under the same host contention, noisy-neighbour variance
+is *common-mode* and cancels in the ratio — so the ratios are trustworthy even on a shared
+CI/sandbox host (dev sandbox here). **Absolute** timings are sandbox-relative and not
+publishable; re-run `make bench/save` on a quiet NVMe host (e.g. the c6id bench host) for
+those. A dedicated bench host was *not* required for the A/B conclusion: the deltas
+(8–27×) dwarf the ~±2× sandbox absolute-noise floor, and the ratio cancels it regardless.
+Criterion settings: `--warm-up-time 1 --measurement-time 3 --sample-size 10`.
 
-| N (ascending) | immutable | in_place | speedup |
-|--------------:|----------:|---------:|--------:|
-| 1,000         | 1.03 ms   | 81 µs    | ~12.6×  |
-| 100,000       | 276 ms    | 15.6 ms  | ~17.7×  |
-| 1,000,000     | 3.34 s    | 173 ms   | ~19.3×  |
+**Micro — `benches/btree_insert_mut_bench.rs`** (build a privately-owned tree of N keys):
 
-The bench also covers two harder cases (present in the harness; re-run on a quiet host for
-publishable numbers):
-- `insert_random` — scattered keys: less path overlap, more splits, so a smaller (but
-  still large) win.
-- `insert_mixed_snapshot` — half the inserts happen *after* a live snapshot is taken, so
-  those hit the CoW branch of `make_mut`. This is the **pessimistic** guard against
-  over-claiming: in-place still wins, but by the smallest margin.
+| pattern          | N       | immutable | in_place | speedup |
+|------------------|--------:|----------:|---------:|--------:|
+| ascending        | 1,000   | 1.029 ms  | 79.8 µs  | 12.9×   |
+| ascending        | 100,000 | 277.3 ms  | 12.76 ms | 21.7×   |
+| ascending        | 1,000,000 | 3.362 s | 160.1 ms | 21.0×   |
+| random           | 1,000   | 991.8 µs  | 95.4 µs  | 10.4×   |
+| random           | 100,000 | 241.1 ms  | 16.82 ms | 14.3×   |
+| random           | 1,000,000 | 3.506 s | 450.5 ms | 7.8×    |
+| mixed_snapshot   | 100,000 | 273.9 ms  | 10.80 ms | 25.4×   |
+| mixed_snapshot   | 1,000,000 | 3.325 s | 142.3 ms | 23.4×   |
 
-`benches/table_insert_e2e_bench.rs` drives the real `Store → WriteTx → Table` path
-(`e2e_insert_batch`, `e2e_single_insert_loop`, `e2e_incremental_append`) so the win can be
-measured as a user sees it, including the CoW-on-first-touch cost against a populated
-table. Its header documents the A/B protocol (save `--baseline inplace`, revert the six
-call sites, re-run) for regression tracking.
+- `random` (scattered keys) is the **smallest** win — less path overlap, more splits — yet
+  still 7.8–14.3×: in-place avoids the per-key full-spine reallocation regardless of order.
+- `mixed_snapshot` takes a live snapshot mid-build, so half the inserts hit the CoW branch
+  of `make_mut`. It was included as a **pessimistic** guard against over-claiming; in
+  practice it still wins ~23–25× because only the *first* touch of each shared spine node
+  re-clones — the rest of the appended growth is in place.
+
+**End-to-end — `benches/table_insert_e2e_bench.rs`** (real `Store → WriteTx → Table`,
+in-memory), immutable vs in_place via the revert protocol:
+
+| bench                | N       | immutable | in_place | speedup |
+|----------------------|--------:|----------:|---------:|--------:|
+| insert_batch         | 10,000  | 21.44 ms  | 809 µs   | 26.5×   |
+| insert_batch         | 100,000 | 317.0 ms  | 12.77 ms | 24.8×   |
+| single_insert_loop   | 10,000  | 21.22 ms  | 1.073 ms | 19.8×   |
+| single_insert_loop   | 100,000 | 289.1 ms  | 14.10 ms | 20.5×   |
+| incremental_append   | 10,000  | 37.19 ms  | 1.613 ms | 23.1×   |
+| incremental_append   | 100,000 | 387.3 ms  | 14.60 ms | 26.5×   |
+
+The e2e win (~20–27×) is if anything *larger* than the raw btree micro, because at the
+transaction level the immutable path's per-key spine-realloc dominates while commit is
+cheap (fast-path single Arc swap). `incremental_append` is the realistic steady-state case
+— append into a table already holding 200 K committed rows, so the writer's cloned data
+tree shares the committed snapshot's spine and pays the CoW-on-first-touch cost — and it
+still runs **26.5×** faster. `single_insert_loop` (one `Table::insert` at a time, not
+batched) confirms the win is not an artifact of batching.
 
 ## 6. Notes / limitations
 
