@@ -7,14 +7,12 @@
 //! Mirrors `btree_insert_mut_bench.rs`. Each arm builds a privately-owned tree
 //! of N keys (untimed setup, via the fast in-place `insert_mut`) and then times
 //! deleting **every** key. The immutable `remove` allocates a fresh
-//! `Arc<BTreeNode>` for the whole root->leaf path on *every* delete; the planned
-//! `remove_mut` will descend through `Arc::make_mut`, mutating uniquely-owned
+//! `Arc<BTreeNode>` for the whole root->leaf path on *every* delete; the
+//! `remove_mut` arm descends through `Arc::make_mut`, mutating uniquely-owned
 //! nodes in place.
 //!
-//! NOTE: the `in_place` arm is commented out until `BTree::remove_mut` exists —
-//! this file currently measures the immutable-delete **baseline** the
-//! optimization must beat. Uncomment the `in_place` arms when `remove_mut`
-//! lands (that step is part of the implementation plan).
+//! NOTE: both the `immutable` and `in_place` arms are active — `remove_mut`
+//! has landed, so this file measures the A/B ratio directly.
 //!
 //! Run: `cargo bench --bench btree_remove_mut_bench`
 
@@ -64,18 +62,18 @@ fn bench_delete_ascending(c: &mut Criterion) {
             );
         });
 
-        // group.bench_with_input(BenchmarkId::new("in_place", n), &keys, |b, keys| {
-        //     b.iter_batched(
-        //         || build(keys),
-        //         |mut t| {
-        //             for k in keys {
-        //                 t.remove_mut(k);
-        //             }
-        //             black_box(t)
-        //         },
-        //         criterion::BatchSize::PerIteration,
-        //     );
-        // });
+        group.bench_with_input(BenchmarkId::new("in_place", n), &keys, |b, keys| {
+            b.iter_batched(
+                || build(keys),
+                |mut t| {
+                    for k in keys {
+                        t.remove_mut(k);
+                    }
+                    black_box(t)
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
     }
     group.finish();
 }
@@ -99,18 +97,18 @@ fn bench_delete_random(c: &mut Criterion) {
             );
         });
 
-        // group.bench_with_input(BenchmarkId::new("in_place", n), &keys, |b, keys| {
-        //     b.iter_batched(
-        //         || build(keys),
-        //         |mut t| {
-        //             for k in keys {
-        //                 t.remove_mut(k);
-        //             }
-        //             black_box(t)
-        //         },
-        //         criterion::BatchSize::PerIteration,
-        //     );
-        // });
+        group.bench_with_input(BenchmarkId::new("in_place", n), &keys, |b, keys| {
+            b.iter_batched(
+                || build(keys),
+                |mut t| {
+                    for k in keys {
+                        t.remove_mut(k);
+                    }
+                    black_box(t)
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
     }
     group.finish();
 }
