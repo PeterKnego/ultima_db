@@ -8,3 +8,5 @@
 
 pub mod smallbank;
 pub mod ycsb;
+
+pub mod bulk_load;
