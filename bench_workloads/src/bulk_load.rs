@@ -94,3 +94,8 @@ pub fn ultima_bulk_store() -> UltimaBulkStore {
         _tmpdir: tmpdir,
     }
 }
+
+/// True iff the current tier is Strict (one end-of-load fsync).
+pub fn bench_durability_is_strict() -> bool {
+    matches!(bench_durability(), BenchDurability::Strict)
+}
