@@ -431,6 +431,32 @@ impl BTree {
             }
         }
     }
+
+    /// In-place delete; mutates `self` instead of returning a new tree.
+    /// Returns `true` iff the key was present. (Mirror of `BTree::remove_mut`
+    /// in `src/btree.rs`.)
+    ///
+    /// # Delta from the real code
+    ///
+    /// Same reasoning as `insert_mut`: the real `remove_mut` descends through
+    /// `Arc::make_mut` (clone-if-shared vs mutate-in-place), a property of `Arc`
+    /// reference counts that this uniquely-owned-`Box` model cannot express.
+    /// What survives is that it mutates `self` into exactly the tree `remove`
+    /// returns (or leaves it unchanged if absent). The differential test
+    /// `remove_mut_matches_remove_and_std_btreemap` pins
+    /// `remove_mut ≡ remove ≡ std::collections::BTreeMap`. The CoW /
+    /// snapshot-isolation property is out of Aeneas scope (like store/OCC/WAL),
+    /// covered by `uncommitted_remove_mut_invisible_to_concurrent_reader` in
+    /// `tests/store_integration.rs`.
+    pub fn remove_mut(&mut self, key: u64) -> bool {
+        match self.remove(key) {
+            Some(t) => {
+                *self = t;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -864,5 +890,45 @@ mod tests {
         }
         // Removing from an empty tree is a no-op miss.
         assert!(tree.remove(42).is_none());
+    }
+
+    #[test]
+    fn remove_mut_matches_remove_and_std_btreemap() {
+        // remove_mut must mutate `self` into exactly what the immutable remove
+        // returns, and both must track std::BTreeMap, across interleaved churn.
+        let mut model = BTreeMap::new();
+        let mut imm = BTree::new(); // immutable remove (returns Option<BTree>)
+        let mut inp = BTree::new(); // in-place remove_mut
+        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+        for _ in 0..3000 {
+            x = lcg(x);
+            let k = x % 600;
+            imm = imm.insert(k, k);
+            inp.insert_mut(k, k);
+            model.insert(k, k);
+        }
+        for _ in 0..6000 {
+            x = lcg(x);
+            let k = x % 600;
+            if x & 1 == 0 {
+                imm = imm.insert(k, k);
+                inp.insert_mut(k, k);
+                model.insert(k, k);
+            } else {
+                let inp_had = inp.remove_mut(k);
+                let model_had = model.remove(&k).is_some();
+                assert_eq!(inp_had, model_had, "remove_mut presence vs std, key {k}");
+                if let Some(t) = imm.remove(k) {
+                    imm = t;
+                }
+            }
+            assert_eq!(inp.len, imm.len, "len: in-place vs immutable");
+            assert_eq!(inp.len, model.len(), "len: in-place vs std");
+        }
+        for k in 0..600 {
+            let want = model.get(&k).copied();
+            assert_eq!(inp.get(k), want, "in-place vs std, key {k}");
+            assert_eq!(inp.get(k), imm.get(k), "in-place vs immutable, key {k}");
+        }
     }
 }
