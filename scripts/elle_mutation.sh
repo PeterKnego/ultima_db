@@ -61,6 +61,17 @@ else
     echo "FAIL: skip-writeset-validation NOT caught (verdict=$v) — no teeth on the OCC path" >&2; fail=1
 fi
 
+echo "== mutation drop-merge-key: commit merge drops an edit -> snapshot-isolation INVALID =="
+gen drop-merge-key si "$DIR/mut-merge/history.edn"
+v="$(verdict snapshot-isolation "$DIR/mut-merge/history.edn")"
+if [ "$v" = "false" ]; then
+    echo "OK: CAUGHT — SI history violates snapshot-isolation when the commit merge drops a key"
+elif [ "$v" = "unknown" ]; then
+    echo "FAIL: elle-cli verdict UNDECIDED (unknown) on drop-merge-key — cannot confirm teeth (bump --cycle-search-timeout?)" >&2; fail=1
+else
+    echo "FAIL: drop-merge-key NOT caught (verdict=$v) — no teeth on the commit-merge path" >&2; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "elle mutation-testing passed: all injected bugs caught"
 else

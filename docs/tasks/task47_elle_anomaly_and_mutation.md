@@ -90,7 +90,7 @@ compile it in. Under the feature, `src/lib.rs` compiles in a new module,
 `src/mutation.rs`, gated as `#[cfg(feature = "mutation-testing")] pub(crate)
 mod mutation;`.
 
-`src/mutation.rs` defines a `Mutation` enum with two variants and an
+`src/mutation.rs` defines a `Mutation` enum with three variants and an
 `active()` accessor that reads the `ULTIMA_MUTATION` env var exactly once via
 a `OnceLock`:
 
@@ -98,12 +98,14 @@ a `OnceLock`:
 pub(crate) enum Mutation {
     SkipReadSetValidation,
     SkipWriteSetValidation,
+    DropMergeKey,
 }
 ```
 
 `parse()` maps the env value: `"skip-readset-validation"` →
 `SkipReadSetValidation`, `"skip-writeset-validation"` →
-`SkipWriteSetValidation`, `None`/`""` → `None` (no mutation active), any other
+`SkipWriteSetValidation`, `"drop-merge-key"` → `DropMergeKey`,
+`None`/`""` → `None` (no mutation active), any other
 string → `panic!` (typos in `ULTIMA_MUTATION` surface immediately rather than
 silently no-op'ing). `parse()` is a pure function with its own unit tests
 (`mutation::tests::parse_maps_known_values`,
@@ -115,16 +117,17 @@ property that makes the feature safe to compile into a mutation-testing build
 without accidentally shipping a bug — `active()` returns `None` whenever
 `ULTIMA_MUTATION` is unset, so both injection sites below become dead code at
 runtime. This was verified two ways: a plain `cargo test --features
-mutation-testing --lib` run (no env var set) passes all 379 lib tests (377
-feature-off tests plus the 2 new `mutation::` unit tests — no other test
+mutation-testing --lib` run (no env var set) passes all 380 lib tests (378
+feature-off tests plus the 2 `mutation::` unit tests — no other test
 count drift), and the mutation driver's own **control run** (below) builds
 the feature in and requires the clean Elle checks to still pass before it
 will attempt either mutation.
 
 ### Injection points
 
-Both injection points live in `src/store.rs`, one statement each, at the top
-of the two commit-time validation functions:
+Two injection points live in `src/store.rs`, one statement each, at the top
+of the two commit-time validation functions; a third lives in
+`src/table.rs` inside the commit merge itself:
 
 - `validate_write_set` (src/store.rs:3079) — OCC's commit-time write-conflict
   scan. With `ULTIMA_MUTATION=skip-writeset-validation`, it returns `None`
@@ -142,11 +145,25 @@ of the two commit-time validation functions:
   `ULTIMA_MUTATION=skip-readset-validation`, it returns `None`
   unconditionally, so SSI silently degrades to plain SI: write skew, which
   SSI is supposed to forbid, reappears.
+- `Table::merge_keys_from` (src/table.rs) — the commit slow-path merge that
+  replays a writer's edited keys onto the current latest snapshot's table.
+  With `ULTIMA_MUTATION=drop-merge-key`, it silently skips the *first* key of
+  each merge (`continue` before the upsert/delete), losing that edit. Unlike
+  the other two, this bug lives *below* the isolation layer: OCC/SSI
+  validation has already passed (the dropped key is disjoint from every
+  concurrent commit, so it never was a conflict), yet the writer's append at
+  that key never lands — a lost update the merge is contractually required to
+  preserve. It only bites in the MultiWriter slow path (a concurrent commit
+  touched the same table since the writer's base); under the small-keyspace
+  list-append workload that path runs constantly.
 
-Both sites are a single `#[cfg(feature = "mutation-testing")]`-gated `if
-matches!(crate::mutation::active(), Some(crate::mutation::Mutation::...)) {
-return None; }` — with the feature off they vanish entirely; with it on but
-`ULTIMA_MUTATION` unset, `active()` returns `None` and they're unreachable.
+The two `store.rs` sites are a single `#[cfg(feature = "mutation-testing")]`-
+gated `if matches!(crate::mutation::active(),
+Some(crate::mutation::Mutation::...)) { return None; }`; the `table.rs` site
+is a gated `let mut drop_first = matches!(...)` plus an in-loop `if drop_first
+{ drop_first = false; continue; }`. With the feature off all three vanish
+entirely; with it on but `ULTIMA_MUTATION` unset, `active()` returns `None`
+and they're unreachable.
 
 ### autobench wiring
 
@@ -176,6 +193,10 @@ features` showing no trace of it without the flag, and a plain `cargo build
 3. **`skip-writeset-validation`** (generated under `--isolation si`): the SI
    history must now come back `snapshot-isolation`-**invalid** (lost update).
    Same hard-failure-on-miss behavior.
+4. **`drop-merge-key`** (generated under `--isolation si`): the SI history
+   must likewise come back `snapshot-isolation`-**invalid** (lost update from
+   the commit merge silently dropping an edit). Same hard-failure-on-miss
+   behavior — "drop-merge-key NOT caught — no teeth on the commit-merge path".
 
 The assertion deliberately **inverts** the clean harness rather than pattern
 matching a specific anomaly name — it just requires the previously-clean
@@ -184,14 +205,17 @@ type elle-cli assigns to a given mutation.
 
 Contention is tuned via `GEN_ARGS`/`ELLE_MUTATION_ARGS` (default `--threads 8
 --keys 8 --txns-per-thread 2000` — 8 threads hammering only 8 pre-seeded keys)
-so both injected bugs are reliably observable in a single run: heavy overlap
-on a small keyspace gives the mutated commit path many chances per run to let
-a lost update or a write-skew pair through, and eliding detection even once is
-enough for elle-cli to flag the whole history invalid. Both mutations were
-caught on the first attempt at this contention level during implementation —
-no escalation (smaller `--keys`, more threads/txns) was needed in practice,
-though the design explicitly calls for raising contention rather than
-weakening the assertion if a mutation ever isn't reliably caught.
+so all three injected bugs are reliably observable in a single run: heavy
+overlap on a small keyspace gives the mutated commit path many chances per run
+to let a lost update or a write-skew pair through, and eliding detection even
+once is enough for elle-cli to flag the whole history invalid. The
+`drop-merge-key` mutation additionally needs the MultiWriter *slow-path* merge
+to fire (a concurrent commit on the same table), which the small keyspace
+makes near-constant. All three mutations were caught on the first attempt at
+this contention level during implementation — no escalation (smaller `--keys`,
+more threads/txns) was needed in practice, though the design explicitly calls
+for raising contention rather than weakening the assertion if a mutation ever
+isn't reliably caught.
 
 ### `make consistency/elle-mutation`
 
@@ -218,12 +242,14 @@ additionally needs a `cargo build --features elle-mutation` of
 
 ## Limitations
 
-- Only two mutations are wired up: the SSI read-set bypass and the OCC
-  write-set bypass. A third natural candidate — dropping a key inside
-  `Table::merge_keys_from` during the commit merge — was deliberately left
-  out to keep the injection surface minimal; the two chosen mutations already
-  cover both of UltimaDB's isolation-enforcement paths (SSI's read-set
-  tracking and OCC's write-set conflict detection).
+- Three mutations are wired up, covering both isolation-enforcement paths and
+  the commit merge below them: the SSI read-set bypass, the OCC write-set
+  bypass, and the `drop-merge-key` bug in `Table::merge_keys_from` (a lost
+  update in the merge slow path, below the isolation layer). Further injection
+  sites (e.g. corrupting `next_id` reconciliation, or dropping an index
+  maintenance hook) are possible but were left out — the three wired ones
+  already exercise conflict detection on both read and write sets plus the
+  per-key merge that reconciles disjoint concurrent writers.
 - Mutation testing is manual/opt-in (`make consistency/elle-mutation`), not
   wired into CI. Introducing CI to this repo at all remains a separate
   maintainer decision, independent of this feature.
