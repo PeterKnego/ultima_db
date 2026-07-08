@@ -1,0 +1,10 @@
+---
+# Reload (not restart) sshd so UseDNS takes effect WITHOUT dropping the live
+# control connection. failed_when:false — the unit name varies (ssh vs sshd)
+# and a reload failure must not abort a provision whose real work succeeded.
+- name: Reload sshd
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: reloaded
+  loop: [ssh, sshd]
+  failed_when: false

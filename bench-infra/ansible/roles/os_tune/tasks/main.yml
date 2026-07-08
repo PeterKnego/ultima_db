@@ -1,0 +1,114 @@
+---
+# --- Fix the intermittent ~62s sudo/sshd getaddrinfo stall (cloud hosts whose
+# own name is not in /etc/hosts + slow reverse-DNS). Idempotent; persists on
+# disk. Placed FIRST so the rest of provisioning runs against fast sudo. ---
+- name: Map the host's own name to a local address (kills sudo getaddrinfo stall)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "127.0.1.1 {{ ansible_fqdn }} {{ ansible_hostname }}"
+    regexp: '^127\.0\.1\.1\s'
+    state: present
+    create: false
+
+- name: Disable sshd reverse-DNS lookups (UseDNS no — avoids connect-time stall)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    line: "UseDNS no"
+    regexp: '^\s*#?\s*UseDNS\b'
+    state: present
+    validate: "/usr/sbin/sshd -t -f %s"
+  notify: Reload sshd
+
+- name: Install tuning tools
+  ansible.builtin.apt:
+    name: [linux-tools-common, util-linux, tuned, e2fsprogs]
+    update_cache: true
+    state: present
+  failed_when: false   # linux-tools-common naming varies; non-fatal
+
+# --- Local NVMe instance store: detect the "Instance Storage" device, format
+# ext4, mount at remote_home so source, cargo target, AND bench data all land
+# on local NVMe. No-op on EBS-only hosts. ---
+- name: Detect local instance-store NVMe device
+  ansible.builtin.shell: |
+    set -e
+    for d in /sys/block/nvme*; do
+      [ -e "$d/device/model" ] || continue
+      if grep -qi 'Instance Storage' "$d/device/model"; then
+        dev="/dev/$(basename "$d")"
+        if [ -z "$(lsblk -nro MOUNTPOINT "$dev" | tr -d '[:space:]')" ]; then
+          echo "$dev"; exit 0
+        fi
+      fi
+    done
+    exit 0   # none found -> empty stdout
+  register: nvme_detect
+  changed_when: false
+
+- name: Mount the instance-store NVMe at remote_home
+  when: nvme_detect.stdout | trim | length > 0
+  block:
+    - name: Ensure mount point exists
+      ansible.builtin.file:
+        path: "{{ remote_home }}"
+        state: directory
+        mode: "0755"
+
+    - name: Format ext4 + mount (idempotent — skips if already mounted)
+      ansible.builtin.shell: |
+        set -e
+        DEV="{{ nvme_detect.stdout | trim }}"
+        if mountpoint -q "{{ remote_home }}"; then
+          echo "already-mounted"; exit 0
+        fi
+        mkfs.ext4 -F -q "$DEV"
+        mount -o noatime "$DEV" "{{ remote_home }}"
+        echo "mounted $DEV at {{ remote_home }}"
+      register: nvme_mount
+      changed_when: "'mounted ' in nvme_mount.stdout"
+
+    - name: Report NVMe mount status
+      ansible.builtin.debug:
+        msg: "instance-store NVMe: {{ nvme_mount.stdout | trim }}"
+
+- name: Ensure remote_home exists (EBS-only fallback when no NVMe was mounted)
+  ansible.builtin.file:
+    path: "{{ remote_home }}"
+    state: directory
+    mode: "0755"
+
+- name: Set CPU governor to performance
+  ansible.builtin.shell: |
+    if command -v cpupower >/dev/null; then cpupower frequency-set -g performance || true; fi
+    for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      [ -w "$c" ] && echo performance > "$c" || true
+    done
+  changed_when: false
+
+- name: Disable transparent hugepages
+  ansible.builtin.shell: |
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled || true
+    echo never > /sys/kernel/mm/transparent_hugepage/defrag || true
+  changed_when: false
+
+- name: Apply low-latency sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.k }}"
+    value: "{{ item.v }}"
+    sysctl_set: true
+    reload: true
+  loop:
+    - { k: "vm.swappiness", v: "0" }
+
+- name: Raise open-file limits
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/99-bench.conf
+    content: |
+      * soft nofile 1048576
+      * hard nofile 1048576
+    mode: "0644"
+
+- name: Apply tuned latency profile (best effort)
+  ansible.builtin.command: tuned-adm profile latency-performance
+  changed_when: false
+  failed_when: false

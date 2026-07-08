@@ -1,0 +1,14 @@
+# --- Layout on the provisioned host (all on the NVMe mount) ---
+remote_home: "/opt/bench"                 # NVMe instance store is mounted here by os_tune
+bench_dir: "/opt/bench/bench-data"        # ULTIMA_BENCH_DIR — on NVMe
+ud_src_dir: "/opt/bench/ultima_db"        # rsync target for the local ultima_db tree
+
+# --- Source sync (rsync the local working tree, so a branch / uncommitted state benches) ---
+# playbook_dir = bench-infra/ansible ; ../../ = ultima_db repo root
+ud_local_path: "{{ playbook_dir }}/../../"
+
+# --- Which workload the run role executes: competitor | wal-ab | autobench ---
+bench_target: "competitor"
+
+# --- Results pulled back to the control machine (bench-infra/bench-out/dist/<ts>/) ---
+results_local_dir: "{{ playbook_dir }}/../bench-out/dist"
