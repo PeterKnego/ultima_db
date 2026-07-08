@@ -37,6 +37,16 @@ struct Args {
     /// preserves the point-read workload exactly.
     #[arg(long, default_value_t = 0.0)]
     scan_ratio: f64,
+    /// Number of index buckets for predicate reads (rows are assigned
+    /// `id_index % buckets` at seed).
+    #[arg(long, default_value_t = 4)]
+    buckets: usize,
+    /// Probability a transaction reads a bucket group via the `bucket` index
+    /// (`get_by_index`/`index_range`) instead of point/scan. Exercises the
+    /// index read path; degrades to the same SSI `table_scan` tracking as a
+    /// full scan. Default 0.0 preserves the point/scan workload.
+    #[arg(long, default_value_t = 0.0)]
+    predicate_ratio: f64,
     /// PRNG seed (per-thread stream: seed + thread index).
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -94,10 +104,6 @@ impl SplitMix64 {
     }
 }
 
-// `Predicate`, `bucket_members`, and `select_predicate` are pure helpers for
-// predicate-read mode; wired into the txn/worker path in Task 3. Silence
-// dead_code until that wiring lands.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Predicate {
     /// Equality lookup on one bucket (`get_by_index`).
@@ -108,7 +114,6 @@ enum Predicate {
 
 /// Static bucket membership: `members[b]` = ids at seed positions `i` where
 /// `i % buckets == b`, in seed order. Mirrors `seed`'s assignment exactly.
-#[allow(dead_code)]
 fn bucket_members(ids: &[u64], buckets: usize) -> Vec<Vec<u64>> {
     let mut m = vec![Vec::new(); buckets];
     for (i, &id) in ids.iter().enumerate() {
@@ -120,7 +125,6 @@ fn bucket_members(ids: &[u64], buckets: usize) -> Vec<Vec<u64>> {
 /// Deterministically choose an equality or range predicate (50/50) and resolve
 /// its expected key set from static membership. Consumes RNG draws in a fixed
 /// order so a given RNG state always yields the same predicate.
-#[allow(dead_code)]
 fn select_predicate(
     rng: &mut SplitMix64,
     buckets: usize,
@@ -202,33 +206,64 @@ enum TxnFail {
     Conflict(Option<CommitWaiter>),
     /// SSI read-set validation failure at commit: definitely not committed.
     Serialization,
+    /// A predicate index read returned a membership other than the static
+    /// expectation — an index-maintenance bug, surfaced loudly.
+    IndexIntegrity(String),
     /// Anything else: outcome treated as indeterminate.
     Other(Error),
 }
 
-/// Run one list-append transaction. Returns completed ops (reads filled in)
-/// on commit. When `scan` is true the transaction reads the whole table once
-/// via `range(..)` (registering the SSI coarse `table_scan` read) and serves
-/// every read and append from a local working copy, preserving
-/// read-your-writes; otherwise each op does a point `get`.
-fn run_txn(store: &Store, ops: &[Op], scan: bool) -> Result<Vec<Op>, TxnFail> {
+enum Mode {
+    Point,
+    Scan,
+    /// Predicate read over the `bucket` index. `expected` is the statically
+    /// known membership the index read must return (integrity check).
+    Predicate { query: Predicate, expected: Vec<u64> },
+}
+
+/// Run one list-append transaction. Returns completed ops (reads filled in) on
+/// commit. In `Scan`/`Predicate` mode the transaction reads a group of rows up
+/// front (registering the SSI coarse `table_scan` read) and serves reads/appends
+/// from a local working copy, preserving read-your-writes; `Point` mode uses per-
+/// op `get`. Predicate mode additionally asserts the index returned exactly the
+/// statically-known bucket membership.
+fn run_txn(store: &Store, ops: &[Op], mode: &Mode) -> Result<Vec<Op>, TxnFail> {
     let mut tx = store.begin_write(None).map_err(TxnFail::Other)?;
     let mut completed = Vec::with_capacity(ops.len());
     {
         let mut t = tx.open_table::<ElleRow>("elle").map_err(TxnFail::Other)?;
-        // Scan mode reads the whole table up front (registering the SSI coarse
-        // `table_scan` read) into a local working copy so later reads observe
-        // earlier appends in this txn. The copy carries the full row so appends
-        // preserve the (static) `bucket`.
-        let mut local: std::collections::HashMap<u64, ElleRow> = if scan {
-            t.range(..).map(|(id, row)| (id, row.clone())).collect()
-        } else {
-            std::collections::HashMap::new()
+        let mut local: std::collections::HashMap<u64, ElleRow> = match mode {
+            Mode::Scan => t.range(..).map(|(id, row)| (id, row.clone())).collect(),
+            Mode::Predicate { query, expected } => {
+                // The index read registers the SSI coarse `table_scan` read.
+                let result = match query {
+                    Predicate::Equality(b) => {
+                        t.get_by_index("bucket", b).map_err(TxnFail::Other)?
+                    }
+                    Predicate::Range(lo, hi) => {
+                        t.index_range("bucket", *lo..=*hi).map_err(TxnFail::Other)?
+                    }
+                };
+                let mut got: Vec<u64> = result.iter().map(|(id, _)| *id).collect();
+                let seeded: std::collections::HashMap<u64, ElleRow> =
+                    result.iter().map(|(id, row)| (*id, (*row).clone())).collect();
+                got.sort_unstable();
+                let mut exp = expected.clone();
+                exp.sort_unstable();
+                if got != exp {
+                    return Err(TxnFail::IndexIntegrity(format!(
+                        "predicate {query:?} returned ids {got:?}, expected {exp:?}"
+                    )));
+                }
+                seeded
+            }
+            Mode::Point => std::collections::HashMap::new(),
         };
+        let from_local = !matches!(mode, Mode::Point);
         for op in ops {
             match op {
                 Op::Read { key, .. } => {
-                    let list = if scan {
+                    let list = if from_local {
                         local.get(key).map(|r| r.list.clone()).unwrap_or_default()
                     } else {
                         t.get(*key).map(|r| r.list.clone()).unwrap_or_default()
@@ -236,8 +271,8 @@ fn run_txn(store: &Store, ops: &[Op], scan: bool) -> Result<Vec<Op>, TxnFail> {
                     completed.push(Op::Read { key: *key, result: Some(list) });
                 }
                 Op::Append { key, value } => {
-                    let next = if scan {
-                        let row = local.get_mut(key).expect("scan seeds every key");
+                    let next = if from_local {
+                        let row = local.get_mut(key).expect("local seeds every op key");
                         row.list.push(*value);
                         row.clone()
                     } else {
@@ -272,11 +307,13 @@ struct Stats {
     serialization_failure: AtomicU64,
     info: AtomicU64,
     scan_txns: AtomicU64,
+    predicate_txns: AtomicU64,
 }
 
 struct Shared {
     store: Store,
     keys: Vec<u64>,
+    members: Vec<Vec<u64>>,
     history: Mutex<Vec<Event>>,
     values: AtomicU64,
     stats: Stats,
@@ -324,19 +361,31 @@ fn seed(store: &Store, keys: usize, buckets: usize) -> Vec<u64> {
 fn worker(shared: &Shared, args: &Args, process: usize) {
     let mut rng = SplitMix64(args.seed.wrapping_add(process as u64));
     for _ in 0..args.txns_per_thread {
+        // Mode is rolled before op generation because predicate mode restricts
+        // ops to the selected bucket's keys. predicate -> scan -> point.
+        let mode = if rng.chance(args.predicate_ratio) {
+            let (query, expected) = select_predicate(&mut rng, args.buckets, &shared.members);
+            shared.stats.predicate_txns.fetch_add(1, Ordering::Relaxed);
+            Mode::Predicate { query, expected }
+        } else if rng.chance(args.scan_ratio) {
+            shared.stats.scan_txns.fetch_add(1, Ordering::Relaxed);
+            Mode::Scan
+        } else {
+            Mode::Point
+        };
+        let key_subset: &[u64] = match &mode {
+            Mode::Predicate { expected, .. } => expected,
+            _ => &shared.keys,
+        };
         let ops = gen_ops(
             &mut rng,
-            &shared.keys,
+            key_subset,
             args.ops_per_txn,
             args.read_ratio,
             &shared.values,
         );
-        let scan = rng.chance(args.scan_ratio);
-        if scan {
-            shared.stats.scan_txns.fetch_add(1, Ordering::Relaxed);
-        }
         shared.push(EventType::Invoke, process, ops.clone());
-        match run_txn(&shared.store, &ops, scan) {
+        match run_txn(&shared.store, &ops, &mode) {
             Ok(completed) => {
                 shared.stats.ok.fetch_add(1, Ordering::Relaxed);
                 shared.push(EventType::Ok, process, completed);
@@ -354,6 +403,12 @@ fn worker(shared: &Shared, args: &Args, process: usize) {
                     .serialization_failure
                     .fetch_add(1, Ordering::Relaxed);
                 shared.push(EventType::Fail, process, ops);
+            }
+            Err(TxnFail::IndexIntegrity(msg)) => {
+                eprintln!("elle-history: process {process}: INDEX INTEGRITY VIOLATION: {msg}");
+                shared.stats.info.fetch_add(1, Ordering::Relaxed);
+                shared.push(EventType::Info, process, ops);
+                return;
             }
             Err(TxnFail::Other(e)) => {
                 // Indeterminate outcome: record :info and retire this process
@@ -378,16 +433,22 @@ fn main() {
         }
     };
 
+    if args.buckets == 0 {
+        eprintln!("elle-history: --buckets must be >= 1");
+        std::process::exit(2);
+    }
+
     let store = build_store(isolation);
 
     // Pre-seed the keyspace: TableWriter has no insert-at-key, and update()
     // requires the key to exist, so the workload is pure get+update.
-    // TODO(task3): swap the hardcoded `4` for `args.buckets`.
-    let keys = seed(&store, args.keys, 4);
+    let keys = seed(&store, args.keys, args.buckets);
+    let members = bucket_members(&keys, args.buckets);
 
     let shared = Arc::new(Shared {
         store,
         keys,
+        members,
         history: Mutex::new(Vec::with_capacity(args.threads * args.txns_per_thread * 2)),
         values: AtomicU64::new(1),
         stats: Stats::default(),
@@ -415,15 +476,17 @@ fn main() {
 
     let s = &shared.stats;
     eprintln!(
-        "elle-history: isolation={} scan_ratio={} events={} ok={} write_conflict={} serialization_failure={} info={} scan_txns={}",
+        "elle-history: isolation={} scan_ratio={} predicate_ratio={} events={} ok={} write_conflict={} serialization_failure={} info={} scan_txns={} predicate_txns={}",
         args.isolation,
         args.scan_ratio,
+        args.predicate_ratio,
         history.len(),
         s.ok.load(Ordering::Relaxed),
         s.write_conflict.load(Ordering::Relaxed),
         s.serialization_failure.load(Ordering::Relaxed),
         s.info.load(Ordering::Relaxed),
         s.scan_txns.load(Ordering::Relaxed),
+        s.predicate_txns.load(Ordering::Relaxed),
     );
     if s.info.load(Ordering::Relaxed) > 0 {
         eprintln!("elle-history: degraded run (unexpected errors above)");
@@ -556,7 +619,7 @@ mod tests {
             Op::Append { key, value: 200 },
             Op::Read { key, result: None },
         ];
-        let completed = match run_txn(&store, &ops, true) {
+        let completed = match run_txn(&store, &ops, &Mode::Scan) {
             Ok(c) => c,
             Err(_) => panic!("uncontended scan txn should commit"),
         };
@@ -576,7 +639,7 @@ mod tests {
         let ids = seed(&store, 3, 3); // ids[1] has bucket 1
 
         let ops = vec![Op::Append { key: ids[1], value: 5 }];
-        run_txn(&store, &ops, false).expect("uncontended append commits");
+        run_txn(&store, &ops, &Mode::Point).expect("uncontended append commits");
 
         let mut tx = store.begin_write(None).unwrap();
         let t = tx.open_table::<ElleRow>("elle").unwrap();
@@ -638,5 +701,83 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut rng = SplitMix64(7);
         assert!(gen_ops(&mut rng, &[], 4, 0.4, &counter).is_empty());
+    }
+
+    #[test]
+    fn predicate_txn_reads_its_own_appends_equality() {
+        let store = build_store(IsolationLevel::Serializable);
+        let ids = seed(&store, 4, 2); // bucket 0 = {ids[0], ids[2]}
+        let members = bucket_members(&ids, 2);
+
+        // Equality predicate on bucket 0, ops within that bucket.
+        let mode = Mode::Predicate { query: Predicate::Equality(0), expected: members[0].clone() };
+        let ops = vec![
+            Op::Append { key: ids[0], value: 100 },
+            Op::Read { key: ids[0], result: None },
+            Op::Append { key: ids[2], value: 200 },
+            Op::Read { key: ids[2], result: None },
+        ];
+        let completed = run_txn(&store, &ops, &mode).expect("uncontended predicate txn commits");
+        match &completed[1] {
+            Op::Read { result: Some(l), .. } => assert_eq!(l, &vec![100]),
+            other => panic!("expected read of [100], got {other:?}"),
+        }
+        match &completed[3] {
+            Op::Read { result: Some(l), .. } => assert_eq!(l, &vec![200]),
+            other => panic!("expected read of [200], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predicate_txn_reads_its_own_appends_range() {
+        let store = build_store(IsolationLevel::Serializable);
+        let ids = seed(&store, 4, 2);
+        let members = bucket_members(&ids, 2);
+        let mut expected = members[0].clone();
+        expected.extend_from_slice(&members[1]); // range 0..=1 = all keys
+
+        let mode = Mode::Predicate { query: Predicate::Range(0, 1), expected };
+        let ops = vec![
+            Op::Append { key: ids[1], value: 7 },
+            Op::Read { key: ids[1], result: None },
+        ];
+        let completed = run_txn(&store, &ops, &mode).expect("range predicate txn commits");
+        match &completed[1] {
+            Op::Read { result: Some(l), .. } => assert_eq!(l, &vec![7]),
+            other => panic!("expected read of [7], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predicate_txn_preserves_bucket_after_append() {
+        let store = build_store(IsolationLevel::SnapshotIsolation);
+        let ids = seed(&store, 4, 2);
+        let members = bucket_members(&ids, 2);
+
+        let mode = Mode::Predicate { query: Predicate::Equality(1), expected: members[1].clone() };
+        let ops = vec![Op::Append { key: ids[1], value: 9 }];
+        run_txn(&store, &ops, &mode).expect("commit");
+
+        // The row is still in bucket 1, so a fresh equality predicate still finds it.
+        let mut tx = store.begin_write(None).unwrap();
+        let t = tx.open_table::<ElleRow>("elle").unwrap();
+        let b1: Vec<u64> =
+            t.get_by_index("bucket", &1u64).unwrap().iter().map(|(id, _)| *id).collect();
+        assert!(b1.contains(&ids[1]));
+    }
+
+    #[test]
+    fn generation_is_reproducible_for_a_fixed_seed() {
+        let ids = vec![10, 20, 30, 40];
+        let members = bucket_members(&ids, 2);
+
+        let run = || {
+            let counter = AtomicU64::new(1);
+            let mut rng = SplitMix64(99);
+            let (p, keys) = select_predicate(&mut rng, 2, &members);
+            let ops = gen_ops(&mut rng, &keys, 4, 0.4, &counter);
+            (p, keys, format!("{ops:?}"))
+        };
+        assert_eq!(run(), run(), "same seed must produce identical predicate + ops");
     }
 }
