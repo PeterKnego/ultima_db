@@ -154,6 +154,10 @@ tree shares the committed snapshot's spine and pays the CoW-on-first-touch cost 
 still runs **26.5×** faster. `single_insert_loop` (one `Table::insert` at a time, not
 batched) confirms the win is not an artifact of batching.
 
+A cross-engine timed bulk-load comparison (UltimaDB `insert_batch` / `bulk_load`
+vs RocksDB / Fjall / ReDB) lives in `docs/tasks/task49_bulk_load_bench.md`
+(`make bench/bulk-load/compare`).
+
 ## 6. Notes / limitations
 
 - The win is proportional to how much successive inserts share path nodes and to how

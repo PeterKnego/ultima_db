@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -88,6 +88,31 @@ bench/ycsb/compare:
 	critcmp -g '(.+)/[^/]+' ultima_nondurable fjall_nondurable rocksdb_nondurable redb_nondurable
 	@echo "===== strict tier (fsync per commit) ====="
 	critcmp -g '(.+)/[^/]+' ultima_strict fjall_strict rocksdb_strict redb_strict
+
+# Bulk-load ingest comparison (build empty db of N records). Five arms:
+# UltimaDB insert_batch, UltimaDB Store::bulk_load, RocksDB, Fjall, ReDB.
+# Same ULTIMA_BENCH_DIR real-disk guard as bench/ycsb/compare.
+bench/bulk-load/compare:
+	$(call check_cmd,critcmp)
+	@if [ -z "$(ULTIMA_BENCH_DIR)" ]; then \
+	  echo "ERROR: ULTIMA_BENCH_DIR is not set — refusing to run."; \
+	  echo "  Point it at a real disk-backed dir (NOT a tmpfs like /tmp):"; \
+	  echo "    make bench/bulk-load/compare ULTIMA_BENCH_DIR=\$$HOME/bench-disk"; \
+	  exit 1; \
+	fi
+	@mkdir -p "$(ULTIMA_BENCH_DIR)"
+	@for tier in nondurable strict; do \
+	  echo "===== bulk-load tier: $$tier ====="; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench --bench ycsb_bulk_load_ultima_batch_bench  -- --save-baseline ub_batch_$$tier  || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench --bench ycsb_bulk_load_ultima_sorted_bench -- --save-baseline ub_sorted_$$tier || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_bulk_load_rocksdb_bench -- --save-baseline ub_rocksdb_$$tier || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_bulk_load_fjall_bench   -- --save-baseline ub_fjall_$$tier   || exit 1; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_bulk_load_redb_bench    -- --save-baseline ub_redb_$$tier    || exit 1; \
+	done
+	@echo "===== non-durable tier (build cost) ====="
+	critcmp ub_batch_nondurable ub_sorted_nondurable ub_rocksdb_nondurable ub_fjall_nondurable ub_redb_nondurable
+	@echo "===== strict tier (one fsync at end of load) ====="
+	critcmp ub_batch_strict ub_sorted_strict ub_rocksdb_strict ub_fjall_strict ub_redb_strict
 
 # Multi-writer contention benchmarks
 # Use bench/multiwriter/clean to remove stale criterion data before comparing
