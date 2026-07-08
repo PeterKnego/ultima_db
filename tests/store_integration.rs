@@ -3225,3 +3225,77 @@ fn uncommitted_insert_mut_invisible_to_concurrent_reader() {
     assert_eq!(t.get(1), Some(&999_001));
     assert_eq!(t.get(N + 1), Some(&777));
 }
+
+// ---------------------------------------------------------------------------
+// In-place delete (`BTree::remove_mut`) must not leak uncommitted deletes to
+// concurrent reads. Mirror of the insert_mut isolation test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uncommitted_remove_mut_invisible_to_concurrent_reader() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let store = Store::default();
+    const N: u64 = 1_000;
+
+    // Base: commit N rows so the writer opens a populated table (shared spine).
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<u64>("t").unwrap();
+        t.insert_batch((0..N).map(|i| i * 10).collect()).unwrap();
+        wtx.commit().unwrap();
+    }
+    let base_val = |id: u64| (id - 1) * 10; // ids are 1..=N
+
+    let rtx_before = store.begin_read(None).unwrap();
+
+    let mutated = Arc::new(Barrier::new(2));
+    let read_done = Arc::new(Barrier::new(2));
+
+    let reader = {
+        let store = store.clone();
+        let mutated = Arc::clone(&mutated);
+        let read_done = Arc::clone(&read_done);
+        thread::spawn(move || {
+            mutated.wait(); // writer has done its in-place deletes, uncommitted
+            let rtx = store.begin_read(None).unwrap();
+            let t = rtx.open_table::<u64>("t").unwrap();
+            // Uncommitted deletes are invisible: all N rows still present.
+            assert_eq!(t.len() as u64, N, "reader saw uncommitted deletes");
+            assert_eq!(t.get(1), Some(&base_val(1)));
+            assert_eq!(t.get(N), Some(&base_val(N)));
+            read_done.wait();
+        })
+    };
+
+    // Writer: delete the first half of the rows in place, uncommitted.
+    let mut wtx = store.begin_write(None).unwrap();
+    {
+        let mut t = wtx.open_table::<u64>("t").unwrap();
+        for id in 1..=(N / 2) {
+            t.delete(id).unwrap(); // -> BTree::remove_mut
+        }
+        assert_eq!(t.len() as u64, N / 2);
+        assert_eq!(t.get(1), None);
+    }
+    mutated.wait();
+    read_done.wait();
+    wtx.commit().unwrap();
+
+    reader.join().unwrap();
+
+    // Reader opened before the writer is unchanged (repeatable read).
+    {
+        let t = rtx_before.open_table::<u64>("t").unwrap();
+        assert_eq!(t.len() as u64, N);
+        assert_eq!(t.get(1), Some(&base_val(1)));
+    }
+
+    // A fresh read sees the committed deletions.
+    let rtx_after = store.begin_read(None).unwrap();
+    let t = rtx_after.open_table::<u64>("t").unwrap();
+    assert_eq!(t.len() as u64, N / 2);
+    assert_eq!(t.get(1), None);
+    assert_eq!(t.get(N), Some(&base_val(N)));
+}
