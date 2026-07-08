@@ -148,10 +148,12 @@ bench/compare-engines:
 
 # Transactional consistency check (Elle list-append via vendored elle-cli,
 # needs java) — opt-in tier, not part of `make test`. Tune via ELLE_ARGS. See task45.
-# Two passes: point reads (SSI point read-set), then a scan-heavy pass
-# (SSI coarse table_scan read-set). Both must satisfy their isolation claim.
+# Three passes: point reads, a scan-heavy pass, then a predicate (index) pass.
+# Each pass must satisfy its isolation claim (SSI point/scan/predicate read-set).
 ELLE_DIR ?= /tmp/ultima-elle
 ELLE_SCAN_RATIO ?= 0.5
+ELLE_PREDICATE_RATIO ?= 0.5
+ELLE_BUCKETS ?= 4
 consistency/elle:
 	cargo run --release -p ultima-autobench --bin elle-history -- \
 		--isolation si $(ELLE_ARGS) --out $(ELLE_DIR)/point-si/history.edn
@@ -163,6 +165,11 @@ consistency/elle:
 	cargo run --release -p ultima-autobench --bin elle-history -- \
 		--isolation serializable --scan-ratio $(ELLE_SCAN_RATIO) $(ELLE_ARGS) --out $(ELLE_DIR)/scan-ser/history.edn
 	scripts/elle_check.sh $(ELLE_DIR)/scan-si/history.edn $(ELLE_DIR)/scan-ser/history.edn
+	cargo run --release -p ultima-autobench --bin elle-history -- \
+		--isolation si --predicate-ratio $(ELLE_PREDICATE_RATIO) --buckets $(ELLE_BUCKETS) $(ELLE_ARGS) --out $(ELLE_DIR)/pred-si/history.edn
+	cargo run --release -p ultima-autobench --bin elle-history -- \
+		--isolation serializable --predicate-ratio $(ELLE_PREDICATE_RATIO) --buckets $(ELLE_BUCKETS) $(ELLE_ARGS) --out $(ELLE_DIR)/pred-ser/history.edn
+	scripts/elle_check.sh $(ELLE_DIR)/pred-si/history.edn $(ELLE_DIR)/pred-ser/history.edn
 
 # Mutation test: inject known bugs into the commit path and confirm Elle catches
 # them (opt-in; builds ultima-db with the mutation-testing feature). See task47.
