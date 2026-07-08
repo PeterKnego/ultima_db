@@ -94,6 +94,37 @@ misconfigured checker silently passes everything.
   `{:index N, :type :invoke|:ok|:fail|:info, :f :txn, :process P, :time NS,
   :value [[:append K V] [:r K nil-or-[V ...]]]}`.
 
+## Predicate reads (index pass)
+
+A third read shape exercises UltimaDB's secondary-index read path. Each row
+carries a static `bucket` field (assigned `id_index % --buckets` at seed, never
+mutated) with a non-unique index. A predicate transaction (probability
+`--predicate-ratio`) selects a key group via the index — `get_by_index(bucket)`
+for equality or `index_range(lo..=hi)` for a range — then reads/appends within
+that group, serving read-your-writes from a local copy exactly like the scan
+pass. The index read is invisible to the emitted history (like the scan), so the
+EDN stays valid `list-append`.
+
+Two properties are checked:
+
+1. **SSI conflict tracking.** Every index read registers the coarse `table_scan`
+   read (`src/store.rs`), so a predicate reader is serialization-failed by any
+   concurrent write to the table — phantoms are prevented. The predicate pass is
+   therefore clean under SSI, exactly like the scan pass.
+2. **Index integrity under concurrency.** Each predicate transaction asserts the
+   index returned exactly the statically-known bucket membership; a mismatch
+   (an index-maintenance bug under concurrent `update`s) retires the process and
+   fails the run.
+
+Because index reads degrade to `table_scan`, a predicate read has the **same
+conflict profile as a full scan**: SSI clean, SI shows `{G2-item}` write skew and
+nothing worse. So the predicate pass reuses the existing whitelist — **no new
+anomaly type is needed.** (This resolves the task45/47 note that a predicate
+workload "could need its own whitelist": for the index-read shape it does not.)
+
+`make consistency/elle` runs a predicate pass after the point and scan passes,
+tuned by `ELLE_PREDICATE_RATIO` (default 0.5) and `ELLE_BUCKETS` (default 4).
+
 ## Components
 
 - `autobench/src/bin/elle-history.rs` — workload driver
@@ -156,12 +187,20 @@ serializable.
 - **In-memory only** (`Persistence::None`): exercises the OCC/SSI commit path,
   not recovery. Crash-durability checking (LazyFS-style fault injection
   against the WAL) is a separate future task.
-- **Full-table scans only**: the scan pass registers `table_scan` via
-  `range(..)`; sub-range and secondary-index reads (which also taint the whole
-  table under v1 coarse tracking) are not separately exercised, though the
-  read-set effect is identical.
+- **Coarse read-set tracking**: the scan pass registers `table_scan` via
+  `range(..)`, and secondary-index reads ARE now exercised by the predicate pass
+  (see "Predicate reads" above) — but both taint the whole table under v1 coarse
+  tracking, so *fine-grained* sub-range / per-predicate read-set tracking is not
+  exercised (there is none to exercise: index and sub-range reads all degrade to
+  `table_scan`).
 - **Histories, not final state**: Elle checks the recorded history; the frozen
   `autobench/tests/mw_commit_torture.rs` floor already covers final-state
   lost-update checking.
 - **Write-skew occurrence under SI is probabilistic**, hence WARN rather than
   FAIL when absent (with default parameters it is reliably present).
+- **Predicate reads via `table_scan` only**: predicate reads are covered by the
+  index pass (see "Predicate reads" above), but only via UltimaDB's coarse
+  `table_scan` degradation — the harness does not yet test *fine-grained*
+  predicate read-set tracking (there is none to test) or predicate write skew via
+  a domain invariant (a possible future SmallBank-style workload, deliberately
+  out of scope here).
