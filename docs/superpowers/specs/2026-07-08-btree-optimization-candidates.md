@@ -114,7 +114,10 @@ win and the from_sorted gap.
 1. ✅ `remove_mut` (Tier 1) — shipped (`task50`).
 2. ✅ Fanout A/B experiment (Tier 2.2) — done; `T=32` confirmed near-optimal, and gated the
    in-place rebalance micro-opt as the prerequisite for any fanout increase (see #2 above).
-3. In-place rebalance sibling-clone micro-opt (`task50` §6) — now the top open item: unblocks
-   both delete-heavy random workloads and a future fanout bump.
+3. ✅ In-place rebalance sibling-clone micro-opt (`task50` §5.1) — done: `rotate_*`/`merge_*`
+   now mutate siblings in place (`make_mut`/`try_unwrap`). Random-delete gained a further ~2.8×
+   (1M in_place 994→351 ms; overall vs immutable 3.7× → 9.8×). Unblocks a future fanout bump —
+   a fanout re-sweep with in-place rebalancing is now warranted (the old delete cliff should
+   flatten).
 4. Bulk-append fast path (Tier 2.3) — if the sequential-insert path matters.
 5. Flamegraph, then reconsider Tier 3/4 with data.

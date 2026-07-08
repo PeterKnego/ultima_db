@@ -841,85 +841,69 @@ fn fix_underfull_child<K: Ord + Clone, V>(
 }
 
 /// Rotates an entry from the left sibling into the current child.
+///
+/// Mutates the two siblings in place via [`Arc::make_mut`]: each is cloned only
+/// if still shared with an older snapshot, otherwise edited directly. `split_at_mut`
+/// yields disjoint `&mut` handles to the two adjacent children at once.
 fn rotate_right<K: Clone, V>(
     entries: &mut [(K, Arc<V>)],
     children: &mut [Arc<BTreeNode<K, V>>],
     idx: usize,
 ) {
-    let left = &children[idx - 1];
-    let right = &children[idx];
+    let (left_part, right_part) = children.split_at_mut(idx);
+    let left = Arc::make_mut(&mut left_part[idx - 1]);
+    let right = Arc::make_mut(&mut right_part[0]);
 
-    // Steal the last entry of the left sibling.
-    let stolen = left.entries.last().unwrap().clone();
-    // The current separator goes down into the right child.
-    let separator = entries[idx - 1].clone();
-    // The stolen entry becomes the new separator.
-    entries[idx - 1] = stolen;
-
-    let new_left_entries = left.entries[..left.entries.len() - 1].to_vec();
-    let mut new_left_children = left.children.clone();
-    let stolen_child = if !new_left_children.is_empty() {
-        Some(new_left_children.pop().unwrap())
-    } else {
+    // Steal the last entry (and trailing child) of the left sibling.
+    let stolen = left.entries.pop().unwrap();
+    let stolen_child = if left.children.is_empty() {
         None
+    } else {
+        Some(left.children.pop().unwrap())
     };
-
-    let mut new_right_entries = right.entries.clone();
-    new_right_entries.insert(0, separator);
-    let mut new_right_children = right.children.clone();
+    // The stolen entry becomes the new separator; the old separator descends
+    // into the front of the right child.
+    let separator = std::mem::replace(&mut entries[idx - 1], stolen);
+    right.entries.insert(0, separator);
     if let Some(sc) = stolen_child {
-        new_right_children.insert(0, sc);
+        right.children.insert(0, sc);
     }
-
-    children[idx - 1] = Arc::new(BTreeNode {
-        entries: new_left_entries,
-        children: new_left_children,
-    });
-    children[idx] = Arc::new(BTreeNode {
-        entries: new_right_entries,
-        children: new_right_children,
-    });
 }
 
 /// Rotates an entry from the right sibling into the current child.
+///
+/// In-place counterpart of `rotate_right` — see its docs for the CoW reasoning.
 fn rotate_left<K: Clone, V>(
     entries: &mut [(K, Arc<V>)],
     children: &mut [Arc<BTreeNode<K, V>>],
     idx: usize,
 ) {
-    let left = &children[idx];
-    let right = &children[idx + 1];
+    let (left_part, right_part) = children.split_at_mut(idx + 1);
+    let left = Arc::make_mut(&mut left_part[idx]);
+    let right = Arc::make_mut(&mut right_part[0]);
 
-    let stolen = right.entries[0].clone();
-    let separator = entries[idx].clone();
-    entries[idx] = stolen;
-
-    let new_right_entries = right.entries[1..].to_vec();
-    let mut new_right_children = right.children.clone();
-    let stolen_child = if !new_right_children.is_empty() {
-        Some(new_right_children.remove(0))
-    } else {
+    // Steal the first entry (and leading child) of the right sibling.
+    let stolen = right.entries.remove(0);
+    let stolen_child = if right.children.is_empty() {
         None
+    } else {
+        Some(right.children.remove(0))
     };
-
-    let mut new_left_entries = left.entries.clone();
-    new_left_entries.push(separator);
-    let mut new_left_children = left.children.clone();
+    // The stolen entry becomes the new separator; the old separator descends
+    // onto the end of the left child.
+    let separator = std::mem::replace(&mut entries[idx], stolen);
+    left.entries.push(separator);
     if let Some(sc) = stolen_child {
-        new_left_children.push(sc);
+        left.children.push(sc);
     }
-
-    children[idx] = Arc::new(BTreeNode {
-        entries: new_left_entries,
-        children: new_left_children,
-    });
-    children[idx + 1] = Arc::new(BTreeNode {
-        entries: new_right_entries,
-        children: new_right_children,
-    });
 }
 
 /// Merges an underfull child with its left sibling.
+///
+/// The absorbing (left) sibling is opened with [`Arc::make_mut`] and edited in
+/// place; the absorbed (right) node's contents are **moved** into it via
+/// [`Arc::try_unwrap`] when it is uniquely owned, falling back to a clone only
+/// when it is still shared with a snapshot.
 fn merge_with_left<K: Clone, V>(
     entries: &mut Vec<(K, Arc<V>)>,
     children: &mut Vec<Arc<BTreeNode<K, V>>>,
@@ -927,21 +911,14 @@ fn merge_with_left<K: Clone, V>(
 ) {
     let separator = entries.remove(idx - 1);
     let right = children.remove(idx);
-
-    let mut merged_entries = children[idx - 1].entries.clone();
-    merged_entries.push(separator);
-    merged_entries.extend(right.entries.iter().cloned());
-
-    let mut merged_children = children[idx - 1].children.clone();
-    merged_children.extend(right.children.iter().cloned());
-
-    children[idx - 1] = Arc::new(BTreeNode {
-        entries: merged_entries,
-        children: merged_children,
-    });
+    let left = Arc::make_mut(&mut children[idx - 1]);
+    left.entries.push(separator);
+    absorb(left, right);
 }
 
 /// Merges an underfull child with its right sibling.
+///
+/// In-place counterpart of `merge_with_left` — see its docs.
 fn merge_with_right<K: Clone, V>(
     entries: &mut Vec<(K, Arc<V>)>,
     children: &mut Vec<Arc<BTreeNode<K, V>>>,
@@ -949,18 +926,26 @@ fn merge_with_right<K: Clone, V>(
 ) {
     let separator = entries.remove(idx);
     let right = children.remove(idx + 1);
+    let left = Arc::make_mut(&mut children[idx]);
+    left.entries.push(separator);
+    absorb(left, right);
+}
 
-    let mut merged_entries = children[idx].entries.clone();
-    merged_entries.push(separator);
-    merged_entries.extend(right.entries.iter().cloned());
-
-    let mut merged_children = children[idx].children.clone();
-    merged_children.extend(right.children.iter().cloned());
-
-    children[idx] = Arc::new(BTreeNode {
-        entries: merged_entries,
-        children: merged_children,
-    });
+/// Appends `right`'s entries and children onto `left`, moving them out of
+/// `right` when it is uniquely owned (no snapshot shares it) and cloning
+/// otherwise. `left` must already carry the descended separator as its last
+/// entry.
+fn absorb<K: Clone, V>(left: &mut BTreeNode<K, V>, right: Arc<BTreeNode<K, V>>) {
+    match Arc::try_unwrap(right) {
+        Ok(rn) => {
+            left.entries.extend(rn.entries);
+            left.children.extend(rn.children);
+        }
+        Err(shared) => {
+            left.entries.extend(shared.entries.iter().cloned());
+            left.children.extend(shared.children.iter().cloned());
+        }
+    }
 }
 
 /// In-place counterpart to `delete_from_node`. Descends through
@@ -2062,5 +2047,40 @@ mod tests {
         assert!(!t.remove_mut(&1000));
         assert_eq!(t.len(), 500);
         assert_eq!(dump(&t), before);
+    }
+
+    /// In-place rebalancing (rotate/merge) opens sibling nodes via
+    /// `Arc::make_mut` / `Arc::try_unwrap`. When a sibling is still shared with
+    /// an older snapshot it MUST be cloned, never mutated/moved in place —
+    /// otherwise a merge would corrupt the snapshot. Deleting a long contiguous
+    /// run from the low end forces repeated merges and rotations at every level
+    /// while a snapshot holds those very siblings.
+    #[test]
+    fn remove_mut_merge_under_snapshot_preserves_isolation() {
+        use std::collections::BTreeMap;
+        let mut t = BTree::new();
+        for i in 0..4000u64 {
+            t.insert_mut(i, i);
+        }
+        let snapshot = t.clone();
+        let snapshot_dump = dump(&snapshot);
+
+        // Delete a large contiguous prefix — guarantees underflow-driven merges
+        // and rotations touching siblings shared with `snapshot`.
+        let mut model: BTreeMap<u64, u64> = (0..4000u64).map(|i| (i, i)).collect();
+        for i in 0..3000u64 {
+            assert!(t.remove_mut(&i));
+            model.remove(&i);
+        }
+
+        // Snapshot is byte-for-byte what it was at capture time.
+        assert_eq!(dump(&snapshot), snapshot_dump);
+        assert_eq!(snapshot.len(), 4000);
+        assert_eq!(snapshot.get(&0).copied(), Some(0));
+        assert_eq!(snapshot.get(&2999).copied(), Some(2999));
+
+        // Live tree exactly tracks the model after all the merges.
+        assert_eq!(t.len(), model.len());
+        assert_eq!(dump(&t), model.into_iter().collect::<Vec<_>>());
     }
 }

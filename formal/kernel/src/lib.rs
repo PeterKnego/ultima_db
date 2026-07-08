@@ -552,6 +552,21 @@ fn drop_last_child(c: &Children) -> Children {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rebalancing (rotate / merge).
+//
+// # Delta from the real code
+//
+// The real `src/btree.rs` rebalancers mutate the two involved sibling nodes
+// **in place** via `Arc::make_mut` (rotate) and `Arc::try_unwrap` (merge's
+// `absorb`): a sibling is cloned only when still shared with a snapshot,
+// otherwise it is edited/moved directly (copy-on-write). This functional model
+// instead rebuilds siblings by unconditional cloning. The distinction is a
+// property of `Arc` reference counts, invisible in this uniquely-owned model —
+// the input→output mapping is identical, which `remove_matches_std_btreemap`
+// and `remove_mut_matches_remove_and_std_btreemap` pin down.
+// ---------------------------------------------------------------------------
+
 /// Rotate an entry from the left sibling (at `idx-1`) into the child at `idx`.
 /// Returns the parent's repaired `(entries, children)`. (Mirror of `rotate_right`.)
 fn rotate_right(entries: &Vec<(u64, u64)>, children: &Children, idx: usize) -> (Vec<(u64, u64)>, Children) {

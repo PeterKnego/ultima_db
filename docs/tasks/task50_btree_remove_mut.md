@@ -1,12 +1,13 @@
 # task50: In-place B-tree delete (`BTree::remove_mut`)
 
 **Status:** Implemented and validated. The symmetric twin of `insert_mut` (task48).
-Correctness proven by 4 dedicated unit tests (equivalence to the immutable `remove` +
-snapshot-isolation preservation) plus a concurrent-reader isolation integration test; the
-full existing suite (386 lib + 82 `store_integration`) passes unchanged; clippy clean; the
-formal drift guard passes (kernel mirror + differential test). A/B benchmarked:
-**~18× faster** on ascending and **~3.7× faster** on random delete-heavy batches at the raw
-B-tree layer — see §5.
+Correctness proven by 5 dedicated unit tests (equivalence to the immutable `remove` +
+snapshot-isolation preservation, incl. isolation under merge) plus a concurrent-reader
+isolation integration test; the full existing suite (387 lib + 82 `store_integration`) passes
+unchanged; clippy clean; the formal drift guard passes (kernel mirror + differential test).
+A/B benchmarked: **~26× faster** on ascending and **~9.8× faster** on random delete-heavy
+batches at the raw B-tree layer — see §5. (Both figures include the in-place rebalancing
+follow-up, §5.1; the initial descent-only version was ~18×/~3.7×.)
 
 **Related:**
 - `benches/btree_remove_mut_bench.rs` (micro A/B: immutable `remove` vs in-place `remove_mut`, ascending + random)
@@ -108,22 +109,41 @@ is invisible in the uniquely-owned `Box` model) with a differential test
 setup, via `insert_mut`) and times deleting **every** key. Immutable arm rebuilds the spine per
 delete; in-place arm descends via `Arc::make_mut`. Dev sandbox, criterion, `sample_size = 10`.
 
+Current numbers (with the in-place rebalancing of §5.1):
+
 | workload | immutable `remove` | in-place `remove_mut` | speedup |
 |---|--:|--:|--:|
-| delete ascending, 100K | 249.3 ms | 14.9 ms | **16.8×** |
-| delete ascending, 1M | 3.12 s | 169.6 ms | **18.4×** |
-| delete random, 100K | 263.0 ms | 47.4 ms | **5.5×** |
-| delete random, 1M | 3.66 s | 994.6 ms | **3.7×** |
+| delete ascending, 100K | 249.3 ms | 8.6 ms | **~29×** |
+| delete ascending, 1M | 3.06 s | 117.3 ms | **26.1×** |
+| delete random, 100K | 263.0 ms | 14.0 ms | **~19×** |
+| delete random, 1M | 3.44 s | 350.9 ms | **9.8×** |
 
 The **ratios are the deliverable** — A/B cancels common-mode host noise; the absolute numbers
-are sandbox-relative. The immutable baseline reproduced across two runs (~3.66 s random @1M),
-so the cross-run random ratio is trustworthy.
+are sandbox-relative. Random delete is still a smaller win than ascending (9.8× vs 26×) because
+scattered deletion order triggers far more rebalancing and has worse cache locality — but the
+gap is now driven by rebalance *frequency* and cache behaviour, not allocation (§5.1 removed the
+per-rebalance sibling clone).
 
-Random delete is a smaller win than ascending (~3.7× vs ~18×) because scattered deletion order
-triggers far more rebalancing (rotations/merges), and the rebalance path still **clones the two
-involved sibling nodes** (see §6) — that allocation is not eliminated by the in-place descent.
-This mirrors `insert_mut`'s own ascending-vs-random asymmetry (~21× vs ~8×), where splits are
-rarer than delete's rebalancing.
+### 5.1 Follow-up: in-place rebalancing (2026-07-08)
+
+The initial `remove_mut` reused the existing `rotate_*`/`merge_*` helpers verbatim, which
+rebuilt the two involved sibling nodes by **cloning** (`left.entries.clone()` + `Arc::new(...)`).
+On every underflow that cost two full node allocations — the dominant remaining cost on
+random-delete workloads (which rebalance constantly). The follow-up rewrote those helpers to
+mutate the siblings **in place** via `Arc::make_mut` (rotate) and `Arc::try_unwrap` (merge's
+`absorb` helper), with `slice::split_at_mut` to hold `&mut` to two adjacent children at once.
+
+The helpers are shared by both delete paths, and the CoW rewrite is correct for both:
+- **`remove_mut` on a private tree:** siblings are uniquely owned → `make_mut` mutates in place,
+  `try_unwrap` moves the merged node's contents. The win.
+- **Snapshotted tree / immutable `remove`:** siblings are shared → `make_mut` clones and
+  `try_unwrap` fails to a clone — byte-identical to the previous behaviour; snapshots preserved.
+
+Measured effect on the `in_place` arm (same host, before → after): ascending 1M 169.6 → 117.3 ms
+(−31%), random 1M 994.6 → 350.9 ms (**−65%, ~2.8× faster**); random 100K 47.4 → 14.0 ms (−70%).
+The immutable arm was unaffected (−2%/−6%, noise). Snapshot safety of the shared-sibling path is
+pinned by `remove_mut_merge_under_snapshot_preserves_isolation` (deletes a 3000-key contiguous
+prefix while a snapshot holds the merged siblings) and `remove_mut_preserves_snapshot_isolation`.
 
 ## 6. Notes / limitations
 
@@ -137,11 +157,13 @@ rarer than delete's rebalancing.
   hot path by adding a full traversal per delete (and would triple `Table`'s traversal count).
   A single-pass in-place delete fundamentally cannot avoid make-mut-before-descend on the
   internal-miss case without a presence pre-check.
-- **Rebalance sibling clone (future micro-opt).** The reused `rotate_*`/`merge_*` helpers still
-  rebuild the two involved sibling nodes by cloning. This fires only on `MIN_KEYS` underflow, so
-  it is amortized-rare, but it is the main reason the random-delete win is smaller than
-  ascending. In-place sibling rebalancing (via `split_at_mut` + `make_mut` on the siblings) is a
-  plausible follow-up if delete-heavy random workloads show up in profiles.
+- **Rebalance sibling clone — DONE (§5.1).** The `rotate_*`/`merge_*` helpers now mutate the two
+  involved sibling nodes in place (`Arc::make_mut` / `Arc::try_unwrap` + `split_at_mut`) instead
+  of cloning them. This was the main reason the random-delete win was smaller than ascending;
+  eliminating it gave random-delete a further ~2.8× (see §5.1). The fanout experiment
+  (`docs/superpowers/specs/2026-07-08-btree-optimization-candidates.md` §Tier 2.2) had flagged
+  this as the prerequisite for any future `T` increase, since the old sibling clone made large
+  fanout degrade delete badly.
 - **Immutable `remove` is retained** — `remove_mut` is strictly additive. The delete algorithm,
   `MIN_KEYS`, and rebalance semantics are unchanged; only the allocation discipline differs,
   which the persistent structure makes observationally identical.
