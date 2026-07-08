@@ -19,11 +19,12 @@ lean_lib «EntrySpecs»
 lean_lib «RemoveSpecs»
 lean_lib «TransportLemmas»
 lean_lib «BalancedInvariant»
+lean_lib «MinKeysInvariant»
 lean_lib «RemoveRebalance»
 lean_lib «RemoveInv»
 lean_lib «RemoveFlatten»
 lean_lib «RemoveGet»
-lean_lib «RemoveFrame»
+lean_lib «RemoveTotalCore»
 
 @[default_target]
 lean_lib «BtreeProofs»
@@ -36,3 +37,9 @@ lean_lib «BtreeInsertGet»
 
 @[default_target]
 lean_lib «BtreeInsertFrame»
+
+@[default_target]
+lean_lib «RemoveFrame»
+
+@[default_target]
+lean_lib «RemoveTotal»
