@@ -1,0 +1,20 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Local config (copy from the *.example templates)
+terraform.tfvars
+.env
+
+# Generated inventory + keys
+inventory/hosts.yml
+*.pem
+
+# Ansible
+ansible/*.retry
+
+# Collected results
+bench-out/
