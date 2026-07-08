@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use ultima_db::{CommitWaiter, Error, IsolationLevel, Store, StoreConfig, WriterMode};
+use ultima_db::{CommitWaiter, Error, IndexKind, IsolationLevel, Store, StoreConfig, WriterMode};
 
 #[derive(Parser)]
 #[command(about = "Generate an Elle list-append history from UltimaDB MultiWriter transactions")]
@@ -47,6 +47,9 @@ struct Args {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ElleRow {
+    /// Static bucket, assigned once at seed (`i % buckets`), never mutated.
+    /// Indexed for predicate reads.
+    bucket: u64,
     list: Vec<u64>,
 }
 
@@ -144,6 +147,7 @@ fn edn_event(index: usize, e: &Event) -> String {
     )
 }
 
+#[derive(Debug)]
 enum TxnFail {
     /// WriteConflict at the write site or at commit: definitely not committed.
     Conflict(Option<CommitWaiter>),
@@ -163,10 +167,12 @@ fn run_txn(store: &Store, ops: &[Op], scan: bool) -> Result<Vec<Op>, TxnFail> {
     let mut completed = Vec::with_capacity(ops.len());
     {
         let mut t = tx.open_table::<ElleRow>("elle").map_err(TxnFail::Other)?;
-        // Scan mode reads the table up front; `local` is the transaction's own
-        // working copy so later reads observe earlier appends in this txn.
-        let mut local: std::collections::HashMap<u64, Vec<u64>> = if scan {
-            t.range(..).map(|(id, row)| (id, row.list.clone())).collect()
+        // Scan mode reads the whole table up front (registering the SSI coarse
+        // `table_scan` read) into a local working copy so later reads observe
+        // earlier appends in this txn. The copy carries the full row so appends
+        // preserve the (static) `bucket`.
+        let mut local: std::collections::HashMap<u64, ElleRow> = if scan {
+            t.range(..).map(|(id, row)| (id, row.clone())).collect()
         } else {
             std::collections::HashMap::new()
         };
@@ -174,32 +180,24 @@ fn run_txn(store: &Store, ops: &[Op], scan: bool) -> Result<Vec<Op>, TxnFail> {
             match op {
                 Op::Read { key, .. } => {
                     let list = if scan {
-                        local.get(key).cloned().unwrap_or_default()
+                        local.get(key).map(|r| r.list.clone()).unwrap_or_default()
                     } else {
-                        match t.get(*key) {
-                            Some(row) => row.list.clone(),
-                            None => Vec::new(),
-                        }
+                        t.get(*key).map(|r| r.list.clone()).unwrap_or_default()
                     };
                     completed.push(Op::Read { key: *key, result: Some(list) });
                 }
                 Op::Append { key, value } => {
                     let next = if scan {
-                        // Read-modify-write against the local working copy; the
-                        // up-front scan already registered the read.
-                        let list = local.entry(*key).or_default();
-                        list.push(*value);
-                        list.clone()
+                        let row = local.get_mut(key).expect("scan seeds every key");
+                        row.list.push(*value);
+                        row.clone()
                     } else {
-                        // get() both fetches the list and registers the SSI point read.
-                        let mut list = match t.get(*key) {
-                            Some(row) => row.list.clone(),
-                            None => Vec::new(),
-                        };
-                        list.push(*value);
-                        list
+                        // get() both fetches the row and registers the SSI point read.
+                        let mut row = t.get(*key).cloned().expect("seeded key exists");
+                        row.list.push(*value);
+                        row
                     };
-                    match t.update(*key, ElleRow { list: next }) {
+                    match t.update(*key, next) {
                         Ok(()) => completed.push(op.clone()),
                         Err(Error::WriteConflict { wait_for, .. }) => {
                             return Err(TxnFail::Conflict(wait_for));
@@ -244,6 +242,34 @@ impl Shared {
             .unwrap()
             .push(Event { typ, process, time_ns, value });
     }
+}
+
+fn build_store(isolation: IsolationLevel) -> Store {
+    Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(isolation)
+            .build(),
+    )
+    .expect("store construction")
+}
+
+/// Seed `keys` rows with round-robin buckets (`ids[i]` has bucket `i % buckets`)
+/// and define the non-unique `"bucket"` index. Returns row ids in seed order.
+fn seed(store: &Store, keys: usize, buckets: usize) -> Vec<u64> {
+    let mut tx = store.begin_write(None).expect("setup begin_write");
+    let ids = {
+        let mut t = tx.open_table::<ElleRow>("elle").expect("setup open_table");
+        let rows: Vec<ElleRow> = (0..keys)
+            .map(|i| ElleRow { bucket: (i % buckets) as u64, list: Vec::new() })
+            .collect();
+        let ids = t.insert_batch(rows).expect("setup insert_batch");
+        t.define_index("bucket", IndexKind::NonUnique, |r: &ElleRow| r.bucket)
+            .expect("setup define_index");
+        ids
+    };
+    tx.commit().expect("setup commit");
+    ids
 }
 
 fn worker(shared: &Shared, args: &Args, process: usize) {
@@ -303,26 +329,12 @@ fn main() {
         }
     };
 
-    let store = Store::new(
-        StoreConfig::builder()
-            .writer_mode(WriterMode::MultiWriter)
-            .isolation_level(isolation)
-            .build(),
-    )
-    .expect("store construction");
+    let store = build_store(isolation);
 
     // Pre-seed the keyspace: TableWriter has no insert-at-key, and update()
     // requires the key to exist, so the workload is pure get+update.
-    let keys = {
-        let mut tx = store.begin_write(None).expect("setup begin_write");
-        let ids = {
-            let mut t = tx.open_table::<ElleRow>("elle").expect("setup open_table");
-            t.insert_batch(vec![ElleRow { list: Vec::new() }; args.keys])
-                .expect("setup insert_batch")
-        };
-        tx.commit().expect("setup commit");
-        ids
-    };
+    // TODO(task3): swap the hardcoded `4` for `args.buckets`.
+    let keys = seed(&store, args.keys, 4);
 
     let shared = Arc::new(Shared {
         store,
@@ -484,7 +496,7 @@ mod tests {
             let mut tx = store.begin_write(None).unwrap();
             let id = {
                 let mut t = tx.open_table::<ElleRow>("elle").unwrap();
-                t.insert(ElleRow { list: vec![] }).unwrap()
+                t.insert(ElleRow { bucket: 0, list: vec![] }).unwrap()
             };
             tx.commit().unwrap();
             id
@@ -507,5 +519,37 @@ mod tests {
             Op::Read { result: Some(l), .. } => assert_eq!(l, &vec![100, 200]),
             other => panic!("expected read of [100, 200], got {other:?}"),
         }
+    }
+
+    #[test]
+    fn point_append_preserves_bucket_and_index_membership() {
+        let store = build_store(IsolationLevel::SnapshotIsolation);
+        let ids = seed(&store, 3, 3); // ids[1] has bucket 1
+
+        let ops = vec![Op::Append { key: ids[1], value: 5 }];
+        run_txn(&store, &ops, false).expect("uncontended append commits");
+
+        let mut tx = store.begin_write(None).unwrap();
+        let t = tx.open_table::<ElleRow>("elle").unwrap();
+        assert_eq!(t.get(ids[1]).unwrap().bucket, 1, "append must not change bucket");
+        let bucket1: Vec<u64> =
+            t.get_by_index("bucket", &1u64).unwrap().iter().map(|(id, _)| *id).collect();
+        assert!(bucket1.contains(&ids[1]), "row must still be in its bucket after append");
+    }
+
+    #[test]
+    fn seed_assigns_round_robin_buckets_and_indexes_them() {
+        use std::collections::BTreeSet;
+        let store = build_store(IsolationLevel::Serializable);
+        let ids = seed(&store, 6, 3); // buckets: 0,1,2,0,1,2
+
+        let mut tx = store.begin_write(None).unwrap();
+        let t = tx.open_table::<ElleRow>("elle").unwrap();
+        let bucket0: BTreeSet<u64> =
+            t.get_by_index("bucket", &0u64).unwrap().iter().map(|(id, _)| *id).collect();
+        assert_eq!(bucket0, BTreeSet::from([ids[0], ids[3]]));
+        let bucket2: BTreeSet<u64> =
+            t.get_by_index("bucket", &2u64).unwrap().iter().map(|(id, _)| *id).collect();
+        assert_eq!(bucket2, BTreeSet::from([ids[2], ids[5]]));
     }
 }
