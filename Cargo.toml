@@ -98,6 +98,10 @@ name = "btree_insert_mut_bench"
 harness = false
 
 [[bench]]
+name = "btree_remove_mut_bench"
+harness = false
+
+[[bench]]
 name = "table_insert_e2e_bench"
 harness = false
 
