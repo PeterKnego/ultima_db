@@ -12,7 +12,7 @@ Along the way we built a compile-feedback harness for **Leanstral** (Mistral's s
 
 Final integrity check: `#print axioms` on the top-level theorem reports only `propext`, `Classical.choice`, `Quot.sound` — Lean's three standard axioms. No `sorry` anywhere in the chain.
 
-*A third session (also 2026-07-07) extended this to the full mutating API: **`remove` is now machine-checked to behave exactly as a map deletion** (invariant preservation + `get k = none` + frame), with two findings that make deletion the more interesting story — the proof forced a strictly stronger invariant because the naive theorem is literally false, and the rebalancing turned out to be provably "flatten-invariant." See Part IV (§5).*
+*A third session (2026-07-07 onward) extended this to the full mutating API: **`remove` is now machine-checked to behave exactly as a map deletion** (invariant preservation + `get k = none` + frame) **and to never fail on a well-formed tree** (`remove_total`). Deletion is the more interesting story — the proof forced a strictly stronger invariant because the naive theorem is literally false; the rebalancing turned out to be provably "flatten-invariant"; and totality collapsed to an almost length-only argument once the right (weak) invariant was isolated. See Part IV (§5).*
 
 ---
 
@@ -189,9 +189,17 @@ The headline. `NodeInv`/`Aligned` encode sortedness, child-interval alignment, a
 
 Real, insert-built trees are never height-mixed — but the *invariant admits them*, and the proof cannot proceed until they're excluded. This is exactly the kind of gap testing never surfaces (no insert sequence ever builds such a tree) and a proof cannot paper over. The fix is an additive height-uniformity predicate `HeightInv` (a mutual inductive with `ChildrenHeight`, `BalancedInvariant.lean`) carried alongside `NodeInv` through every remove lemma; `merge`'s surgery lemma now *requires* both children at the same height. It doesn't touch the insert proofs. Discovering that the invariant you've been carrying is too weak to even *state* your next theorem is the verification dividend in miniature — and it was surfaced by the orchestrator reading the existing lemmas before dispatching the surgery work, not after a failed proof.
 
-### 5.3 Honest scoping: conditional on success, not total
+### 5.3 Honest scoping — then closing the gap with totality
 
-Even with `HeightInv`, `NodeInv ∧ HeightInv` still admit a *degenerate* case: a 0-entry internal node (one child, no separator). `fix_underfull_child` on such a parent indexes an empty entry vector and the kernel legitimately **fails** (`Result.fail`). So — unlike the insert theorems, which are total WP triples that double as no-panic proofs — the remove theorems are stated **conditional on the kernel returning `ok`**: *whenever remove succeeds, the result is well-formed and behaves as a deletion.* Proving remove *total* (never fails on a well-formed tree) needs the full B-tree balance invariant — the MIN_KEYS lower bound (every non-root node ≥ T−1 entries) — threaded through the rebalancers, which is the clean next increment. Neatly, the nonempty precondition the rebalance lemmas need is *derived from* the success hypothesis rather than assumed (`fix_underfull_child_ok_pos`: every reachable branch indexes `entries`, so `ok` ⇒ nonempty).
+Even with `HeightInv`, `NodeInv ∧ HeightInv` still admit a *degenerate* case: a 0-entry internal node (one child, no separator). `fix_underfull_child` on such a parent indexes an empty entry vector and the kernel legitimately **fails** (`Result.fail`). So `remove_inv`/`remove_get`/`remove_frame` are stated **conditional on the kernel returning `ok`**: *whenever remove succeeds, the result is well-formed and behaves as a deletion.*
+
+A follow-on pass **closed that gap** — `remove_total`: under the full B-tree balance invariant (the MIN_KEYS lower bound, every non-root node ≥ T−1 = 31 entries; `MinKeysInvariant.lean`), `remove` provably returns `ok`, and `remove_spec` packages this with the properties into an unconditional statement. Three things made totality far cheaper than re-proving correctness:
+
+- **Totality is almost a length-only property.** `fix_underfull_child` returns `ok` from alignment (`#children = #entries + 1`) and nonemptiness (`0 < #entries`) alone — rotation only fires against a sibling with `> MIN_KEYS ≥ 1` entries, a merge only reads the separator. And `replace_child`/`replace_entry` preserve counts, so the node assembled after a recursive call inherits alignment and nonemptiness from the *original* node. The upshot: the delete recursion's induction hypothesis needs only **existence** of the recursive result, not its correctness.
+- **It doesn't even need `HeightInv`.** Merging mixed-height children still *returns* `ok` (it concatenates child lists); height-uniformity is purely a *correctness* concern. So the returns-`ok` core threads only `NodeInv` (for alignment) and a lightweight "nonempty nodes" invariant.
+- **One machine-capacity wrinkle.** Aeneas models `Vec α` with the invariant `length ≤ Usize.max` (not `<`), so pure length facts don't rule out overflow at absolute machine capacity — a `push` on a max-length vector genuinely fails. The rebalancers therefore carry small capacity caps (`… ≤ Usize.max`), each trivially discharged once the ≤ 63 arity from `NodeInv` is in scope. A reminder that "obviously total" still has to be *proved* total, boundary and all.
+
+Neatly, the nonempty precondition the rebalance lemmas need had *already* been extracted in the conditional proof, but backwards — `fix_underfull_child_ok_pos` derives "the node was nonempty" *from* the fact the fix succeeded; totality simply supplies that fact *up front* from the MIN_KEYS invariant instead.
 
 ### 5.4 The elegant part: rebalancers are flatten-invariant
 
@@ -217,9 +225,9 @@ The honest caveat is the **twin-code gap**: we verified a port with five documen
 
 **Update (day 2, final):** the frame property is also proved — `BTree.insert_frame`: `insert k v` leaves `get k'` unchanged for every `k' ≠ k` (1,200 further lines incl. bracket-transport lemmas for median insertion). Together, `insert_inv` + `insert_get` + `insert_frame` constitute **complete functional correctness of insertion**: the translated B-tree insert behaves exactly as a map update, machine-checked.
 
-**Update (session 3):** the same three-part completeness now holds for **deletion** — `remove_inv` + `remove_get` + `remove_frame` (Part IV, §5). So both mutating operations of the B-tree are machine-checked to behave as the corresponding map operations. Cumulative verified Lean: ~10,000 hand-written lines, ~240 theorems (the deletion half alone is ~5,400 lines / ~150 theorems — larger than all of insertion).
+**Update (session 3):** the same three-part completeness now holds for **deletion** — `remove_inv` + `remove_get` + `remove_frame` (Part IV, §5), and a follow-on pass proved **`remove_total`** (`remove` never fails on a well-formed tree, under the MIN_KEYS balance invariant) plus the unconditional **`remove_spec`** (§5.3). So both mutating operations of the B-tree are machine-checked to behave as the corresponding map operations, deletion now including a no-panic/no-fail guarantee. Cumulative verified Lean: ~11,000 hand-written lines, ~260 theorems (the deletion half alone is ~6,200 lines / ~170 theorems — larger than all of insertion).
 
-What this does *not* cover (roadmap, in value order): **totality of `remove`** (the theorems are conditional on the kernel returning `ok`; making remove provably non-failing needs the MIN_KEYS balance invariant — §5.3); range iterators; and everything concurrent — the MultiWriter OCC merge protocol, commit-version promotion ordering, WAL recovery. Those last three are out of Aeneas's scope (its unsafe/concurrency support is future work) and need hand-written protocol models — where the model-fidelity gap returns and the payoff is arguably even higher.
+What this does *not* cover (roadmap, in value order): closure of the balanced class under `remove` (the result also satisfies MIN_KEYS — the arithmetic-heavy preservation direction, not needed for totality); range iterators; and everything concurrent — the MultiWriter OCC merge protocol, commit-version promotion ordering, WAL recovery. Those last three are out of Aeneas's scope (its unsafe/concurrency support is future work) and need hand-written protocol models — where the model-fidelity gap returns and the payoff is arguably even higher.
 
 ### 6.2 For the "AI + formal methods" story
 
@@ -262,6 +270,9 @@ formal/proofs/                       # lake package: everything below
     RemoveFlatten.lean               # in-order flatten + get_flatten + rebalancer flatten-invariance
     RemoveGet.lean                   # BTree.remove_get
     RemoveFrame.lean                 # delete_from_node_flatten, BTree.remove_frame
+    MinKeysInvariant.lean            # NE/NERoot + MinArity/MinKeysInv (balance invariant)
+    RemoveTotalCore.lean             # length-only rebalancer totality (rotate/merge/fix return ok)
+    RemoveTotal.lean                 # delete_from_node_total, BTree.remove_total, BTree.remove_spec
 ~/ultima/leanstral-demo/             # Leanstral experiments incl. drive.py harness (outside repo)
 ```
 (The `Agent*.lean` names in the narrative above were the working names of the
@@ -278,12 +289,13 @@ cp BtreeKernel.lean ../proofs/
 cd ../proofs && lake build                        # checks every theorem
 ```
 
-Integrity check (all six top-level theorems report the same three axioms):
+Integrity check (all eight top-level theorems report the same three axioms):
 ```lean
 import BtreeInsertInv; import BtreeInsertGet; import BtreeInsertFrame
-import RemoveInv;      import RemoveGet;      import RemoveFrame
+import RemoveInv;      import RemoveGet;      import RemoveFrame; import RemoveTotal
 #print axioms btree_kernel.BTree.insert_inv    -- insert_get, insert_frame
 #print axioms btree_kernel.BTree.remove_inv    -- remove_get, remove_frame
+#print axioms btree_kernel.BTree.remove_total  -- remove_spec
 -- each: depends on axioms: [propext, Classical.choice, Quot.sound]
 ```
 
@@ -310,4 +322,18 @@ theorem BTree.remove_frame (t t' : BTree) (key k' : Std.U64) (hne : k'.val ≠ k
     (hinv : BTreeInv t) (hbal : BTreeBalanced t)
     (hok : BTree.remove t key = ok (some t')) :
     t'.get k' = t.get k'
+
+-- Totality (§5.3). MinKeysInv t := BalancedRoot t.root (every non-root node ≥ 31 entries).
+theorem BTree.remove_total (t : BTree) (key : Std.U64)
+    (hinv : BTreeInv t) (hbal : BTreeBalanced t) (hmin : MinKeysInv t)
+    (hlen : 0 < t.len.val) :
+    ∃ r, BTree.remove t key = ok r
+
+-- Unconditional spec: absent, or a valid balanced tree with the key gone.
+theorem BTree.remove_spec (t : BTree) (key : Std.U64)
+    (hinv : BTreeInv t) (hbal : BTreeBalanced t) (hmin : MinKeysInv t)
+    (hlen : 0 < t.len.val) :
+    BTree.remove t key = ok none ∨
+    ∃ t', BTree.remove t key = ok (some t') ∧
+      BTreeInv t' ∧ BTreeBalanced t' ∧ t'.get key = ok none
 ```

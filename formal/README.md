@@ -17,30 +17,34 @@ all sorry-free, `#print axioms` = `propext, Classical.choice, Quot.sound` only:
 | `BTree.remove_inv` (`RemoveInv.lean`) | remove preserves the ordering invariant **and** height-uniformity (`HeightInv`), through rotate/merge rebalancing and root collapse |
 | `BTree.remove_get` (`RemoveGet.lean`) | `get k` after `remove k` returns `none` |
 | `BTree.remove_frame` (`RemoveFrame.lean`) | `get k'` is unchanged for every `k' ≠ k` |
+| `BTree.remove_total` (`RemoveTotal.lean`) | `remove` never fails on a well-formed nonempty tree (`∃ r, remove k = ok r`) |
+| `BTree.remove_spec` (`RemoveTotal.lean`) | unconditional: `remove k` reports the key absent, or returns a valid balanced tree with `k` gone |
 
 Together: **insert behaves exactly as a map update, and remove exactly as a map
 deletion.** Because the Aeneas translation is total-with-explicit-effects, the
-insert theorems also rule out panics, overflow, and out-of-bounds indexing on
-the insert/get paths for any tree satisfying the invariant.
+theorems also rule out panics, overflow, and out-of-bounds indexing on the
+insert/get and (via `remove_total`) remove/rebalance paths for any tree
+satisfying the invariant.
 
 Two notes on the remove proofs:
 - The invariant is strengthened with a height-uniformity predicate (`HeightInv`,
   `BalancedInvariant.lean`). Bare `NodeInv`/`Aligned` permit a parent whose
   children have mixed leaf/internal status, on which `merge` is malformed — so
   height-uniformity is *required* to state remove-preserves-the-invariant truly.
-- The remove theorems are stated **conditional on the kernel returning `ok`**.
-  `NodeInv ∧ HeightInv` still admit pathological 0-entry internal nodes on which
-  `delete` legitimately fails; proving remove *total* would additionally need the
-  MIN_KEYS lower-bound invariant (not yet modeled).
+- `remove_inv`/`remove_get`/`remove_frame` are stated conditional on the kernel
+  returning `ok`, because `NodeInv ∧ HeightInv` still admit pathological 0-entry
+  internal nodes on which `delete` legitimately fails. `remove_total`
+  (`MinKeysInvariant.lean`) closes that gap: under the MIN_KEYS balance invariant
+  (every non-root node ≥ 31 entries), `remove` provably returns `ok`, and
+  `remove_spec` packages this with the properties into an unconditional statement.
 
 The remove-preserves-lookups proofs go through an in-order `flatten`
 characterization (`RemoveFlatten.lean`): `get` equals a lookup in the flattened
 key list, and every rebalancer (rotate/merge/fix) is flatten-invariant, so
 delete's only effect on lookups is dropping the deleted key.
 
-Not yet covered: range iterators; totality of remove (needs the MIN_KEYS
-invariant); anything concurrent (store/OCC/WAL — out of Aeneas scope; needs
-hand-written protocol models).
+Not yet covered: range iterators; anything concurrent (store/OCC/WAL — out of
+Aeneas scope; needs hand-written protocol models).
 
 ## Layout
 
@@ -52,12 +56,13 @@ hand-written protocol models).
   `make test/formal-kernel`). Excluded from the cargo workspace so Charon
   owns its build.
 - `proofs/` — the lake package: `BtreeKernel.lean` (generated),
-  `BtreeInvariant.lean` + `BalancedInvariant.lean` (invariant definitions),
-  helper-lemma modules (`FindPosSpec`, `EntrySpecs`, `ChildrenSpecs`,
-  `ListLemmas`, `AlignedLemmas`, `TransportLemmas`, `RemoveSpecs`), the
-  rebalance surgery (`RemoveRebalance.lean`), the in-order flatten foundation
-  (`RemoveFlatten.lean`), and the theorem files (`BtreeInsert{Inv,Get,Frame}`,
-  `Remove{Inv,Get,Frame}`).
+  `BtreeInvariant.lean` + `BalancedInvariant.lean` + `MinKeysInvariant.lean`
+  (invariant definitions), helper-lemma modules (`FindPosSpec`, `EntrySpecs`,
+  `ChildrenSpecs`, `ListLemmas`, `AlignedLemmas`, `TransportLemmas`,
+  `RemoveSpecs`), the rebalance surgery (`RemoveRebalance.lean`), the length-only
+  rebalancer-totality lemmas (`RemoveTotalCore.lean`), the in-order flatten
+  foundation (`RemoveFlatten.lean`), and the theorem files
+  (`BtreeInsert{Inv,Get,Frame}`, `Remove{Inv,Get,Frame}`, `RemoveTotal`).
 - `WRITEUP.md` — the full narrative (methodology, Leanstral evaluation,
   Lean-engineering findings).
 
@@ -106,7 +111,8 @@ regenerating.
   matching `formal/` change. For a change outside the verified surface (e.g.
   range iterators, comments, an unrelated method), acknowledge it with
   `ACK_NO_FORMAL=1` locally, or `[skip-formal-drift]` in the PR title.
-- No `sorry` may be committed; verify with `#print axioms` on the six top-level
-  theorems `btree_kernel.BTree.{insert,remove}_{inv,get,frame}` — only the three
-  standard Lean axioms are acceptable. The scheduled `lean` CI job (weekly +
-  `workflow_dispatch`) rebuilds the proofs and re-runs this check.
+- No `sorry` may be committed; verify with `#print axioms` on the top-level
+  theorems `btree_kernel.BTree.{insert,remove}_{inv,get,frame}` plus
+  `BTree.remove_total` / `BTree.remove_spec` — only the three standard Lean
+  axioms are acceptable. The scheduled `lean` CI job (weekly + `workflow_dispatch`)
+  rebuilds the proofs and re-runs this check.

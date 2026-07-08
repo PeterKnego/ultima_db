@@ -59,12 +59,15 @@ jobs:
           import RemoveInv
           import RemoveGet
           import RemoveFrame
+          import RemoveTotal
           #print axioms btree_kernel.BTree.insert_inv
           #print axioms btree_kernel.BTree.insert_get
           #print axioms btree_kernel.BTree.insert_frame
           #print axioms btree_kernel.BTree.remove_inv
           #print axioms btree_kernel.BTree.remove_get
           #print axioms btree_kernel.BTree.remove_frame
+          #print axioms btree_kernel.BTree.remove_total
+          #print axioms btree_kernel.BTree.remove_spec
           EOF
           lake env lean _AxiomCheck.lean 2>&1 | tee _axioms.txt
           rm -f _AxiomCheck.lean

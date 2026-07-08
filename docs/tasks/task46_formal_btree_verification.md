@@ -26,12 +26,18 @@ build/regeneration and `formal/WRITEUP.md` for the full narrative.
    root-collapse rebalancing.
 5. **`BTree.remove_get`** — `get k` after `remove k` = `ok none`.
 6. **`BTree.remove_frame`** — `get k'` unchanged for all `k' ≠ k`.
+7. **`BTree.remove_total`** — `remove` never fails on a well-formed nonempty
+   tree (`∃ r, remove k = ok r`), under the MIN_KEYS balance invariant.
+8. **`BTree.remove_spec`** — the unconditional statement combining 4–7:
+   `remove k` reports the key absent, or returns a valid balanced tree with `k`
+   gone.
 
 Together (1–3) say insert behaves exactly as a map update, and (4–6) say remove
 behaves exactly as a map deletion. The insert theorems are total (the Aeneas
 `Result` monad makes no-panic/overflow/OOB part of the statement for
-invariant-satisfying trees); the remove theorems are conditional on the kernel
-returning `ok` (see "Remove-specific decisions").
+invariant-satisfying trees); 4–6 are conditional on the kernel returning `ok`,
+and `remove_total` (7) discharges that condition under the MIN_KEYS invariant,
+so `remove_spec` (8) is unconditional (see "Remove-specific decisions").
 
 ## Remove-specific decisions
 
@@ -42,13 +48,21 @@ returning `ok` (see "Remove-specific decisions").
   (`BalancedInvariant.lean`, a mutual inductive with `ChildrenHeight`) is
   carried alongside `NodeInv` through every remove proof; it is additive and
   does not touch the insert proofs.
-- **Conditional on success, not total.** `NodeInv ∧ HeightInv` still admit
-  pathological 0-entry internal nodes on which `fix_underfull_child` indexes an
-  empty entry vector and `delete` legitimately fails. The theorems therefore
-  read "if the kernel returns `ok`, the result is well-formed / behaves as a
-  deletion." Totality would additionally need the MIN_KEYS lower-bound invariant
-  (future work). The nonempty precondition of the rebalance lemmas is *derived
-  from* that success (`fix_underfull_child_ok_pos`).
+- **Conditional on success — then discharged by totality.** `NodeInv ∧ HeightInv`
+  still admit pathological 0-entry internal nodes on which `fix_underfull_child`
+  indexes an empty entry vector and `delete` legitimately fails, so `remove_inv`/
+  `remove_get`/`remove_frame` read "if the kernel returns `ok`, …". `remove_total`
+  (`MinKeysInvariant.lean`, `RemoveTotal.lean`) closes this: the MIN_KEYS balance
+  invariant (every non-root node ≥ 31 entries) rules out those nodes, and `remove`
+  provably returns `ok`. Key facts that made totality tractable: (a) it is almost
+  a *length-only* property — `fix_underfull_child` returns `ok` from alignment +
+  nonemptiness alone, so the delete recursion's induction hypothesis needs only
+  *existence* of sub-results, not their correctness; (b) it does not even need
+  `HeightInv` for the returns-`ok` core (merging mixed-height children still
+  *returns* `ok` — height-uniformity is only about correctness). The one wrinkle:
+  Aeneas's `Vec` invariant is `length ≤ Usize.max`, so the rebalancers also carry
+  machine-capacity caps, all discharged once arity ≤ 63 is in scope. `remove_spec`
+  packages totality with the properties into an unconditional statement.
 - **Lookups via an in-order `flatten`.** Rather than track `get` through each
   rebalancer, `RemoveFlatten.lean` proves `get_in_node` equals a lookup in the
   in-order flattened key list and that every rebalancer (rotate/merge/fix) is
@@ -96,10 +110,11 @@ std functions, e.g. `Vec::is_empty` — use `len() == 0`).
 
 ## Limitations / next steps
 
-- Totality of `remove`: the theorems are conditional on the kernel returning
-  `ok`. Proving `remove` never fails on a well-formed tree needs the MIN_KEYS
-  lower-bound invariant (every non-root node ≥ T−1 entries) threaded through the
-  rebalancers — the natural next strengthening.
+- `remove` totality is now proven (`remove_total`, under the MIN_KEYS invariant).
+  A natural further strengthening: prove the balanced class is *closed* under
+  `remove` (the result still satisfies MIN_KEYS), i.e. remove maps proper B-trees
+  to proper B-trees — the arithmetic-heavy preservation direction, not needed for
+  totality but completing the algebraic picture.
 - Range iterators unverified.
 - Concurrency (MultiWriter OCC merge, promotion ordering, WAL recovery) is
   out of Aeneas scope — needs hand-written protocol models.
