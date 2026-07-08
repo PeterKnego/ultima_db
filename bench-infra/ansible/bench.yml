@@ -12,3 +12,4 @@
       ansible.builtin.setup:
   roles:
     - run
+    - collect

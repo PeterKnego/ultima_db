@@ -1,0 +1,20 @@
+---
+- name: Compute run timestamp (once)
+  ansible.builtin.command: date +%Y%m%dT%H%M%SZ
+  register: run_ts
+  run_once: true
+  changed_when: false
+
+- name: Fetch results to local bench-out/dist/<ts>
+  ansible.posix.synchronize:
+    mode: pull
+    src: "{{ remote_home }}/results/"
+    dest: "{{ results_local_dir }}/{{ run_ts.stdout }}/"
+    rsync_opts:
+      - "--mkpath"   # create dest parent dirs (rsync only makes the leaf otherwise)
+  changed_when: true
+
+- name: Report collected location
+  ansible.builtin.debug:
+    msg: "Results pulled to {{ results_local_dir }}/{{ run_ts.stdout }}/"
+  run_once: true
