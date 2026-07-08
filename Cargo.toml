@@ -101,6 +101,10 @@ harness = false
 name = "table_insert_e2e_bench"
 harness = false
 
+[[bench]]
+name = "ycsb_bulk_load_ultima_batch_bench"
+harness = false
+
 [[example]]
 name = "profile_commit"
 required-features = ["persistence"]
