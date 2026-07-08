@@ -30,11 +30,13 @@
   register: rustc_version
   changed_when: false
 
-- name: Record git rev of the synced tree (best-effort)
-  ansible.builtin.command: "git -C {{ ud_src_dir }} rev-parse --short HEAD"
+- name: Record git rev of the local tree being synced (provenance; best-effort)
+  ansible.builtin.command: "git -C {{ ud_local_path }} rev-parse --short HEAD"
   register: ud_git_rev
   changed_when: false
   failed_when: false
+  delegate_to: localhost
+  become: false
 
 - name: Run competitor YCSB matrix
   when: bench_target == "competitor"
@@ -90,5 +92,5 @@
       mem_mb={{ ansible_memtotal_mb | default('?') }}
       kernel={{ ansible_kernel }}
       rustc={{ rustc_version.stdout | default('n/a') }}
-      ud_git_rev={{ ud_git_rev.stdout | default('n/a') }}
+      ud_git_rev={{ ud_git_rev.stdout | default('n/a', true) }}
       bench_dir={{ bench_dir }}
