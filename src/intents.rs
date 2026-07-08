@@ -141,17 +141,11 @@ impl std::fmt::Debug for CommitWaiter {
 
 type IntentKey = (String, u64);
 
-/// Per-key state in the intent table.
-///
-/// `holder == 0` is a sentinel meaning "no active holder, but successors
-/// are queued": released by a prior holder with more waiters in line, not
-/// yet claimed by the signaled successor. Any writer that sees holder=0
-/// may claim the entry in place without being queued — effectively
-/// granting the lock to whoever gets there first, which is fine because
-/// `release_all_for` already signaled exactly one successor.
-///
-/// Writer ids are assigned via `fetch_add` starting at 1, so 0 is always
-/// a safe sentinel; `SingleWriter` mode never creates intent entries.
+/// Per-key state in the intent table. `holder` is the writer id currently
+/// owning `(table, id)`; `queue` holds the waiters that conflicted with it.
+/// `release_all_for` always empties the queue (waking every waiter) and
+/// removes the entry, so `holder` is only ever a live writer id (≥1) — there
+/// is no "no holder but queued" transitioning state.
 struct IntentEntry {
     holder: u64,
     queue: VecDeque<Arc<IntentWaiter>>,
@@ -173,11 +167,11 @@ pub(crate) struct IntentMap {
 impl IntentMap {
     /// Try to claim `(table, id)` for `writer_id`.
     ///
-    /// - If vacant, or marked transitioning (holder=0): claim and return `Ok(())`.
+    /// - If vacant: claim and return `Ok(())`.
     /// - If held by `writer_id`: `Ok(())` (idempotent).
     /// - Otherwise: push `my_waiter` onto the holder's FIFO queue and
     ///   return `Err(my_waiter)`. The caller blocks on its own waiter
-    ///   until the holder releases and pops it from the queue.
+    ///   until the holder releases and wakes the queue.
     pub(crate) fn try_acquire(
         &self,
         table: &str,
@@ -190,10 +184,6 @@ impl IntentMap {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
                 let entry = e.get_mut();
                 if entry.holder == writer_id {
-                    Ok(())
-                } else if entry.holder == 0 {
-                    // Transitioning entry — no active holder. Claim it.
-                    entry.holder = writer_id;
                     Ok(())
                 } else {
                     entry.queue.push_back(Arc::clone(my_waiter));
@@ -210,46 +200,35 @@ impl IntentMap {
         }
     }
 
-    /// Release every intent held by `writer_id`. For each released key
-    /// with a non-empty waiter queue, signal exactly one successor (the
-    /// head). If more successors remain, mark the entry transitioning
-    /// (`holder = 0`) and keep the rest of the queue so they aren't lost.
-    /// If the queue is empty after the pop, remove the entry entirely.
+    /// Release every intent held by `writer_id`, waking **all** queued
+    /// waiters on each released key and removing the entry.
     ///
-    /// `_my_waiter` is kept in the signature for API compatibility but is
-    /// no longer self-signaled: in the fair-queue model, nobody waits on
-    /// the holder's own waiter — successors wait on their own.
+    /// Signalling only the head and keeping the rest queued (behind a
+    /// `holder = 0` "transitioning" entry) deadlocks: a queued waiter belongs
+    /// to a transaction that was already dropped before it began waiting
+    /// (drop-before-wait), so no waiter can be promoted to holder — it would
+    /// never release — and the leftover queue could only be drained by a
+    /// *future* acquirer touching the same key. If every other thread is
+    /// itself parked as such a waiter, no future acquirer exists and the
+    /// system hangs forever. Waking all contenders lets them re-race on
+    /// retry: whoever re-acquires the key first becomes the new holder and
+    /// the rest re-queue behind it. Not FIFO-fair, but liveness-safe — a
+    /// released key never leaves behind a waiter only a future acquirer
+    /// could reach.
+    ///
+    /// `_my_waiter` is kept in the signature for API compatibility; nobody
+    /// waits on the holder's own waiter (successors wait on their own).
     pub(crate) fn release_all_for(&self, writer_id: u64, _my_waiter: &IntentWaiter) {
-        // Collect successors first, then signal outside the DashMap
-        // retain closure so signal_done's downstream work (cvar notify +
-        // wake) doesn't happen under any bucket lock.
+        // Collect successors first, then signal outside the DashMap retain
+        // closure so signal_done's downstream work (cvar notify + wake)
+        // doesn't happen under any bucket lock.
         let mut to_signal: Vec<Arc<IntentWaiter>> = Vec::new();
         self.map.retain(|_k, entry| {
             if entry.holder != writer_id {
                 return true;
             }
-            match entry.queue.pop_front() {
-                Some(successor) => {
-                    if entry.queue.is_empty() {
-                        // Final successor; drop the entry. The signaled
-                        // successor's retry will either find the key free
-                        // and claim it, or find a new holder and queue up.
-                        to_signal.push(successor);
-                        false
-                    } else {
-                        // More waiters in line. Mark transitioning so the
-                        // signaled successor can claim via the holder=0
-                        // path without being cut in front of.
-                        entry.holder = 0;
-                        to_signal.push(successor);
-                        true
-                    }
-                }
-                None => {
-                    // No waiters; just remove.
-                    false
-                }
-            }
+            to_signal.extend(entry.queue.drain(..));
+            false
         });
         for w in to_signal {
             w.signal_done();
@@ -399,10 +378,10 @@ mod tests {
         assert_eq!(map.len(), 0, "entry should be fully removed");
     }
 
-    /// Release with multiple queued successors: signals only the head;
-    /// entry stays with holder=0 (transitioning) carrying remaining queue.
+    /// Release with multiple queued successors: signals ALL of them and
+    /// removes the entry (no orphaned waiters, no transitioning state).
     #[test]
-    fn release_with_multiple_waiters_signals_head_only() {
+    fn release_with_multiple_waiters_signals_all() {
         let map = IntentMap::default();
         let wa = IntentWaiter::new();
         let wb = IntentWaiter::new();
@@ -413,20 +392,16 @@ mod tests {
         assert_eq!(map.queue_len("t", 1), 2);
 
         map.release_all_for(100, &wa);
-        // Head (wb) was popped and signaled.
-        assert!(wb.is_signaled(), "head successor wb should be signaled");
-        assert!(
-            !wc.is_signaled(),
-            "queued successor wc should NOT be signaled yet"
-        );
-        // Entry still present with wc in queue.
-        assert_eq!(map.queue_len("t", 1), 1);
+        // Every queued successor is signaled; the entry is gone.
+        assert!(wb.is_signaled(), "successor wb should be signaled");
+        assert!(wc.is_signaled(), "successor wc should be signaled");
+        assert_eq!(map.len(), 0, "entry should be removed after release");
     }
 
-    /// A new acquirer arriving while the entry is in the transitioning
-    /// state (holder=0) claims it in place and preserves the queue.
+    /// After a release wakes the queue, a new acquirer finds the key vacant
+    /// and claims it fresh; the woken contenders re-race on retry.
     #[test]
-    fn new_acquirer_claims_transitioning_entry_and_preserves_queue() {
+    fn new_acquirer_after_release_claims_fresh() {
         let map = IntentMap::default();
         let wa = IntentWaiter::new();
         let wb = IntentWaiter::new();
@@ -435,17 +410,48 @@ mod tests {
         map.try_acquire("t", 1, 100, &wa).unwrap();
         let _ = map.try_acquire("t", 1, 200, &wb).unwrap_err();
         let _ = map.try_acquire("t", 1, 300, &wc).unwrap_err();
-        map.release_all_for(100, &wa); // wb signaled, entry holder=0, queue=[wc]
+        map.release_all_for(100, &wa); // wb and wc both signaled, entry removed
 
-        // Writer 400 arrives, claims the transitioning entry.
+        assert!(wb.is_signaled() && wc.is_signaled());
+        assert_eq!(map.len(), 0);
+
+        // A fresh acquirer claims the now-vacant key without being queued.
         map.try_acquire("t", 1, 400, &wd).unwrap();
-        assert_eq!(map.queue_len("t", 1), 1, "queue must survive the claim");
+        assert_eq!(map.queue_len("t", 1), 0);
+    }
 
-        // When 400 releases, wc (still queued) is signaled.
-        let wc_for_thread = Arc::clone(&wc);
-        let handle = std::thread::spawn(move || wc_for_thread.wait());
-        map.release_all_for(400, &wd);
-        handle.join().unwrap();
+    /// Root-cause regression (SSI+scan quiescence deadlock): when a holder
+    /// releases a key with MULTIPLE queued waiters, every queued waiter must
+    /// become signalable without requiring a *new* acquirer to touch the key.
+    /// Queued waiters belong to already-dropped transactions (drop-before-wait),
+    /// so a woken successor is under no obligation to re-acquire the key; if the
+    /// remainder of the queue could only be drained by a future acquirer, a
+    /// quiesced system (all threads parked as waiters) deadlocks forever.
+    #[test]
+    fn release_does_not_orphan_queued_waiters() {
+        let map = IntentMap::default();
+        let wa = IntentWaiter::new();
+        let wb = IntentWaiter::new();
+        let wc = IntentWaiter::new();
+        map.try_acquire("t", 1, 100, &wa).unwrap();
+        map.try_acquire("t", 1, 200, &wb).unwrap_err();
+        map.try_acquire("t", 1, 300, &wc).unwrap_err(); // queue = [wb, wc]
+
+        // Holder releases. No further try_acquire on ("t",1) will happen
+        // (simulating quiescence — every other thread is a parked waiter).
+        map.release_all_for(100, &wa);
+
+        // Both queued waiters must already be signaled. wait_timeout turns the
+        // deadlock into a bounded, observable failure instead of hanging the
+        // test runner.
+        assert!(
+            wb.wait_timeout_inner(Duration::from_secs(2)),
+            "head waiter wb must be signaled"
+        );
+        assert!(
+            wc.wait_timeout_inner(Duration::from_secs(2)),
+            "queued waiter wc must not be orphaned by the release"
+        );
     }
 
     #[test]
