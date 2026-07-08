@@ -3128,3 +3128,100 @@ fn table_reader_first_last_get_many_iter() {
     assert!(!table.is_empty());
     assert!(table.contains(first.0));
 }
+
+// ---------------------------------------------------------------------------
+// In-place insert (`BTree::insert_mut`) must not leak uncommitted writes to
+// concurrent reads. See docs/tasks/task48_btree_insert_mut.md.
+//
+// Since task48 the `Table` insert/update paths mutate the data B-tree in place
+// via `Arc::make_mut` instead of returning a fresh CoW tree. This test proves
+// that switch preserves snapshot isolation *end to end*: a reader that overlaps
+// in time with an uncommitted writer — one that has already applied in-place
+// overwrites and appends — sees only the last committed version, never the
+// writer's in-flight edits. The safety hinges on the writer's table being a
+// clone of the committed snapshot, so every shared spine node has refcount >= 2
+// and `make_mut` copies it before mutating rather than mutating in place.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uncommitted_insert_mut_invisible_to_concurrent_reader() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let store = Store::default();
+    const N: u64 = 1_000;
+
+    // Base: commit N rows so the writer opens a *populated* table. Row `id`
+    // (ids 1..=N) holds value `(id - 1) * 10`. This forces `insert_mut` down its
+    // copy-on-write branch — the whole spine is shared with the committed
+    // snapshot the writer clones from.
+    {
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<u64>("t").unwrap();
+        t.insert_batch((0..N).map(|i| i * 10).collect()).unwrap();
+        wtx.commit().unwrap();
+    }
+    let base_val = |id: u64| (id - 1) * 10;
+
+    // A reader opened *before* the writer even begins. Under repeatable read it
+    // must show the base version for its whole lifetime, even after the commit.
+    let rtx_before = store.begin_read(None).unwrap();
+
+    // Rendezvous: `mutated` releases the reader once the writer has applied its
+    // in-place edits (but before commit); `read_done` releases the writer to
+    // commit once the reader has verified isolation. Commit therefore
+    // strictly happens-after the reader's assertions.
+    let mutated = Arc::new(Barrier::new(2));
+    let read_done = Arc::new(Barrier::new(2));
+
+    let reader = {
+        let store = store.clone(); // O(1); Store: Send + Sync + Clone
+        let mutated = Arc::clone(&mutated);
+        let read_done = Arc::clone(&read_done);
+        thread::spawn(move || {
+            mutated.wait(); // writer has done its in-place mutations, uncommitted
+            let rtx = store.begin_read(None).unwrap();
+            let t = rtx.open_table::<u64>("t").unwrap();
+            // The writer's in-place overwrites and appends are invisible.
+            assert_eq!(t.len() as u64, N, "reader saw appended (uncommitted) rows");
+            assert_eq!(t.get(1), Some(&base_val(1)), "reader saw in-place overwrite");
+            assert_eq!(t.get(N), Some(&base_val(N)));
+            assert_eq!(t.get(N + 1), None, "appended row visible before commit");
+            read_done.wait(); // release the writer to commit
+        })
+    };
+
+    // Writer (this thread): overwrite every row in place (the `Ok(pos)` replace
+    // path of `insert_mut`) and append N new rows (the growth path). No commit.
+    let mut wtx = store.begin_write(None).unwrap();
+    {
+        let mut t = wtx.open_table::<u64>("t").unwrap();
+        for id in 1..=N {
+            t.update(id, 999_000 + id).unwrap(); // in-place value swap
+        }
+        t.insert_batch(vec![777u64; N as usize]).unwrap(); // append ids N+1..=2N
+        // Read-your-own-writes holds inside the transaction.
+        assert_eq!(t.get(1), Some(&999_001));
+        assert_eq!(t.len() as u64, 2 * N);
+    }
+    mutated.wait(); // signal the reader: edits applied
+    read_done.wait(); // wait until the reader has verified isolation
+    wtx.commit().unwrap(); // NOW flip visibility, atomically
+
+    reader.join().unwrap();
+
+    // The reader opened before the writer is unchanged — repeatable read.
+    {
+        let t = rtx_before.open_table::<u64>("t").unwrap();
+        assert_eq!(t.len() as u64, N);
+        assert_eq!(t.get(1), Some(&base_val(1)));
+        assert_eq!(t.get(N + 1), None);
+    }
+
+    // A fresh read sees the committed state.
+    let rtx_after = store.begin_read(None).unwrap();
+    let t = rtx_after.open_table::<u64>("t").unwrap();
+    assert_eq!(t.len() as u64, 2 * N);
+    assert_eq!(t.get(1), Some(&999_001));
+    assert_eq!(t.get(N + 1), Some(&777));
+}

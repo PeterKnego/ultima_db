@@ -383,6 +383,35 @@ impl BTree {
         }
     }
 
+    /// In-place insert; mutates `self` instead of returning a new tree.
+    /// (Mirror of `BTree::insert_mut` / `insert_arc_mut` in `src/btree.rs`.)
+    ///
+    /// # Delta from the real code
+    ///
+    /// The real `insert_mut` descends through `Arc::make_mut`, cloning a node
+    /// only when it is still shared with another snapshot (`strong_count > 1`)
+    /// and mutating it in place otherwise. That clone-if-shared branch is a
+    /// property of `Arc` reference counts; this kernel models nodes as
+    /// uniquely-owned `Box` (see the top-of-file note: "the Arcs are never
+    /// mutated through"), so the clone-vs-mutate distinction is invisible here
+    /// — every node on the path is simply produced fresh, exactly as in
+    /// `insert`. What survives the translation — and what `insert_mut`
+    /// guarantees at the value level — is that it mutates `self` into precisely
+    /// the tree [`insert`](BTree::insert) would return. So the faithful
+    /// functional mirror is that in-place assignment. The differential test
+    /// `insert_mut_matches_insert_and_std_btreemap` pins
+    /// `insert_mut ≡ insert ≡ std::collections::BTreeMap`.
+    ///
+    /// The copy-on-write / snapshot-isolation property that actually
+    /// distinguishes the two paths in the real code is a fact about `Arc`
+    /// sharing, out of the Aeneas-modeled surface (like store/OCC/WAL) and
+    /// covered instead by the concurrent-reader test
+    /// `uncommitted_insert_mut_invisible_to_concurrent_reader` in
+    /// `tests/store_integration.rs`.
+    pub fn insert_mut(&mut self, key: u64, val: u64) {
+        *self = self.insert(key, val);
+    }
+
     /// Remove `key`. Returns the new tree, or `None` if the key was absent
     /// (the `Err(KeyNotFound)` arm of `src/btree.rs`). (Mirror of `remove`.)
     pub fn remove(&self, key: u64) -> Option<BTree> {
@@ -741,6 +770,36 @@ mod tests {
         }
         for k in 0..512 {
             assert_eq!(tree.get(k), model.get(&k).copied(), "key {k}");
+        }
+    }
+
+    #[test]
+    fn insert_mut_matches_insert_and_std_btreemap() {
+        // `insert_mut` must mutate `self` into exactly the tree the immutable
+        // `insert` returns, and both must track `std::BTreeMap`. Drive the same
+        // key stream through all three; the key domain (700) is far smaller than
+        // the iteration count (3000), so this exercises many splits and repeated
+        // replaces of existing keys.
+        let mut model = BTreeMap::new();
+        let mut imm = BTree::new(); // immutable insert (returns a new tree)
+        let mut inp = BTree::new(); // in-place insert_mut (mutates self)
+        let mut x: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for _ in 0..3000 {
+            x = lcg(x);
+            let k = x % 700;
+            let v = x >> 32;
+            imm = imm.insert(k, v);
+            inp.insert_mut(k, v);
+            model.insert(k, v);
+            assert_eq!(inp.len, imm.len, "len: in-place vs immutable");
+            assert_eq!(inp.len, model.len(), "len: in-place vs std");
+        }
+        // Full observable equivalence over the whole key domain, absent keys
+        // included: in-place == immutable == std for every key.
+        for k in 0..700 {
+            let want = model.get(&k).copied();
+            assert_eq!(inp.get(k), want, "in-place vs std, key {k}");
+            assert_eq!(inp.get(k), imm.get(k), "in-place vs immutable, key {k}");
         }
     }
 

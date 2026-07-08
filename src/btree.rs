@@ -22,6 +22,20 @@ struct BTreeNode<K, V> {
     children: Vec<Arc<BTreeNode<K, V>>>,
 }
 
+// Manual `Clone` bounded on `K: Clone` only. A `#[derive(Clone)]` would add a
+// spurious `V: Clone` bound; here values live behind `Arc<V>` and children behind
+// `Arc<BTreeNode>`, so cloning a node only clones the keys and bumps refcounts —
+// `V` is never cloned. This impl is what makes `Arc::make_mut` usable on the
+// in-place insert path (`insert_mut`) without imposing `V: Clone` on callers.
+impl<K: Clone, V> Clone for BTreeNode<K, V> {
+    fn clone(&self) -> Self {
+        BTreeNode {
+            entries: self.entries.clone(),
+            children: self.children.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public BTree type
 // ---------------------------------------------------------------------------
@@ -144,6 +158,61 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                     root: new_root,
                     len: new_len,
                 }
+            }
+        }
+    }
+
+    /// In-place variant of [`insert`](Self::insert). Mutates `self` rather than
+    /// returning a new tree.
+    ///
+    /// # Why this exists (perf prototype, task: btree-insert-mut)
+    ///
+    /// The immutable `insert` allocates a fresh `Arc<BTreeNode>` for every node
+    /// on the root→leaf path on *every* call, because it cannot know whether any
+    /// node is shared with another snapshot. `insert_mut` descends with
+    /// [`Arc::make_mut`], which clones a node **only** when it is actually shared
+    /// (`strong_count > 1`) and otherwise mutates it in place. Copy-on-write, and
+    /// therefore snapshot isolation, is preserved exactly: a node still visible to
+    /// an older snapshot is cloned before mutation; a node uniquely owned by this
+    /// tree (e.g. one just created by a previous insert in a batch) is reused.
+    ///
+    /// The upshot: a batch of inserts into a privately-owned tree drops from
+    /// `O(height)` allocations + refcount traffic *per key* to near-zero when
+    /// successive keys share path nodes.
+    pub fn insert_mut(&mut self, key: K, val: V) {
+        self.insert_arc_mut(key, Arc::new(val));
+    }
+
+    /// In-place variant of [`insert_arc`](Self::insert_arc), reusing an existing
+    /// `Arc<V>`. See [`insert_mut`](Self::insert_mut) for the rationale.
+    pub fn insert_arc_mut(&mut self, key: K, val_arc: Arc<V>) {
+        match insert_into_node_mut(&mut self.root, key, val_arc) {
+            InsertOutcome::Fit { replaced } => {
+                if !replaced {
+                    self.len += 1;
+                }
+            }
+            InsertOutcome::Split {
+                median,
+                right,
+                replaced,
+            } => {
+                if !replaced {
+                    self.len += 1;
+                }
+                // Root split: the mutated `self.root` is now the left half.
+                // Lift it under a fresh root alongside the promoted median.
+                let left = std::mem::replace(
+                    &mut self.root,
+                    Arc::new(BTreeNode {
+                        entries: vec![],
+                        children: vec![],
+                    }),
+                );
+                self.root = Arc::new(BTreeNode {
+                    entries: vec![median],
+                    children: vec![left, right],
+                });
             }
         }
     }
@@ -519,6 +588,109 @@ fn maybe_split<K: Clone, V>(
             replaced,
         }
     }
+}
+
+/// Outcome of an in-place insert into a node (see `insert_into_node_mut`).
+///
+/// Unlike `InsertResult`, this does not carry the mutated node — the node is
+/// updated in place through the `&mut Arc<BTreeNode>` the caller passed. Only the
+/// promoted median + new right sibling (on split) and the replace/insert flag
+/// need to flow back up.
+enum InsertOutcome<K, V> {
+    Fit {
+        replaced: bool,
+    },
+    Split {
+        median: (K, Arc<V>),
+        right: Arc<BTreeNode<K, V>>,
+        replaced: bool,
+    },
+}
+
+/// In-place counterpart to `insert_into_node`. Descends through
+/// `Arc::make_mut`, so each node is cloned only if it is still shared with
+/// another snapshot (copy-on-write preserved) and otherwise mutated directly.
+fn insert_into_node_mut<K: Ord + Clone, V>(
+    node: &mut Arc<BTreeNode<K, V>>,
+    key: K,
+    val: Arc<V>,
+) -> InsertOutcome<K, V> {
+    // The one place CoW happens on this path: clones iff `node` is shared.
+    let n = Arc::make_mut(node);
+
+    match n.entries.binary_search_by(|(k, _)| k.cmp(&key)) {
+        Ok(pos) => {
+            // Replace existing value.
+            n.entries[pos] = (key, val);
+            InsertOutcome::Fit { replaced: true }
+        }
+        Err(pos) => {
+            if n.children.is_empty() {
+                // Leaf: insert and possibly split.
+                n.entries.insert(pos, (key, val));
+                match maybe_split_mut(n) {
+                    None => InsertOutcome::Fit { replaced: false },
+                    Some((median, right)) => InsertOutcome::Split {
+                        median,
+                        right,
+                        replaced: false,
+                    },
+                }
+            } else {
+                // Internal: recurse into child[pos], then absorb the result.
+                match insert_into_node_mut(&mut n.children[pos], key, val) {
+                    InsertOutcome::Fit { replaced } => InsertOutcome::Fit { replaced },
+                    InsertOutcome::Split {
+                        median,
+                        right,
+                        replaced,
+                    } => {
+                        n.entries.insert(pos, median);
+                        n.children.insert(pos + 1, right);
+                        match maybe_split_mut(n) {
+                            None => InsertOutcome::Fit { replaced },
+                            Some((median, right)) => InsertOutcome::Split {
+                                median,
+                                right,
+                                replaced,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Split `n` in place if it overflowed `MAX_KEYS`. On split, `n` is truncated to
+/// the left half and `(median, right_sibling)` is returned; otherwise `None`.
+///
+/// Uses `split_off`/`pop` so the left half reuses `n`'s existing allocation —
+/// only the right sibling allocates. (The immutable `maybe_split` allocates three
+/// fresh Vecs via `to_vec`.)
+#[allow(clippy::type_complexity)]
+fn maybe_split_mut<K: Clone, V>(
+    n: &mut BTreeNode<K, V>,
+) -> Option<((K, Arc<V>), Arc<BTreeNode<K, V>>)> {
+    if n.entries.len() <= MAX_KEYS {
+        return None;
+    }
+    // entries.len() == MAX_KEYS + 1 == 64; split at mid == 32, matching the
+    // immutable path exactly so both produce identically-shaped trees.
+    let mid = n.entries.len() / 2;
+    let right_entries = n.entries.split_off(mid + 1); // entries[mid+1..]
+    let median = n.entries.pop().unwrap(); // entries[mid]
+    // n.entries is now entries[..mid] (the left half).
+    let right_children = if n.children.is_empty() {
+        vec![]
+    } else {
+        n.children.split_off(mid + 1) // children[mid+1..]
+    };
+    let right = Arc::new(BTreeNode {
+        entries: right_entries,
+        children: right_children,
+    });
+    Some((median, right))
 }
 
 /// Recursively deletes a key from a node, potentially triggering rebalancing.
@@ -1557,5 +1729,114 @@ mod tests {
         let t3 = t2.remove(&0).unwrap();
         assert_eq!(t3.get(&0), None);
         assert_eq!(t3.len(), n as usize);
+    }
+
+    // -----------------------------------------------------------------------
+    // In-place insert (`insert_mut`) — prototype for task: btree-insert-mut
+    // -----------------------------------------------------------------------
+
+    /// Collect the full tree as a Vec for structural comparison.
+    fn dump(t: &BTree<u64, u64>) -> Vec<(u64, u64)> {
+        t.range(..).map(|(&k, &v)| (k, v)).collect()
+    }
+
+    /// `insert_mut` must yield the exact same logical tree as `insert` across a
+    /// large key count that forces many splits (multiple levels).
+    #[test]
+    fn insert_mut_matches_insert_ascending() {
+        let n = 10_000u64;
+        let immutable = insert_range(0, n - 1);
+
+        let mut in_place = BTree::new();
+        for i in 0..n {
+            in_place.insert_mut(i, i * 10);
+        }
+
+        assert_eq!(in_place.len(), immutable.len());
+        assert_eq!(dump(&in_place), dump(&immutable));
+    }
+
+    /// Same equivalence under a non-sequential insertion order and with
+    /// replacements of existing keys (the `Ok(pos)` path).
+    #[test]
+    fn insert_mut_matches_insert_scrambled_with_replaces() {
+        // A cheap deterministic scramble (LCG) — no rng dependency, no Date/rand
+        // (which are unavailable here anyway).
+        let n = 5000u64;
+        let mut lcg = 12345u64;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lcg % n
+        };
+
+        let mut immutable = BTree::new();
+        let mut in_place = BTree::new();
+        for _ in 0..(n * 3) {
+            let k = next();
+            let v = k.wrapping_mul(7).wrapping_add(1);
+            immutable = immutable.insert(k, v);
+            in_place.insert_mut(k, v);
+        }
+
+        assert_eq!(in_place.len(), immutable.len());
+        assert_eq!(dump(&in_place), dump(&immutable));
+    }
+
+    /// The load-bearing correctness property: `insert_mut` must preserve
+    /// copy-on-write. A previously-cloned handle (a "snapshot") must NOT observe
+    /// mutations applied to the tree afterwards — `Arc::make_mut` has to clone the
+    /// shared nodes rather than mutate them in place.
+    #[test]
+    fn insert_mut_preserves_snapshot_isolation() {
+        let mut t = BTree::new();
+        for i in 0..2000u64 {
+            t.insert_mut(i, i);
+        }
+
+        // Take a snapshot (O(1) Arc bump). Its root is now shared.
+        let snapshot = t.clone();
+        let snapshot_dump = dump(&snapshot);
+        assert_eq!(snapshot.len(), 2000);
+
+        // Mutate the live tree in place: overwrite existing keys, add new ones,
+        // all of which walk paths shared with `snapshot`.
+        for i in 0..2000u64 {
+            t.insert_mut(i, i + 1_000_000); // overwrite
+        }
+        for i in 2000..4000u64 {
+            t.insert_mut(i, i); // grow
+        }
+
+        // Snapshot is completely unaffected.
+        assert_eq!(dump(&snapshot), snapshot_dump);
+        assert_eq!(snapshot.len(), 2000);
+        assert_eq!(snapshot.get(&0).copied(), Some(0));
+        assert_eq!(snapshot.get(&1999).copied(), Some(1999));
+        assert_eq!(snapshot.get(&3000), None);
+
+        // Live tree reflects every mutation.
+        assert_eq!(t.len(), 4000);
+        assert_eq!(t.get(&0).copied(), Some(1_000_000));
+        assert_eq!(t.get(&1999).copied(), Some(1_001_999));
+        assert_eq!(t.get(&3000).copied(), Some(3000));
+    }
+
+    /// Repeated snapshot-then-mutate cycles: chained snapshots must each retain
+    /// the value they saw at capture time (structural sharing across versions).
+    #[test]
+    fn insert_mut_chained_snapshots_independent() {
+        let mut t = BTree::new();
+        let mut snaps = Vec::new();
+        for round in 0..50u64 {
+            for i in 0..200u64 {
+                t.insert_mut(i, round * 1000 + i);
+            }
+            snaps.push((round, t.clone()));
+        }
+        for (round, snap) in &snaps {
+            assert_eq!(snap.get(&0).copied(), Some(round * 1000));
+            assert_eq!(snap.get(&199).copied(), Some(round * 1000 + 199));
+            assert_eq!(snap.len(), 200);
+        }
     }
 }

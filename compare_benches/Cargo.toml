@@ -45,3 +45,15 @@ harness = false
 [[bench]]
 name = "smallbank_fjall_bench"
 harness = false
+
+[[bench]]
+name = "ycsb_bulk_load_rocksdb_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_bulk_load_fjall_bench"
+harness = false
+
+[[bench]]
+name = "ycsb_bulk_load_redb_bench"
+harness = false
