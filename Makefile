@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -88,6 +88,31 @@ bench/ycsb/compare:
 	critcmp -g '(.+)/[^/]+' ultima_nondurable fjall_nondurable rocksdb_nondurable redb_nondurable
 	@echo "===== strict tier (fsync per commit) ====="
 	critcmp -g '(.+)/[^/]+' ultima_strict fjall_strict rocksdb_strict redb_strict
+
+# WAL/durability A/B sweep (ultima-only): the standalone_fast toggles on real
+# NVMe. Baselines: nondurable (Eventual), strict-consistent (bg-thread fsync),
+# strict-inline (off-lock fsync), strict-standalone_fast (inline + prealloc).
+# ycsb_bench reads ULTIMA_BENCH_{DURABILITY,INLINE,PREALLOC} (benches/ycsb_bench.rs).
+# Requires ULTIMA_BENCH_DIR on a REAL disk (refuses tmpfs, like bench/ycsb/compare).
+bench/wal-ab:
+	$(call check_cmd,critcmp)
+	@if [ -z "$(ULTIMA_BENCH_DIR)" ]; then \
+	  echo "ERROR: ULTIMA_BENCH_DIR is not set — refusing to run."; \
+	  echo "  Point it at a real disk-backed dir (NOT a tmpfs like /tmp):"; \
+	  echo "    make bench/wal-ab ULTIMA_BENCH_DIR=\$$HOME/bench-disk"; \
+	  exit 1; \
+	fi
+	@mkdir -p "$(ULTIMA_BENCH_DIR)"
+	ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=nondurable \
+	  cargo bench --bench ycsb_bench -- --save-baseline wal_nondurable
+	ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=strict \
+	  cargo bench --bench ycsb_bench -- --save-baseline wal_strict_consistent
+	ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=strict ULTIMA_BENCH_INLINE=1 \
+	  cargo bench --bench ycsb_bench -- --save-baseline wal_strict_inline
+	ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=strict ULTIMA_BENCH_INLINE=1 ULTIMA_BENCH_PREALLOC=1 \
+	  cargo bench --bench ycsb_bench -- --save-baseline wal_strict_standalone_fast
+	@echo "===== WAL A/B (lower = better) ====="
+	critcmp wal_nondurable wal_strict_consistent wal_strict_inline wal_strict_standalone_fast
 
 # Bulk-load ingest comparison (build empty db of N records). Five arms:
 # UltimaDB insert_batch, UltimaDB Store::bulk_load, RocksDB, Fjall, ReDB.
