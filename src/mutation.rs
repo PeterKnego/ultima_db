@@ -11,6 +11,10 @@ pub(crate) enum Mutation {
     SkipReadSetValidation,
     /// OCC bug: `validate_write_set` never reports a conflict — lost updates.
     SkipWriteSetValidation,
+    /// Merge bug: `Table::merge_keys_from` silently drops one of the writer's
+    /// edited keys during the commit slow-path merge — a lost update below the
+    /// isolation layer (the write-set validation still passes).
+    DropMergeKey,
 }
 
 /// Pure mapping from the env-var value to a mutation (testable without env).
@@ -18,6 +22,7 @@ fn parse(v: Option<&str>) -> Option<Mutation> {
     match v {
         Some("skip-readset-validation") => Some(Mutation::SkipReadSetValidation),
         Some("skip-writeset-validation") => Some(Mutation::SkipWriteSetValidation),
+        Some("drop-merge-key") => Some(Mutation::DropMergeKey),
         None | Some("") => None,
         Some(other) => panic!("unknown ULTIMA_MUTATION value: {other}"),
     }
@@ -43,6 +48,7 @@ mod tests {
             parse(Some("skip-writeset-validation")),
             Some(Mutation::SkipWriteSetValidation)
         );
+        assert_eq!(parse(Some("drop-merge-key")), Some(Mutation::DropMergeKey));
         assert_eq!(parse(None), None);
         assert_eq!(parse(Some("")), None);
     }

@@ -78,7 +78,23 @@ impl<R: Record> MergeableTable for Table<R> {
             .as_any()
             .downcast_ref::<Table<R>>()
             .ok_or_else(|| Error::TypeMismatch("merge source".to_string()))?;
+
+        // BUG(task47): under the `drop-merge-key` mutation, silently skip the
+        // writer's edit to the first key of this merge — a lost update the
+        // commit merge is supposed to preserve. OCC/SSI validation already
+        // passed, so this exercises the merge path itself. Off in normal builds.
+        #[cfg(feature = "mutation-testing")]
+        let mut drop_first = matches!(
+            crate::mutation::active(),
+            Some(crate::mutation::Mutation::DropMergeKey)
+        );
+
         for &k in keys {
+            #[cfg(feature = "mutation-testing")]
+            if drop_first {
+                drop_first = false;
+                continue;
+            }
             match (source.data.get_arc(&k), self.data.get_arc(&k)) {
                 (Some(new_arc), _) => self.upsert_arc(k, new_arc)?,
                 (None, Some(_)) => {
