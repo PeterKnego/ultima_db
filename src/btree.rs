@@ -72,6 +72,14 @@ enum DeleteResult<K, V> {
     },
 }
 
+/// Outcome of an in-place delete into a node (see `delete_from_node_mut`).
+/// The mutated node flows back through the `&mut Arc<BTreeNode>` the caller
+/// passed; only the found/underfull flags propagate up.
+enum DeleteOutcome {
+    NotFound,
+    Removed { underfull: bool },
+}
+
 // ---------------------------------------------------------------------------
 // BTree impl
 // ---------------------------------------------------------------------------
@@ -234,6 +242,30 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                     root: actual_root,
                     len: self.len - 1,
                 })
+            }
+        }
+    }
+
+    /// In-place variant of [`remove`](Self::remove). Deletes `key`, mutating
+    /// `self`; returns `true` iff the key was present. Copy-on-write preserved:
+    /// nodes shared with an older snapshot are cloned before mutation, so a
+    /// snapshot never observes the deletion. See [`insert_mut`](Self::insert_mut)
+    /// for the rationale.
+    pub fn remove_mut(&mut self, key: &K) -> bool {
+        match delete_from_node_mut(&mut self.root, key) {
+            DeleteOutcome::NotFound => false,
+            DeleteOutcome::Removed { .. } => {
+                self.len -= 1;
+                // Root collapse: an internal root left with no entries and one
+                // child drops a level. Move that child up (no clone).
+                if self.root.entries.is_empty() && !self.root.children.is_empty() {
+                    let child = {
+                        let root = Arc::make_mut(&mut self.root);
+                        root.children.remove(0)
+                    };
+                    self.root = child;
+                }
+                true
             }
         }
     }
@@ -929,6 +961,75 @@ fn merge_with_right<K: Clone, V>(
         entries: merged_entries,
         children: merged_children,
     });
+}
+
+/// In-place counterpart to `delete_from_node`. Descends through
+/// `Arc::make_mut`, so each node is cloned only if it is still shared with
+/// another snapshot (copy-on-write preserved) and otherwise mutated directly.
+/// Reuses the existing rebalance helpers (`fix_underfull_child` et al.),
+/// which already mutate the parent's `entries`/`children` in place.
+fn delete_from_node_mut<K: Ord + Clone, V>(
+    node: &mut Arc<BTreeNode<K, V>>,
+    key: &K,
+) -> DeleteOutcome {
+    let n = Arc::make_mut(node);
+    let pos = n.entries.binary_search_by(|(k, _)| k.cmp(key));
+
+    if n.children.is_empty() {
+        // Leaf.
+        match pos {
+            Err(_) => DeleteOutcome::NotFound,
+            Ok(i) => {
+                n.entries.remove(i);
+                DeleteOutcome::Removed {
+                    underfull: n.entries.len() < MIN_KEYS,
+                }
+            }
+        }
+    } else {
+        match pos {
+            Ok(i) => {
+                // Key here: replace with in-order successor from child[i+1].
+                let (succ, right_underfull) = remove_leftmost_mut(&mut n.children[i + 1]);
+                n.entries[i] = succ;
+                if right_underfull {
+                    fix_underfull_child(&mut n.entries, &mut n.children, i + 1);
+                }
+                DeleteOutcome::Removed {
+                    underfull: n.entries.len() < MIN_KEYS,
+                }
+            }
+            Err(child_idx) => match delete_from_node_mut(&mut n.children[child_idx], key) {
+                DeleteOutcome::NotFound => DeleteOutcome::NotFound,
+                DeleteOutcome::Removed { underfull } => {
+                    if underfull {
+                        fix_underfull_child(&mut n.entries, &mut n.children, child_idx);
+                    }
+                    DeleteOutcome::Removed {
+                        underfull: n.entries.len() < MIN_KEYS,
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// In-place counterpart to `remove_leftmost`: removes and returns the
+/// minimum-key entry from the subtree, mutating shared nodes only via CoW.
+fn remove_leftmost_mut<K: Ord + Clone, V>(
+    node: &mut Arc<BTreeNode<K, V>>,
+) -> ((K, Arc<V>), bool) {
+    let n = Arc::make_mut(node);
+    if n.children.is_empty() {
+        let first = n.entries.remove(0);
+        (first, n.entries.len() < MIN_KEYS)
+    } else {
+        let (entry, child_underfull) = remove_leftmost_mut(&mut n.children[0]);
+        if child_underfull {
+            fix_underfull_child(&mut n.entries, &mut n.children, 0);
+        }
+        (entry, n.entries.len() < MIN_KEYS)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,5 +1939,128 @@ mod tests {
             assert_eq!(snap.get(&199).copied(), Some(round * 1000 + 199));
             assert_eq!(snap.len(), 200);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // In-place delete (`remove_mut`) — prototype for task: btree-remove-mut
+    // -----------------------------------------------------------------------
+
+    /// `remove_mut` must yield the exact same logical tree as the immutable
+    /// `remove`, across interleaved insert/remove churn that forces rotations,
+    /// merges, and root collapse — and must track `std::BTreeMap`.
+    #[test]
+    fn remove_mut_matches_remove_scrambled() {
+        use std::collections::BTreeMap;
+        let n = 800u64;
+        let mut lcg = 0x9E3779B97F4A7C15u64;
+        // Returns `(k, lcg)` — the branch decision below needs the raw LCG
+        // state's parity, but `next` already holds `lcg` by unique borrow for
+        // its own lifetime, so the state must flow out through the return
+        // value rather than being re-read from the outer binding.
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg % n, lcg)
+        };
+
+        let mut immutable = BTree::new();
+        let mut in_place = BTree::new();
+        let mut model = BTreeMap::new();
+
+        // Seed both trees identically.
+        for _ in 0..(n * 4) {
+            let (k, _) = next();
+            immutable = immutable.insert(k, k);
+            in_place.insert_mut(k, k);
+            model.insert(k, k);
+        }
+        assert_eq!(dump(&in_place), dump(&immutable));
+
+        // Interleave inserts and removes (present + absent keys).
+        for _ in 0..(n * 8) {
+            let (k, state) = next();
+            if state & 1 == 0 {
+                immutable = immutable.insert(k, k);
+                in_place.insert_mut(k, k);
+                model.insert(k, k);
+            } else {
+                let imm_had = immutable.remove(&k);
+                let inp_had = in_place.remove_mut(&k);
+                let model_had = model.remove(&k).is_some();
+                assert_eq!(inp_had, model_had, "remove_mut presence disagrees with std for {k}");
+                if let Ok(t) = imm_had {
+                    immutable = t;
+                }
+                assert_eq!(dump(&in_place), dump(&immutable), "trees diverged at key {k}");
+            }
+        }
+        assert_eq!(in_place.len(), immutable.len());
+        assert_eq!(dump(&in_place), dump(&immutable));
+    }
+
+    /// A previously-cloned snapshot must NOT observe deletions applied afterwards.
+    #[test]
+    fn remove_mut_preserves_snapshot_isolation() {
+        let mut t = BTree::new();
+        for i in 0..4000u64 {
+            t.insert_mut(i, i);
+        }
+        let snapshot = t.clone();
+        let snapshot_dump = dump(&snapshot);
+
+        // Delete half the keys from the live tree in place.
+        for i in 0..2000u64 {
+            assert!(t.remove_mut(&i));
+        }
+
+        // Snapshot is completely unaffected.
+        assert_eq!(dump(&snapshot), snapshot_dump);
+        assert_eq!(snapshot.len(), 4000);
+        assert_eq!(snapshot.get(&0).copied(), Some(0));
+        assert_eq!(snapshot.get(&1999).copied(), Some(1999));
+
+        // Live tree reflects every deletion.
+        assert_eq!(t.len(), 2000);
+        assert_eq!(t.get(&0), None);
+        assert_eq!(t.get(&1999), None);
+        assert_eq!(t.get(&2000).copied(), Some(2000));
+    }
+
+    /// Chained snapshot-then-delete cycles: each snapshot retains what it saw.
+    #[test]
+    fn remove_mut_chained_snapshots_independent() {
+        let mut t = BTree::new();
+        for i in 0..4000u64 {
+            t.insert_mut(i, i);
+        }
+        let mut snaps = Vec::new();
+        for round in 0..20u64 {
+            // Delete a distinct 100-key window each round.
+            for i in 0..100u64 {
+                t.remove_mut(&(round * 100 + i));
+            }
+            snaps.push((round, t.clone(), t.len()));
+        }
+        for (round, snap, len) in &snaps {
+            assert_eq!(snap.len(), *len);
+            // The window deleted in this round is absent in this snapshot.
+            assert_eq!(snap.get(&(round * 100)), None);
+            // A key past all deletions is still present.
+            assert_eq!(snap.get(&3999).copied(), Some(3999));
+        }
+    }
+
+    /// Deleting an absent key returns false and leaves the tree unchanged.
+    #[test]
+    fn remove_mut_absent_key_is_noop() {
+        let mut t = BTree::new();
+        for i in 0..500u64 {
+            t.insert_mut(i, i);
+        }
+        let before = dump(&t);
+        assert!(!t.remove_mut(&1000));
+        assert_eq!(t.len(), 500);
+        assert_eq!(dump(&t), before);
     }
 }
