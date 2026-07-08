@@ -4,18 +4,20 @@
 Serializable (SSI) as opt-in — are verified by
 [Elle](https://github.com/jepsen-io/elle), the transactional-safety checker
 behind the Jepsen analyses, running against real concurrent MultiWriter
-histories. Both claims hold. Two opt-in tiers:
+histories. Both claims hold, and the checks now gate every pull request. Two
+opt-in tiers:
 
-- `make consistency/elle` — generates histories (point-read **and** table-scan
-  passes, both isolation levels) and asserts the *exact anomaly set*: SI must
-  show only `G2-item` (write skew), SSI none.
-- `make consistency/elle-mutation` — injects known bugs into the commit path
-  and proves Elle *catches* them (the harness's teeth-test).
+- `make consistency/elle` — generates histories (point-read, table-scan, **and
+  predicate/index** passes, both isolation levels) and asserts the *exact
+  anomaly set*: SI must show only `G2-item` (write skew), SSI none.
+- `make consistency/elle-mutation` — injects **three** known commit-path bugs
+  and proves Elle *catches* each (the harness's teeth-test).
 
-Both need Java + `jq`. Technical detail in
-`docs/tasks/task45_elle_consistency_harness.md` (harness) and
-`docs/tasks/task47_elle_anomaly_and_mutation.md` (classification + mutation
-testing).
+Both need Java + `jq`. `.github/workflows/consistency.yml` runs the bounded
+`elle` check on every PR and the full-sizing check plus the mutation suite
+weekly. Technical detail in `docs/tasks/task45_elle_consistency_harness.md`
+(harness + predicate reads) and `docs/tasks/task47_elle_anomaly_and_mutation.md`
+(classification + mutation testing).
 
 ## What was built (in order)
 
@@ -41,7 +43,19 @@ history would show a false anomaly). `make consistency/elle` now runs both a
 point pass and a scan pass; the coarse read set roughly doubles the SSI abort
 count, and the surviving history is still serializable.
 
-**3. Anomaly classification (task47).** The check no longer asserts a bare
+**3. The predicate-read (index) pass (task45 extension).** A `--predicate-ratio`
+fraction of transactions select a row group through a **secondary index** —
+`get_by_index` (equality) or `index_range` (range) on a static `bucket` column —
+instead of a point `get` or a full scan, exercising the index read path the
+other passes never touch. Because every secondary-index read registers the same
+coarse `table_scan` read-set entry (`src/store.rs`), a predicate read has the
+*same* conflict profile as a full scan: SSI stays clean (phantoms prevented), SI
+shows only `{G2-item}` — so it needs **no new anomaly whitelist**. Each predicate
+transaction also asserts the index returned exactly the statically-known bucket
+membership, an index-integrity check under concurrent updates. `make
+consistency/elle` now runs three passes: point, scan, predicate.
+
+**4. Anomaly classification (task47).** The check no longer asserts a bare
 pass/fail. It parses elle-cli `--verbose` JSON and asserts the **exact anomaly
 set**: SI histories must classify as anomalies ⊆ `{G2-item}` (write skew and
 nothing worse — a `G-single`, `lost-update`, or `G1c` fails), SSI histories as
@@ -49,14 +63,29 @@ nothing worse — a `G-single`, `lost-update`, or `G1c` fails), SSI histories as
 This gives two independent detectors for a lost-update regression: the
 SI-validity check flips *and* the classification whitelist rejects.
 
-**4. Mutation testing (task47).** A `mutation-testing` cargo feature — off in
+**5. Mutation testing (task47).** A `mutation-testing` cargo feature — off in
 every normal build, and inert even when compiled in unless `ULTIMA_MUTATION` is
 set — injects known bugs into the commit path: `skip-readset-validation`
-(disables SSI read-set validation → write skew reappears) and
-`skip-writeset-validation` (disables OCC write-conflict detection → lost update).
-`make consistency/elle-mutation` runs a control (feature on, no mutation → clean
-checks still pass, proving inertness), then confirms elle-cli **catches** each
-injected bug. The assertion is inverted: a clean check must *fail* when mutated.
+(disables SSI read-set validation → write skew reappears),
+`skip-writeset-validation` (disables OCC write-conflict detection → lost update),
+and `drop-merge-key` (silently drops a writer's edited key in the commit
+slow-path merge `Table::merge_keys_from` → a lost update *below* the isolation
+layer, where OCC/SSI validation has already passed). The three cover both
+isolation-enforcement paths (read-set and write-set validation) *and* the per-key
+merge that reconciles disjoint concurrent writers. `make consistency/elle-mutation`
+runs a control (feature on, no mutation → clean checks still pass, proving
+inertness), then confirms elle-cli **catches** each injected bug. The assertion
+is inverted: a clean check must *fail* when mutated.
+
+**6. CI gating (task45).** `.github/workflows/consistency.yml` (mirroring the
+existing `formal.yml` split) runs a bounded `elle` job on every pull request —
+the three passes at reduced contention (`--threads 8 --keys 8
+--txns-per-thread 800`), sized so elle-cli's cycle search stays clear of an
+`unknown` verdict — blocking a consistency regression at merge time. A weekly
+`elle-deep` job re-runs the canonical sizing plus `make consistency/elle-mutation`.
+java is provisioned per-job (Temurin 21); `jq` ships on the runner; the elle-cli
+jar is vendored, so nothing is downloaded. Self-tested live on its own
+introducing PR.
 
 ### Results (2026-07-08, defaults)
 
@@ -66,15 +95,19 @@ injected bug. The assertion is inverted: a clean check must *fail* when mutated.
 | SI history vs `snapshot-isolation` | valid | ✅ |
 | SI history vs `serializable`, classified | invalid, anomalies = `{G2-item}` | ✅ write skew only |
 | SSI history vs `serializable`, classified | valid, anomalies = `∅` | ✅ |
+| predicate/index pass, SI vs `serializable` / SSI vs `serializable` | `{G2-item}` / `∅` (same as scan) | ✅ / ✅ |
 | (mutation) `skip-readset-validation` | SSI now non-serializable | ✅ CAUGHT |
 | (mutation) `skip-writeset-validation` | SI now violates snapshot-isolation | ✅ CAUGHT |
+| (mutation) `drop-merge-key` | SI now violates snapshot-isolation | ✅ CAUGHT |
 | (mutation control) feature on, env unset | clean checks still pass | ✅ inert |
 
 Point pass, 24k events/level: SI ~6.4k committed / ~5.6k write-conflicts / 0
 serialization failures; SSI ~5.5k committed / ~5.3k write-conflicts / ~1.1k
 serialization failures. Scan pass (`--scan-ratio 0.5`): SSI serialization
-failures roughly double (~2.2k), history still serializable. Feature-off root
-`cargo test` unchanged (377); the injected code compiles out entirely.
+failures roughly double (~2.2k), history still serializable. Predicate pass
+(`--predicate-ratio 0.5 --buckets 4`): same anomaly profile as the scan pass
+(index reads degrade to `table_scan`), SI shows `{G2-item}`, SSI clean.
+Feature-off root `cargo test` unchanged; the injected code compiles out entirely.
 
 ## Why this is important
 
@@ -90,9 +123,11 @@ concrete counterexample with an SVG of the offending cycle.
 **It checks the distinction, not just the happy path.** The SI history being
 provably *non*-serializable (exactly `{G2-item}`) while the SSI history is clean
 demonstrates, on real data, that `IsolationLevel::Serializable` does exactly the
-work it claims. The scan pass proves the *coarse* read-set path is exercised, not
-just point reads. The classification whitelist means a lost-update regression can
-no longer hide behind "SI is not serializable, for some reason."
+work it claims. The scan and predicate passes prove the *coarse* read-set path is
+exercised — through both full-table scans and secondary-index (`get_by_index` /
+`index_range`) reads — not just point reads. The classification whitelist means a
+lost-update regression can no longer hide behind "SI is not serializable, for
+some reason."
 
 **The mutation tests prove the harness has teeth.** A checker that never fails is
 worthless. By deliberately breaking read-set and write-set validation and
@@ -101,11 +136,11 @@ preview of this value early: the first hand-written "known-bad" fixture turned
 out to be *legally serializable* under reordering, and the self-test caught it
 before the harness shipped.
 
-**It is a regression net for the riskiest code in the store,** the same way
-`make perf/check` gates performance — and the fault injection is provably absent
-from production builds (feature off = zero code; feature on + env unset =
-byte-for-byte normal behavior, verified by the control run and the unchanged
-test suite).
+**It is a regression net for the riskiest code in the store,** and it now runs
+automatically: the `elle` job gates every pull request the way `make perf/check`
+gates performance, and the fault injection is provably absent from production
+builds (feature off = zero code; feature on + env unset = byte-for-byte normal
+behavior, verified by the control run and the unchanged test suite).
 
 **It is credibility.** This is the same methodology (list-append + Elle) used in
 the published Jepsen analyses of PostgreSQL, MySQL, and CockroachDB, and applied
@@ -132,6 +167,19 @@ Confirmed with a deterministic `IntentMap`-level regression test and a
 harness paying for itself: a rare deadlock in the OCC/SSI intent path, found by
 the scan workload and reproduced deterministically.
 
+## Completed since 2026-07-07
+
+- **Third mutation (`drop-merge-key`).** Covers the per-key commit merge
+  (`Table::merge_keys_from`) alongside the read-set/write-set validation — the
+  one injection *below* the isolation layer. Caught on the first attempt.
+- **Predicate-read (index) pass.** Widened the workload to secondary-index reads
+  (`get_by_index` / `index_range`); confirmed they share the scan pass's
+  `{G2-item}` profile (index reads degrade to `table_scan`), so no new whitelist.
+- **CI gating.** `.github/workflows/consistency.yml` — `elle` on every PR,
+  `elle-deep` (canonical sizing + mutation suite) weekly. (The repo does have CI
+  now — `formal.yml` — so this was no longer a maintainer-decision blocker; the
+  SSI+scan deadlock that would have hung such a job was already fixed.)
+
 ## Next steps
 
 1. **Crash-durability harness — the other half of the Jepsen methodology.**
@@ -143,18 +191,14 @@ the scan workload and reproduced deterministically.
 2. **Persistence-enabled Elle run.** Repeat the checks with
    `Persistence::Standalone` (Eventual durability) to cover the WAL-batched
    commit path's visibility ordering, not just the in-memory OCC path.
-3. **A third mutation** — dropping a key in `Table::merge_keys_from` — to cover
-   the per-key merge path alongside the read-set/write-set validation already
-   injected.
-4. **CI integration.** A nightly GitHub Actions job (`setup-java`, `jq`,
-   `make consistency/elle` + `consistency/elle-mutation`). Everything needed is
-   in-repo (the SSI+scan deadlock that would have hung such a job is now fixed).
-   *Note: introducing CI to this repo is a maintainer decision — it currently
-   has none.*
-5. **Full Jepsen for ultima_cluster** (separate repo). The Raft/SMR deployment
+3. **Predicate write skew via a domain invariant.** The index pass exercises the
+   read *path* but, because index reads degrade to coarse `table_scan`, it shares
+   the scan anomaly profile rather than probing *phantoms* directly — elle-cli's
+   list-append model can't express a predicate. A SmallBank-style workload with a
+   checked invariant (e.g. "sum over a group ≥ 0") would demonstrate SSI prevents
+   (and SI allows) predicate write skew, and would motivate any future
+   fine-grained predicate read-set tracking (there is none today).
+4. **Full Jepsen for ultima_cluster** (separate repo). The Raft/SMR deployment
    is a genuine distributed system — partitions, leader elections, clock skew —
    which is what the full Jepsen harness was built for; the etcd and redis-raft
    suites are the templates.
-6. **Gate risky changes on it.** Adopt the convention that any PR touching
-   `src/store.rs` commit/merge logic runs `make consistency/elle` before merge,
-   alongside `make perf/check`.
