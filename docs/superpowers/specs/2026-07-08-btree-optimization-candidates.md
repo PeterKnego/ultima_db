@@ -77,6 +77,18 @@ zero effort** — change one const, A/B the existing benches.
   increase —
   fixing it would flatten the delete regression and could shift the optimum `T` upward,
   capturing the read/insert gains without the delete penalty.
+- **🔁 RETEST PENDING (prerequisite now shipped).** The in-place rebalance sibling-clone
+  micro-opt landed (`task50` §5.1, commit `0a240c2`), so the "T=32 near-optimal" conclusion
+  above is provisional — it was measured *before* the fix that was its stated prerequisite.
+  A committed, reproducible sweep harness now exists to re-settle it on a quiet bench host:
+  `scripts/fanout_ab.sh` (sweeps `T ∈ {8,16,32,64,128}`, rewrites the `T` const + rebuilds per
+  value, times the `get` / `insert_mut` / `remove_mut` in-place arms at 1M random keys, and
+  prints a table normalized to T=32). Reads/inserts add the `btree_get_bench` / `btree_insert_mut_bench`
+  columns; `btree_get_bench` was added for this. **Hypothesis to confirm/refute:** with the
+  sibling clone gone, the delete-at-high-fanout cliff flattens and the optimum `T` moves up
+  (T=64 becomes a candidate default, or T=128 for read/insert-heavy). Do **not** decide from
+  dev-sandbox numbers (per-run noise ~±2×). Record the resulting table here (replacing this
+  block) and in `task50`.
 
 **3. Auto-increment bulk-append fast path in `insert_batch`.** The bulk-load bench showed
 `Store::bulk_load` (from_sorted) beats `insert_batch` ~2× even with `insert_mut`. For
