@@ -2,7 +2,7 @@
 
    `NodeInv lo hi n` says every key in the subtree `n` lies strictly inside the
    open interval `(lo, hi)` (`none` = unbounded), each node's entries are
-   strictly sorted, node arity is ≤ MAX_KEYS = 63, and — via
+   strictly sorted, node arity is ≤ MAX_KEYS = 127, and — via
    `ChildrenAligned` — an internal node's children interleave its entries
    positionally: child i holds keys strictly between entry i-1 and entry i.
    `ChildrenAligned` also forces #children = #entries + 1.
@@ -41,13 +41,13 @@ inductive NodeInv : Option Nat → Option Nat → Node → Prop where
   | leaf : ∀ {lo hi} (entries : alloc.vec.Vec (Std.U64 × Std.U64)),
       SortedE entries.val →
       (∀ e ∈ entries.val, InB lo hi e.1.val) →
-      entries.val.length ≤ 63 →
+      entries.val.length ≤ 127 →
       NodeInv lo hi (Node.mk entries Children.Nil)
   | internal : ∀ {lo hi} (entries : alloc.vec.Vec (Std.U64 × Std.U64))
       (c : Node) (cs : Children),
       SortedE entries.val →
       (∀ e ∈ entries.val, InB lo hi e.1.val) →
-      entries.val.length ≤ 63 →
+      entries.val.length ≤ 127 →
       Aligned lo hi entries.val (c :: clist cs) →
       NodeInv lo hi (Node.mk entries (Children.Cons c cs))
 

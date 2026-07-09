@@ -783,8 +783,8 @@ theorem merge_with_right_flatten {lo hi : Option Nat} {h : Nat}
   rw [← hrightv] at hrinv0
   have hlh : HeightInv h left := by rw [hleftv]; exact hall.getElem _ hchlt
   have hrh : HeightInv h right := by rw [hrightv]; exact hall.getElem _ hchlt1
-  have hll : left.entries.val.length ≤ 63 := hlinv0.entries_len_le
-  have hrl : right.entries.val.length ≤ 63 := hrinv0.entries_len_le
+  have hll : left.entries.val.length ≤ 127 := hlinv0.entries_len_le
+  have hrl : right.entries.val.length ≤ 127 := hrinv0.entries_len_le
   obtain ⟨me, hmee, hmev⟩ := WP.spec_imp_exists
     (merge_entries_spec left.entries separator right.entries (by scalar_tac))
   obtain ⟨mc, hmce, hmcv⟩ := WP.spec_imp_exists
@@ -848,8 +848,8 @@ theorem merge_with_left_flatten {lo hi : Option Nat} {h : Nat}
   rw [← hrightv] at hrinv0
   have hlh : HeightInv h left := by rw [hleftv]; exact hall.getElem _ hchlt'
   have hrh : HeightInv h right := by rw [hrightv]; exact hall.getElem _ hchlt
-  have hll : left.entries.val.length ≤ 63 := hlinv0.entries_len_le
-  have hrl : right.entries.val.length ≤ 63 := hrinv0.entries_len_le
+  have hll : left.entries.val.length ≤ 127 := hlinv0.entries_len_le
+  have hrl : right.entries.val.length ≤ 127 := hrinv0.entries_len_le
   obtain ⟨me, hmee, hmev⟩ := WP.spec_imp_exists
     (merge_entries_spec left.entries separator right.entries (by scalar_tac))
   obtain ⟨mc, hmce, hmcv⟩ := WP.spec_imp_exists

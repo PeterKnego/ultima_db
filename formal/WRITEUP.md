@@ -2,6 +2,13 @@
 
 *Working notes / raw material for an article. Sessions of 2026-07-06 and 2026-07-07.*
 
+> **Note (2026-07-09): the model was later re-instantiated from `T=32` to `T=64`** to match a
+> production fanout bump (see `docs/tasks/task50` / the optimization-candidates doc). The proofs
+> are parametric in `T` in structure; only the concrete constants scale, so every fanout number in
+> the narrative below is the *original* `T=32` value — read them with `MIN_KEYS 31→63`,
+> `MAX_KEYS 63→127`, `MIN_KEYS−1 30→62`, `2·MIN_KEYS 62→126`, median-split `64→128` entries,
+> `33+32→65+64` children. All theorems re-verified sorry-free at `T=64` with the same three axioms.
+
 ---
 
 ## 0. TL;DR

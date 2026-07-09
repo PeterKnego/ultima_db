@@ -147,12 +147,11 @@ win and the from_sorted gap.
 4. ✅ Fanout re-sweep (post-rebalance, Tier 2.2 redux) — done on the AWS NVMe bench host
    (2026-07-09, see #2 above): the delete cliff flattened as predicted and the optimum moved up.
    Default bumped `T = 32 → 64` (commit `7f6c3fb`, broad ~8–19% win, no losing axis).
-5. ⬜ **Re-instantiate the formal model at `T=64`** (follow-up to #4). The `T` bump was landed with
-   the drift gate acknowledged (`ACK_NO_FORMAL=1` / `[skip-formal-drift]` PR title) because the Lean
-   proofs verify the *algorithm* (invariants parametric in `T`), but the model is pinned at `T=32`.
-   To close the model↔production gap: `formal/scripts/fetch-toolchain.sh`, bump `formal/kernel/src/lib.rs`
-   `T` to 64, re-extract the `.llbc`, update the ~53 hardcoded proof constants (`32→64`, `63→127`),
-   `(cd formal/proofs && lake build)` until axiom-clean. Mechanical but non-trivial; the Lean grind
-   may need manual hints.
+5. ✅ **Re-instantiated the formal model at `T=64`** (follow-up to #4) — done. Bumped
+   `formal/kernel/src/lib.rs` `T` to 64, re-extracted (charon → aeneas), and updated the `T`-scaled
+   proof constants (`MAX_KEYS` 63→127, `MIN_KEYS` 31→63, split median/counts, `NodeInv` arity +
+   `MinArity` balance invariant, underfull thresholds). `lake build` clean, generated kernel
+   axiom-free, all eight theorems on only the three standard Lean axioms. Model now matches
+   production, so `formal/drift-check` passes without `[skip-formal-drift]`.
 6. Bulk-append fast path (Tier 2.3) — if the sequential-insert path matters.
 7. Flamegraph, then reconsider Tier 3/4 with data.

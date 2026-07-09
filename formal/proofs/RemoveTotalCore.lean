@@ -34,7 +34,7 @@ set_option maxRecDepth 4096
 -- Local copy of `RemoveRebalance.MIN_KEYS_spec` (kept here to avoid importing
 -- the whole invariant-preservation file just for one 3-line lemma).
 unseal MIN_KEYS T in
-@[local step] theorem MIN_KEYS_spec_local : MIN_KEYS ⦃ m => m.val = 31 ⦄ := by
+@[local step] theorem MIN_KEYS_spec_local : MIN_KEYS ⦃ m => m.val = 63 ⦄ := by
   simp only [MIN_KEYS, T]
   step*
 
@@ -271,7 +271,7 @@ theorem fix_underfull_child_total
     simp only [hisub, hn1e, hmk, bind_tc_ok]
     split
     · rename_i hgt
-      have hn1len : 31 < n1.entries.val.length := by
+      have hn1len : 63 < n1.entries.val.length := by
         have := alloc.vec.Vec.len_val n1.entries
         scalar_tac
       exact rotate_right_total entries children idx halign hidx0 hidx
@@ -295,7 +295,7 @@ theorem fix_underfull_child_total
         simp only [hn2e, bind_tc_ok]
         split
         · rename_i hgt4
-          have hn2len : 31 < n2.entries.val.length := by
+          have hn2len : 63 < n2.entries.val.length := by
             have := alloc.vec.Vec.len_val n2.entries
             scalar_tac
           exact rotate_left_total entries children idx halign hidxlt
@@ -325,7 +325,7 @@ theorem fix_underfull_child_total
       simp only [hn1e, hmk, bind_tc_ok]
       split
       · rename_i hgt
-        have hn1len : 31 < n1.entries.val.length := by
+        have hn1len : 63 < n1.entries.val.length := by
           have := alloc.vec.Vec.len_val n1.entries
           scalar_tac
         exact rotate_left_total entries children idx halign hidxlt

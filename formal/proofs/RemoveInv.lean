@@ -317,7 +317,7 @@ theorem remove_leftmost_spec (fuel : Nat) {lo hi : Option Nat} {h : Nat}
     (hinv : NodeInv lo hi node) (hh : HeightInv h node)
     (hok : remove_leftmost node = ok (e, n', uf)) :
     InB lo hi e.1.val ∧ NodeInv (some e.1.val) hi n'
-    ∧ HeightInv h n' ∧ (uf = true → n'.entries.val.length < 31) := by
+    ∧ HeightInv h n' ∧ (uf = true → n'.entries.val.length < 63) := by
   induction fuel generalizing lo hi h node e n' uf with
   | zero =>
     exfalso; have := Node.one_le_size node; omega
@@ -346,7 +346,7 @@ theorem remove_leftmost_spec (fuel : Nat) {lo hi : Option Nat} {h : Nat}
         have hrev : new_entries.val = entries.val.eraseIdx (0#usize).val :=
           spec_elim (remove_entry_at_spec entries 0#usize) hre
         obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-        have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+        have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
         simp only [ok.injEq, Prod.mk.injEq] at hok
         obtain ⟨hfe, hnn, hufe⟩ := hok
         subst hnn; subst hufe
@@ -366,7 +366,7 @@ theorem remove_leftmost_spec (fuel : Nat) {lo hi : Option Nat} {h : Nat}
             refine InB.tighten_lo (hb_cons f (by simp [hf])) ?_
             rw [hea]; exact (List.pairwise_cons.mp hs_cons).1 f hf
           · rw [ht_eq]
-            have : (a :: t).length ≤ 63 := hcons ▸ hlen
+            have : (a :: t).length ≤ 127 := hcons ▸ hlen
             simp only [List.length_cons] at this; omega
         · exact HeightInv.leaf new_entries
         · intro huf
@@ -417,7 +417,7 @@ theorem remove_leftmost_spec (fuel : Nat) {lo hi : Option Nat} {h : Nat}
           rw [hc0]; simp [clist]
         obtain ⟨⟨entries1, children1⟩, hmf, hok⟩ := bind_ok_inv hok
         obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-        have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+        have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
         simp only [ok.injEq, Prod.mk.injEq] at hok
         obtain ⟨he, hnn, hufe⟩ := hok
         -- build parent invariants at (some entry, hi)
@@ -468,7 +468,7 @@ theorem delete_from_node_inv (fuel : Nat) {lo hi : Option Nat} {h : Nat}
     (hfuel : Node.size node ≤ fuel)
     (hinv : NodeInv lo hi node) (hh : HeightInv h node)
     (hok : delete_from_node node key = ok (DeleteResult.Removed n' uf)) :
-    NodeInv lo hi n' ∧ HeightInv h n' ∧ (uf = true → n'.entries.val.length < 31) := by
+    NodeInv lo hi n' ∧ HeightInv h n' ∧ (uf = true → n'.entries.val.length < 63) := by
   induction fuel generalizing lo hi h node n' uf with
   | zero =>
     exfalso; have := Node.one_le_size node; omega
@@ -492,7 +492,7 @@ theorem delete_from_node_inv (fuel : Nat) {lo hi : Option Nat} {h : Nat}
           have hrev : new_entries.val = entries.val.eraseIdx pos.val :=
             spec_elim (remove_entry_at_spec entries pos) hre
           obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-          have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+          have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
           simp only [ok.injEq, DeleteResult.Removed.injEq] at hok
           obtain ⟨hnn, hufe⟩ := hok
           subst hnn; subst hufe
@@ -558,7 +558,7 @@ theorem delete_from_node_inv (fuel : Nat) {lo hi : Option Nat} {h : Nat}
             spec_elim (replace_child_spec (Children.Cons c cs) i1 new_right) hrc0
           obtain ⟨⟨entries1, children1⟩, hmf, hok⟩ := bind_ok_inv hok
           obtain ⟨i3, hmk, hok⟩ := bind_ok_inv hok
-          have hi3 : i3.val = 31 := spec_elim MIN_KEYS_spec hmk
+          have hi3 : i3.val = 63 := spec_elim MIN_KEYS_spec hmk
           simp only [ok.injEq, DeleteResult.Removed.injEq] at hok
           obtain ⟨hnn, hufe⟩ := hok
           obtain ⟨hbk1, hbk2⟩ := bracket_of_InB_bnd entries.val (pos.val + 1) entry.1.val hs
@@ -640,7 +640,7 @@ theorem delete_from_node_inv (fuel : Nat) {lo hi : Option Nat} {h : Nat}
               spec_elim (replace_child_spec (Children.Cons c cs) pos new_child) hrc0
             obtain ⟨⟨entries1, children1⟩, hmf, hok⟩ := bind_ok_inv hok
             obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-            have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+            have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
             simp only [ok.injEq, DeleteResult.Removed.injEq] at hok
             obtain ⟨hnn, hufe⟩ := hok
             have hal' : Aligned lo hi entries.val (clist children0) := by

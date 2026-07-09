@@ -408,7 +408,7 @@ theorem NodeInv.entries_bounds {lo hi : Option Nat} {n : Node}
   | internal entries c cs hs hb hlen hal => simpa using hb
 
 theorem NodeInv.entries_len_le {lo hi : Option Nat} {n : Node}
-    (h : NodeInv lo hi n) : n.entries.val.length ≤ 63 := by
+    (h : NodeInv lo hi n) : n.entries.val.length ≤ 127 := by
   cases h with
   | leaf entries hs hb hlen => simpa using hlen
   | internal entries c cs hs hb hlen hal => simpa using hlen
@@ -426,7 +426,7 @@ theorem NodeInv.mk_node {lo hi : Option Nat}
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
     (hs : SortedE entries.val)
     (hb : ∀ e ∈ entries.val, InB lo hi e.1.val)
-    (hlen : entries.val.length ≤ 63)
+    (hlen : entries.val.length ≤ 127)
     (hal : clist children = [] ∨ Aligned lo hi entries.val (clist children)) :
     NodeInv lo hi (Node.mk entries children) := by
   cases children with
@@ -454,7 +454,7 @@ theorem merged_node_inv {L R : Option Nat} {h : Nat} {left right : Node}
     (hrinv : NodeInv (some S.1.val) R right)
     (hlh : HeightInv h left) (hrh : HeightInv h right)
     (hS : InB L R S.1.val)
-    (hcap : left.entries.val.length + 1 + right.entries.val.length ≤ 63)
+    (hcap : left.entries.val.length + 1 + right.entries.val.length ≤ 127)
     (me : alloc.vec.Vec (Std.U64 × Std.U64)) (mc : Children)
     (hme : me.val = left.entries.val ++ S :: right.entries.val)
     (hmc : clist mc = clist left.children ++ clist right.children) :
@@ -467,7 +467,7 @@ theorem merged_node_inv {L R : Option Nat} {h : Nat} {left right : Node}
     (hlinv.entries_sorted) (hrinv.entries_sorted)
     (by simpa using hlinv.entries_bounds) (by simpa using hrinv.entries_bounds)
     hS
-  have hlm : me.val.length ≤ 63 := by
+  have hlm : me.val.length ≤ 127 := by
     rw [hme]; simp only [List.length_append, List.length_cons]; omega
   cases hlh with
   | leaf _ =>
@@ -503,7 +503,7 @@ theorem rotate_right_nodes {L R : Option Nat} {h : Nat} {left right : Node}
     (hlh : HeightInv h left) (hrh : HeightInv h right)
     (hS : InB L R S.1.val)
     (hll : 0 < left.entries.val.length)
-    (hrl : right.entries.val.length < 63)
+    (hrl : right.entries.val.length < 127)
     (stolen : Std.U64 × Std.U64)
     (hstolen : left.entries.val[left.entries.val.length - 1]? = some stolen)
     (nle nre : alloc.vec.Vec (Std.U64 × Std.U64)) (nlc nrc : Children)
@@ -541,7 +541,7 @@ theorem rotate_right_nodes {L R : Option Nat} {h : Nat} {left right : Node}
     refine (hbl e (List.mem_of_mem_take he)).tighten_hi ?_
     have := mem_take_lt_median le.val (le.val.length - 1) hlt1 hsl e he
     rwa [hst] at this
-  have hlnl : nle.val.length ≤ 63 := by
+  have hlnl : nle.val.length ≤ 127 := by
     rw [hnle]; simp only [List.length_take]
     have := hlinv.entries_len_le
     simp only [Node.entries._simpLemma_] at this
@@ -568,7 +568,7 @@ theorem rotate_right_nodes {L R : Option Nat} {h : Nat} {left right : Node}
           simp only [Option.mem_def, Option.some.injEq] at hl
           subst hl
           exact hstoltS)
-  have hlnr : nre.val.length ≤ 63 := by
+  have hlnr : nre.val.length ≤ 127 := by
     rw [hnre]; simp only [List.length_cons]; omega
   cases hlh with
   | leaf _ =>
@@ -641,7 +641,7 @@ theorem rotate_left_nodes {L R : Option Nat} {h : Nat} {left right : Node}
     (hlh : HeightInv h left) (hrh : HeightInv h right)
     (hS : InB L R S.1.val)
     (hrl0 : 0 < right.entries.val.length)
-    (hll : left.entries.val.length < 63)
+    (hll : left.entries.val.length < 127)
     (stolen : Std.U64 × Std.U64)
     (hstolen : right.entries.val[0]? = some stolen)
     (nle nre : alloc.vec.Vec (Std.U64 × Std.U64)) (nlc nrc : Children)
@@ -691,7 +691,7 @@ theorem rotate_left_nodes {L R : Option Nat} {h : Nat} {left right : Node}
         simp only [Option.mem_def, Option.some.injEq] at hu
         subst hu
         exact hSltst⟩
-  have hlnl : nle.val.length ≤ 63 := by
+  have hlnl : nle.val.length ≤ 127 := by
     rw [hnle]; simp only [List.length_append, List.length_cons,
       List.length_nil]; omega
   -- new right entry facts
@@ -704,7 +704,7 @@ theorem rotate_left_nodes {L R : Option Nat} {h : Nat} {left right : Node}
     subst hl
     have := mem_drop_gt_median re.val 0 hrl0 hsr e (by simpa using he)
     rwa [hst] at this
-  have hlnr : nre.val.length ≤ 63 := by
+  have hlnr : nre.val.length ≤ 127 := by
     rw [hnre]; simp only [List.length_drop]
     have := hrinv.entries_len_le
     simp only [Node.entries._simpLemma_] at this
@@ -772,7 +772,7 @@ theorem rotate_left_nodes {L R : Option Nat} {h : Nat} {left right : Node}
 /-! ## Monadic surgery lemmas -/
 
 theorem NodeInv.children_len_le {lo hi : Option Nat} {n : Node}
-    (h : NodeInv lo hi n) : (clist n.children).length ≤ 64 := by
+    (h : NodeInv lo hi n) : (clist n.children).length ≤ 128 := by
   cases h with
   | leaf entries hs hb hlen => simp [clist]
   | internal entries c cs hs hb hlen hal =>
@@ -782,7 +782,7 @@ theorem NodeInv.children_len_le {lo hi : Option Nat} {n : Node}
     omega
 
 unseal MIN_KEYS T in
-@[step] theorem MIN_KEYS_spec : MIN_KEYS ⦃ m => m.val = 31 ⦄ := by
+@[step] theorem MIN_KEYS_spec : MIN_KEYS ⦃ m => m.val = 63 ⦄ := by
   simp only [MIN_KEYS, T]
   step*
 
@@ -793,7 +793,7 @@ theorem parent_facts {lo hi : Option Nat} {h : Nat}
     (hinv : NodeInv lo hi (Node.mk entries children))
     (hh : HeightInv (h + 1) (Node.mk entries children)) :
     SortedE entries.val ∧ (∀ e ∈ entries.val, InB lo hi e.1.val)
-    ∧ entries.val.length ≤ 63
+    ∧ entries.val.length ≤ 127
     ∧ Aligned lo hi entries.val (clist children)
     ∧ AllH h (clist children)
     ∧ (clist children).length = entries.val.length + 1 := by
@@ -809,7 +809,7 @@ theorem parent_facts {lo hi : Option Nat} {h : Nat}
 theorem parent_assemble {lo hi : Option Nat} {h : Nat}
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
     (hs : SortedE entries.val) (hb : ∀ e ∈ entries.val, InB lo hi e.1.val)
-    (hlen : entries.val.length ≤ 63)
+    (hlen : entries.val.length ≤ 127)
     (hal : Aligned lo hi entries.val (clist children))
     (hne : clist children ≠ []) (hall : AllH h (clist children)) :
     NodeInv lo hi (Node.mk entries children) ∧
@@ -831,7 +831,7 @@ theorem rotate_right_inv {lo hi : Option Nat} {h : Nat}
     (hlsz : ∀ n, (clist children)[idx.val - 1]? = some n →
       0 < n.entries.val.length)
     (hrsz : ∀ n, (clist children)[idx.val]? = some n →
-      n.entries.val.length < 63) :
+      n.entries.val.length < 127) :
     rotate_right entries children idx ⦃ out =>
       NodeInv lo hi (Node.mk out.1 out.2) ∧
       HeightInv (h + 1) (Node.mk out.1 out.2) ⦄ := by
@@ -867,7 +867,7 @@ theorem rotate_right_inv {lo hi : Option Nat} {h : Nat}
   have hll0 : 0 < left.entries.val.length := by
     apply hlsz left
     rw [List.getElem?_eq_getElem hchlt', hleftv]
-  have hrl : right.entries.val.length < 63 := by
+  have hrl : right.entries.val.length < 127 := by
     apply hrsz right
     rw [List.getElem?_eq_getElem hchlt, hrightv]
   have hlle := hlinv0.entries_len_le
@@ -979,7 +979,7 @@ theorem rotate_left_inv {lo hi : Option Nat} {h : Nat}
     (hrsz : ∀ n, (clist children)[idx.val + 1]? = some n →
       0 < n.entries.val.length)
     (hlsz : ∀ n, (clist children)[idx.val]? = some n →
-      n.entries.val.length < 63) :
+      n.entries.val.length < 127) :
     rotate_left entries children idx ⦃ out =>
       NodeInv lo hi (Node.mk out.1 out.2) ∧
       HeightInv (h + 1) (Node.mk out.1 out.2) ⦄ := by
@@ -1015,7 +1015,7 @@ theorem rotate_left_inv {lo hi : Option Nat} {h : Nat}
   have hrl0 : 0 < right.entries.val.length := by
     apply hrsz right
     rw [List.getElem?_eq_getElem hchlt1, hrightv]
-  have hll : left.entries.val.length < 63 := by
+  have hll : left.entries.val.length < 127 := by
     apply hlsz left
     rw [List.getElem?_eq_getElem hchlt, hleftv]
   -- stolen ← right.entries[0]
@@ -1121,7 +1121,7 @@ theorem merge_with_right_inv {lo hi : Option Nat} {h : Nat}
     (hidx : idx.val < entries.val.length)
     (hsz : ∀ nl nr, (clist children)[idx.val]? = some nl →
       (clist children)[idx.val + 1]? = some nr →
-      nl.entries.val.length + nr.entries.val.length ≤ 62) :
+      nl.entries.val.length + nr.entries.val.length ≤ 126) :
     merge_with_right entries children idx ⦃ out =>
       NodeInv lo hi (Node.mk out.1 out.2) ∧
       HeightInv (h + 1) (Node.mk out.1 out.2) ⦄ := by
@@ -1158,7 +1158,7 @@ theorem merge_with_right_inv {lo hi : Option Nat} {h : Nat}
   have hrh : HeightInv h right := by
     rw [hrightv]; exact hall.getElem _ hchlt1
   -- combined size of the two siblings
-  have hszv : left.entries.val.length + right.entries.val.length ≤ 62 := by
+  have hszv : left.entries.val.length + right.entries.val.length ≤ 126 := by
     apply hsz left right
     · rw [List.getElem?_eq_getElem hchlt, hleftv]
     · rw [List.getElem?_eq_getElem hchlt1, hrightv]
@@ -1220,7 +1220,7 @@ theorem merge_with_left_inv {lo hi : Option Nat} {h : Nat}
     (hidx0 : 0 < idx.val) (hidx : idx.val ≤ entries.val.length)
     (hsz : ∀ nl nr, (clist children)[idx.val - 1]? = some nl →
       (clist children)[idx.val]? = some nr →
-      nl.entries.val.length + nr.entries.val.length ≤ 62) :
+      nl.entries.val.length + nr.entries.val.length ≤ 126) :
     merge_with_left entries children idx ⦃ out =>
       NodeInv lo hi (Node.mk out.1 out.2) ∧
       HeightInv (h + 1) (Node.mk out.1 out.2) ⦄ := by
@@ -1258,7 +1258,7 @@ theorem merge_with_left_inv {lo hi : Option Nat} {h : Nat}
   have hrh : HeightInv h right := by
     rw [hrightv]; exact hall.getElem _ hchlt
   -- combined size of the two siblings
-  have hszv : left.entries.val.length + right.entries.val.length ≤ 62 := by
+  have hszv : left.entries.val.length + right.entries.val.length ≤ 126 := by
     apply hsz left right
     · rw [List.getElem?_eq_getElem hchlt', hleftv]
     · rw [List.getElem?_eq_getElem hchlt, hrightv]
@@ -1315,7 +1315,7 @@ theorem merge_with_left_inv {lo hi : Option Nat} {h : Nat}
     `HeightInv` of the parent family. Side conditions: the parent has at
     least one entry (so child `idx` has a sibling — with a single child the
     kernel function would fail), `idx` is a valid child slot, and child `idx`
-    is underfull (`< MIN_KEYS = 31` entries; needed so a merge fits in one
+    is underfull (`< MIN_KEYS = 63` entries; needed so a merge fits in one
     node). The sibling-size tests only pick the branch. -/
 theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
@@ -1325,7 +1325,7 @@ theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
     (hnz : 0 < entries.val.length)
     (hidx : idx.val ≤ entries.val.length)
     (hund : ∀ n, (clist children)[idx.val]? = some n →
-      n.entries.val.length < 31) :
+      n.entries.val.length < 63) :
     fix_underfull_child entries children idx ⦃ out =>
       NodeInv lo hi (Node.mk out.1 out.2) ∧
       HeightInv (h + 1) (Node.mk out.1 out.2) ⦄ := by
@@ -1349,7 +1349,7 @@ theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
     split
     · rename_i hgt
       -- left sibling can donate: rotate_right
-      have hn1len : 31 < n1.entries.val.length := by
+      have hn1len : 63 < n1.entries.val.length := by
         have := alloc.vec.Vec.len_val n1.entries
         scalar_tac
       exact rotate_right_inv entries children idx hinv hh hidx0 hidx
@@ -1360,7 +1360,7 @@ theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
           rw [hmn]; omega)
         (fun m hm => by have := hund m hm; omega)
     · rename_i hngt
-      have hn1len : n1.entries.val.length ≤ 31 := by
+      have hn1len : n1.entries.val.length ≤ 63 := by
         have := alloc.vec.Vec.len_val n1.entries
         scalar_tac
       obtain ⟨i3, hi3a, hi3p⟩ := WP.spec_imp_exists
@@ -1378,7 +1378,7 @@ theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
         split
         · rename_i hgt4
           -- right sibling can donate: rotate_left
-          have hn2len : 31 < n2.entries.val.length := by
+          have hn2len : 63 < n2.entries.val.length := by
             have := alloc.vec.Vec.len_val n2.entries
             scalar_tac
           exact rotate_left_inv entries children idx hinv hh hidxlt
@@ -1423,7 +1423,7 @@ theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
       split
       · rename_i hgt
         -- right sibling can donate: rotate_left
-        have hn1len : 31 < n1.entries.val.length := by
+        have hn1len : 63 < n1.entries.val.length := by
           have := alloc.vec.Vec.len_val n1.entries
           scalar_tac
         exact rotate_left_inv entries children idx hinv hh hidxlt
@@ -1434,7 +1434,7 @@ theorem fix_underfull_child_inv {lo hi : Option Nat} {h : Nat}
             rw [hmn]; omega)
           (fun m hm => by have := hund m hm; omega)
       · rename_i hngt
-        have hn1len : n1.entries.val.length ≤ 31 := by
+        have hn1len : n1.entries.val.length ≤ 63 := by
           have := alloc.vec.Vec.len_val n1.entries
           scalar_tac
         exact merge_with_right_inv entries children idx hinv hh hidxlt
@@ -1462,7 +1462,7 @@ theorem maybe_fix_inv {lo hi : Option Nat} {h : Nat}
     (hnz : underfull = true → 0 < entries.val.length)
     (hidx : underfull = true → idx.val ≤ entries.val.length)
     (hund : underfull = true → ∀ n, (clist children)[idx.val]? = some n →
-      n.entries.val.length < 31) :
+      n.entries.val.length < 63) :
     maybe_fix entries children idx underfull ⦃ out =>
       NodeInv lo hi (Node.mk out.1 out.2) ∧
       HeightInv (h + 1) (Node.mk out.1 out.2) ⦄ := by
