@@ -94,6 +94,10 @@ harness = false
 required-features = ["bench-internals"]
 
 [[bench]]
+name = "btree_get_bench"
+harness = false
+
+[[bench]]
 name = "btree_insert_mut_bench"
 harness = false
 

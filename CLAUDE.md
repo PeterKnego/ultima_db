@@ -17,6 +17,33 @@ cargo run --example basic_usage          # run examples
 cargo run --example multi_store
 ```
 
+## Benchmarking & Performance Testing
+
+Two tiers, and the choice is about *repeatability*, not convenience:
+
+- **Local (`cargo bench`, `make bench/*`, `make perf/check`)** — fine for a quick dev smoke test, catching an obvious regression, or exercising a bench harness for correctness. But the dev/CI/sandbox environment is too noisy for trustworthy numbers: absolute results are meaningless across machines and even same-machine A/B noise floors run ±2x on the Claude sandbox (±2.5–9% on a real bench host). **Never draw a perf conclusion — "X is faster than Y", a new baseline, a competitor ratio — from a local run.**
+- **Remote NVMe host (`bench-infra/`)** — use this whenever **comprehensive, repeatable, or publishable** performance results are required: competitor comparisons, WAL/durability A/B sweeps, autobench Gate-A baselines, or any number that will land in `docs/benchmarks/` or a task doc. It provisions one AWS local-NVMe host, OS-tunes it, rsyncs the working tree, runs the workload on ephemeral NVMe, and pulls results to `bench-out/dist/<ts>/`. See `bench-infra/README.md` and `docs/superpowers/specs/2026-07-08-bench-infra-carveout-design.md`.
+
+Remote usage (all from `bench-infra/`):
+
+```bash
+make init                       # terraform init (once)
+make up                         # provision + configure (cold build: several min)
+make bench/competitor           # UltimaDB vs RocksDB/Fjall/ReDB, both durability tiers
+make bench/wal-ab               # ultima-only WAL/durability A/B sweep
+make bench/autobench            # autobench Gate-A microbenches + baseline record
+make status                     # list host + uptime (cost guard)
+make destroy                    # tear everything down
+make bench-oneshot TARGET=competitor|wal-ab|autobench   # up -> bench -> destroy
+```
+
+**Guardrails — read before touching `make up`/`bench-oneshot`:**
+
+- These commands spin up **real, billable AWS resources**. Get **explicit user authorization** before any `make up`/`bench-oneshot` — do not provision cloud infra on your own initiative.
+- **Nothing auto-reaps** (`ttl_hours` is only a tag). Always `make destroy` when done, and run `make status` to confirm no host is left running. Prefer `make bench-oneshot` for one-off runs so teardown is automatic.
+- **Same-host relative only** — compare engine ordering and ratios, never absolute numbers across machines. NVMe is ephemeral (instance store); never store data you want to keep.
+- Gate B (needs `ultima_cluster`) is **not** run remotely — it is a local-only step.
+
 ## Architecture
 
 UltimaDB is an MVCC store built on a persistent copy-on-write B-tree. The data lives in memory; durability is opt-in via the `persistence` cargo feature (WAL + checkpoints, or checkpoint-only for SMR deployments). The key insight: mutations create new tree roots sharing unchanged subtrees via `Arc`, so old versions stay alive for free.
