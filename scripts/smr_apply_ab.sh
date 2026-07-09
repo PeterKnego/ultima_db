@@ -32,46 +32,51 @@ NORM_T="${NORM_T:-32}"
 set_t() { sed -i -E "s/^const T: usize = [0-9]+;/const T: usize = $1;/" "$BTREE"; }
 # git-independent restore (bench-infra rsyncs the tree WITHOUT .git/).
 ORIG_T="$(grep -oE '^const T: usize = [0-9]+;' "$BTREE" | grep -oE '[0-9]+')"
-trap 'set_t "$ORIG_T"' EXIT
+WORK="$(mktemp -d)"
+trap 'set_t "$ORIG_T"; rm -rf "$WORK"' EXIT
 
 # $1 = T. Rebuild, warm up once, run $RUNS times, echo "median_apply median_p99".
+# $1 = T. Rebuild, warm up once (untimed), then save each run's raw JSON to
+# $WORK/$T.jsonl so the aggregator can report the full spread, not just a median.
 measure() {
   local T="$1"
   set_t "$T"
   ( cd "$REPO_ROOT" && cargo build -q -p ultima-autobench --release ) >/dev/null 2>&1
   ( cd "$REPO_ROOT" && cargo run -q -p ultima-autobench --bin smr-apply-microbench --release -- --json ) >/dev/null 2>&1 || true
-  local out=""
+  : > "$WORK/$T.jsonl"
   for _ in $(seq 1 "$RUNS"); do
-    out+="$(cd "$REPO_ROOT" && cargo run -q -p ultima-autobench --bin smr-apply-microbench --release -- --json 2>/dev/null)"$'\n'
+    ( cd "$REPO_ROOT" && cargo run -q -p ultima-autobench --bin smr-apply-microbench --release -- --json 2>/dev/null ) >> "$WORK/$T.jsonl"
   done
-  printf '%s' "$out" | python3 -c '
-import json,sys,statistics
-ap=[];rp=[]
-for line in sys.stdin:
-    line=line.strip()
-    if not line.startswith("{"): continue
-    d=json.loads(line); ap.append(d["apply_sw_batch_throughput"]); rp.append(d["read_p99_under_load_ns"])
-print(f"{statistics.median(ap):.1f} {statistics.median(rp):.1f}")'
 }
 
-declare -A AP RP
 for T in $T_SWEEP; do
   echo ">>> building + benching T=$T (MAX_KEYS=$((2*T-1))), $RUNS runs..." >&2
-  read -r ap rp <<<"$(measure "$T")"
-  AP[$T]="$ap"; RP[$T]="$rp"
+  measure "$T"
 done
 
-python3 - "$NORM_T" "$RUNS" <<PY
-import sys
-norm, runs = sys.argv[1], sys.argv[2]
-ap = { $(for T in $T_SWEEP; do echo "$T: ${AP[$T]},"; done) }
-rp = { $(for T in $T_SWEEP; do echo "$T: ${RP[$T]},"; done) }
-apN, rpN = ap[int(norm)], rp[int(norm)]
-print(f"\n# SMR-apply A/B — median of {runs} runs, normalized to T={norm}\n")
+# Report median [min-max] per arm for BOTH metrics plus the raw sorted per-run
+# values — so overlapping arms (noise) are distinguishable from real separation.
+python3 - "$NORM_T" "$RUNS" "$WORK" $T_SWEEP <<'PY'
+import sys, json, statistics
+norm=int(sys.argv[1]); runs=sys.argv[2]; work=sys.argv[3]; sweep=[int(x) for x in sys.argv[4:]]
+data={}
+for T in sweep:
+    ap=[]; rp=[]
+    for line in open(f"{work}/{T}.jsonl"):
+        line=line.strip()
+        if not line.startswith("{"): continue
+        d=json.loads(line); ap.append(d["apply_sw_batch_throughput"]); rp.append(d["read_p99_under_load_ns"])
+    data[T]=(ap,rp)
+st=lambda xs:(min(xs),statistics.median(xs),max(xs))
+apN=st(data[norm][0])[1]; rpN=st(data[norm][1])[1]
+print(f"\n# SMR-apply A/B — {runs} runs/arm, median [min-max], normalized to T={norm}\n")
 print("| T | MAX_KEYS | apply_sw_batch_throughput (higher=better) | read_p99_under_load_ns (lower=better) |")
 print("|--:|--:|--:|--:|")
-for T in sorted(ap):
-    mark = "**" if str(T)==norm else ""
-    # throughput ratio >1 = faster; p99 ratio <1 = better
-    print(f"| {mark}{T}{mark} | {2*T-1} | {ap[T]:.0f}  ({ap[T]/apN:.2f}x) | {rp[T]:.0f}  ({rp[T]/rpN:.2f}x) |")
+for T in sweep:
+    ap,rp=data[T]; a=st(ap); r=st(rp); mark="**" if T==norm else ""
+    print(f"| {mark}{T}{mark} | {2*T-1} | {a[1]:.0f} [{a[0]:.0f}-{a[2]:.0f}]  {a[1]/apN:.2f}x | {r[1]:.0f} [{r[0]:.0f}-{r[2]:.0f}]  {r[1]/rpN:.2f}x |")
+print("\nraw apply_sw_batch_throughput per run (sorted):")
+for T in sweep: print(f"  T={T}: " + " ".join(f"{v:.0f}" for v in sorted(data[T][0])))
+print("raw read_p99_under_load_ns per run (sorted):")
+for T in sweep: print(f"  T={T}: " + " ".join(f"{v:.0f}" for v in sorted(data[T][1])))
 PY
