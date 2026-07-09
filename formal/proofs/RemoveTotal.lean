@@ -5,7 +5,7 @@
    `fix_underfull_child` fails. `MinKeysInv` (`MinKeysInvariant.lean`) rules those
    out. Totality is essentially a *length* property (`RemoveTotalCore.lean` proves
    each rebalancer returns `ok` from alignment + nonemptiness + machine-capacity
-   caps); here we thread `NodeInv` (alignment + the ≤ 63 arity that discharges the
+   caps); here we thread `NodeInv` (alignment + the ≤ 127 arity that discharges the
    caps), `HeightInv` (to read off `NodeInv` of a recursive result via the F2/F3
    lemmas), and the nonempty invariant (`NE`/`NERoot`) down the delete recursion,
    so every call returns `ok`.
@@ -34,9 +34,9 @@ private theorem min_keys_ok : ∃ m : Std.Usize, MIN_KEYS = ok m := by
   obtain ⟨m, hm, -⟩ := WP.spec_imp_exists MIN_KEYS_spec
   exact ⟨m, hm⟩
 
-/-- A valid node has ≤ 64 children (leaf: 0; internal: entries + 1 ≤ 64). -/
-theorem NodeInv.children_le64 {lo hi : Option Nat} {n : Node} (h : NodeInv lo hi n) :
-    (clist n.children).length ≤ 64 := by
+/-- A valid node has ≤ 128 children (leaf: 0; internal: entries + 1 ≤ 128). -/
+theorem NodeInv.children_le128 {lo hi : Option Nat} {n : Node} (h : NodeInv lo hi n) :
+    (clist n.children).length ≤ 128 := by
   cases h with
   | leaf entries _ _ _ => simp [clist]
   | internal entries c cs _ _ hlen hal =>
@@ -44,37 +44,37 @@ theorem NodeInv.children_le64 {lo hi : Option Nat} {n : Node} (h : NodeInv lo hi
     simp only [List.length_cons] at hh
     simp only [Node.children._simpLemma_, clist, List.length_cons]; omega
 
-/-- Every node in an aligned family is a valid node: ≤ 63 entries and ≤ 64
+/-- Every node in an aligned family is a valid node: ≤ 127 entries and ≤ 128
     children (used to discharge the machine-capacity caps of the rebalancers). -/
 theorem Aligned.mem_bounds {lo hi : Option Nat} {es : List (Std.U64 × Std.U64)}
     {cs : List Node} (h : Aligned lo hi es cs) :
-    ∀ m ∈ cs, m.entries.val.length ≤ 63 ∧ (clist m.children).length ≤ 64 := by
+    ∀ m ∈ cs, m.entries.val.length ≤ 127 ∧ (clist m.children).length ≤ 128 := by
   induction es generalizing lo cs with
   | nil =>
     cases h with
     | last c hc =>
       intro m hm
       simp only [List.mem_singleton] at hm; subst hm
-      exact ⟨hc.entries_len_le, hc.children_le64⟩
+      exact ⟨hc.entries_len_le, hc.children_le128⟩
   | cons e es ih =>
     cases h with
     | step _ _ c cs hc htail =>
       intro m hm
       rcases List.mem_cons.mp hm with rfl | hm
-      · exact ⟨hc.entries_len_le, hc.children_le64⟩
+      · exact ⟨hc.entries_len_le, hc.children_le128⟩
       · exact ih htail m hm
 
 /-- Wrapper over `maybe_fix_total`: the five machine-capacity caps all follow from
-    uniform "every child ≤ 63 entries / ≤ 64 children" bounds plus the parent's
-    own ≤ 63 arity. -/
+    uniform "every child ≤ 127 entries / ≤ 128 children" bounds plus the parent's
+    own ≤ 127 arity. -/
 theorem maybe_fix_total' (entries : alloc.vec.Vec (Std.U64 × Std.U64))
     (children : Children) (idx : Std.Usize) (underfull : Bool)
     (halign : (clist children).length = entries.val.length + 1)
-    (hent : entries.val.length ≤ 63)
+    (hent : entries.val.length ≤ 127)
     (hnz : underfull = true → 0 < entries.val.length)
     (hidx : underfull = true → idx.val ≤ entries.val.length)
-    (hb63 : ∀ m ∈ clist children, m.entries.val.length ≤ 63)
-    (hbc : ∀ m ∈ clist children, (clist m.children).length ≤ 64) :
+    (hb63 : ∀ m ∈ clist children, m.entries.val.length ≤ 127)
+    (hbc : ∀ m ∈ clist children, (clist m.children).length ≤ 128) :
     ∃ out, maybe_fix entries children idx underfull = ok out := by
   have hmem : ∀ {i : Nat} {n : Node}, (clist children)[i]? = some n → n ∈ clist children :=
     fun h => List.mem_of_getElem? h
@@ -177,19 +177,19 @@ theorem remove_leftmost_total (fuel : Nat) {lo hi : Option Nat} {h : Nat} (node 
       obtain ⟨children0, hrc, hrcv⟩ :=
         WP.spec_imp_exists (replace_child_spec (Children.Cons c cs) 0#usize n')
       simp only [hrc, bind_tc_ok]
-      -- NodeInv of n' (for its ≤ 63 / ≤ 64 bounds) via F3
+      -- NodeInv of n' (for its ≤ 127 / ≤ 128 bounds) via F3
       obtain ⟨_, hNI_n', _, _⟩ :=
         remove_leftmost_spec (Node.size n0) n0 e' n' uf' (le_refl _) hNIn0 hHc hrl
       have halign0 : (clist children0).length = entries.val.length + 1 := by
         rw [hrcv]; simp only [List.length_set]; exact halen
       -- uniform child bounds for children0 = (clist (Cons c cs)).set 0 n'
       have hbounds := hal.mem_bounds
-      have hb63 : ∀ m ∈ clist children0, m.entries.val.length ≤ 63 := by
+      have hb63 : ∀ m ∈ clist children0, m.entries.val.length ≤ 127 := by
         rw [hrcv]
         exact forall_mem_set hNI_n'.entries_len_le (fun m hm => (hbounds m hm).1)
-      have hbc : ∀ m ∈ clist children0, (clist m.children).length ≤ 64 := by
+      have hbc : ∀ m ∈ clist children0, (clist m.children).length ≤ 128 := by
         rw [hrcv]
-        refine forall_mem_set hNI_n'.children_le64 (fun m hm => (hbounds m hm).2)
+        refine forall_mem_set hNI_n'.children_le128 (fun m hm => (hbounds m hm).2)
       obtain ⟨out, hmf⟩ :=
         maybe_fix_total' entries children0 0#usize uf' halign0 hlen
           (fun _ => hne.entries_pos) (fun _ => by scalar_tac) hb63 hbc
@@ -347,12 +347,12 @@ theorem delete_from_node_total (fuel : Nat) {lo hi : Option Nat} {h : Nat} (node
           rw [he0v]; simp [List.length_set]
         have halign0 : (clist children0).length = e0.val.length + 1 := by
           rw [hrcv]; simp only [List.length_set]; rw [halen, he0len]
-        have hb63 : ∀ m ∈ clist children0, m.entries.val.length ≤ 63 := by
+        have hb63 : ∀ m ∈ clist children0, m.entries.val.length ≤ 127 := by
           rw [hrcv]
           exact forall_mem_set hNI_nr.entries_len_le (fun m hm => (hbounds m hm).1)
-        have hbc : ∀ m ∈ clist children0, (clist m.children).length ≤ 64 := by
+        have hbc : ∀ m ∈ clist children0, (clist m.children).length ≤ 128 := by
           rw [hrcv]
-          refine forall_mem_set hNI_nr.children_le64 (fun m hm => (hbounds m hm).2)
+          refine forall_mem_set hNI_nr.children_le128 (fun m hm => (hbounds m hm).2)
         obtain ⟨out, hmf⟩ :=
           maybe_fix_total' e0 children0 i1 ruf halign0 (by rw [he0len]; exact hlen)
             (fun _ => by rw [he0len]; exact hnz) (fun _ => by rw [he0len]; omega) hb63 hbc
@@ -389,12 +389,12 @@ theorem delete_from_node_total (fuel : Nat) {lo hi : Option Nat} {h : Nat} (node
             delete_from_node_inv (Node.size n1) n1 key new_child uf (le_refl _) hNIn1 hHn1 hdr
           have halign0 : (clist children0).length = entries.val.length + 1 := by
             rw [hrcv]; simp only [List.length_set]; exact halen
-          have hb63 : ∀ m ∈ clist children0, m.entries.val.length ≤ 63 := by
+          have hb63 : ∀ m ∈ clist children0, m.entries.val.length ≤ 127 := by
             rw [hrcv]
             exact forall_mem_set hNI_nc.entries_len_le (fun m hm => (hbounds m hm).1)
-          have hbc : ∀ m ∈ clist children0, (clist m.children).length ≤ 64 := by
+          have hbc : ∀ m ∈ clist children0, (clist m.children).length ≤ 128 := by
             rw [hrcv]
-            refine forall_mem_set hNI_nc.children_le64 (fun m hm => (hbounds m hm).2)
+            refine forall_mem_set hNI_nc.children_le128 (fun m hm => (hbounds m hm).2)
           obtain ⟨out, hmf⟩ :=
             maybe_fix_total' entries children0 pos uf halign0 hlen
               (fun _ => hnz) (fun _ => hposle) hb63 hbc
@@ -421,7 +421,7 @@ theorem BTree.remove_total (t : BTree) (key : Std.U64)
       delete_from_node_inv (Node.size t.root) t.root key new_root ufflag
         (le_refl _) hinv hh hdr
     have hnrbound : (clist new_root.children).length ≤ Std.Usize.max := by
-      have h1 := hNI_nr.children_le64
+      have h1 := hNI_nr.children_le128
       scalar_tac
     have hact : ∃ ar, (if alloc.vec.Vec.len new_root.entries = 0#usize then
           (do let i1 ← children_len new_root.children

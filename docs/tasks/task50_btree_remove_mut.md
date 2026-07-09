@@ -173,16 +173,18 @@ prefix while a snapshot holds the merged siblings) and `remove_mut_preserves_sna
   warnings` clean with and without the `persistence` feature. Correctness is unaffected — the
   delete/insert algorithm, rebalance semantics, and the `MIN_KEYS = T-1` / `MAX_KEYS = 2T-1`
   relations are all unchanged and generic in `T`.
-- **Formal-model drift — deliberately acknowledged, follow-up filed.** The `T` change trips the
-  `formal/drift-check` gate (`src/btree.rs` changed without a matching `formal/` change). This is
-  intentional: the Lean model in `formal/` verifies the *algorithm*, whose invariants hold for any
-  valid `T`; the model is simply instantiated at `T=32` (the kernel hardcodes `T=32`, and ~53 proof
-  sites assert `MAX_KEYS=63`/`mid=32`). Re-instantiating at `T=64` requires re-extracting the `.llbc`
-  (charon/aeneas via `formal/scripts/fetch-toolchain.sh`) and updating those numeric constants —
-  tracked as a follow-up (candidates doc §"Recommended order"). Until then: acknowledge locally with
-  `ACK_NO_FORMAL=1 formal/scripts/check-drift.sh`, and **the PR that lands this must carry
-  `[skip-formal-drift]` in its title** (how `formal.yml` CI passes the drift job — `test/formal-kernel`
-  is unaffected, the kernel crate keeps its own `T=32`).
+- **Formal model re-instantiated at `T=64` — drift closed.** The Lean model in `formal/` was
+  re-instantiated to match production: bumped `formal/kernel/src/lib.rs` `T` to 64, re-extracted the
+  translation (charon → aeneas, toolchain via `formal/scripts/fetch-toolchain.sh`), and updated the
+  proof constants that scale with `T` — `MAX_KEYS` 63→127, `MIN_KEYS` 31→63, split median/counts
+  (`mid=64`, pre-split `2T=128`, child counts `T+1=65`), the `NodeInv` arity bound and `MinArity`
+  balance invariant, and the underfull thresholds. All parametric (the split/merge relationships —
+  `merge-fits = 2(T−1)+1 = 2T−1 = MAX_KEYS`, split median at index `T` — are preserved at any `T`).
+  Verified: `lake build` clean (1719 jobs), the differential kernel test passes, the generated
+  `BtreeKernel.lean` has **zero axioms**, and all eight top-level theorems
+  (`BTree.{insert,remove}_{inv,get,frame}`, `remove_total`, `remove_spec`) depend on only the three
+  standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`). Because both `src/btree.rs` and
+  `formal/` changed, `formal/drift-check` now passes normally — **no `[skip-formal-drift]` needed**.
 - **Immutable `remove` is retained** — `remove_mut` is strictly additive. The delete algorithm,
   `MIN_KEYS`, and rebalance semantics are unchanged; only the allocation discipline differs,
   which the persistent structure makes observationally identical.

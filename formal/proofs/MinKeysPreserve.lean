@@ -1,18 +1,18 @@
 /- PRESERVATION of the MIN_KEYS balance invariant under `remove`.
 
    `MinKeysInvariant.lean` proved `remove` TOTAL under `MinKeysInv` (every
-   non-root node ≥ 31 entries). This file proves the complementary, arithmetic
+   non-root node ≥ 63 entries). This file proves the complementary, arithmetic
    direction: `remove` PRESERVES `MinKeysInv` — the result is again balanced.
 
    The classic B-tree deletion argument. A delete drops one node to exactly
-   `MIN_KEYS - 1 = 30`; the rotate/merge rebalancers restore it to ≥ 31. So the
+   `MIN_KEYS - 1 = 62`; the rotate/merge rebalancers restore it to ≥ 63. So the
    right post-condition of the recursion is the "almost-balanced" predicate
 
-     `AlmostMinArity n := 30 ≤ #entries ∧ ChildrenMinArity n.children`
+     `AlmostMinArity n := 62 ≤ #entries ∧ ChildrenMinArity n.children`
 
    — the returned subtree root may be underfull by one, but every *proper*
-   descendant is ≥ 31, and the `underfull` flag exactly tracks whether the root
-   itself dropped below 31 (`RemoveInv`/`RemoveTotal` already prove that half).
+   descendant is ≥ 63, and the `underfull` flag exactly tracks whether the root
+   itself dropped below 63 (`RemoveInv`/`RemoveTotal` already prove that half).
 
    Layering (each reuses the structural surgery in `RemoveRebalance.lean` and
    the helper specs, so nothing is reproved):
@@ -35,7 +35,7 @@ namespace btree_kernel
 /-! ## L0 — `MinArity` destructors + `AllMinArity` algebra -/
 
 theorem MinArity.entries_ge {n : Node} (h : MinArity n) :
-    31 ≤ n.entries.val.length := by
+    63 ≤ n.entries.val.length := by
   cases h with | mk entries cs hlen _ => exact hlen
 
 theorem MinArity.children {n : Node} (h : MinArity n) :
@@ -57,7 +57,7 @@ theorem ChildrenMinArity_iff_allMinArity {cs : Children} :
   ⟨ChildrenMinArity.allMinArity, ChildrenMinArity.of_allMinArity⟩
 
 /-- `MinArity` reconstructor from the two component facts. -/
-theorem MinArity.mk' {n : Node} (hlen : 31 ≤ n.entries.val.length)
+theorem MinArity.mk' {n : Node} (hlen : 63 ≤ n.entries.val.length)
     (hcs : ChildrenMinArity n.children) : MinArity n := by
   obtain ⟨entries, cs⟩ := n
   exact MinArity.mk entries cs hlen hcs
@@ -187,17 +187,17 @@ theorem allMinArity_set_eraseIdx {l : List Node} {p q : Nat} {x : Node}
 
 /-! ## `AlmostMinArity` — the delete recursion's post-condition -/
 
-/-- The returned subtree root may be underfull by one (`≥ 30`), but every proper
-    descendant is `MinArity` (`≥ 31`). -/
+/-- The returned subtree root may be underfull by one (`≥ 62`), but every proper
+    descendant is `MinArity` (`≥ 63`). -/
 def AlmostMinArity (n : Node) : Prop :=
-  30 ≤ n.entries.val.length ∧ ChildrenMinArity n.children
+  62 ≤ n.entries.val.length ∧ ChildrenMinArity n.children
 
 theorem AlmostMinArity.of_minArity {n : Node} (h : MinArity n) : AlmostMinArity n :=
   ⟨by have := h.entries_ge; omega, h.children⟩
 
-/-- Not-underfull (`≥ 31`) + `AlmostMinArity` upgrades to `MinArity`. -/
+/-- Not-underfull (`≥ 63`) + `AlmostMinArity` upgrades to `MinArity`. -/
 theorem AlmostMinArity.toMinArity {n : Node} (h : AlmostMinArity n)
-    (hge : 31 ≤ n.entries.val.length) : MinArity n :=
+    (hge : 63 ≤ n.entries.val.length) : MinArity n :=
   MinArity.mk' hge h.2
 
 /-- A `MinArity` node is `BalancedRoot`-well-formed (either a leaf, or an
@@ -209,8 +209,8 @@ theorem MinArity.toBalancedRoot {n : Node} (h : MinArity n) : BalancedRoot n := 
 
 /-! ## L1 — the rebalancers restore `ChildrenMinArity` -/
 
-/-- `rotate_right`: the donor (child `idx-1`, `≥ 32` entries) lends one to the
-    receiver (child `idx`, `≥ 30`); both come out `≥ 31` and all other children
+/-- `rotate_right`: the donor (child `idx-1`, `≥ 64` entries) lends one to the
+    receiver (child `idx`, `≥ 62`); both come out `≥ 63` and all other children
     are untouched. The parent's entry count is preserved (a `replace_entry`).
     Capacity caps mirror `rotate_right_total`. -/
 theorem rotate_right_minarity
@@ -221,7 +221,7 @@ theorem rotate_right_minarity
     (hgcl : ∀ n, (clist children)[idx.val - 1]? = some n →
       (clist n.children).length ≤ Std.Usize.max)
     (hdon : ∀ n, (clist children)[idx.val - 1]? = some n →
-      32 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
+      64 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
     (hrec : ∀ n, (clist children)[idx.val]? = some n → AlmostMinArity n)
     (hoth : ∀ (j : Nat) (n : Node), j ≠ idx.val - 1 → j ≠ idx.val →
       (clist children)[j]? = some n → MinArity n) :
@@ -303,15 +303,15 @@ theorem rotate_right_minarity
     have hj' : j ≠ idx.val - 1 := by simpa [hiv] using hjp
     exact hoth j n hj' hjq
 
-/-- `rotate_left`: the donor (child `idx+1`, `≥ 32`) lends one to the receiver
-    (child `idx`, `≥ 30`). Parent entry count preserved. -/
+/-- `rotate_left`: the donor (child `idx+1`, `≥ 64`) lends one to the receiver
+    (child `idx`, `≥ 62`). Parent entry count preserved. -/
 theorem rotate_left_minarity
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children) (idx : Std.Usize)
     (halign : (clist children).length = entries.val.length + 1)
     (hidx : idx.val < entries.val.length)
     (hins : ∀ n, (clist children)[idx.val]? = some n → n.entries.val.length < Std.Usize.max)
     (hdon : ∀ n, (clist children)[idx.val + 1]? = some n →
-      32 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
+      64 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
     (hrec : ∀ n, (clist children)[idx.val]? = some n → AlmostMinArity n)
     (hoth : ∀ (j : Nat) (n : Node), j ≠ idx.val → j ≠ idx.val + 1 →
       (clist children)[j]? = some n → MinArity n) :
@@ -383,8 +383,8 @@ theorem rotate_left_minarity
     rw [hch2v]
     exact allMinArity_set2 (by omega) (by omega) hNL hNR hoth
 
-/-- `merge_with_left`: fuse child `idx` (`≥ 30`) into its left sibling (child
-    `idx-1`, `≥ 31`) with the separator; result `≥ 62`. Parent loses one entry. -/
+/-- `merge_with_left`: fuse child `idx` (`≥ 62`) into its left sibling (child
+    `idx-1`, `≥ 63`) with the separator; result `≥ 126`. Parent loses one entry. -/
 theorem merge_with_left_minarity
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children) (idx : Std.Usize)
     (halign : (clist children).length = entries.val.length + 1)
@@ -393,7 +393,7 @@ theorem merge_with_left_minarity
       (clist children)[idx.val]? = some nr →
       nl.entries.val.length + 1 + nr.entries.val.length ≤ Std.Usize.max)
     (hsib : ∀ n, (clist children)[idx.val - 1]? = some n →
-      31 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
+      63 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
     (hrec : ∀ n, (clist children)[idx.val]? = some n → AlmostMinArity n)
     (hoth : ∀ (j : Nat) (n : Node), j ≠ idx.val - 1 → j ≠ idx.val →
       (clist children)[j]? = some n → MinArity n) :
@@ -451,8 +451,8 @@ theorem merge_with_left_minarity
     have hj' : j ≠ idx.val - 1 := by simpa [hiv] using hjp
     exact hoth j n hj' hjq
 
-/-- `merge_with_right`: fuse child `idx` (`≥ 30`) into its right sibling (child
-    `idx+1`, `≥ 31`) with the separator. Parent loses one entry. -/
+/-- `merge_with_right`: fuse child `idx` (`≥ 62`) into its right sibling (child
+    `idx+1`, `≥ 63`) with the separator. Parent loses one entry. -/
 theorem merge_with_right_minarity
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children) (idx : Std.Usize)
     (halign : (clist children).length = entries.val.length + 1)
@@ -462,7 +462,7 @@ theorem merge_with_right_minarity
       nl.entries.val.length + 1 + nr.entries.val.length ≤ Std.Usize.max)
     (hrec : ∀ n, (clist children)[idx.val]? = some n → AlmostMinArity n)
     (hsib : ∀ n, (clist children)[idx.val + 1]? = some n →
-      31 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
+      63 ≤ n.entries.val.length ∧ ChildrenMinArity n.children)
     (hoth : ∀ (j : Nat) (n : Node), j ≠ idx.val → j ≠ idx.val + 1 →
       (clist children)[j]? = some n → MinArity n) :
     merge_with_right entries children idx ⦃ out =>
@@ -515,21 +515,21 @@ theorem merge_with_right_minarity
     exact allMinArity_set_eraseIdx (by omega) hME hoth
 
 /-- `fix_underfull_child` restores `ChildrenMinArity` (all children back to
-    `≥ 31`) and drops the parent's entry count by at most one — the delete-site
+    `≥ 63`) and drops the parent's entry count by at most one — the delete-site
     dispatcher. Every non-`idx` child is `MinArity` (`hother`); child `idx` is
-    the recursively-deleted, possibly-underfull one (`hidxc`, `≥ 30`). The
+    the recursively-deleted, possibly-underfull one (`hidxc`, `≥ 62`). The
     branch structure and capacity discharges mirror `fix_underfull_child_total`;
     each leaf calls the matching `*_minarity` lemma. -/
 theorem fix_underfull_child_minarity
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children) (idx : Std.Usize)
     (halign : (clist children).length = entries.val.length + 1)
-    (hpar63 : entries.val.length ≤ 63)
+    (hpar63 : entries.val.length ≤ 127)
     (hnz : 0 < entries.val.length)
     (hidx : idx.val ≤ entries.val.length)
     (hcap63 : ∀ (j : Nat) (n : Node), (clist children)[j]? = some n →
-      n.entries.val.length ≤ 63)
+      n.entries.val.length ≤ 127)
     (hcapC : ∀ (j : Nat) (n : Node), (clist children)[j]? = some n →
-      (clist n.children).length ≤ 64)
+      (clist n.children).length ≤ 128)
     (hother : ∀ (j : Nat) (n : Node), j ≠ idx.val →
       (clist children)[j]? = some n → MinArity n)
     (hidxc : ∀ n, (clist children)[idx.val]? = some n → AlmostMinArity n) :
@@ -537,10 +537,10 @@ theorem fix_underfull_child_minarity
       entries.val.length - 1 ≤ out.1.val.length ∧ ChildrenMinArity out.2 ⦄ := by
   have hclen := halign
   have hchE : ∀ (j : Nat), j ≤ entries.val.length → ∀ m,
-      (clist children)[j]? = some m → m.entries.val.length ≤ 63 :=
+      (clist children)[j]? = some m → m.entries.val.length ≤ 127 :=
     fun j _ m hm => hcap63 j m hm
   have hchC : ∀ (j : Nat), j ≤ entries.val.length → ∀ m,
-      (clist children)[j]? = some m → (clist m.children).length ≤ 64 :=
+      (clist children)[j]? = some m → (clist m.children).length ≤ 128 :=
     fun j _ m hm => hcapC j m hm
   -- `hother` restated to exclude a second slot (for the rebalancer `hoth`)
   have hoth2r : ∀ (j : Nat) (n : Node), j ≠ idx.val - 1 → j ≠ idx.val →
@@ -562,10 +562,10 @@ theorem fix_underfull_child_minarity
     simp only [hisub, hn1e, hmk, bind_tc_ok]
     split
     · rename_i hgt
-      have hn1len : 31 < n1.entries.val.length := by
+      have hn1len : 63 < n1.entries.val.length := by
         have := alloc.vec.Vec.len_val n1.entries; scalar_tac
       have hdon : ∀ m, (clist children)[idx.val - 1]? = some m →
-          32 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
+          64 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
         intro m hm
         have hmn : m = n1 := by
           rw [List.getElem?_eq_getElem (show idx.val - 1 < (clist children).length by omega)] at hm
@@ -589,10 +589,10 @@ theorem fix_underfull_child_minarity
         simp only [hn2e, bind_tc_ok]
         split
         · rename_i hgt4
-          have hn2len : 31 < n2.entries.val.length := by
+          have hn2len : 63 < n2.entries.val.length := by
             have := alloc.vec.Vec.len_val n2.entries; scalar_tac
           have hdon : ∀ m, (clist children)[idx.val + 1]? = some m →
-              32 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
+              64 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
             intro m hm
             have hmn : m = n2 := by
               rw [List.getElem?_eq_getElem (show idx.val + 1 < (clist children).length by omega)] at hm
@@ -604,7 +604,7 @@ theorem fix_underfull_child_minarity
           rintro out ⟨h1, h2⟩; exact ⟨by omega, h2⟩
         · rename_i hngt4
           have hsib : ∀ m, (clist children)[idx.val - 1]? = some m →
-              31 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
+              63 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
             intro m hm
             have := hother (idx.val - 1) m (by omega) hm
             exact ⟨this.entries_ge, this.children⟩
@@ -616,7 +616,7 @@ theorem fix_underfull_child_minarity
           rintro out ⟨h1, h2⟩; exact ⟨by omega, h2⟩
       · rename_i hge3
         have hsib : ∀ m, (clist children)[idx.val - 1]? = some m →
-            31 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
+            63 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
           intro m hm
           have := hother (idx.val - 1) m (by omega) hm
           exact ⟨this.entries_ge, this.children⟩
@@ -641,10 +641,10 @@ theorem fix_underfull_child_minarity
       simp only [hn1e, hmk, bind_tc_ok]
       split
       · rename_i hgt
-        have hn1len : 31 < n1.entries.val.length := by
+        have hn1len : 63 < n1.entries.val.length := by
           have := alloc.vec.Vec.len_val n1.entries; scalar_tac
         have hdon : ∀ m, (clist children)[idx.val + 1]? = some m →
-            32 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
+            64 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
           intro m hm
           have hmn : m = n1 := by
             rw [List.getElem?_eq_getElem (show idx.val + 1 < (clist children).length by omega)] at hm
@@ -656,7 +656,7 @@ theorem fix_underfull_child_minarity
         rintro out ⟨h1, h2⟩; exact ⟨by omega, h2⟩
       · rename_i hngt
         have hsib : ∀ m, (clist children)[idx.val + 1]? = some m →
-            31 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
+            63 ≤ m.entries.val.length ∧ ChildrenMinArity m.children := by
           intro m hm
           have := hother (idx.val + 1) m (by omega) hm
           exact ⟨this.entries_ge, this.children⟩
@@ -675,18 +675,18 @@ theorem maybe_fix_minarity
     (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (children : Children)
     (idx : Std.Usize) (underfull : Bool)
     (halign : (clist children).length = entries.val.length + 1)
-    (hpar63 : entries.val.length ≤ 63)
+    (hpar63 : entries.val.length ≤ 127)
     (hnz : underfull = true → 0 < entries.val.length)
     (hidx : idx.val ≤ entries.val.length)
     (hcap63 : ∀ (j : Nat) (n : Node), (clist children)[j]? = some n →
-      n.entries.val.length ≤ 63)
+      n.entries.val.length ≤ 127)
     (hcapC : ∀ (j : Nat) (n : Node), (clist children)[j]? = some n →
-      (clist n.children).length ≤ 64)
+      (clist n.children).length ≤ 128)
     (hother : ∀ (j : Nat) (n : Node), j ≠ idx.val →
       (clist children)[j]? = some n → MinArity n)
     (hidxc : ∀ n, (clist children)[idx.val]? = some n → AlmostMinArity n)
     (hfull : underfull = false → ∀ n, (clist children)[idx.val]? = some n →
-      31 ≤ n.entries.val.length) :
+      63 ≤ n.entries.val.length) :
     maybe_fix entries children idx underfull ⦃ out =>
       entries.val.length - 1 ≤ out.1.val.length ∧ ChildrenMinArity out.2 ⦄ := by
   rw [maybe_fix]
@@ -711,19 +711,19 @@ private theorem child_minArity_of_getElem? {node : Node} (hma : MinArity node)
   hma.children.allMinArity n (List.mem_of_getElem? hn)
 
 /-- `remove_leftmost` on a `MinArity` subtree returns an `AlmostMinArity` one,
-    and the underfull flag is exact enough to recover `≥ 31` when it is `false`. -/
+    and the underfull flag is exact enough to recover `≥ 63` when it is `false`. -/
 theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
     (node : Node) (e : Std.U64 × Std.U64) (n' : Node) (uf : Bool)
     (hfuel : Node.size node ≤ fuel)
     (hinv : NodeInv lo hi node) (hh : HeightInv h node) (hma : MinArity node)
     (hok : remove_leftmost node = ok (e, n', uf)) :
-    AlmostMinArity n' ∧ (uf = false → 31 ≤ n'.entries.val.length) := by
+    AlmostMinArity n' ∧ (uf = false → 63 ≤ n'.entries.val.length) := by
   induction fuel generalizing lo hi h node e n' uf with
   | zero => exfalso; have := Node.one_le_size node; omega
   | succ fuel ih =>
     cases hinv with
     | leaf entries hs hb hlen =>
-      have hmalen : 31 ≤ entries.val.length := by simpa using hma.entries_ge
+      have hmalen : 63 ≤ entries.val.length := by simpa using hma.entries_ge
       rw [remove_leftmost] at hok
       simp only [Node.entries._simpLemma_, Node.children._simpLemma_] at hok
       obtain ⟨i, hi', hok⟩ := bind_ok_inv hok
@@ -737,7 +737,7 @@ theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
       have hne0v : ne0.val = entries.val.eraseIdx (0#usize).val :=
         spec_elim (remove_entry_at_spec entries 0#usize) hne0
       obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-      have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+      have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
       simp only [ok.injEq, Prod.mk.injEq] at hok
       obtain ⟨-, hnn, hufe⟩ := hok
       subst hnn
@@ -791,15 +791,15 @@ theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
           spec_elim (replace_child_spec (Children.Cons c cs) 0#usize new_first_child) hrc0
         obtain ⟨⟨entries1, children1⟩, hmf, hok⟩ := bind_ok_inv hok
         obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-        have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+        have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
         simp only [ok.injEq, Prod.mk.injEq] at hok
         obtain ⟨-, hnn, hufe⟩ := hok
         -- feed maybe_fix_minarity at (entries0, children0), idx = 0
         have halign0 : (clist children0).length = entries0.val.length + 1 := by
           rw [hc0, List.length_set, hclen, he0]
-        have hpar0 : entries0.val.length ≤ 63 := by rw [he0]; exact hlen
+        have hpar0 : entries0.val.length ≤ 127 := by rw [he0]; exact hlen
         have hchildB : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-            m.entries.val.length ≤ 63 ∧ (clist m.children).length ≤ 64 := by
+            m.entries.val.length ≤ 127 ∧ (clist m.children).length ≤ 128 := by
           intro j m hm
           have hjle : j ≤ entries.val.length := by
             have hlt := getElem?_some_lt hm; rw [halign0, he0] at hlt; omega
@@ -815,9 +815,9 @@ theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
               rw [List.getElem?_eq_getElem hc] at hm; exact (Option.some.inj hm).symm
             rw [hmeq]; exact ⟨hNI.entries_len_le, hNI.children_len_le⟩
         have hcap63 : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-            m.entries.val.length ≤ 63 := fun j m hm => (hchildB j m hm).1
+            m.entries.val.length ≤ 127 := fun j m hm => (hchildB j m hm).1
         have hcapC : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-            (clist m.children).length ≤ 64 := fun j m hm => (hchildB j m hm).2
+            (clist m.children).length ≤ 128 := fun j m hm => (hchildB j m hm).2
         have hother0 : ∀ (j : Nat) (m : Node), j ≠ (0#usize).val →
             (clist children0)[j]? = some m → MinArity m := by
           intro j m hj0 hm
@@ -828,11 +828,11 @@ theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
           rw [hc0, List.getElem?_set_self (by rw [hclen]; scalar_tac), Option.some.injEq] at hm
           subst hm; exact hma_nfc
         have hfull0 : child_underfull = false → ∀ m, (clist children0)[(0#usize).val]? = some m →
-            31 ≤ m.entries.val.length := by
+            63 ≤ m.entries.val.length := by
           intro hcuf m hm
           rw [hc0, List.getElem?_set_self (by rw [hclen]; scalar_tac), Option.some.injEq] at hm
           subst hm; exact hfull_nfc hcuf
-        have hme31 : 31 ≤ entries.val.length := by simpa using hma.entries_ge
+        have hme31 : 63 ≤ entries.val.length := by simpa using hma.entries_ge
         have hmf_spec := maybe_fix_minarity entries0 children0 0#usize child_underfull
           halign0 hpar0 (fun _ => by rw [he0]; omega) (by scalar_tac)
           hcap63 hcapC hother0 hidxc0 hfull0
@@ -840,7 +840,7 @@ theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
         have hlen1' : entries0.val.length - 1 ≤ entries1.val.length := hlen1
         have hcm1' : ChildrenMinArity children1 := hcm1
         subst hnn
-        have hentry0 : 31 ≤ entries0.val.length := by rw [he0]; exact hma.entries_ge
+        have hentry0 : 63 ≤ entries0.val.length := by rw [he0]; exact hma.entries_ge
         refine ⟨⟨by simp only [Node.entries._simpLemma_]; omega, hcm1'⟩, ?_⟩
         intro huff
         simp only [Node.entries._simpLemma_]
@@ -850,19 +850,19 @@ theorem remove_leftmost_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
         scalar_tac
 
 /-- `delete_from_node` on a `MinArity` subtree returns an `AlmostMinArity` one,
-    with the underfull flag exact enough to recover `≥ 31` when `false`. -/
+    with the underfull flag exact enough to recover `≥ 63` when `false`. -/
 theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
     (node : Node) (key : Std.U64) (n' : Node) (uf : Bool)
     (hfuel : Node.size node ≤ fuel)
     (hinv : NodeInv lo hi node) (hh : HeightInv h node) (hma : MinArity node)
     (hok : delete_from_node node key = ok (DeleteResult.Removed n' uf)) :
-    AlmostMinArity n' ∧ (uf = false → 31 ≤ n'.entries.val.length) := by
+    AlmostMinArity n' ∧ (uf = false → 63 ≤ n'.entries.val.length) := by
   induction fuel generalizing lo hi h node n' uf with
   | zero => exfalso; have := Node.one_le_size node; omega
   | succ fuel ih =>
     cases hinv with
     | leaf entries hs hb hlen =>
-      have hme31 : 31 ≤ entries.val.length := by simpa using hma.entries_ge
+      have hme31 : 63 ≤ entries.val.length := by simpa using hma.entries_ge
       cases hh with
       | leaf _ =>
         rw [delete_from_node] at hok
@@ -881,7 +881,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
           have hrev : new_entries.val = entries.val.eraseIdx pos.val :=
             spec_elim (remove_entry_at_spec entries pos) hre
           obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-          have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+          have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
           simp only [ok.injEq, DeleteResult.Removed.injEq] at hok
           obtain ⟨hnn, hufe⟩ := hok
           subst hnn
@@ -899,7 +899,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
       cases hh with
       | @internal h0 e2 c2 cs2 hch =>
         have hma_cs : ChildrenMinArity (Children.Cons c cs) := hma.children
-        have hme31 : 31 ≤ entries.val.length := by simpa using hma.entries_ge
+        have hme31 : 63 ≤ entries.val.length := by simpa using hma.entries_ge
         rw [delete_from_node] at hok
         simp only [Node.entries._simpLemma_, Node.children._simpLemma_] at hok
         obtain ⟨⟨hit, pos⟩, hfp, hok⟩ := bind_ok_inv hok
@@ -949,14 +949,14 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
             spec_elim (replace_child_spec (Children.Cons c cs) i1 new_right) hrc0
           obtain ⟨⟨entries1, children1⟩, hmf, hok⟩ := bind_ok_inv hok
           obtain ⟨i3, hmk, hok⟩ := bind_ok_inv hok
-          have hi3 : i3.val = 31 := spec_elim MIN_KEYS_spec hmk
+          have hi3 : i3.val = 63 := spec_elim MIN_KEYS_spec hmk
           simp only [ok.injEq, DeleteResult.Removed.injEq] at hok
           obtain ⟨hnn, hufe⟩ := hok
           have halign0 : (clist children0).length = entries0.val.length + 1 := by
             rw [hc0v, List.length_set, hclen, he0len]
-          have hpar0 : entries0.val.length ≤ 63 := by rw [he0len]; exact hlen
+          have hpar0 : entries0.val.length ≤ 127 := by rw [he0len]; exact hlen
           have hchildB : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-              m.entries.val.length ≤ 63 ∧ (clist m.children).length ≤ 64 := by
+              m.entries.val.length ≤ 127 ∧ (clist m.children).length ≤ 128 := by
             intro j m hm
             have hjle : j ≤ entries.val.length := by
               have hlt := getElem?_some_lt hm; rw [halign0, he0len] at hlt; omega
@@ -981,7 +981,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
             rw [hc0v, List.getElem?_set_self hi1lt, Option.some.injEq] at hm
             subst hm; exact hma_nr
           have hfull0 : right_underfull = false → ∀ m, (clist children0)[i1.val]? = some m →
-              31 ≤ m.entries.val.length := by
+              63 ≤ m.entries.val.length := by
             intro hcuf m hm
             rw [hc0v, List.getElem?_set_self hi1lt, Option.some.injEq] at hm
             subst hm; exact hfull_nr hcuf
@@ -992,7 +992,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
           obtain ⟨hlen1, hcm1⟩ := spec_elim hmf_spec hmf
           have hlen1' : entries0.val.length - 1 ≤ entries1.val.length := hlen1
           have hcm1' : ChildrenMinArity children1 := hcm1
-          have hentry0 : 31 ≤ entries0.val.length := by rw [he0len]; exact hme31
+          have hentry0 : 63 ≤ entries0.val.length := by rw [he0len]; exact hme31
           subst hnn
           refine ⟨⟨by simp only [Node.entries._simpLemma_]; omega, hcm1'⟩, ?_⟩
           intro huff
@@ -1036,14 +1036,14 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
               spec_elim (replace_child_spec (Children.Cons c cs) pos new_child) hrc0
             obtain ⟨⟨entries1, children1⟩, hmf, hok⟩ := bind_ok_inv hok
             obtain ⟨i2, hmk, hok⟩ := bind_ok_inv hok
-            have hi2 : i2.val = 31 := spec_elim MIN_KEYS_spec hmk
+            have hi2 : i2.val = 63 := spec_elim MIN_KEYS_spec hmk
             simp only [ok.injEq, DeleteResult.Removed.injEq] at hok
             obtain ⟨hnn, hufe⟩ := hok
             have halign0 : (clist children0).length = entries0.val.length + 1 := by
               rw [hc0v, List.length_set, hclen, he0]
-            have hpar0 : entries0.val.length ≤ 63 := by rw [he0]; exact hlen
+            have hpar0 : entries0.val.length ≤ 127 := by rw [he0]; exact hlen
             have hchildB : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-                m.entries.val.length ≤ 63 ∧ (clist m.children).length ≤ 64 := by
+                m.entries.val.length ≤ 127 ∧ (clist m.children).length ≤ 128 := by
               intro j m hm
               have hjle : j ≤ entries.val.length := by
                 have hlt := getElem?_some_lt hm; rw [halign0, he0] at hlt; omega
@@ -1068,7 +1068,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
               rw [hc0v, List.getElem?_set_self hposlt, Option.some.injEq] at hm
               subst hm; exact hma_nc
             have hfull0 : underfull = false → ∀ m, (clist children0)[pos.val]? = some m →
-                31 ≤ m.entries.val.length := by
+                63 ≤ m.entries.val.length := by
               intro hcuf m hm
               rw [hc0v, List.getElem?_set_self hposlt, Option.some.injEq] at hm
               subst hm; exact hfull_nc hcuf
@@ -1079,7 +1079,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
             obtain ⟨hlen1, hcm1⟩ := spec_elim hmf_spec hmf
             have hlen1' : entries0.val.length - 1 ≤ entries1.val.length := hlen1
             have hcm1' : ChildrenMinArity children1 := hcm1
-            have hentry0 : 31 ≤ entries0.val.length := by rw [he0]; exact hme31
+            have hentry0 : 63 ≤ entries0.val.length := by rw [he0]; exact hme31
             subst hnn
             refine ⟨⟨by simp only [Node.entries._simpLemma_]; omega, hcm1'⟩, ?_⟩
             intro huff
@@ -1094,7 +1094,7 @@ theorem delete_from_node_minarity (fuel : Nat) {lo hi : Option Nat} {h : Nat}
 /-- Root-level: `delete_from_node` on a `BalancedRoot` node returns a node whose
     children are all `MinArity`. This is the *only* fact `BTree.remove` needs
     (it discharges every `BalancedRoot` case, including root-collapse). The root
-    itself is not `MinArity` (it may hold < 31 entries), so this cannot use
+    itself is not `MinArity` (it may hold < 63 entries), so this cannot use
     `delete_from_node_minarity` directly — but the recursion descends into
     children, which *are* `MinArity`, so it delegates to the L2 lemmas. -/
 theorem delete_from_node_root_cma {lo hi : Option Nat} {h : Nat}
@@ -1188,7 +1188,7 @@ theorem delete_from_node_root_cma {lo hi : Option Nat} {h : Nat}
         have halign0 : (clist children0).length = entries0.val.length + 1 := by
           rw [hc0v, List.length_set, hclen, he0len]
         have hchildB : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-            m.entries.val.length ≤ 63 ∧ (clist m.children).length ≤ 64 := by
+            m.entries.val.length ≤ 127 ∧ (clist m.children).length ≤ 128 := by
           intro j m hm
           have hjle : j ≤ entries.val.length := by
             have hlt := getElem?_some_lt hm; rw [halign0, he0len] at hlt; omega
@@ -1213,7 +1213,7 @@ theorem delete_from_node_root_cma {lo hi : Option Nat} {h : Nat}
           rw [hc0v, List.getElem?_set_self hi1lt, Option.some.injEq] at hm
           subst hm; exact hma_nr
         have hfull0 : right_underfull = false → ∀ m, (clist children0)[i1.val]? = some m →
-            31 ≤ m.entries.val.length := by
+            63 ≤ m.entries.val.length := by
           intro hcuf m hm
           rw [hc0v, List.getElem?_set_self hi1lt, Option.some.injEq] at hm
           subst hm; exact hfull_nr hcuf
@@ -1260,7 +1260,7 @@ theorem delete_from_node_root_cma {lo hi : Option Nat} {h : Nat}
           have halign0 : (clist children0).length = entries0.val.length + 1 := by
             rw [hc0v, List.length_set, hclen, he0]
           have hchildB : ∀ (j : Nat) (m : Node), (clist children0)[j]? = some m →
-              m.entries.val.length ≤ 63 ∧ (clist m.children).length ≤ 64 := by
+              m.entries.val.length ≤ 127 ∧ (clist m.children).length ≤ 128 := by
             intro j m hm
             have hjle : j ≤ entries.val.length := by
               have hlt := getElem?_some_lt hm; rw [halign0, he0] at hlt; omega
@@ -1285,7 +1285,7 @@ theorem delete_from_node_root_cma {lo hi : Option Nat} {h : Nat}
             rw [hc0v, List.getElem?_set_self hposlt, Option.some.injEq] at hm
             subst hm; exact hma_nc
           have hfull0 : underfull = false → ∀ m, (clist children0)[pos.val]? = some m →
-              31 ≤ m.entries.val.length := by
+              63 ≤ m.entries.val.length := by
             intro hcuf m hm
             rw [hc0v, List.getElem?_set_self hposlt, Option.some.injEq] at hm
             subst hm; exact hfull_nc hcuf

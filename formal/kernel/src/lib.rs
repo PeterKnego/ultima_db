@@ -23,7 +23,7 @@
 //! - `remove` returns `Option<BTree>` (`None` == the `Err(KeyNotFound)` arm)
 //!   since the kernel has no `Error` type.
 
-pub const T: usize = 32;
+pub const T: usize = 64;
 pub const MAX_KEYS: usize = 2 * T - 1;
 /// Minimum entries in a non-root node (mirror of `src/btree.rs`).
 pub const MIN_KEYS: usize = T - 1;
@@ -268,7 +268,7 @@ fn maybe_split(entries: Vec<(u64, u64)>, children: Children, replaced: bool) -> 
     if entries.len() <= MAX_KEYS {
         InsertResult::Fit(Box::new(Node { entries, children }), replaced)
     } else {
-        // entries.len() == MAX_KEYS + 1 == 64; split at mid == 32.
+        // entries.len() == MAX_KEYS + 1 == 128; split at mid == 64.
         let mid = entries.len() / 2;
         let median = entries[mid];
         let left_entries = entries_prefix(&entries, mid);

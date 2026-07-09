@@ -79,7 +79,7 @@ theorem maybe_split_frame_descend {k : Std.U64} {res : Result (Option Std.U64)}
     (hgt : ∀ i, (h : i < entries.val.length) → q ≤ i →
       k.val < (entries.val[i]'h).1.val)
     (hcl : (clist children).length = entries.val.length + 1)
-    (hlen : entries.val.length ≤ 64)
+    (hlen : entries.val.length ≤ 128)
     (hsmall : entries.val.length < Std.Usize.max)
     (hgv : get_in_node ((clist children)[q]'(by rw [hcl]; omega)) k = res) :
     maybe_split entries children replaced ⦃ r => GetR k res r ⦄ := by
@@ -90,8 +90,8 @@ theorem maybe_split_frame_descend {k : Std.U64} {res : Result (Option Std.U64)}
     rw [get_descend' entries children k hs q hq hlt hgt hcl hsmall]
     exact hgv
   · -- Split at the median
-    have h64 : entries.val.length = 64 := by scalar_tac
-    have hmid : mid.val = 32 := by scalar_tac
+    have h64 : entries.val.length = 128 := by scalar_tac
+    have hmid : mid.val = 64 := by scalar_tac
     have hmidlt : mid.val < entries.val.length := by scalar_tac
     have hmedian : median = entries.val[mid.val]'hmidlt := by rw [median_post]
     have hi3 : i3.val = mid.val + 1 := by scalar_tac
@@ -222,7 +222,7 @@ theorem maybe_split_none {k : Std.U64}
       (entries.val[i]'h).1.val < k.val)
     (hgt : ∀ i, (h : i < entries.val.length) → q ≤ i →
       k.val < (entries.val[i]'h).1.val)
-    (hlen : entries.val.length ≤ 64) :
+    (hlen : entries.val.length ≤ 128) :
     maybe_split entries Children.Nil replaced ⦃ r => GetR k (ok none) r ⦄ := by
   rw [maybe_split]
   step*
@@ -232,8 +232,8 @@ theorem maybe_split_none {k : Std.U64}
   · -- side condition
     simp [clist]
   · -- Split
-    have h64 : entries.val.length = 64 := by scalar_tac
-    have hmid : mid.val = 32 := by scalar_tac
+    have h64 : entries.val.length = 128 := by scalar_tac
+    have hmid : mid.val = 64 := by scalar_tac
     have hmidlt : mid.val < entries.val.length := by scalar_tac
     have hmedian : median = entries.val[mid.val]'hmidlt := by rw [median_post]
     have hlpost : left_entries.val = entries.val.take mid.val := left_entries_post
