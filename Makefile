@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/fanout bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/fanout bench/smr-ab bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -120,6 +120,12 @@ bench/wal-ab:
 # at 1M random keys, prints a table normalized to T=32. See scripts/fanout_ab.sh.
 bench/fanout: ## B-tree fanout (T) A/B sweep — get/insert/remove @1M random keys
 	scripts/fanout_ab.sh
+
+# B-tree fanout (T) A/B on the CONTENDED SMR-apply + read-under-load workload
+# (the perf-gate regime). Complements bench/fanout (uncontended bulk ops): here
+# concurrent make_mut CoW-clones make bigger nodes costlier. See scripts/smr_apply_ab.sh.
+bench/smr-ab: ## SMR-apply/read-p99 fanout (T) A/B — the contended perf-gate workload
+	scripts/smr_apply_ab.sh
 
 # Bulk-load ingest comparison (build empty db of N records). Five arms:
 # UltimaDB insert_batch, UltimaDB Store::bulk_load, RocksDB, Fjall, ReDB.

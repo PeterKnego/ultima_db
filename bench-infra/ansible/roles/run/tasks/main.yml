@@ -71,6 +71,17 @@
     executable: /bin/bash
   changed_when: true
 
+- name: Run SMR-apply/read-p99 fanout (T) A/B
+  when: bench_target == "smr-ab"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/smr-ab 2>&1 | tee {{ remote_home }}/results/smr-ab.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Run autobench Gate-A microbenches (record baselines)
   when: bench_target == "autobench"
   ansible.builtin.shell: |
