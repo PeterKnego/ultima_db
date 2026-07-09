@@ -42,12 +42,15 @@ N="${N:-1000000}"
 NORM_T="${NORM_T:-32}"          # baseline the table is normalized against
 QUICK_ARG=""; [ -n "${QUICK:-}" ] && QUICK_ARG="--quick"
 
-# We rewrite one line of a tracked file; guarantee we restore it no matter how
-# we exit (Ctrl-C, error, or normal completion) so no run can leave `T` mutated.
-restore() { git -C "$REPO_ROOT" checkout -- src/btree.rs; }
-trap restore EXIT
-
 set_t() { sed -i -E "s/^const T: usize = [0-9]+;/const T: usize = $1;/" "$BTREE"; }
+
+# We rewrite one line of a tracked file; guarantee we restore it no matter how we
+# exit (Ctrl-C, error, or normal completion) so no run leaves `T` mutated. Restore
+# by rewriting the saved value, NOT `git checkout` — bench-infra rsyncs the tree
+# to the remote host *without* .git/, so a git-based restore would fail there.
+ORIG_T="$(grep -oE '^const T: usize = [0-9]+;' "$BTREE" | grep -oE '[0-9]+')"
+restore() { set_t "$ORIG_T"; }
+trap restore EXIT
 
 # Run one criterion benchmark id and echo its median in nanoseconds.
 # $1 = bench target, $2 = benchmark id (also the criterion dir path).

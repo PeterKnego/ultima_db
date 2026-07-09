@@ -12,7 +12,7 @@ TFVARS  ?= terraform.tfvars
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS) 2>/dev/null)
 
-.PHONY: init up inventory bench/competitor bench/wal-ab bench/autobench bench-oneshot status ssh destroy
+.PHONY: init up inventory bench/competitor bench/wal-ab bench/autobench bench/fanout bench-oneshot status ssh destroy
 
 init: ## terraform init
 	$(TF) init
@@ -34,8 +34,11 @@ bench/wal-ab: ## WAL/durability A/B sweep (ultima-only) on NVMe
 bench/autobench: ## autobench Gate-A microbenches + baseline record
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=autobench
 
-bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench) -> destroy
-	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|autobench"; exit 1; fi
+bench/fanout: ## B-tree fanout (T) A/B sweep — get/insert/remove @1M random keys
+	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fanout
+
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench|fanout) -> destroy
+	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|autobench|fanout"; exit 1; fi
 	$(MAKE) up
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET)
 	$(MAKE) destroy

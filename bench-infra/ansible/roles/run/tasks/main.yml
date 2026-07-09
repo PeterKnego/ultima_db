@@ -60,6 +60,17 @@
     executable: /bin/bash
   changed_when: true
 
+- name: Run B-tree fanout (T) A/B sweep
+  when: bench_target == "fanout"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/fanout 2>&1 | tee {{ remote_home }}/results/fanout.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Run autobench Gate-A microbenches (record baselines)
   when: bench_target == "autobench"
   ansible.builtin.shell: |
@@ -72,8 +83,8 @@
     executable: /bin/bash
   changed_when: true
 
-- name: Copy criterion output into results (competitor / wal-ab)
-  when: bench_target in ["competitor", "wal-ab"]
+- name: Copy criterion output into results (competitor / wal-ab / fanout)
+  when: bench_target in ["competitor", "wal-ab", "fanout"]
   ansible.builtin.shell: |
     set -e
     if [ -d {{ ud_src_dir }}/target/criterion ]; then

@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/fanout bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -114,6 +114,12 @@ bench/wal-ab:
 	  cargo bench --bench ycsb_bench -- --save-baseline wal_strict_standalone_fast
 	@echo "===== WAL A/B (lower = better) ====="
 	critcmp wal_nondurable wal_strict_consistent wal_strict_inline wal_strict_standalone_fast
+
+# B-tree fanout (T) A/B sweep. Pure in-memory (no ULTIMA_BENCH_DIR / disk needed):
+# rewrites the compile-time T const + rebuilds per value, times get/insert/remove
+# at 1M random keys, prints a table normalized to T=32. See scripts/fanout_ab.sh.
+bench/fanout: ## B-tree fanout (T) A/B sweep — get/insert/remove @1M random keys
+	scripts/fanout_ab.sh
 
 # Bulk-load ingest comparison (build empty db of N records). Five arms:
 # UltimaDB insert_batch, UltimaDB Store::bulk_load, RocksDB, Fjall, ReDB.
