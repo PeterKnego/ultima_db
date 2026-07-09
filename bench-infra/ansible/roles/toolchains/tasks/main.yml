@@ -39,6 +39,12 @@
   ansible.builtin.command: "{{ remote_home }}/.cargo/bin/rustc --version"
   register: rustc_version
   changed_when: false
+  # The rustc shim is a rustup proxy: without RUSTUP_HOME it resolves the default
+  # toolchain against $HOME/.rustup (the become-user's home, not remote_home) and
+  # fails with "no default is configured". Mirror the critcmp task's environment.
+  environment:
+    CARGO_HOME: "{{ remote_home }}/.cargo"
+    RUSTUP_HOME: "{{ remote_home }}/.rustup"
 
 - name: Show toolchain version
   ansible.builtin.debug:
