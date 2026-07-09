@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/fanout bench/smr-ab bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
 
 build:
 	cargo build
@@ -126,6 +126,12 @@ bench/fanout: ## B-tree fanout (T) A/B sweep — get/insert/remove @1M random ke
 # concurrent make_mut CoW-clones make bigger nodes costlier. See scripts/smr_apply_ab.sh.
 bench/smr-ab: ## SMR-apply/read-p99 fanout (T) A/B — the contended perf-gate workload
 	scripts/smr_apply_ab.sh
+
+# B-tree fanout (T) read-vs-write ASYMMETRY sweep: get/insert/update/remove in
+# BOTH the warm (CoW-clone, ~T/lnT) and cold (in-place, U-shape) regimes over
+# T in 8..256. Checks the asymmetry formula + corollary. See scripts/fanout_micro_ab.sh.
+bench/fanout-micro: ## Fanout (T) read-vs-write asymmetry — warm+cold, get/insert/update/remove @T 8..256
+	scripts/fanout_micro_ab.sh
 
 # Bulk-load ingest comparison (build empty db of N records). Five arms:
 # UltimaDB insert_batch, UltimaDB Store::bulk_load, RocksDB, Fjall, ReDB.

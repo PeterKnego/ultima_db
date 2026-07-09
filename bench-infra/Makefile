@@ -12,7 +12,7 @@ TFVARS  ?= terraform.tfvars
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS) 2>/dev/null)
 
-.PHONY: init up inventory bench/competitor bench/wal-ab bench/autobench bench/fanout bench/smr-ab bench-oneshot status ssh destroy
+.PHONY: init up inventory bench/competitor bench/wal-ab bench/autobench bench/fanout bench/smr-ab bench/fanout-micro bench-oneshot status ssh destroy
 
 init: ## terraform init
 	$(TF) init
@@ -40,8 +40,11 @@ bench/fanout: ## B-tree fanout (T) A/B sweep — get/insert/remove @1M random ke
 bench/smr-ab: ## SMR-apply/read-p99 fanout (T) A/B — the contended perf-gate workload
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=smr-ab
 
-bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench|fanout|smr-ab) -> destroy
-	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|autobench|fanout|smr-ab"; exit 1; fi
+bench/fanout-micro: ## Fanout (T) read-vs-write asymmetry — warm+cold get/insert/update/remove @T 8..256
+	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fanout-micro
+
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench|fanout|smr-ab|fanout-micro) -> destroy
+	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|autobench|fanout|smr-ab|fanout-micro"; exit 1; fi
 	$(MAKE) up
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET)
 	$(MAKE) destroy
