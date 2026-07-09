@@ -163,10 +163,12 @@ prefix while a snapshot holds the merged siblings) and `remove_mut_preserves_sna
   eliminating it gave random-delete a further ~2.8× (see §5.1). The fanout experiment
   (`docs/superpowers/specs/2026-07-08-btree-optimization-candidates.md` §Tier 2.2) had flagged
   this as the prerequisite for any future `T` increase, since the old sibling clone made large
-  fanout degrade delete badly. With the clone gone, the fanout sweep is worth re-running to
-  see if the optimum `T` has shifted up — a committed harness (`scripts/fanout_ab.sh`, plus the
-  new `benches/btree_get_bench.rs` read column) drives it; run on a bench host, record in the
-  candidates doc §2.
+  fanout degrade delete badly. With the clone gone, the fanout sweep was re-run on the AWS NVMe
+  bench host (2026-07-09, `scripts/fanout_ab.sh` / `make bench/fanout`, new `benches/btree_get_bench.rs`
+  read column): the delete cliff is gone (0.81 @T=64 / 0.80 @T=128 vs the old 1.31 / 1.89) and the
+  optimum shifted up — **T=64 dominates T=32 on all three axes** (get −18%, insert −8%, remove −19%).
+  Full table + provenance in the candidates doc §2; the recommendation is to bump the default to
+  `T=64`.
 - **Immutable `remove` is retained** — `remove_mut` is strictly additive. The delete algorithm,
   `MIN_KEYS`, and rebalance semantics are unchanged; only the allocation discipline differs,
   which the persistent structure makes observationally identical.

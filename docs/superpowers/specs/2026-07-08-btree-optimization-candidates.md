@@ -77,18 +77,33 @@ zero effort** — change one const, A/B the existing benches.
   increase —
   fixing it would flatten the delete regression and could shift the optimum `T` upward,
   capturing the read/insert gains without the delete penalty.
-- **🔁 RETEST PENDING (prerequisite now shipped).** The in-place rebalance sibling-clone
-  micro-opt landed (`task50` §5.1, commit `0a240c2`), so the "T=32 near-optimal" conclusion
-  above is provisional — it was measured *before* the fix that was its stated prerequisite.
-  A committed, reproducible sweep harness now exists to re-settle it on a quiet bench host:
-  `scripts/fanout_ab.sh` (sweeps `T ∈ {8,16,32,64,128}`, rewrites the `T` const + rebuilds per
-  value, times the `get` / `insert_mut` / `remove_mut` in-place arms at 1M random keys, and
-  prints a table normalized to T=32). Reads/inserts add the `btree_get_bench` / `btree_insert_mut_bench`
-  columns; `btree_get_bench` was added for this. **Hypothesis to confirm/refute:** with the
-  sibling clone gone, the delete-at-high-fanout cliff flattens and the optimum `T` moves up
-  (T=64 becomes a candidate default, or T=128 for read/insert-heavy). Do **not** decide from
-  dev-sandbox numbers (per-run noise ~±2×). Record the resulting table here (replacing this
-  block) and in `task50`.
+- **✅ RE-MEASURED (2026-07-09, AWS NVMe bench host — 8 vcpu, kernel 6.17.0-aws, rustc 1.96.1,
+  git `906e5a4`; random 1M keys; sweep `T ∈ {8,16,32,64,128}` via `scripts/fanout_ab.sh`,
+  `make bench/fanout` on `bench-infra`).** After the in-place rebalance micro-opt landed
+  (`task50` §5.1, commit `0a240c2`), re-ran the sweep the old result had gated. Times normalized
+  to **T=32** (lower = faster):
+
+  | T | MAX_KEYS | get | insert | remove |
+  |--:|--:|--:|--:|--:|
+  | 8 | 15 | 1.73 | 1.27 | 1.24 |
+  | 16 | 31 | 1.26 | 1.07 | 1.00 |
+  | **32** | **63** | **1.00** | **1.00** | **1.00** |
+  | **64** | **127** | **0.82** | **0.92** | **0.81** |
+  | 128 | 255 | 0.96 | 0.88 | 0.80 |
+
+  (absolute @T=32: get 213.0 ms, insert 512.5 ms, remove 450.4 ms.)
+- **Finding — the delete cliff is gone and the optimum moved up.** The pre-fix sweep had delete
+  *regressing* at large fanout (1.31× @T=64, 1.89× @T=128) from sibling clones during rebalancing;
+  that pinned T=32. With in-place rebalancing, delete is now *faster* at larger `T` (0.81 @T=64,
+  0.80 @T=128), confirming the hypothesis. **T=64 dominates T=32 on all three axes** (get −18%,
+  insert −8%, remove −19%) and beats T=128 on reads (0.82 vs 0.96 — 255-key in-node search and
+  node cache footprint start to cost past T=64) while nearly matching its writes.
+- **Conclusion: bump the default to `T = 64`** (MAX_KEYS=127) — it is the new balance point, a
+  broad ~8–19% win over T=32 with no losing axis. T=128 is marginally better on writes only and
+  clearly worse on reads; not worth the read regression for a mixed default. Numbers are single-run
+  medians (bench-host noise floor ~±2.5–9%); the get/remove wins clear it comfortably, insert
+  (−8%) is nearer the floor but same-signed and coherent across all axes. Re-run `make bench/fanout`
+  to reconfirm if desired before flipping the const.
 
 **3. Auto-increment bulk-append fast path in `insert_batch`.** The bulk-load bench showed
 `Store::bulk_load` (from_sorted) beats `insert_batch` ~2× even with `insert_mut`. For
@@ -128,8 +143,9 @@ win and the from_sorted gap.
    in-place rebalance micro-opt as the prerequisite for any fanout increase (see #2 above).
 3. ✅ In-place rebalance sibling-clone micro-opt (`task50` §5.1) — done: `rotate_*`/`merge_*`
    now mutate siblings in place (`make_mut`/`try_unwrap`). Random-delete gained a further ~2.8×
-   (1M in_place 994→351 ms; overall vs immutable 3.7× → 9.8×). Unblocks a future fanout bump —
-   a fanout re-sweep with in-place rebalancing is now warranted (the old delete cliff should
-   flatten).
-4. Bulk-append fast path (Tier 2.3) — if the sequential-insert path matters.
-5. Flamegraph, then reconsider Tier 3/4 with data.
+   (1M in_place 994→351 ms; overall vs immutable 3.7× → 9.8×). Unblocked the fanout bump below.
+4. ✅ Fanout re-sweep (post-rebalance, Tier 2.2 redux) — done on the AWS NVMe bench host
+   (2026-07-09, see #2 above): the delete cliff flattened as predicted and the optimum moved up.
+   **Recommendation: bump the default `T = 32 → 64`** (broad ~8–19% win, no losing axis).
+5. Bulk-append fast path (Tier 2.3) — if the sequential-insert path matters.
+6. Flamegraph, then reconsider Tier 3/4 with data.
