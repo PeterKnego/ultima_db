@@ -8,6 +8,35 @@ per-run data (below) would otherwise be lost.
 **Host (all runs):** AWS local-NVMe, 8 vcpu, 15701 MB, kernel `6.17.0-1019-aws`. Provisioned +
 torn down per run via `bench-infra` (`make bench-oneshot`-style, guaranteed teardown).
 
+---
+
+## ⭐ The core finding: fanout `T` pulls reads and writes in *opposite* directions
+
+**This is the single most important result from all the fanout testing. Bigger `T` makes reads
+faster and CoW writes slower — on the *same tree* — because reads only *traverse* nodes while writes
+*clone* them.** Any future re-tuning of `T` (or a decision to make it configurable) must weigh both
+sides; you cannot optimize `T` for one without paying on the other.
+
+| | What `T` controls | Effect of **bigger** `T` | Net |
+|---|---|---|---|
+| **Read** (`get`, p99-under-load) | tree **height** ≈ `ln N / ln T` — nodes *traversed & binary-searched*, never copied | shallower tree → fewer cache-missing hops | **faster** ✅ (T=64 read p99 **−62%**) |
+| **CoW write** (SMR-apply update on a warm/shared tree) | **width** of each node cloned by `Arc::make_mut` on the root→leaf path, O(`T`) per node | total copy ≈ height × width ≈ `T / ln T` — *increasing* in `T` for T>e | **slower** ❌ (T=64 apply **−22%**) |
+
+**Why writes lose despite the shallower tree:** a CoW write must `Arc::make_mut`-clone every node on
+its path that is still shared with a retained snapshot, and each clone deep-copies that node's full
+`entries`/`children` `Vec` (width O(`T`)). Fewer levels (`1/ln T`) but each level twice as wide
+(`∝ T`) nets out to `T / ln T` copy work — e.g. `32/ln32 ≈ 9.2` → `64/ln64 ≈ 15.4`, ~**1.7× more
+copy per update** at T=64. Reads pay none of this: they clone nothing, so they only see the height
+win. (Details + code anchors in §3.)
+
+> **Corollary — the write penalty is an MVCC-sharing tax, not intrinsic to `T`.** It exists *only*
+> because `make_mut` finds nodes shared with live snapshots (warm store, ~10 retained). On a cold
+> store with uniquely-owned nodes, `make_mut` mutates in place, the O(`T`) clones vanish, and bigger
+> `T` would help writes too (shallower descent). The read/write split is a property of copy-on-write
+> under retained readers, not of B-trees in general.
+
+---
+
 ## TL;DR
 
 - **Uncontended bulk ops (1M random keys):** larger `T` wins monotonically up to ~64. **T=64**
