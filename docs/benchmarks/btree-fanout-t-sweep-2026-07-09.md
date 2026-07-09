@@ -58,6 +58,16 @@ essentially none of the insert/remove win.
 Run `20260709T130609Z`, git `07cf6ba`, rustc 1.97.0. `median [min-max]`, ratio ×T32.
 `apply_sw_batch_throughput` higher = better; `read_p99_under_load_ns` lower = better.
 
+> **Where the fanout cost actually lands: the row update, not the commit.** Each timed txn is
+> `begin_write → open_table → update → commit` (`smr_bench.rs` block (c)). The `T`-dependent cost is
+> entirely in `tbl.update` → `BTree::insert_mut` (`table.rs:317`), which `Arc::make_mut`-copies every
+> node on the root→leaf path still shared with the live snapshot — bigger `T` = bigger node `Vec` =
+> bigger memmove per copied node. `commit_single_writer` (`store.rs:2638`) is a *fixed* cost
+> independent of `T`: it Arc-clones the table map, wraps the already-built dirty tree, and inserts a
+> snapshot — it never touches a B-tree node. And because this is SMR mode (no `wal_handle`), commit
+> does **no fsync/parking**. So "apply throughput" here is the CoW path-copy rate, **not** a commit
+> rate — which is exactly why fanout moves it.
+
 | T | MAX_KEYS | apply throughput | read p99 (ns) |
 |--:|--:|--:|--:|
 | **32** | 63 | 346014 [343330–347444] · 1.00× | 2287 [2194–2367] · 1.00× |
