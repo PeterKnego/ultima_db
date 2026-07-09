@@ -7,7 +7,11 @@ use std::sync::Arc;
 use crate::{Error, Result};
 
 // Minimum degree: every non-root node has at least T-1 keys, at most 2T-1 keys.
-const T: usize = 32;
+// T=64 (MAX_KEYS=127) is the measured balance point on a 1M-key mixed workload:
+// once in-place rebalancing (task50 §5.1) removed the sibling-clone cost, the old
+// delete-at-high-fanout cliff flattened and T=64 beat T=32 on all axes (get -18%,
+// insert -8%, remove -19%). See docs/superpowers/specs/2026-07-08-btree-optimization-candidates.md §2.
+const T: usize = 64;
 const MIN_KEYS: usize = T - 1;
 const MAX_KEYS: usize = 2 * T - 1;
 
