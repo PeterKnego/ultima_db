@@ -104,6 +104,28 @@ zero effort** — change one const, A/B the existing benches.
   medians (bench-host noise floor ~±2.5–9%); the get/remove wins clear it comfortably, insert
   (−8%) is nearer the floor but same-signed and coherent across all axes. Re-run `make bench/fanout`
   to reconfirm if desired before flipping the const.
+- **↳ Intermediate `T=48` probe (2026-07-09, AWS NVMe, git `05b19ea`) — dominated, not a middle
+  ground.** A separate run swept `T ∈ {32,48,64}`. Read against *this run's own* T=32/64 baseline
+  (run-to-run variance makes it invalid to splice into the 8–128 table above — e.g. this run's T=64
+  get is 0.72 vs 0.82 there):
+
+  | T | MAX_KEYS | get | insert | remove |
+  |--:|--:|--:|--:|--:|
+  | **32** | **63** | **1.00** | **1.00** | **1.00** |
+  | 48 | 95 | 0.83 | 0.95 | 0.99 |
+  | 64 | 127 | 0.72 | 0.94 | 0.94 |
+
+  (absolute @T=32: get 179.0 ms, insert 411.4 ms, remove 333.3 ms.) T=48 captures only ~half the
+  get win and essentially none of the insert/remove win — and on the **SMR-apply** cross-check
+  (below) it takes ~the full apply hit (0.81×) with a *bimodal*, no-better-than-T=32 read p99. No
+  reason to prefer it over T=64. Kept `T=64`.
+- **↳ SMR-apply cross-check (2026-07-09, AWS NVMe, git `07cf6ba`, 15 runs/arm).** The bulk benches
+  above are *uncontended*; the perf gate's `smr-apply-microbench` is the contended regime (apply of
+  already-committed SMR batches + reads under load). There **T=64 costs −22% apply throughput** (0.78×;
+  bigger `Arc::make_mut` clones per applied batch) but wins **read p99 −62%** (0.38×, cleanly
+  separated). Accepted the apply regression for the broad read/bulk/p99 wins. Full tables, raw
+  per-run spreads, and provenance: **`docs/benchmarks/btree-fanout-t-sweep-2026-07-09.md`** and
+  `task50` §fanout.
 
 **3. Auto-increment bulk-append fast path in `insert_batch`.** The bulk-load bench showed
 `Store::bulk_load` (from_sorted) beats `insert_batch` ~2× even with `insert_mut`. For
