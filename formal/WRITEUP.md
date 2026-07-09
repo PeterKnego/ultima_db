@@ -227,7 +227,9 @@ The honest caveat is the **twin-code gap**: we verified a port with five documen
 
 **Update (session 3):** the same three-part completeness now holds for **deletion** — `remove_inv` + `remove_get` + `remove_frame` (Part IV, §5), and a follow-on pass proved **`remove_total`** (`remove` never fails on a well-formed tree, under the MIN_KEYS balance invariant) plus the unconditional **`remove_spec`** (§5.3). So both mutating operations of the B-tree are machine-checked to behave as the corresponding map operations, deletion now including a no-panic/no-fail guarantee. Cumulative verified Lean: ~11,000 hand-written lines, ~260 theorems (the deletion half alone is ~6,200 lines / ~170 theorems — larger than all of insertion).
 
-What this does *not* cover (roadmap, in value order): closure of the balanced class under `remove` (the result also satisfies MIN_KEYS — the arithmetic-heavy preservation direction, not needed for totality); range iterators; and everything concurrent — the MultiWriter OCC merge protocol, commit-version promotion ordering, WAL recovery. Those last three are out of Aeneas's scope (its unsafe/concurrency support is future work) and need hand-written protocol models — where the model-fidelity gap returns and the payoff is arguably even higher.
+**Update (session 4):** the balanced class is now proved **closed under `remove`** — `remove_minkeys` (`MinKeysPreserve.lean`): whenever `remove` succeeds on a MIN_KEYS-balanced tree, the result is again MIN_KEYS-balanced. This is the arithmetic-heavy preservation direction `remove_total` left open. The proof carries an *almost-balanced* post-condition through the delete recursion — `AlmostMinArity n := 30 ≤ #entries ∧ ChildrenMinArity n.children`: the returned subtree root may be underfull by exactly one (`MIN_KEYS − 1 = 30`), but every proper descendant is ≥ 31 — and shows each rebalancer restores the ≥ 31 lower bound (rotate: a sibling with ≥ 32 lends one; merge: 31 + 1 + 30 = 62). The whole layer reuses the existing structural surgery (`RemoveRebalance`) and helper specs, so the rebalancers' MinArity effect needed only *alignment + child-arity caps*, not the full ordering invariant; the one genuinely new ingredient is pointwise `getElem?` reasoning through the `set`/`eraseIdx` child-list surgery, since at the delete site the child list is not uniformly `MinArity`. The capstone `remove_balanced_spec` bundles this with `remove_spec` into a single fully-balanced deletion statement (~700 further lines / ~30 theorems, same three axioms). Notably, the underfull flag's reverse direction (`uf = false → ≥ 31`) — which the existing conditional proofs did not expose — falls out for free when peeling the return, since the flag *is* `decide(#entries < 31)`.
+
+What this does *not* cover (roadmap, in value order): range iterators; and everything concurrent — the MultiWriter OCC merge protocol, commit-version promotion ordering, WAL recovery. Those last three are out of Aeneas's scope (its unsafe/concurrency support is future work) and need hand-written protocol models — where the model-fidelity gap returns and the payoff is arguably even higher.
 
 ### 6.2 For the "AI + formal methods" story
 
@@ -273,6 +275,8 @@ formal/proofs/                       # lake package: everything below
     MinKeysInvariant.lean            # NE/NERoot + MinArity/MinKeysInv (balance invariant)
     RemoveTotalCore.lean             # length-only rebalancer totality (rotate/merge/fix return ok)
     RemoveTotal.lean                 # delete_from_node_total, BTree.remove_total, BTree.remove_spec
+    MinKeysPreserve.lean             # AlmostMinArity; *_minarity rebalancers; delete/leftmost_minarity;
+                                     #   BTree.remove_minkeys (MIN_KEYS preserved) + remove_balanced_spec
 ~/ultima/leanstral-demo/             # Leanstral experiments incl. drive.py harness (outside repo)
 ```
 (The `Agent*.lean` names in the narrative above were the working names of the

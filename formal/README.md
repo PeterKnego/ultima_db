@@ -19,6 +19,8 @@ all sorry-free, `#print axioms` = `propext, Classical.choice, Quot.sound` only:
 | `BTree.remove_frame` (`RemoveFrame.lean`) | `get k'` is unchanged for every `k' ≠ k` |
 | `BTree.remove_total` (`RemoveTotal.lean`) | `remove` never fails on a well-formed nonempty tree (`∃ r, remove k = ok r`) |
 | `BTree.remove_spec` (`RemoveTotal.lean`) | unconditional: `remove k` reports the key absent, or returns a valid balanced tree with `k` gone |
+| `BTree.remove_minkeys` (`MinKeysPreserve.lean`) | `remove` **preserves** the MIN_KEYS balance invariant: the rotate/merge rebalancers restore every non-root node to ≥ `T−1 = 31` entries after a delete drops one to 30 |
+| `BTree.remove_balanced_spec` (`MinKeysPreserve.lean`) | capstone: absent, or a valid tree that is well-formed, height-uniform, **and MIN_KEYS-balanced**, with `k` gone |
 
 Together: **insert behaves exactly as a map update, and remove exactly as a map
 deletion.** Because the Aeneas translation is total-with-explicit-effects, the
@@ -37,6 +39,13 @@ Two notes on the remove proofs:
   (`MinKeysInvariant.lean`) closes that gap: under the MIN_KEYS balance invariant
   (every non-root node ≥ 31 entries), `remove` provably returns `ok`, and
   `remove_spec` packages this with the properties into an unconditional statement.
+- `remove_total` shows the balance invariant is *strong enough* for `remove` to
+  succeed; `remove_minkeys` (`MinKeysPreserve.lean`) closes the other direction —
+  the invariant is *preserved*, so the balanced class is closed under `remove`.
+  The proof carries an "almost-balanced" post-condition through the recursion
+  (`AlmostMinArity`: the returned subtree root may be underfull by one, but every
+  proper descendant is ≥ 31) and shows each rebalancer restores ≥ 31; this is the
+  arithmetic-heavy direction. `remove_balanced_spec` bundles it with `remove_spec`.
 
 The remove-preserves-lookups proofs go through an in-order `flatten`
 characterization (`RemoveFlatten.lean`): `get` equals a lookup in the flattened
@@ -61,8 +70,9 @@ Aeneas scope; needs hand-written protocol models).
   `ChildrenSpecs`, `ListLemmas`, `AlignedLemmas`, `TransportLemmas`,
   `RemoveSpecs`), the rebalance surgery (`RemoveRebalance.lean`), the length-only
   rebalancer-totality lemmas (`RemoveTotalCore.lean`), the in-order flatten
-  foundation (`RemoveFlatten.lean`), and the theorem files
-  (`BtreeInsert{Inv,Get,Frame}`, `Remove{Inv,Get,Frame}`, `RemoveTotal`).
+  foundation (`RemoveFlatten.lean`), the theorem files
+  (`BtreeInsert{Inv,Get,Frame}`, `Remove{Inv,Get,Frame}`, `RemoveTotal`), and the
+  MIN_KEYS-preservation layer (`MinKeysPreserve.lean`).
 - `WRITEUP.md` — the full narrative (methodology, Leanstral evaluation,
   Lean-engineering findings).
 
@@ -113,6 +123,7 @@ regenerating.
   `ACK_NO_FORMAL=1` locally, or `[skip-formal-drift]` in the PR title.
 - No `sorry` may be committed; verify with `#print axioms` on the top-level
   theorems `btree_kernel.BTree.{insert,remove}_{inv,get,frame}` plus
-  `BTree.remove_total` / `BTree.remove_spec` — only the three standard Lean
+  `BTree.remove_total` / `BTree.remove_spec` / `BTree.remove_minkeys` /
+  `BTree.remove_balanced_spec` — only the three standard Lean
   axioms are acceptable. The scheduled `lean` CI job (weekly + `workflow_dispatch`)
   rebuilds the proofs and re-runs this check.

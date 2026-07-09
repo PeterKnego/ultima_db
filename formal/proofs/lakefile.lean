@@ -27,6 +27,9 @@ lean_lib «RemoveGet»
 lean_lib «RemoveTotalCore»
 
 @[default_target]
+lean_lib «MinKeysPreserve»
+
+@[default_target]
 lean_lib «BtreeProofs»
 
 @[default_target]
