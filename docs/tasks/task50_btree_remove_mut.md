@@ -169,6 +169,20 @@ prefix while a snapshot holds the merged siblings) and `remove_mut_preserves_sna
   optimum shifted up — **T=64 dominates T=32 on all three axes** (get −18%, insert −8%, remove −19%).
   Full table + provenance in the candidates doc §2; the recommendation is to bump the default to
   `T=64`.
+- **Default bumped to `T=64` (commit `7f6c3fb`).** One-const change; `cargo test` + `clippy -D
+  warnings` clean with and without the `persistence` feature. Correctness is unaffected — the
+  delete/insert algorithm, rebalance semantics, and the `MIN_KEYS = T-1` / `MAX_KEYS = 2T-1`
+  relations are all unchanged and generic in `T`.
+- **Formal-model drift — deliberately acknowledged, follow-up filed.** The `T` change trips the
+  `formal/drift-check` gate (`src/btree.rs` changed without a matching `formal/` change). This is
+  intentional: the Lean model in `formal/` verifies the *algorithm*, whose invariants hold for any
+  valid `T`; the model is simply instantiated at `T=32` (the kernel hardcodes `T=32`, and ~53 proof
+  sites assert `MAX_KEYS=63`/`mid=32`). Re-instantiating at `T=64` requires re-extracting the `.llbc`
+  (charon/aeneas via `formal/scripts/fetch-toolchain.sh`) and updating those numeric constants —
+  tracked as a follow-up (candidates doc §"Recommended order"). Until then: acknowledge locally with
+  `ACK_NO_FORMAL=1 formal/scripts/check-drift.sh`, and **the PR that lands this must carry
+  `[skip-formal-drift]` in its title** (how `formal.yml` CI passes the drift job — `test/formal-kernel`
+  is unaffected, the kernel crate keeps its own `T=32`).
 - **Immutable `remove` is retained** — `remove_mut` is strictly additive. The delete algorithm,
   `MIN_KEYS`, and rebalance semantics are unchanged; only the allocation discipline differs,
   which the persistent structure makes observationally identical.
