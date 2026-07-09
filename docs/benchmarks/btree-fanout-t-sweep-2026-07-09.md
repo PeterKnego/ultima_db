@@ -43,7 +43,9 @@ Run `20260709T153011Z` (git `95a878a`, rustc 1.97.0, same host), `examples/fanou
 (op on a uniquely-owned tree → in-place, no clone). `get` never clones. This isolates the asymmetry
 directly rather than inferring it from the SMR metric.
 
-![Fanout read-vs-write asymmetry](btree-fanout-read-write-asymmetry-2026-07-09.png)
+[![Fanout read-vs-write asymmetry: reads (blue) fall as T grows while warm CoW writes (red/orange/purple) climb, cold writes (dashed) stay flat](btree-fanout-read-write-asymmetry-2026-07-09.png)](btree-fanout-read-write-asymmetry-2026-07-09.svg)
+
+*(click the plot for the scalable SVG)*
 
 Median ns/op, normalized to T=32 (lower = faster):
 
