@@ -105,3 +105,5 @@
       rustc={{ rustc_version.stdout | default('n/a') }}
       ud_git_rev={{ ud_git_rev.stdout | default('n/a', true) }}
       bench_dir={{ bench_dir }}
+      {% if bench_target == 'competitor' %}ud_ycsb_strict_config=standalone_fast (ConsistentInline+CoalescedPrealloc)
+      {% endif %}

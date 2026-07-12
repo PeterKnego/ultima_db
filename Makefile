@@ -63,6 +63,13 @@ bench/ycsb/redb:
 # Run all YCSB suites across both durability tiers (non-durable + strict) with
 # named baselines and compare side-by-side per tier.
 #
+# The UltimaDB STRICT arm runs `standalone_fast` (ULTIMA_BENCH_INLINE=1 +
+# ULTIMA_BENCH_PREALLOC=1 → ConsistentInline + CoalescedPrealloc) — the shippable
+# fast durable single-writer preset the competitors are compared against. Without
+# these the arm falls back to the ~3.8×-slower Consistent+Coalesced default,
+# understating UltimaDB (the wal-ab A/B sweep still exercises that default arm).
+# The non-durable arm stays Eventual to match the competitors' no-fsync path.
+#
 # Requires ULTIMA_BENCH_DIR to point at a REAL disk-backed dir: on hosts where
 # /tmp is a tmpfs (RAM), the default temp dir makes every "on-disk" engine
 # in-memory with free fsyncs, silently invalidating the comparison. All engines
@@ -79,7 +86,8 @@ bench/ycsb/compare:
 	@mkdir -p "$(ULTIMA_BENCH_DIR)"
 	@for tier in nondurable strict; do \
 	  echo "===== YCSB tier: $$tier ====="; \
-	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench --bench ycsb_bench -- --save-baseline ultima_$$tier || exit 1; \
+	  if [ "$$tier" = strict ]; then UD_FAST="ULTIMA_BENCH_INLINE=1 ULTIMA_BENCH_PREALLOC=1"; else UD_FAST=""; fi; \
+	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier env $$UD_FAST cargo bench --bench ycsb_bench -- --save-baseline ultima_$$tier || exit 1; \
 	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_fjall_bench -- --save-baseline fjall_$$tier || exit 1; \
 	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_rocksdb_bench -- --save-baseline rocksdb_$$tier || exit 1; \
 	  ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" ULTIMA_BENCH_DURABILITY=$$tier cargo bench -p compare-benches --bench ycsb_redb_bench -- --save-baseline redb_$$tier || exit 1; \
