@@ -7,6 +7,7 @@ crash.log
 
 # Local config (copy from the *.example templates)
 terraform.tfvars
+terraform.tfvars.*
 .env
 
 # Generated inventory + keys
