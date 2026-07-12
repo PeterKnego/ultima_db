@@ -392,7 +392,9 @@ impl<'s> BulkLoadBatch<'s> {
         if self.pending.is_empty() {
             return Ok(self.base_version);
         }
-        let new_version = self.store.install_batch(self.pending, self.base_version)?;
+        let new_version = self
+            .store
+            .install_batch(self.pending, self.base_version, None)?;
         if opts.checkpoint_after {
             self.store.checkpoint_and_prune_after_bulk(new_version)?;
         }

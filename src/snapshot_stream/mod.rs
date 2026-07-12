@@ -41,6 +41,11 @@ pub enum SnapshotStreamError {
     InvalidPayload { table: String, reason: String },
     #[error("version not found: {0}")]
     VersionNotFound(u64),
+    #[error(
+        "commit_version {requested} must be strictly greater than the current \
+         latest_version {latest}"
+    )]
+    InvalidCommitVersion { requested: u64, latest: u64 },
     #[error("bulk load: {0}")]
     BulkLoad(#[from] crate::Error),
 }
