@@ -1747,7 +1747,7 @@ mod tests {
 
     #[test]
     fn scan_wal_returns_durable_offset_and_strict_wrapper_matches() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
         // Two framed entries written back-to-back.
         let e1 = WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] };
@@ -1768,7 +1768,7 @@ mod tests {
 
     #[test]
     fn scan_wal_tolerant_stops_at_crc_mismatch_strict_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
         let good = WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] };
         let mut bytes = frame_entry(&good).unwrap();
@@ -1791,7 +1791,7 @@ mod tests {
 
     #[test]
     fn frame_entry_concatenation_reads_back_via_read_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
         let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), id: 1, data: vec![1, 2, 3] }] };
         let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), id: 1 }] };
@@ -1814,7 +1814,7 @@ mod tests {
 
     /// Create a store with WAL enabled (Standalone/Consistent) so wal_ops are tracked.
     fn wal_store() -> (Store, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let store = Store::new(crate::StoreConfig {
             persistence: crate::Persistence::Standalone {
                 dir: dir.path().to_path_buf(),
@@ -1937,7 +1937,7 @@ mod tests {
 
     #[test]
     fn wal_file_write_and_read_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         // Write entries
@@ -1974,7 +1974,7 @@ mod tests {
     fn inline_write_is_durable_and_recoverable() {
         // Off-lock inline: write() returns InlineSync (no I/O yet); wait() does
         // the append+fsync and makes it durable.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let poison = Arc::new(WalPoison::new());
         {
             let wal = WalHandle::with_sink_inline(
@@ -2039,7 +2039,7 @@ mod tests {
 
     #[test]
     fn wal_crc_corruption_detected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         {
@@ -2074,7 +2074,7 @@ mod tests {
     #[test]
     fn prune_through_wal_thread_keeps_interleaved_appends() {
         for kind in [WalSinkKind::FsWrite, WalSinkKind::Coalesced] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_scratch::scratch_dir();
             let poison = Arc::new(WalPoison::new());
             let handle =
                 WalHandle::with_sink_kind(dir.path(), true, Arc::clone(&poison), kind).unwrap();
@@ -2116,7 +2116,7 @@ mod tests {
 
     #[test]
     fn wal_prune_removes_old_entries() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         {
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn wal_handle_consistent_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         let w1 = handle
             .write(WalEntry {
@@ -2164,7 +2164,7 @@ mod tests {
 
     #[test]
     fn wal_handle_eventual_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         handle
             .write(WalEntry {
@@ -2181,7 +2181,7 @@ mod tests {
 
     #[test]
     fn wal_handle_pending_writes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         assert_eq!(handle.pending_writes(), 0);
         handle
@@ -2198,7 +2198,7 @@ mod tests {
 
     #[test]
     fn wal_handle_consistent_pending_writes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         assert_eq!(handle.pending_writes(), 0);
         let w = handle
@@ -2219,7 +2219,7 @@ mod tests {
     /// caller observe when a committed version became fsync-durable.
     #[test]
     fn durability_watermark_advances_in_eventual_mode() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         for v in 1..=3u64 {
             handle.write(WalEntry { version: v, ops: vec![] }).unwrap();
@@ -2233,7 +2233,7 @@ mod tests {
     /// Consistent mode too (additive — does not disturb the SyncWaiter path).
     #[test]
     fn durability_watermark_advances_in_consistent_mode() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), true, Arc::new(WalPoison::new())).unwrap();
         let w = handle.write(WalEntry { version: 7, ops: vec![] }).unwrap();
         w.wait().unwrap();
@@ -2244,7 +2244,7 @@ mod tests {
     /// Waiting on an already-durable version returns immediately (no block).
     #[test]
     fn wait_durable_on_already_durable_is_immediate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
         let dur = handle.durability();
@@ -2256,7 +2256,7 @@ mod tests {
     /// `on_complete` fires exactly once, with `Ok`, after the version is durable.
     #[test]
     fn on_complete_fires_once_after_fsync() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         let (tx, rx) = mpsc::channel();
         handle
@@ -2276,7 +2276,7 @@ mod tests {
     /// `on_complete` fires inline (on the calling thread) when already durable.
     #[test]
     fn on_complete_fires_inline_when_already_durable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         handle.write(WalEntry { version: 1, ops: vec![] }).unwrap();
         handle.durability().wait(1).unwrap();
@@ -2294,7 +2294,7 @@ mod tests {
     /// error when the WAL closes (handle dropped), rather than blocking forever.
     #[test]
     fn close_releases_parked_waiter_with_err() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         let (tx, rx) = mpsc::channel();
         handle
@@ -2311,7 +2311,7 @@ mod tests {
     /// error when the handle is dropped.
     #[test]
     fn wait_unblocks_with_err_on_close() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         let dur = handle.durability();
         let waiter = thread::spawn(move || dur.wait(999));
@@ -2326,7 +2326,7 @@ mod tests {
     /// without advancing the watermark.
     #[test]
     fn publish_error_poisons_waiters_without_advancing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let handle = WalHandle::new(dir.path(), false, Arc::new(WalPoison::new())).unwrap();
         let dur = handle.durability();
         // Drive the watermark primitive directly: simulate a failed batch fsync.
@@ -2344,7 +2344,7 @@ mod tests {
     /// version becomes observably durable via `wait_durable`/`durable_version`.
     #[test]
     fn store_wait_durable_eventual_end_to_end() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let store = Store::new(crate::StoreConfig {
             persistence: crate::Persistence::Standalone {
                 dir: dir.path().to_path_buf(),
@@ -2388,7 +2388,7 @@ mod tests {
     /// read_wal should return entries before the truncation.
     #[test]
     fn wal_truncated_entry_at_eof() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         {
@@ -2423,7 +2423,7 @@ mod tests {
     /// (The CRC only guards against accidental corruption.)
     #[test]
     fn wal_huge_op_count_errors_not_allocates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         let config = bincode::config::standard();
@@ -2450,7 +2450,7 @@ mod tests {
     /// Unknown op tag in WAL entry data triggers WalCorrupted error.
     #[test]
     fn wal_unknown_op_tag() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         // Write a valid entry, then manually craft one with a bad op tag.
@@ -2478,7 +2478,7 @@ mod tests {
     /// Truncated op data inside an entry (op_count says 2, but data ends after 1).
     #[test]
     fn wal_truncated_op_data() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         {
@@ -2507,7 +2507,7 @@ mod tests {
     /// prune_wal with a version below all entries does nothing.
     #[test]
     fn wal_prune_nothing_to_remove() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
 
         {
@@ -2531,7 +2531,7 @@ mod tests {
     /// read_wal on a nonexistent file returns empty Vec.
     #[test]
     fn wal_read_nonexistent_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join("does_not_exist.bin");
         let entries = read_wal(&path).unwrap();
         assert!(entries.is_empty());
@@ -2555,7 +2555,7 @@ mod tests {
 
     #[test]
     fn sync_dir_on_normal_directory_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         // Create a file so the directory is non-trivial.
         std::fs::write(dir.path().join("x"), b"hello").unwrap();
         assert!(sync_dir(dir.path()).is_ok());
@@ -2636,7 +2636,7 @@ mod tests {
 
     #[test]
     fn with_sink_kind_coalesced_writes_recoverable_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let poison = Arc::new(WalPoison::new());
         {
             let h = WalHandle::with_sink_kind(dir.path(), true, poison, WalSinkKind::Coalesced).unwrap();
@@ -2652,7 +2652,7 @@ mod tests {
 
     #[test]
     fn with_sink_kind_fswrite_writes_recoverable_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let poison = Arc::new(WalPoison::new());
         {
             let h = WalHandle::with_sink_kind(dir.path(), true, poison, WalSinkKind::FsWrite).unwrap();
@@ -2668,7 +2668,7 @@ mod tests {
 
     #[test]
     fn buffered_file_sink_roundtrips_via_read_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         {
             let mut sink = BufferedFileSink::open(dir.path(), true).unwrap();
             for v in 1..=5u64 {
@@ -2683,7 +2683,7 @@ mod tests {
 
     #[test]
     fn buffered_file_sink_sync_all_roundtrips_via_read_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         {
             let mut sink = BufferedFileSink::open(dir.path(), false).unwrap(); // sync_all
             for v in 1..=5u64 {
@@ -2698,7 +2698,7 @@ mod tests {
 
     #[test]
     fn read_wal_stops_at_zero_length_tail() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
         // One valid record followed by a zero tail (as a pre-sized mmap crash leaves).
         let mut bytes = frame_entry(&WalEntry { version: 7, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
@@ -2713,7 +2713,7 @@ mod tests {
     #[cfg(feature = "bench-internals")]
     #[test]
     fn mmap_sink_roundtrips_via_read_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=5u64 {
@@ -2729,7 +2729,7 @@ mod tests {
     #[cfg(feature = "bench-internals")]
     #[test]
     fn mmap_sink_recovers_after_growing_past_quantum() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         // ~9.6 MiB of records forces at least one grow past the 8 MiB quantum.
         let n = 600u64;
         {
@@ -2747,7 +2747,7 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
     #[test]
     fn iouring_sink_roundtrips_via_read_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         {
             let mut sink = IoUringSink::open(dir.path()).unwrap();
             for v in 1..=5u64 {
@@ -2795,7 +2795,7 @@ mod tests {
 
     #[test]
     fn prealloc_sink_roundtrips_like_buffered() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open(dir.path()).unwrap();
         sink.append(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
         sink.append(&WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
@@ -2808,7 +2808,7 @@ mod tests {
 
     #[test]
     fn prealloc_sink_extends_in_chunks_and_holds_invariant() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         // Tiny 256-byte chunk so a couple of entries force an extend.
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 256).unwrap();
         let physical = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
@@ -2827,7 +2827,7 @@ mod tests {
 
     #[test]
     fn prealloc_sink_steady_state_does_not_grow_physical() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 1 << 20).unwrap();
         let path = dir.path().join(WAL_FILENAME);
         sink.append(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
@@ -2841,7 +2841,7 @@ mod tests {
 
     #[test]
     fn prune_wal_prealloc_compacts_and_presizes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
         for v in 1..=5u64 {
             sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap();
@@ -2861,7 +2861,7 @@ mod tests {
 
     #[test]
     fn prune_then_append_recovers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         {
             let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
             for v in 1..=4u64 {
@@ -2881,7 +2881,7 @@ mod tests {
 
     #[test]
     fn prune_wal_prealloc_noop_when_nothing_to_prune() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
         sink.append(&WalEntry { version: 9, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
         sink.sync().unwrap();
@@ -2892,7 +2892,7 @@ mod tests {
     #[test]
     fn preallocate_to_zero_fills_and_is_durable() {
         use std::io::{Read, Seek, SeekFrom, Write};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join("p.bin");
         let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
         preallocate_to(&mut f, 0, 8192).unwrap();

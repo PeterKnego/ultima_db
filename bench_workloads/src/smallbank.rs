@@ -704,7 +704,7 @@ pub fn bench_contention_at_n(
 /// Build a MultiWriter store with persistence (Eventual durability) and
 /// pre-seeded SmallBank tables (accounts, savings, checking).
 pub fn build_concurrent_store() -> (Store, tempfile::TempDir) {
-    let tmpdir = tempfile::tempdir().unwrap();
+    let tmpdir = tempfile::tempdir_in(crate::ycsb::bench_disk_dir()).unwrap();
     let cfg = StoreConfig::builder()
         .num_snapshots_retained(2)
         .auto_snapshot_gc(true)

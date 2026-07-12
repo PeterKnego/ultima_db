@@ -217,7 +217,7 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
 
     // SMR (checkpoint-only; no per-commit WAL)
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::smr(std::path::PathBuf::new()),
             Some(tmpdir.path()),
@@ -234,7 +234,7 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
 
     // Standalone Consistent
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),
@@ -255,7 +255,7 @@ fn bench_multiwriter_persistent(c: &mut Criterion) {
 
     // Standalone Eventual
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),

@@ -48,7 +48,7 @@ struct FjallEngine {
 
 impl FjallEngine {
     fn preload() -> Self {
-        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).expect("failed to create temp dir");
         let db = OptimisticTxDatabase::builder(tmpdir.path())
             .open()
             .expect("failed to open fjall database");

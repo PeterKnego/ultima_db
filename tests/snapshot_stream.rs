@@ -8,6 +8,9 @@
 //! `Store::install_snapshot_stream`, and `Store::register_table` are gated on it.
 
 #[cfg(feature = "persistence")]
+mod common;
+
+#[cfg(feature = "persistence")]
 mod tests {
     use std::io::Read;
 
@@ -375,7 +378,7 @@ mod tests {
     fn list_checkpoints_returns_versions() {
         use ultima_db::Persistence;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::common::test_scratch::scratch_dir();
         let cfg = StoreConfig::builder()
             .persistence(Persistence::smr(dir.path().to_path_buf()))
             .build();
@@ -422,7 +425,7 @@ mod tests {
         use ultima_db::Persistence;
         use ultima_db::snapshot_stream::codec::FILE_MAGIC;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::common::test_scratch::scratch_dir();
         let cfg = StoreConfig::builder()
             .persistence(Persistence::smr(dir.path().to_path_buf()))
             .build();

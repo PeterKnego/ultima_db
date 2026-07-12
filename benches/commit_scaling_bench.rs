@@ -254,7 +254,7 @@ fn bench_commit_scaling(c: &mut Criterion) {
                 // Keep the tempdir alive for the whole bench_function.
                 let tmpdir = match tier {
                     Tier::Inmem => None,
-                    _ => Some(tempfile::tempdir().unwrap()),
+                    _ => Some(tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap()),
                 };
                 let store = make_store(tier, tmpdir.as_ref().map(|d| d.path()), &tables);
                 let pool = Pool::new(&store, assignments);

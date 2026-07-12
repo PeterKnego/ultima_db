@@ -160,7 +160,7 @@ fn disjoint_table_name(idx: usize) -> String {
 }
 
 fn disjoint_build_store(max_writers: usize) -> (Store, tempfile::TempDir) {
-    let tmpdir = tempfile::tempdir().unwrap();
+    let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
     let cfg = StoreConfig::builder()
         .num_snapshots_retained(2)
         .auto_snapshot_gc(true)

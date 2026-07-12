@@ -3,6 +3,8 @@
 
 #![cfg(feature = "persistence")]
 
+mod common;
+
 use std::path::Path;
 use ultima_db::{Durability, Persistence, Store, StoreConfig, WalWrite};
 
@@ -42,7 +44,7 @@ fn open_store(config: StoreConfig) -> Store {
 
 #[test]
 fn standalone_wal_recovery_consistent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     // Write data
@@ -97,7 +99,7 @@ fn standalone_wal_recovery_consistent() {
 
 #[test]
 fn standalone_checkpoint_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -134,7 +136,7 @@ fn standalone_checkpoint_roundtrip() {
 
 #[test]
 fn standalone_checkpoint_plus_wal_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -184,7 +186,7 @@ fn standalone_checkpoint_plus_wal_recovery() {
 
 #[test]
 fn smr_checkpoint_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = smr_config(dir.path());
 
     {
@@ -239,7 +241,7 @@ fn smr_checkpoint_concurrent_with_writes_recovers_consistent_prefix() {
     const COMMITS: usize = 1000;
 
     for round in 0..ROUNDS {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::test_scratch::scratch_dir();
         let config = smr_config(dir.path());
 
         {
@@ -339,7 +341,7 @@ fn smr_checkpoint_concurrent_with_writes_recovers_consistent_prefix() {
 
 #[test]
 fn wal_pruned_after_checkpoint() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     let store = open_store(config);
@@ -369,7 +371,7 @@ fn wal_pruned_after_checkpoint() {
 
 #[test]
 fn standalone_eventual_basic() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Eventual);
 
     let store = open_store(config);
@@ -428,7 +430,7 @@ fn persistence_none_unchanged() {
 
 #[test]
 fn wal_update_and_delete_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -497,7 +499,7 @@ fn wal_update_and_delete_recovery() {
 
 #[test]
 fn wal_delete_table_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -528,7 +530,7 @@ fn wal_delete_table_recovery() {
 
 #[test]
 fn eventual_drop_flushes_all_pending_wal_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Eventual);
     let num_records = 5_000;
 
@@ -573,7 +575,7 @@ fn eventual_drop_flushes_all_pending_wal_writes() {
 
 #[test]
 fn consistent_wal_recovery_after_multiple_commits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     // Write several transactions, then drop without checkpointing.
@@ -607,7 +609,7 @@ fn consistent_wal_recovery_after_multiple_commits() {
 
 #[test]
 fn consistent_checkpoint_plus_wal_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -657,7 +659,7 @@ fn consistent_checkpoint_plus_wal_recovery() {
 
 #[test]
 fn recover_unregistered_table_returns_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     // Write data with a registered User table.
@@ -701,7 +703,7 @@ fn recover_unregistered_table_returns_error() {
 fn bulk_load_persists_via_checkpoint_and_recovers() {
     use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -738,7 +740,7 @@ fn bulk_load_persists_via_checkpoint_and_recovers() {
 fn bulk_load_skip_checkpoint_loses_data_on_crash() {
     use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -813,7 +815,7 @@ fn pending_wal_writes_zero_without_wal_handle() {
 
 #[test]
 fn update_batch_and_delete_batch_replay_through_wal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     // Seed three users.
@@ -885,7 +887,7 @@ fn update_batch_and_delete_batch_replay_through_wal() {
 fn write_tx_bulk_load_replays_through_wal() {
     use ultima_db::{BulkDelta, BulkLoadInput, BulkSource};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     {
@@ -954,7 +956,7 @@ fn write_tx_bulk_load_replays_through_wal() {
 
 #[test]
 fn read_only_write_tx_commit_with_persistence_no_wal_entry() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent);
 
     // Seed.
@@ -991,7 +993,7 @@ fn read_only_write_tx_commit_with_persistence_no_wal_entry() {
 
 #[test]
 fn standalone_wal_recovery_consistent_coalesced() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = StoreConfig::builder()
         .persistence(Persistence::standalone(
             dir.path().to_path_buf(),
@@ -1025,7 +1027,7 @@ fn standalone_wal_recovery_consistent_coalesced() {
 
 #[test]
 fn standalone_wal_recovery_eventual_coalesced() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = StoreConfig::builder()
         .persistence(Persistence::standalone(
             dir.path().to_path_buf(),
@@ -1063,7 +1065,7 @@ fn standalone_wal_recovery_eventual_coalesced() {
 #[test]
 fn standalone_perentry_default_still_recovers() {
     // Sanity: the default WalWrite::PerEntry path behaves as before.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Consistent); // sets PerEntry
     {
         let store = open_store(config.clone());
@@ -1091,7 +1093,7 @@ fn standalone_perentry_default_still_recovers() {
 fn recovery_fails_cleanly_when_commits_follow_uncheckpointed_bulk_load() {
     use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, Error};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Eventual);
 
     {
@@ -1162,7 +1164,7 @@ fn recovery_fails_cleanly_when_commits_follow_uncheckpointed_bulk_load() {
 fn recovery_without_commits_after_uncheckpointed_bulk_load_loses_only_the_load() {
     use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Eventual);
 
     {
@@ -1209,7 +1211,7 @@ fn recovery_without_commits_after_uncheckpointed_bulk_load_loses_only_the_load()
 fn recovery_after_checkpointed_bulk_load_replays_later_commits() {
     use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = standalone_config(dir.path(), Durability::Eventual);
 
     {
@@ -1274,7 +1276,7 @@ fn checkpoint_concurrent_with_commits_loses_no_acknowledged_commit() {
     const COMMITS: usize = 150;
 
     for round in 0..ROUNDS {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::test_scratch::scratch_dir();
         let config = standalone_config(dir.path(), Durability::Consistent);
 
         {

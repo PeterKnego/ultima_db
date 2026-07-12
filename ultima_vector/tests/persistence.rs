@@ -6,6 +6,8 @@
 
 #![cfg(feature = "persistence")]
 
+mod common;
+
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -37,7 +39,7 @@ fn standalone_config(dir: &std::path::Path) -> StoreConfig {
 
 #[test]
 fn round_trip_after_wal_replay_matches_pre_close_results() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let config = standalone_config(dir.path());
 
     let mut rng = StdRng::seed_from_u64(0xCAFE);
@@ -93,7 +95,7 @@ fn round_trip_after_wal_replay_matches_pre_close_results() {
 #[test]
 fn wal_only_recovery_works_without_checkpoint() {
     // Skip checkpoint; rely entirely on WAL replay to reconstruct the graph.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let config = standalone_config(dir.path());
 
     let mut rng = StdRng::seed_from_u64(0x1234);
@@ -139,7 +141,7 @@ fn restore_through_bulk_load_persists() {
     // Build a collection, restore a single hand-built row via `restore_vec`
     // (which goes through bulk-load + checkpoint), drop the store, reopen
     // the same dir, and verify search returns the restored id.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let config = standalone_config(dir.path());
 
     // Build phase: restore one row at id=42, checkpoint via bulk-load default.

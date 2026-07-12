@@ -13,6 +13,8 @@
 
 #![cfg(feature = "persistence")]
 
+mod common;
+
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -110,7 +112,7 @@ fn append_bytes(path: &Path, bytes: &[u8]) {
 /// durable prefix and the store remains fully usable.
 #[test]
 fn wal_truncated_mid_last_entry_recovers_prefix() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_commits(dir.path(), 3);
 
     let wal = wal_path(dir.path());
@@ -137,7 +139,7 @@ fn wal_truncated_mid_last_entry_recovers_prefix() {
 /// Crash after writing only part of the next entry's length prefix.
 #[test]
 fn wal_truncated_in_length_prefix_recovers_prefix() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_commits(dir.path(), 3);
 
     let wal = wal_path(dir.path());
@@ -174,7 +176,7 @@ fn wal_truncated_in_length_prefix_recovers_prefix() {
 /// reads as a clean end-of-log.
 #[test]
 fn wal_zero_tail_recovers_all_entries() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_commits(dir.path(), 3);
 
     append_bytes(&wal_path(dir.path()), &[0u8; 64]);
@@ -188,7 +190,7 @@ fn wal_zero_tail_recovers_all_entries() {
 /// from a torn write: the prefix is recovered.
 #[test]
 fn wal_garbage_tail_recovers_prefix() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_commits(dir.path(), 3);
 
     // 0xAB×8 → len = 0xABABABAB, far beyond EOF → treated as torn.
@@ -208,7 +210,7 @@ fn wal_garbage_tail_recovers_prefix() {
 /// recovering a partial prefix would present data loss as success.
 #[test]
 fn wal_bitflip_in_first_entry_fails_with_wal_corrupted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_commits(dir.path(), 3);
 
     // Byte 4..8 is the first entry's length prefix; byte 8+ is its payload.
@@ -226,7 +228,7 @@ fn wal_bitflip_in_first_entry_fails_with_wal_corrupted() {
 /// rather than silently dropping a committed entry.
 #[test]
 fn wal_bitflip_in_last_entry_fails_with_wal_corrupted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_commits(dir.path(), 3);
 
     let wal = wal_path(dir.path());
@@ -283,7 +285,7 @@ fn seed_with_checkpoint(dir: &Path, n: u64) {
 /// recovery must fail with `CheckpointCorrupted`, not load garbage state.
 #[test]
 fn checkpoint_bitflip_fails_with_checkpoint_corrupted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_with_checkpoint(dir.path(), 3);
 
     let cp = latest_checkpoint(dir.path());
@@ -300,7 +302,7 @@ fn checkpoint_bitflip_fails_with_checkpoint_corrupted() {
 /// tmp+rename, so this is corruption) fails CRC validation.
 #[test]
 fn checkpoint_truncated_fails_with_checkpoint_corrupted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_with_checkpoint(dir.path(), 3);
 
     let cp = latest_checkpoint(dir.path());
@@ -316,7 +318,7 @@ fn checkpoint_truncated_fails_with_checkpoint_corrupted() {
 /// A checkpoint reduced to a few bytes fails the minimum-size check.
 #[test]
 fn checkpoint_too_short_fails_with_checkpoint_corrupted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_with_checkpoint(dir.path(), 2);
 
     let cp = latest_checkpoint(dir.path());
@@ -333,7 +335,7 @@ fn checkpoint_too_short_fails_with_checkpoint_corrupted() {
 /// rename) is ignored; recovery uses the last complete checkpoint.
 #[test]
 fn stray_checkpoint_tmp_is_ignored() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_with_checkpoint(dir.path(), 3);
 
     std::fs::write(dir.path().join("checkpoint_99.bin.tmp"), b"partial garbage").unwrap();
@@ -347,7 +349,7 @@ fn stray_checkpoint_tmp_is_ignored() {
 /// WAL entry is torn — recovery is checkpoint + the durable WAL prefix.
 #[test]
 fn checkpoint_plus_torn_wal_tail_recovers_durable_prefix() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     seed_with_checkpoint(dir.path(), 2); // checkpoint covers u0, u1
 
     // Two more commits land in the WAL only.

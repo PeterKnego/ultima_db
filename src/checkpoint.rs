@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn checkpoint_file_write_and_load() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let (snapshot, reg) = make_snapshot_with_users();
 
         write_checkpoint(dir.path(), &snapshot, &reg).unwrap();
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn find_latest_checkpoint_picks_highest_version() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let (snapshot, reg) = make_snapshot_with_users();
 
         // Write checkpoints at versions 10, 42, 5
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn cleanup_old_checkpoints_keeps_only_latest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let (snapshot, reg) = make_snapshot_with_users();
 
         let mut snap10 = snapshot.clone();
@@ -405,7 +405,7 @@ mod tests {
     /// entries; deleting it makes those commits unrecoverable.
     #[test]
     fn cleanup_old_checkpoints_never_deletes_newer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let (snapshot, reg) = make_snapshot_with_users();
 
         for v in [8u64, 10, 12] {
@@ -555,14 +555,14 @@ mod tests {
 
     #[test]
     fn find_latest_checkpoint_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let result = find_latest_checkpoint(dir.path()).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn find_latest_checkpoint_ignores_non_checkpoint_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         // Create non-checkpoint files
         std::fs::write(dir.path().join("wal.bin"), b"data").unwrap();
         std::fs::write(dir.path().join("random.txt"), b"data").unwrap();
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn write_checkpoint_creates_tmp_then_renames() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let (snapshot, reg) = make_snapshot_with_users();
 
         write_checkpoint(dir.path(), &snapshot, &reg).unwrap();
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn write_checkpoint_dir_fsync_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::scratch_dir();
         let store = crate::Store::new(crate::StoreConfig {
             persistence: crate::Persistence::Smr {
                 dir: dir.path().to_path_buf(),

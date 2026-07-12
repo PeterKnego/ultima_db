@@ -1,4 +1,6 @@
 #![cfg(feature = "persistence")]
+mod common;
+
 use ultima_db::{Durability, Error, Persistence, Store, StoreConfig, WalWrite, WriterMode};
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +34,7 @@ fn standalone_fast_preset_is_inline_plus_prealloc() {
 
 #[test]
 fn standalone_fast_preset_commits_and_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let mk = || {
         StoreConfig::builder()
             .persistence(Persistence::standalone_fast(dir.path())) // SingleWriter by default
@@ -59,7 +61,7 @@ fn standalone_fast_preset_commits_and_recovers() {
 
 #[test]
 fn standalone_fast_preset_rejects_multiwriter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let cfg = StoreConfig::builder()
         .writer_mode(WriterMode::MultiWriter)
         .persistence(Persistence::standalone_fast(dir.path()))
@@ -75,7 +77,7 @@ fn standalone_fast_preset_rejects_multiwriter() {
 
 #[test]
 fn inline_singlewriter_commits_and_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     {
         let store = Store::new(cfg(dir.path(), WriterMode::SingleWriter)).unwrap();
         store.register_table::<Row>("rows").unwrap();
@@ -106,7 +108,7 @@ fn inline_singlewriter_commits_and_recovers() {
 fn inline_bulk_load_marker_is_durable_recovery_fails_cleanly() {
     use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let config = cfg(dir.path(), WriterMode::SingleWriter);
 
     {
@@ -147,7 +149,7 @@ fn inline_bulk_load_marker_is_durable_recovery_fails_cleanly() {
 
 #[test]
 fn inline_multiwriter_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     let err = Store::new(cfg(dir.path(), WriterMode::MultiWriter));
     match err {
         Err(e) => {

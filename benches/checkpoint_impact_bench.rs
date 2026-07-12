@@ -132,7 +132,7 @@ fn bench_checkpoint_impact(c: &mut Criterion) {
 
     // Baseline: writers run alone.
     {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(dir.path());
         group.bench_function("no_checkpoint", |b| {
             b.iter(|| {
@@ -144,7 +144,7 @@ fn bench_checkpoint_impact(c: &mut Criterion) {
 
     // Same writers, with a periodic checkpointer running the whole time.
     {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(dir.path());
 
         let stop = Arc::new(AtomicBool::new(false));

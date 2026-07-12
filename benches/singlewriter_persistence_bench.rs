@@ -131,7 +131,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
 
     // SMR (checkpoint-only; no per-commit WAL)
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::smr(std::path::PathBuf::new()),
             Some(tmpdir.path()),
@@ -146,7 +146,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
 
     // Standalone Consistent
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),
@@ -173,7 +173,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     // worktree+shared-CARGO_TARGET_DIR A/B protocol (sandbox noise floors reach
     // ±2×).  Until that run is complete the feature stays opt-in/off.
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),
@@ -201,7 +201,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     // Projected NVMe: ~72 µs → ~38 µs (~1.9×).  Real bench-host A/B still pending
     // (NVMe fleet was torn down).  See docs/tasks/task38_wal_inline_fsync.md.
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),
@@ -223,7 +223,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
     // async-prealloc 61.2 µs (1.51×) and async-PerEntry 153.5 µs (3.78×).
     // See docs/tasks/task38_wal_inline_fsync.md §6.
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),
@@ -242,7 +242,7 @@ fn bench_singlewriter_persistent(c: &mut Criterion) {
 
     // Standalone Eventual
     {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
         let store = make_store(
             Persistence::standalone(
                 std::path::PathBuf::new(),

@@ -47,6 +47,12 @@ pub mod transaction;
 #[cfg(feature = "persistence")]
 pub mod wal;
 
+/// Real-disk scratch dirs for durability unit tests. Also re-used by
+/// integration tests via `tests/common/mod.rs` (`#[path]`-included). Gated the
+/// same as its only in-crate consumers (`wal`/`checkpoint` unit tests).
+#[cfg(all(test, feature = "persistence"))]
+mod test_scratch;
+
 pub use btree::BTree;
 pub use bulk_load::{
     AddOptions, BulkDelta, BulkLoadBatch, BulkLoadInput, BulkLoadOptions, BulkSource,

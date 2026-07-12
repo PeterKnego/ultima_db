@@ -1,4 +1,6 @@
 #![cfg(feature = "persistence")]
+mod common;
+
 use ultima_db::{Durability, Persistence, Store, StoreConfig, WalWrite};
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +20,7 @@ fn cfg(dir: &std::path::Path) -> StoreConfig {
 #[test]
 fn prealloc_store_recovers_through_torn_preallocated_tail() {
     use std::io::{Seek, SeekFrom, Write};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     {
         let store = Store::new(cfg(dir.path())).unwrap();
         store.register_table::<Row>("rows").unwrap();
@@ -48,7 +50,7 @@ fn prealloc_store_recovers_through_torn_preallocated_tail() {
 
 #[test]
 fn prealloc_store_commits_and_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     {
         let store = Store::new(cfg(dir.path())).unwrap();
         store.register_table::<Row>("rows").unwrap();
@@ -67,7 +69,7 @@ fn prealloc_store_commits_and_recovers() {
 
 #[test]
 fn prealloc_every_acked_commit_survives_recovery() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     {
         let store = Store::new(cfg(dir.path())).unwrap();
         store.register_table::<Row>("rows").unwrap();
@@ -94,7 +96,7 @@ fn prealloc_every_acked_commit_survives_recovery() {
 #[test]
 fn prealloc_checkpoint_after_torn_tail_recovery_succeeds() {
     use std::io::{Seek, SeekFrom, Write};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     // Write some Consistent commits.
     {
         let store = Store::new(cfg(dir.path())).unwrap();
@@ -134,7 +136,7 @@ fn prealloc_checkpoint_after_torn_tail_recovery_succeeds() {
 
 #[test]
 fn prealloc_checkpoint_prunes_and_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::test_scratch::scratch_dir();
     {
         let store = Store::new(cfg(dir.path())).unwrap();
         store.register_table::<Row>("rows").unwrap();

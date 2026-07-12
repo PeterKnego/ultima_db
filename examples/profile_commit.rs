@@ -236,7 +236,7 @@ fn run_burst(store: &Store, op_sets: &[Vec<Op>]) -> (u64, u64) {
 }
 
 fn main() {
-    let tmpdir = tempfile::tempdir().unwrap();
+    let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
     let cfg = StoreConfig::builder()
         .num_snapshots_retained(2)
         .auto_snapshot_gc(true)

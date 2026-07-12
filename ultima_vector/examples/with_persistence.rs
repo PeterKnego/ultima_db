@@ -44,7 +44,12 @@ fn config(dir: &std::path::Path) -> StoreConfig {
 fn main() {
     const DIM: usize = 8;
 
-    let dir = tempfile::tempdir().unwrap();
+    // Root scratch on a real disk (under target/), not the default temp dir,
+    // which is often a tmpfs where fsync is a no-op — see the durability note in
+    // ultima_db's src/test_scratch.rs.
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/example-scratch");
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(&base).unwrap();
     println!("persistence dir: {}", dir.path().display());
 
     let mut rng = StdRng::seed_from_u64(0xD15C);

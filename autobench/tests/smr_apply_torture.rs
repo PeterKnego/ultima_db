@@ -7,6 +7,8 @@
 //! multi-writer commutative equivalence.
 //! Frozen-paths enforcement lives in autobench/program.md (loop discipline).
 
+mod common;
+
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
@@ -62,7 +64,7 @@ fn preload(store: &Store, rows: u64) {
 
 #[test]
 fn pinned_versions_track_log_index() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let store = smr_store(dir.path(), WriterMode::SingleWriter);
     preload(&store, 16);
     for idx in 2..=500u64 {
@@ -77,7 +79,7 @@ fn pinned_versions_track_log_index() {
 
 #[test]
 fn snapshot_stream_install_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let store = smr_store(dir.path(), WriterMode::SingleWriter);
     preload(&store, 100);
     for idx in 2..=200u64 {
@@ -90,7 +92,7 @@ fn snapshot_stream_install_round_trip() {
         .read_to_end(&mut buf)
         .unwrap();
 
-    let dir2 = tempfile::tempdir().unwrap();
+    let dir2 = common::scratch_dir();
     let store2 = smr_store(dir2.path(), WriterMode::SingleWriter);
     // ADJUSTED: `install_snapshot_stream` ignores `InstallOptions::commit_version`
     // in v1 — the installed snapshot always lands at the destination's
@@ -134,7 +136,7 @@ fn snapshot_stream_install_round_trip() {
 
 #[test]
 fn checkpoint_recover_equality() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let last;
     {
         let store = smr_store(dir.path(), WriterMode::SingleWriter);
@@ -185,7 +187,7 @@ fn checkpoint_concurrent_with_apply_recovers_consistent_prefix() {
     const LAST: u64 = 1000; // apply log indices 2..=LAST (version tracks the index)
 
     for round in 0..ROUNDS {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::scratch_dir();
         {
             let store = smr_store(dir.path(), WriterMode::SingleWriter);
             // preload commits at version 1 *before* the racer spawns, so every
@@ -257,7 +259,7 @@ fn checkpoint_concurrent_with_apply_recovers_consistent_prefix() {
 
 #[test]
 fn reads_are_isolated_during_apply() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let store = smr_store(dir.path(), WriterMode::SingleWriter);
     preload(&store, 2);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -307,7 +309,7 @@ fn reads_are_isolated_during_apply() {
 
 #[test]
 fn multiwriter_commutative_equivalence() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::scratch_dir();
     let store = smr_store(dir.path(), WriterMode::MultiWriter);
     preload(&store, 8);
     const WRITERS: usize = 4;

@@ -76,7 +76,7 @@ impl UltimaEngine {
         let tmpdir = match &config.persistence {
             ultima_db::Persistence::None => None,
             ultima_db::Persistence::Standalone { durability, .. } => {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).unwrap();
                 store_config.persistence = ultima_db::Persistence::standalone(
                     dir.path().to_path_buf(),
                     *durability,

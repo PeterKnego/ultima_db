@@ -41,7 +41,7 @@ struct RocksDbEngine {
 
 impl RocksDbEngine {
     fn preload() -> Self {
-        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).expect("failed to create temp dir");
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);

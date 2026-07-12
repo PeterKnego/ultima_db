@@ -36,7 +36,7 @@ struct RocksDbMultiWriterEngine {
 
 impl RocksDbMultiWriterEngine {
     fn preload() -> Self {
-        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let tmpdir = tempfile::tempdir_in(ultima_bench_workloads::ycsb::bench_disk_dir()).expect("failed to create temp dir");
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_write_buffer_size(256 * 1024 * 1024);

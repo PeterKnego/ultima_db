@@ -22,16 +22,62 @@ pub const ZIPFIAN_CONSTANT: f64 = 0.99;
 
 /// Base directory for on-disk bench artifacts (WAL, LSM/SST files).
 ///
-/// Defaults to the system temp dir. On hosts where `/tmp` is a tmpfs
+/// Defaults to `<bench_workloads>/target/bench-scratch` (a real disk). The old
+/// default was the system temp dir, but on hosts where `/tmp` is a tmpfs
 /// (RAM-backed) — common on CI/sandbox VMs — that silently makes every
 /// "on-disk" engine in-memory and its fsyncs free, defeating an on-disk
-/// comparison. Set `ULTIMA_BENCH_DIR` to a real disk-backed path to force
-/// genuine disk I/O for all engines uniformly.
+/// comparison. Set `ULTIMA_BENCH_DIR` to another disk-backed path to relocate.
+///
+/// Panics if the chosen dir is tmpfs/ramfs (bypass with `ULTIMA_ALLOW_TMPFS=1`),
+/// so a bogus `ULTIMA_BENCH_DIR=/tmp/...` can't quietly void the numbers.
 pub fn bench_disk_dir() -> std::path::PathBuf {
-    match std::env::var_os("ULTIMA_BENCH_DIR") {
+    let dir = match std::env::var_os("ULTIMA_BENCH_DIR") {
         Some(p) => std::path::PathBuf::from(p),
-        None => std::env::temp_dir(),
+        None => std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bench-scratch"),
+    };
+    std::fs::create_dir_all(&dir).expect("create bench_disk_dir");
+    assert_bench_real_disk(&dir);
+    dir
+}
+
+/// Resolve the fstype backing `path` by scanning `/proc/mounts`.
+fn backing_fstype(path: &std::path::Path) -> String {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let mut best: (usize, String) = (0, "unknown".to_string());
+    for line in mounts.lines() {
+        let mut f = line.split_whitespace();
+        let _dev = f.next();
+        let mp = match f.next() {
+            Some(m) => m,
+            None => continue,
+        };
+        let fstype = f.next().unwrap_or("unknown");
+        if canon.starts_with(std::path::Path::new(mp)) && mp.len() >= best.0 {
+            best = (mp.len(), fstype.to_string());
+        }
     }
+    best.1
+}
+
+/// Panic (once) if `dir` is tmpfs/ramfs, where fsync is a no-op and every
+/// on-disk bench number would be meaningless. Bypass with `ULTIMA_ALLOW_TMPFS=1`.
+fn assert_bench_real_disk(dir: &std::path::Path) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("ULTIMA_ALLOW_TMPFS").is_some() {
+            return;
+        }
+        let fs = backing_fstype(dir);
+        assert!(
+            fs != "tmpfs" && fs != "ramfs",
+            "bench_disk_dir {} is on {fs}; fsync is a no-op there, so on-disk bench \
+             numbers would be meaningless. Set ULTIMA_BENCH_DIR to a real disk, or \
+             ULTIMA_ALLOW_TMPFS=1 to bypass.",
+            dir.display(),
+        );
+    });
 }
 
 /// Durability tier for the competitor comparison, selected by the
