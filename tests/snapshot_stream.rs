@@ -184,6 +184,121 @@ mod tests {
         }
     }
 
+    /// `InstallOptions::commit_version = Some(v)` lands the installed snapshot
+    /// at exactly version `v` (the SMR position-as-version hook), instead of
+    /// `latest_version + 1`, and keeps the auto-assign counter ahead of it.
+    #[test]
+    fn install_honors_commit_version() {
+        use ultima_db::snapshot_stream::install::InstallOptions;
+
+        // Source snapshot with 5 rows.
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=5u64 {
+                t.insert(Row { value: i * 100 }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination advanced to version 7 by an ordinary pinned write.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = dst.begin_write(Some(7)).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 9 }).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(dst.latest_version(), 7);
+
+        // Install pinned to version 4242 (a sparse byte position).
+        let installed = dst
+            .install_snapshot_stream(
+                std::io::Cursor::new(&bytes),
+                InstallOptions {
+                    commit_version: Some(4242),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(installed, 4242, "install must land at the pinned version");
+        assert_eq!(dst.latest_version(), 4242);
+
+        // The rows came from the source snapshot.
+        {
+            let read = dst.begin_read(None).unwrap();
+            let t = read.open_table::<Row>("rows").unwrap();
+            for i in 1..=5u64 {
+                assert_eq!(t.get(i).expect("row must exist").value, i * 100);
+            }
+        }
+
+        // A later auto-assigned write does not collide with 4242.
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            tx.open_table::<Row>("rows").unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(dst.latest_version() > 4242, "next write must exceed 4242");
+    }
+
+    /// A `commit_version` at or below the current `latest_version` is refused
+    /// (the version space must strictly increase).
+    #[test]
+    fn install_rejects_commit_version_not_above_latest() {
+        use ultima_db::snapshot_stream::install::InstallOptions;
+        use ultima_db::snapshot_stream::SnapshotStreamError;
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = dst.begin_write(Some(7)).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            t.insert(Row { value: 9 }).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(dst.latest_version(), 7);
+
+        let err = dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            InstallOptions {
+                commit_version: Some(3),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(
+                err,
+                Err(SnapshotStreamError::InvalidCommitVersion { requested: 3, latest: 7 })
+            ),
+            "expected InvalidCommitVersion, got {err:?}"
+        );
+        // Destination unchanged.
+        assert_eq!(dst.latest_version(), 7);
+    }
+
     /// Truncated wire bytes must fail cleanly without modifying the destination.
     #[test]
     fn truncated_wire_bytes_fail_install_cleanly() {

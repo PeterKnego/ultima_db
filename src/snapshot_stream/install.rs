@@ -61,12 +61,15 @@ pub struct InstallOptions {
     /// [`OnExtra::Drop`] to get strict replace semantics suitable for Raft
     /// `InstallSnapshot`.
     pub on_extra_tables: OnExtra,
-    /// **Currently ignored** (v1 limitation; the new snapshot always lands at
-    /// `latest_version + 1`). The field is reserved for a future API
-    /// extension where `Some(v)` will install the snapshot at version `v` and
-    /// adjust the internal version counter so the next auto-assigned write
-    /// gets `v + 1` — useful for SMR deployments that want the snapshot
-    /// version to match the log index from which it was produced.
+    /// Pin the installed snapshot to an exact version. `None` (default) lands
+    /// it at the next auto-assigned version (`> latest_version`). `Some(v)`
+    /// installs it at version `v` and advances the internal counter so the next
+    /// auto-assigned write gets `v + 1`. `v` must be **strictly greater** than
+    /// the destination's current `latest_version`, or the install is refused
+    /// with [`SnapshotStreamError::InvalidCommitVersion`]. Used by SMR
+    /// deployments that want the snapshot version to match the log index (byte
+    /// position) it was produced from — see `ultima_cluster`'s
+    /// `StoreStateMachine` position-as-version invariant.
     pub commit_version: Option<u64>,
 }
 
@@ -134,6 +137,21 @@ impl crate::store::Store {
             let snap = inner.snapshots.get(&v).cloned();
             (Arc::clone(&inner.registry), snap, v)
         };
+
+        // A caller-pinned `commit_version` must strictly exceed the current
+        // latest — reject before decoding so a bad request is cheap and the
+        // destination is provably untouched. The OCC check inside
+        // `install_batch` re-validates `latest_version == base_version` under
+        // the write lock, so if a concurrent commit races in between it fails
+        // there (WriteConflict) rather than installing at a stale version.
+        if let Some(v) = opts.commit_version
+            && v <= base_version
+        {
+            return Err(SnapshotStreamError::InvalidCommitVersion {
+                requested: v,
+                latest: base_version,
+            });
+        }
 
         // ── 3. Per-table parsing ──────────────────────────────────────────
         let mut pending: Vec<PendingTable> = Vec::new();
@@ -276,20 +294,21 @@ impl crate::store::Store {
         }
 
         // ── 5. Atomic install ──────────────────────────────────────────────
-        // commit_version: v1 does not support caller-supplied versions for
-        // install_snapshot_stream.  The new snapshot always lands at
-        // `latest_version + 1`.  The field is kept in `InstallOptions` for
-        // future use but is ignored here.
+        // `opts.commit_version` (validated above) pins the installed snapshot
+        // to an exact version; `None` lands it at the next auto-assigned one.
 
         // Empty pending + Keep semantics → nothing changes; skip the snapshot
         // bump. With Drop semantics we must still install if extras would be
-        // dropped, so fall through.
+        // dropped, so fall through. Note a pinned `commit_version` has no
+        // effect in this degenerate no-op case (there is nothing to install to
+        // carry the version) — the SMR path always has a registered table with
+        // state, so `pending` is non-empty in practice.
         if pending.is_empty() && opts.on_extra_tables == OnExtra::Keep {
             return Ok(base_version);
         }
 
         let new_version = match opts.on_extra_tables {
-            OnExtra::Keep => self.install_batch(pending, base_version)?,
+            OnExtra::Keep => self.install_batch(pending, base_version, opts.commit_version)?,
             OnExtra::Drop => {
                 // Build keep-set of names that survived OnUnknown::Drop and
                 // OnUnknown::Keep — anything in the wire stream that's not
@@ -308,7 +327,12 @@ impl crate::store::Store {
                     // empty leader state).
                     return Ok(base_version);
                 }
-                self.install_batch_replace(pending, base_version, stream_table_names)?
+                self.install_batch_replace(
+                    pending,
+                    base_version,
+                    stream_table_names,
+                    opts.commit_version,
+                )?
             }
         };
 

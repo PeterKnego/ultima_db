@@ -169,6 +169,25 @@ prefix while a snapshot holds the merged siblings) and `remove_mut_preserves_sna
   optimum shifted up — **T=64 dominates T=32 on all three axes** (get −18%, insert −8%, remove −19%).
   Full table + provenance in the candidates doc §2; the recommendation is to bump the default to
   `T=64`.
+- **Contended-workload cross-check (SMR-apply + read-p99-under-load).** The fanout win above was
+  measured on *uncontended* bulk ops. The autobench perf gate (`make perf/check`) exercises the
+  opposite regime — SMR apply of SmallBank batches plus reads run *concurrently* with writes, so
+  `Arc::make_mut` frequently CoW-clones shared nodes. Bench-host A/B (`scripts/smr_apply_ab.sh` /
+  `make bench/smr-ab`, 15 runs/arm, AWS NVMe 2026-07-09) at T ∈ {32,48,64}:
+  - **apply_sw_batch_throughput** (tight, monotonic, non-overlapping arms): T=48 **0.81×**, T=64
+    **0.78×** — a real **−22%** SMR-apply throughput regression at T=64 (bigger nodes → bigger
+    memmove/CoW per applied batch). Does *not* recover at T=48.
+  - **read_p99_under_load_ns**: T=64 **0.38×** (**−62%**, tight [715–958] vs T=32 [2194–2367]) — a
+    large, consistent tail-latency *improvement* on real hardware. (An earlier sandbox run showed
+    the opposite sign — a VM artifact; the bench host is authoritative.)
+  - **T=48 is dominated** — takes almost the full apply hit while its p99 is *bimodal* (four runs
+    ~1000 ns, eleven ~2300 ns; median ≈ T=32) and it keeps only ~half the bulk get win. No useful
+    middle ground; the metrics are non-monotonic in `T`.
+  - **Decision: keep `T=64`.** The −22% SMR-apply cost is accepted for the broad wins (get −28%,
+    read p99 −62%, bulk faster). Revisit only for an SMR/Raft-apply-bound deployment (see the
+    "configurable fanout" note below / candidates doc). Autobench baseline should be re-recorded at
+    T=64 on the gate's machine (the committed baseline predates the bump; `make perf/check` also
+    fails on machine-mismatch independent of `T`).
 - **Default bumped to `T=64` (commit `7f6c3fb`).** One-const change; `cargo test` + `clippy -D
   warnings` clean with and without the `persistence` feature. Correctness is unaffected — the
   delete/insert algorithm, rebalance semantics, and the `MIN_KEYS = T-1` / `MAX_KEYS = 2T-1`

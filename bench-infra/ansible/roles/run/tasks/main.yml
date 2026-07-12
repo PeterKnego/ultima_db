@@ -71,6 +71,28 @@
     executable: /bin/bash
   changed_when: true
 
+- name: Run SMR-apply/read-p99 fanout (T) A/B
+  when: bench_target == "smr-ab"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/smr-ab 2>&1 | tee {{ remote_home }}/results/smr-ab.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Run fanout (T) read-vs-write asymmetry sweep
+  when: bench_target == "fanout-micro"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/fanout-micro 2>&1 | tee {{ remote_home }}/results/fanout-micro.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Run autobench Gate-A microbenches (record baselines)
   when: bench_target == "autobench"
   ansible.builtin.shell: |

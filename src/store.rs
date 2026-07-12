@@ -1200,6 +1200,7 @@ impl Store {
             }],
             base_version,
             None,
+            None,
         )
     }
 
@@ -1293,8 +1294,9 @@ impl Store {
         &self,
         pending: Vec<crate::bulk_load::PendingTable>,
         base_version: u64,
+        commit_version: Option<u64>,
     ) -> Result<u64> {
-        self.install_batch_inner(pending, base_version, None)
+        self.install_batch_inner(pending, base_version, None, commit_version)
     }
 
     /// Like [`install_batch`], but discards any tables in the previous
@@ -1307,8 +1309,9 @@ impl Store {
         pending: Vec<crate::bulk_load::PendingTable>,
         base_version: u64,
         keep_set: std::collections::BTreeSet<String>,
+        commit_version: Option<u64>,
     ) -> Result<u64> {
-        self.install_batch_inner(pending, base_version, Some(keep_set))
+        self.install_batch_inner(pending, base_version, Some(keep_set), commit_version)
     }
 
     fn install_batch_inner(
@@ -1316,6 +1319,7 @@ impl Store {
         pending: Vec<crate::bulk_load::PendingTable>,
         base_version: u64,
         keep_set: Option<std::collections::BTreeSet<String>>,
+        commit_version: Option<u64>,
     ) -> Result<u64> {
         debug_assert!(
             !pending.is_empty(),
@@ -1357,10 +1361,35 @@ impl Store {
             });
         }
 
-        // Allocate from `next_version` (not `latest + 1`) so the install can
-        // never collide with a version already handed to a writer.
-        let new_version = inner.next_version;
-        inner.next_version += 1;
+        // Allocate the new version. With `commit_version: Some(v)` the caller
+        // pins the install to an exact version — the SMR position-as-version
+        // hook: the snapshot lands at the log position it was produced from so
+        // the store's version space tracks the Raft/SMR index. The OCC check
+        // above already established `latest_version == base_version`, and the
+        // caller (`install_snapshot_stream`) validated `v > base_version`, so a
+        // pinned `v` strictly exceeds every version handed out so far. Keep the
+        // auto-assign counters ahead of it so a later ordinary write cannot
+        // collide. With `None` we allocate from `next_version` (not `latest+1`)
+        // so the install can never collide with a version already handed to a
+        // writer.
+        let new_version = match commit_version {
+            Some(v) => {
+                debug_assert!(
+                    v > inner.latest_version,
+                    "commit_version {v} must exceed latest_version {} (validated by caller)",
+                    inner.latest_version,
+                );
+                if v >= inner.next_version {
+                    inner.next_version = v + 1;
+                }
+                v
+            }
+            None => {
+                let nv = inner.next_version;
+                inner.next_version += 1;
+                nv
+            }
+        };
         if new_version > inner.last_submitted_version {
             inner.last_submitted_version = new_version;
         }
