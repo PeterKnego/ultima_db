@@ -127,7 +127,6 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// leaves packed densely like `from_sorted`. Debug-asserts the ordering
     /// (including versus the existing max, via the builder's `last_key`);
     /// caller guarantees it — `Table::insert_batch` checks `max_key()` first.
-    #[allow(dead_code)] // pub(crate); first consumer lands in Task 5 (Table::insert_batch)
     pub(crate) fn extend_from_sorted<I>(&mut self, iter: I)
     where
         I: IntoIterator<Item = (K, Arc<V>)>,
@@ -162,7 +161,6 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// The largest key in the tree (rightmost leaf's last entry), or `None`
     /// if empty. O(height); used by `Table::insert_batch` to verify the
     /// append invariant before taking the bulk fast path.
-    #[allow(dead_code)]
     pub(crate) fn max_key(&self) -> Option<&K> {
         let mut node = &self.root;
         loop {
