@@ -8,6 +8,8 @@
 
 use rand::{Rng, RngExt};
 
+/// Samples a node's top HNSW layer, geometric in `m` and capped at
+/// `max_level` (see module docs for the distribution).
 #[derive(Clone, Copy, Debug)]
 pub struct LevelSampler {
     /// `1 / ln(m)`, precomputed.
@@ -16,6 +18,8 @@ pub struct LevelSampler {
 }
 
 impl LevelSampler {
+    /// Build a sampler for branching factor `m` (must be `>= 2`), capping
+    /// sampled levels at `max_level`.
     pub fn new(m: usize, max_level: u8) -> Self {
         assert!(m >= 2, "m must be >= 2");
         let inv_ln_m = 1.0 / (m as f64).ln();

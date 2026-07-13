@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Tuning knobs for an HNSW graph, fixed for the lifetime of a
+/// [`VectorCollection`](crate::VectorCollection) (set once in
+/// `VectorCollection::open`). Start from [`HnswParams::for_dim`] and
+/// override individual fields as needed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HnswParams {
     /// Embedding dimensionality. Every inserted vector must have this length.

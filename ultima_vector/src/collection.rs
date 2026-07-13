@@ -15,6 +15,11 @@ use crate::hnsw::params::HnswParams;
 use crate::hnsw::{insert as hnsw_insert, search as hnsw_search};
 use crate::row::{EntryPoint, VectorRow};
 
+/// A named collection of `(embedding, metadata)` pairs backed by an HNSW
+/// graph, stored across two UltimaDB tables (`<name>_data`,
+/// `<name>_entry`). `Meta` is the caller-defined payload attached to each
+/// vector; `D` is the [`Distance`] metric used for both graph construction
+/// and search.
 pub struct VectorCollection<Meta, D> {
     store: Store,
     base_name: String,
@@ -70,10 +75,14 @@ where
         })
     }
 
+    /// The underlying `Store`. Clone it to drive additional transactions
+    /// (e.g. defining a secondary index on the metadata table for filtered
+    /// search) alongside this collection.
     pub fn store(&self) -> &Store {
         &self.store
     }
 
+    /// The HNSW tuning parameters this collection was opened with.
     pub fn params(&self) -> &HnswParams {
         &self.params
     }
@@ -124,8 +133,11 @@ where
         )
     }
 
-    /// Search top-K nearest neighbors. `ef` overrides
-    /// `params.ef_search_default` if provided.
+    /// Search top-K nearest neighbors. Returns `(id, distance)` pairs
+    /// sorted closest-first (smaller distance = closer, see [`Distance`]).
+    /// `filter` restricts results to ids in the bitmap (see
+    /// [`crate::filter`]); `ef` overrides `params.ef_search_default` if
+    /// provided.
     pub fn search(
         &self,
         query: &[f32],
@@ -218,6 +230,10 @@ where
         Ok(())
     }
 
+    /// Delete a node under an existing write transaction (composes with
+    /// caller-driven txs). Idempotent — deleting an already-tombstoned id
+    /// is a no-op; errors with [`Error::NodeNotFound`] only if `id` was
+    /// never inserted.
     pub fn delete_in(&self, tx: &mut WriteTx, id: u64) -> Result<()> {
         hnsw_insert::delete::<Meta>(tx, &self.data_name(), &self.entry_name(), id)
     }
@@ -230,6 +246,10 @@ where
         Ok(())
     }
 
+    /// Replace the embedding at `id` under an existing write transaction
+    /// (composes with caller-driven txs). See
+    /// [`update_embedding`](Self::update_embedding) for the rebuild
+    /// semantics.
     pub fn update_embedding_in(
         &self,
         tx: &mut WriteTx,
@@ -249,6 +269,10 @@ where
         )
     }
 
+    /// Search under an existing read transaction (composes with
+    /// caller-driven txs, e.g. to read at a pinned historical snapshot).
+    /// See [`search`](Self::search) for the return-value and `ef`
+    /// semantics.
     pub fn search_in(
         &self,
         tx: &ReadTx,

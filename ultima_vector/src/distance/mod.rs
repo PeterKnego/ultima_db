@@ -23,6 +23,7 @@ mod simd;
 /// build profiles, not just debug. Silent prefix-truncation in release
 /// was a garbage-results footgun.
 pub trait Distance: Send + Sync + 'static {
+    /// Distance between `a` and `b`; smaller means closer.
     fn distance(&self, a: &[f32], b: &[f32]) -> f32;
 
     /// Compute `distance(query, targets[i])` for each `i`, writing into `out`.
