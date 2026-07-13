@@ -100,7 +100,7 @@ A and A' share children B, C, E via Arc.
 A still exists, unmodified, for any ReadTx holding it.
 ```
 
-**Parameters:** minimum degree `T = 32`, so `MAX_KEYS = 2T - 1 = 63` and `MIN_KEYS = T - 1 = 31`. These are compile-time constants in `src/btree.rs`.
+**Parameters:** minimum degree `T = 64`, so `MAX_KEYS = 2T - 1 = 127` and `MIN_KEYS = T - 1 = 63`. These are compile-time constants in `src/btree.rs`.
 
 **Key design choices:**
 

@@ -23,6 +23,13 @@ pub trait Record: Send + Sync + serde::Serialize + serde::de::DeserializeOwned +
 #[cfg(feature = "persistence")]
 impl<T: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static> Record for T {}
 
+/// Marker trait that centralises the bounds every record type must satisfy.
+///
+/// The `persistence` feature is **disabled** in this build, so this is
+/// equivalent to `Send + Sync + 'static`. With the feature enabled, record
+/// types must additionally implement `serde::Serialize` and
+/// `serde::de::DeserializeOwned` so they can be written to the WAL and
+/// checkpoints.
 #[cfg(not(feature = "persistence"))]
 pub trait Record: Send + Sync + 'static {}
 

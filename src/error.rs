@@ -5,6 +5,9 @@ use thiserror::Error;
 
 use crate::intents::CommitWaiter;
 
+/// The crate-wide error type returned by fallible `Store`/`Table`/transaction
+/// operations. Each variant documents when it occurs and, where relevant,
+/// how a caller should react (retry, abort, recover).
 #[derive(Debug, Error)]
 pub enum Error {
     /// Requested key or version does not exist.
@@ -13,20 +16,29 @@ pub enum Error {
     /// Requested snapshot version does not exist.
     #[error("snapshot version {0} not found")]
     VersionNotFound(u64),
-    /// Returned when a write transaction conflicts with a concurrent writer.
-    ///
-    /// Two detection sites produce this error:
-    /// 1. *Early-fail* inside `TableWriter::update`/`delete` — another active
-    ///    writer already holds an intent on the same key. `wait_for` is
-    ///    `Some(waiter)`; callers can block on it until the holder commits or
-    ///    aborts, then retry.
-    /// 2. *Commit-time* OCC — a writer that already committed overlapped on
-    ///    a key or deleted a table. `wait_for` is `None`; the winner is gone.
+    /// Returned when a write transaction conflicts with a concurrent writer,
+    /// or when an explicit version is no longer valid at `begin_write`. Callers
+    /// should retry against a fresh base. If `wait_for` is `Some`, blocking on it
+    /// may allow retry to succeed; if `None`, the conflicting writer has finished
+    /// and retry must acquire a fresh snapshot.
     #[error("write conflict on table '{table}', keys {keys:?} (conflicting version {version})")]
     WriteConflict {
+        /// Name of the table on which the conflict was detected. Empty when
+        /// the conflict was a version-level check at `begin_write` rather than
+        /// a key-level overlap.
         table: String,
+        /// The overlapping keys that caused the conflict. Empty for version-level
+        /// and whole-table (deletion / bulk-replace) conflicts.
         keys: Vec<u64>,
+        /// The conflicting writer's version: the winning committed transaction's
+        /// version for commit-time key/table conflicts; the current `latest_version`
+        /// for the begin_write version check; or `0` (sentinel—no committed
+        /// conflicting version exists; the holder is still in flight) for early-fail
+        /// intent conflicts.
         version: u64,
+        /// `Some(waiter)` when blocking may resolve the conflict (intent holder
+        /// in progress); `None` otherwise (writer finished, or version-level
+        /// check at `begin_write`).
         wait_for: Option<CommitWaiter>,
     },
     /// Returned when a `Serializable` WriteTx's read set was invalidated by a
@@ -34,7 +46,12 @@ pub enum Error {
     /// against a fresh base; there is no `wait_for` because the conflicting
     /// writer has already finished.
     #[error("serialization failure on table '{table}' (conflicting version {version})")]
-    SerializationFailure { table: String, version: u64 },
+    SerializationFailure {
+        /// Name of the table whose read set was invalidated.
+        table: String,
+        /// Version of the concurrent transaction that invalidated the read set.
+        version: u64,
+    },
     /// Returned when a MultiWriter commit contained index DDL
     /// (`define_index` / `define_custom_index`) on a table that a concurrent
     /// transaction committed to since this transaction's base snapshot. The
@@ -45,7 +62,10 @@ pub enum Error {
         "index DDL on table '{table}' conflicts with a concurrent commit; \
          retry the DDL in its own transaction when the table is quiet"
     )]
-    IndexDdlConflict { table: String },
+    IndexDdlConflict {
+        /// Name of the table the index DDL targeted.
+        table: String,
+    },
     /// Returned when `begin_write` is called while another write transaction
     /// is active in [`WriterMode::SingleWriter`](crate::WriterMode::SingleWriter) mode.
     #[error("another write transaction is active (SingleWriter mode)")]
@@ -110,6 +130,7 @@ pub enum Error {
     InvalidBulkLoadInput(String),
 }
 
+/// Crate-wide result alias: `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use ultima_db::{Record, TableReader, TableWriter};
 /// and `TableWriter` so the same algorithm code drives both query and
 /// build paths without duplication.
 pub trait NodeAccess<Meta: Record> {
+    /// Look up the row at `id`; `None` if it doesn't exist.
     fn get_row(&self, id: u64) -> Option<&VectorRow<Meta>>;
 }
 

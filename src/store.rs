@@ -57,6 +57,37 @@ pub enum WriterMode {
     /// Multiple concurrent [`WriteTx`] allowed. Key-level write-write conflict
     /// detection via optimistic concurrency control. Conflicting commits return
     /// [`Error::WriteConflict`].
+    ///
+    /// # Examples
+    ///
+    /// The standard retry idiom (see `examples/concurrent_writes.rs`): on
+    /// [`Error::WriteConflict`], rebase onto a fresh [`WriteTx`] and retry.
+    ///
+    /// ```
+    /// use ultima_db::{Error, Store, StoreConfig, WriterMode};
+    /// # let store = Store::new(StoreConfig::builder().writer_mode(WriterMode::MultiWriter).build()).unwrap();
+    /// # let mut seed = store.begin_write(None).unwrap();
+    /// # seed.open_table::<u64>("counters").unwrap().insert(0).unwrap();
+    /// # seed.commit().unwrap();
+    /// # let mut a = store.begin_write(None).unwrap();
+    /// # let mut b = store.begin_write(None).unwrap();
+    /// # b.open_table::<u64>("counters").unwrap().update(1, 2).unwrap();
+    /// # b.commit().unwrap();
+    /// # a.open_table::<u64>("counters").unwrap().update(1, 1).unwrap();
+    /// let mut retries = 0;
+    /// loop {
+    ///     match a.commit() {
+    ///         Ok(_) => break,
+    ///         Err(Error::WriteConflict { .. }) => {
+    ///             retries += 1;
+    /// #           a = store.begin_write(None).unwrap();
+    /// #           a.open_table::<u64>("counters").unwrap().update(1, 1).unwrap();
+    ///         }
+    ///         Err(e) => panic!("unexpected: {e}"),
+    ///     }
+    /// }
+    /// assert_eq!(retries, 1);
+    /// ```
     MultiWriter,
 }
 
@@ -181,6 +212,18 @@ impl StoreConfigBuilder {
         self
     }
     /// See [`StoreConfig::persistence`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::{Store, StoreConfig, Persistence};
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = StoreConfig::builder()
+    ///     .persistence(Persistence::standalone_fast(dir.path()))
+    ///     .build();
+    /// let store = Store::new(cfg).unwrap();
+    /// # drop(store);
+    /// ```
     #[cfg(feature = "persistence")]
     pub fn persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
         self.config.persistence = persistence;
@@ -395,6 +438,15 @@ impl Store {
     /// Returns an error if persistence is configured and the WAL cannot be
     /// initialized (e.g., directory does not exist and cannot be created,
     /// or permission denied).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::{Store, StoreConfig};
+    ///
+    /// let store = Store::new(StoreConfig::builder().num_snapshots_retained(4).build()).unwrap();
+    /// assert!(store.begin_read(None).is_ok());
+    /// ```
     pub fn new(config: StoreConfig) -> Result<Self> {
         #[cfg(feature = "persistence")]
         let wal_poison = Arc::new(crate::wal::WalPoison::new());
@@ -1124,6 +1176,24 @@ impl Store {
     /// unaffected, and a delete touching that leaf restores the floor.
     ///
     /// See `docs/tasks/task23_bulk_load.md`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource, Store};
+    ///
+    /// let store = Store::default();
+    /// let rows: Vec<(u64, String)> = (1..=3).map(|i| (i, format!("v{i}"))).collect();
+    /// let input = BulkLoadInput::Replace(BulkSource::sorted_vec(rows));
+    /// let version = store
+    ///     .bulk_load::<String>("t", input, BulkLoadOptions::default())
+    ///     .unwrap();
+    ///
+    /// let rtx = store.begin_read(None).unwrap();
+    /// let table = rtx.open_table::<String>("t").unwrap();
+    /// assert_eq!(table.len(), 3);
+    /// assert!(version >= 1);
+    /// ```
     pub fn bulk_load<R: Record>(
         &self,
         table_name: &str,
@@ -2582,6 +2652,23 @@ impl WriteTx {
     /// modified overlapping keys. Returns [`Error::WriteConflict`] on conflict.
     ///
     /// Returns the version number of the new snapshot.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::Store;
+    ///
+    /// let store = Store::default();
+    /// let mut wtx = store.begin_write(None).unwrap();
+    /// let mut table = wtx.open_table::<String>("notes").unwrap();
+    /// let id = table.insert("hello".to_string()).unwrap();
+    /// let version = wtx.commit().unwrap();
+    ///
+    /// let rtx = store.begin_read(None).unwrap();
+    /// let table = rtx.open_table::<String>("notes").unwrap();
+    /// assert_eq!(table.get(id).unwrap(), "hello");
+    /// assert!(version >= 1);
+    /// ```
     pub fn commit(self) -> Result<u64> {
         // SingleWriter: no concurrent commits possible, so skip the
         // per-table lock acquisition + read-lock handshake and use the

@@ -17,37 +17,70 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A point-in-time snapshot of all store-level metrics.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
+    /// Total successful `WriteTx::commit` calls (both durability paths).
     pub commits: u64,
+    /// Total `WriteTx::rollback` calls plus implicit rollbacks on `Drop`
+    /// (a `WriteTx` dropped without calling `commit`).
     pub rollbacks: u64,
+    /// Total `Store::gc` invocations, regardless of how many snapshots each
+    /// run actually collected.
     pub gc_runs: u64,
+    /// Total number of retained snapshots reclaimed across all `gc` runs.
     pub snapshots_collected: u64,
+    /// Total MultiWriter commits that failed OCC validation (overlapping
+    /// key set with a concurrently-committed writer).
     pub write_conflicts: u64,
+    /// Total `Serializable`-isolation commits that failed because a
+    /// concurrent transaction invalidated this transaction's read set.
     pub serialization_failures: u64,
     /// MultiWriter commit-phase cumulative wall time, in nanoseconds.
     /// Useful for profiling where commit-path time is actually spent.
     /// All four sum to approximately the total time inside `commit()`.
     pub commit_ns_phase0_acquire_locks: u64,
+    /// Cumulative nanoseconds spent validating the read set against the
+    /// current latest snapshot before merging.
     pub commit_ns_phase1_read_validate: u64,
+    /// Cumulative nanoseconds spent merging dirty tables into the new
+    /// snapshot (fast-path wholesale swap or slow-path per-key replay).
     pub commit_ns_phase2_merge: u64,
+    /// Cumulative nanoseconds spent installing the new snapshot as
+    /// `latest_version` and, if applicable, waiting on WAL durability.
     pub commit_ns_phase3_install: u64,
+    /// Per-table metric snapshots, keyed by table name. Only tables that
+    /// have been opened at least once (read or write) are present.
     pub tables: HashMap<String, TableMetricsSnapshot>,
 }
 
 /// A point-in-time snapshot of per-table metrics.
 #[derive(Debug, Clone)]
 pub struct TableMetricsSnapshot {
+    /// Rows inserted via `insert` (+1) or `insert_batch` (+batch size) on
+    /// success; failed batches do not count.
     pub inserts: u64,
+    /// Rows updated via `update` (+1) or `update_batch` (+batch size) on
+    /// success; failed batches do not count.
     pub updates: u64,
+    /// Rows deleted via `delete` (+1) or `delete_batch` (+batch size) on
+    /// success; failed batches do not count.
     pub deletes: u64,
+    /// Primary-key point lookups: `get`, `contains`, `first`, `last` (+1
+    /// each), `get_many`/`resolve` (+ids.len()).
     pub primary_key_reads: u64,
+    /// Primary-key scans initiated via `range`/`iter` (+1 per call — counts
+    /// scan initiation, not rows yielded by the returned iterator).
     pub primary_key_scans: u64,
+    /// Per-index metric snapshots for this table, keyed by index name.
     pub indexes: HashMap<String, IndexMetricsSnapshot>,
 }
 
 /// A point-in-time snapshot of per-index metrics.
 #[derive(Debug, Clone)]
 pub struct IndexMetricsSnapshot {
+    /// Index point lookups: `get_unique`, `get_by_index`, `get_by_key`
+    /// (+1 each).
     pub reads: u64,
+    /// Index range scans initiated via `index_range` (+1 per call — counts
+    /// scan initiation, not rows yielded).
     pub range_scans: u64,
 }
 

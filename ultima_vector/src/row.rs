@@ -22,8 +22,12 @@ use serde::{Deserialize, Serialize};
 /// `persistence` feature is off. Gating the derive on our feature would skew.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorRow<Meta> {
+    /// The stored embedding. Length must equal the collection's configured
+    /// `HnswParams::dim`.
     pub embedding: Vec<f32>,
+    /// Caller-defined payload attached to this vector.
     pub meta: Meta,
+    /// This node's HNSW graph state (level, tombstone bit, adjacency).
     pub hnsw: HnswState,
 }
 
@@ -48,14 +52,20 @@ impl HnswState {
         }
     }
 
+    /// This node's top layer (`layers.len() - 1`).
     pub fn level(&self) -> u8 {
         self.level
     }
 
+    /// Whether the node has been deleted. Tombstoned nodes are skipped by
+    /// search but their adjacency lists stay in place so live nodes reached
+    /// only through them remain traversable.
     pub fn is_tombstoned(&self) -> bool {
         self.tombstoned
     }
 
+    /// Mark the node deleted. Idempotent — adjacency is left untouched;
+    /// repair is lazy (see [`VectorCollection::delete`](crate::VectorCollection::delete)).
     pub fn tombstone(&mut self) {
         self.tombstoned = true;
     }
@@ -92,7 +102,11 @@ impl HnswState {
 /// graph) and the current global maximum level.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EntryPoint {
+    /// Id of the current entry-point node, or `None` if no live node
+    /// exists (nothing inserted yet, or every inserted node has since been
+    /// tombstoned).
     pub node_id: Option<u64>,
+    /// Highest layer currently present in the graph.
     pub max_level: u8,
 }
 

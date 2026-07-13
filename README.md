@@ -25,12 +25,11 @@ zero-copy and old versions stay alive for free.
 - **Bulk loads & snapshot streaming** — O(N) sorted rebuilds for restores
   and deltas, multi-table atomic installs, and a streaming wire format for
   replication.
-- **Vector search** (`ultima_vector`) — HNSW with SIMD-accelerated distance
+- **Vector search** (`ultima-vector`) — HNSW with SIMD-accelerated distance
   kernels (AVX-512/AVX2/NEON via runtime dispatch), metadata filtering, and
   MVCC-consistent restores.
-- **Raft log storage** (`ultima_journal`) — a segmented, group-committed
-  append log with crash-safe truncation, built to back openraft's
-  `RaftLogStorage`.
+- **Fast batch writes** — auto-increment batches take an O(batch + height)
+  bulk-append path; full restores build trees O(N) via `Store::bulk_load`.
 
 ## Quick example
 
@@ -40,28 +39,43 @@ use ultima_db::Store;
 let store = Store::default();
 
 // Write a snapshot.
-let mut wtx = store.begin_write(None)?;
-let mut users = wtx.open_table::<String>("users")?;
-let id = users.insert("alice".to_string())?;
-let v1 = wtx.commit()?;
+let mut wtx = store.begin_write(None).unwrap();
+let mut users = wtx.open_table::<String>("users").unwrap();
+let id = users.insert("alice".to_string()).unwrap();
+let v1 = wtx.commit().unwrap();
 
 // Read it back — and keep reading it, even as later commits land.
-let rtx = store.begin_read(Some(v1))?;
-assert_eq!(rtx.open_table::<String>("users")?.get(id),
+let rtx = store.begin_read(Some(v1)).unwrap();
+assert_eq!(rtx.open_table::<String>("users").unwrap().get(id),
            Some(&"alice".to_string()));
-# Ok::<(), ultima_db::Error>(())
 ```
 
 More in [`examples/`](examples/): basic usage, multiple stores, concurrent
 writers with conflict retry, and bulk restore.
+
+## Installation
+
+```bash
+cargo add ultima-db            # in-memory store
+cargo add ultima-db --features persistence   # + WAL/checkpoint durability
+cargo add ultima-vector        # HNSW vector search on top
+```
+
+| Feature | What it adds |
+|---|---|
+| *(default)* | In-memory MVCC store — no I/O, no serde |
+| `persistence` | WAL + checkpoints, crash recovery, SMR mode (`serde`/`bincode`) |
+| `fulltext` | BM25 full-text `CustomIndex` |
+| `metrics` | `metrics`-crate instrumentation |
+
+MSRV: Rust 1.88. Pre-1.0: minor versions may break API.
 
 ## Workspace
 
 | Crate | What it is |
 |---|---|
 | `ultima-db` | The store: B-tree, tables, MVCC, OCC/SSI, WAL + checkpoints |
-| `ultima_vector` | HNSW vector search over UltimaDB tables |
-| `ultima-journal` | Segmented append-only log for consensus integrations |
+| `ultima-vector` | HNSW vector search over UltimaDB tables |
 
 ## Development
 
@@ -71,7 +85,7 @@ cargo clippy -- -D warnings      # lint (zero warnings policy)
 cargo bench                      # criterion benchmarks (YCSB, SmallBank, ...)
 ```
 
-Design notes for every feature live in [`docs/tasks/`](docs/tasks/).
+Design notes for every feature live in [`docs/tasks/`](docs/tasks/). The full configuration reference is [docs/configuration.md](docs/configuration.md).
 
 ## License
 

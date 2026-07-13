@@ -11,8 +11,13 @@ use crate::{Error, Result};
 /// Whether an index enforces uniqueness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
+    /// Rejects a second record with the same key; backed by `BTree<K, u64>`.
     Unique,
+    /// Allows multiple records to share a key; backed by
+    /// `BTree<(K, u64), ()>` (id folded into the key for multi-value storage).
     NonUnique,
+    /// User-supplied index implementing [`CustomIndex`] (e.g. full-text);
+    /// storage shape is opaque to the generic maintainer.
     Custom,
 }
 
@@ -54,7 +59,11 @@ pub(crate) trait IndexMaintainer<R>: Send + Sync {
     }
 }
 
+/// Extracts an index key of type `K` from a record of type `R`. Implemented
+/// generically for any `Fn(&R) -> K + Send + Sync`, so a plain closure
+/// passed to `define_index` satisfies this trait.
 pub trait KeyExtractor<R, K>: Send + Sync {
+    /// Computes the index key for `record`.
     fn extract(&self, record: &R) -> K;
 }
 

@@ -7,13 +7,20 @@ description = "HNSW vector search built on UltimaDB"
 authors = ["Peter Knego"]
 license = "Apache-2.0"
 repository = "https://github.com/PeterKnego/ultima_db"
+readme = "README.md"
+keywords = ["vector-search", "hnsw", "embedding", "simd", "database"]
+categories = ["database-implementations"]
+include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE", "NOTICE"]
+
+[package.metadata.docs.rs]
+features = ["persistence"]
 
 [features]
 default = []
 persistence = ["ultima-db/persistence"]
 
 [dependencies]
-ultima-db = { path = ".." }
+ultima-db = { path = "..", version = "0.1.0" }
 smallvec = "1"
 roaring = "0.11"
 rand = "0.10"

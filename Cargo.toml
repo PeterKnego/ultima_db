@@ -12,6 +12,24 @@ authors = ["Peter Knego"]
 license = "Apache-2.0"
 repository = "https://github.com/PeterKnego/ultima_db"
 readme = "README.md"
+keywords = ["database", "mvcc", "btree", "embedded", "snapshot"]
+categories = ["database-implementations", "data-structures"]
+include = [
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "!examples/profile_commit.rs",
+    "!examples/fanout_microbench.rs",
+    "!bench-infra/**",
+    "!formal/**",
+    "!tools/**",
+]
+
+[package.metadata.docs.rs]
+features = ["persistence", "fulltext", "metrics"]
 
 [features]
 default = []

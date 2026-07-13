@@ -153,6 +153,8 @@ pub struct TableDef<R: 'static> {
 }
 
 impl<R: 'static> TableDef<R> {
+    /// Binds `name` to record type `R` as a `const`-constructible table
+    /// definition, usable as a `static` handle for `open_table` call sites.
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
@@ -160,6 +162,7 @@ impl<R: 'static> TableDef<R> {
         }
     }
 
+    /// Returns the bound table name.
     pub const fn name(&self) -> &'static str {
         self.name
     }
@@ -167,6 +170,7 @@ impl<R: 'static> TableDef<R> {
 
 /// Trait for types that can identify a table and its record type.
 pub trait TableOpener<R> {
+    /// Returns the table name to open.
     fn table_name(&self) -> &str;
 }
 
@@ -182,6 +186,9 @@ impl<R: 'static> TableOpener<R> for TableDef<R> {
     }
 }
 
+/// A typed collection wrapping `BTree<u64, R>` with auto-incrementing ids,
+/// secondary indexes, and batch operations. `Clone` is O(1) (CoW via the
+/// backing B-tree's `Arc` sharing) and preserves `next_id`.
 pub struct Table<R> {
     data: BTree<u64, R>,
     next_id: u64,
@@ -407,6 +414,16 @@ impl<R: Record> Table<R> {
     ///
     /// Index updates are deferred until all records are inserted into the
     /// data tree, then applied in one pass per index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::Table;
+    ///
+    /// let mut table: Table<String> = Table::new();
+    /// let ids = table.insert_batch(vec!["a".into(), "b".into(), "c".into()]).unwrap();
+    /// assert_eq!(ids, vec![1, 2, 3]);
+    /// ```
     pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
         if records.is_empty() {
             return Ok(vec![]);
@@ -657,6 +674,21 @@ impl<R: Record> Table<R> {
     /// Define a secondary index. If the table already contains data, the index
     /// is backfilled. Returns an error if the index name is already taken or
     /// if backfilling hits a unique constraint violation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::{Table, IndexKind};
+    ///
+    /// let mut table: Table<String> = Table::new();
+    /// let id = table.insert("alice@example.com".to_string()).unwrap();
+    /// table
+    ///     .define_index("by_email", IndexKind::Unique, |email: &String| email.clone())
+    ///     .unwrap();
+    ///
+    /// let found = table.get_unique("by_email", &"alice@example.com".to_string()).unwrap();
+    /// assert_eq!(found, Some((id, &"alice@example.com".to_string())));
+    /// ```
     pub fn define_index<K: Ord + Clone + Send + Sync + 'static>(
         &mut self,
         name: &str,
