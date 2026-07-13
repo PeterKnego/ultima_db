@@ -2116,4 +2116,75 @@ mod tests {
         assert_eq!(t.len(), model.len());
         assert_eq!(dump(&t), model.into_iter().collect::<Vec<_>>());
     }
+
+    /// Structural invariant check: arity bounds (root exempt from MIN_KEYS),
+    /// uniform leaf depth, internal children == entries + 1, per-node key
+    /// order, global in-order key order, and len consistency.
+    fn check_invariants<K: Ord + Clone + std::fmt::Debug, V>(t: &BTree<K, V>) {
+        fn walk<K: Ord + std::fmt::Debug, V>(
+            node: &BTreeNode<K, V>,
+            is_root: bool,
+            depth: usize,
+            leaf_depth: &mut Option<usize>,
+            count: &mut usize,
+        ) {
+            if node.children.is_empty() {
+                match *leaf_depth {
+                    Some(d) => assert_eq!(d, depth, "non-uniform leaf depth"),
+                    None => *leaf_depth = Some(depth),
+                }
+            } else {
+                assert_eq!(
+                    node.children.len(),
+                    node.entries.len() + 1,
+                    "internal arity: {} children for {} entries",
+                    node.children.len(),
+                    node.entries.len()
+                );
+                if is_root {
+                    assert!(!node.entries.is_empty(), "internal root with no entries");
+                }
+                for c in &node.children {
+                    walk(c, false, depth + 1, leaf_depth, count);
+                }
+            }
+            if !is_root {
+                assert!(
+                    node.entries.len() >= MIN_KEYS,
+                    "underfull non-root: {} < MIN_KEYS",
+                    node.entries.len()
+                );
+            }
+            assert!(node.entries.len() <= MAX_KEYS, "overfull node");
+            for w in node.entries.windows(2) {
+                assert!(w[0].0 < w[1].0, "unsorted entries within node");
+            }
+            *count += node.entries.len();
+        }
+        let mut leaf_depth = None;
+        let mut count = 0;
+        walk(&t.root, true, 0, &mut leaf_depth, &mut count);
+        assert_eq!(count, t.len(), "len does not match entry count");
+        let keys: Vec<&K> = t.range(..).map(|(k, _)| k).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "in-order walk not strictly ascending"
+        );
+    }
+
+    #[test]
+    fn check_invariants_accepts_existing_constructors() {
+        check_invariants(&BTree::<u64, u64>::new());
+        check_invariants(&insert_range(1, 10_000));
+        let entries: Vec<_> = (0..10_000u64).map(|i| (i, Arc::new(i))).collect();
+        check_invariants(&BTree::from_sorted(entries));
+    }
+
+    #[test]
+    #[should_panic(expected = "len does not match")]
+    fn check_invariants_catches_bad_len() {
+        let mut t = insert_range(1, 100);
+        t.len = 99; // deliberately corrupt (private field, same module)
+        check_invariants(&t);
+    }
 }
