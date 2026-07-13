@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UltimaDB — an embedded, in-memory MVCC store built on a persistent
-//! copy-on-write B-tree.
+//! UltimaDB — a high-performance transactional embedded database built on
+//! a persistent copy-on-write B-tree (in-memory, with opt-in durability).
 //!
 //! Every commit produces a new immutable snapshot sharing unchanged
 //! subtrees with its predecessors: [`ReadTx`] pins a snapshot for

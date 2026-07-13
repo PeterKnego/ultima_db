@@ -1,9 +1,14 @@
 # UltimaDB
 
-An embedded, in-memory MVCC store for Rust, built on a persistent
-copy-on-write B-tree. Every commit produces a new immutable snapshot that
-shares unchanged subtrees with its predecessors, so point-in-time reads are
-zero-copy and old versions stay alive for free.
+A high-performance transactional embedded database for Rust, built on a
+persistent copy-on-write B-tree. Data lives in memory with opt-in
+WAL/checkpoint durability; every commit produces a new immutable MVCC
+snapshot that shares unchanged subtrees with its predecessors, so
+point-in-time reads are zero-copy and old versions stay alive for free.
+
+On durable YCSB workloads it leads RocksDB, Fjall, and ReDB by 1.8–5.4×
+(our benchmark, AWS NVMe —
+[details](docs/benchmarks/competitor-nvme-2026-07-13.md)).
 
 ## Highlights
 

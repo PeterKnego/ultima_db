@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 — 2026-07-13
+
+Metadata-only patch (`ultima-db`): crate description and README/crate-doc
+opening repositioned to "high-performance transactional embedded database",
+with the published YCSB comparison linked as evidence. No code changes.
+`ultima-vector` stays at 0.1.0.
+
 ## 0.1.0 — 2026-07-13
 
 First public release of `ultima-db` and `ultima-vector`.
