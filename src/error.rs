@@ -27,12 +27,14 @@ pub enum Error {
         /// the conflict was a version-level check at `begin_write` rather than
         /// a key-level overlap.
         table: String,
-        /// The overlapping keys that caused the conflict. Empty when the
-        /// conflict was a version-level check at `begin_write`.
+        /// The overlapping keys that caused the conflict. Empty for version-level
+        /// and whole-table (deletion / bulk-replace) conflicts.
         keys: Vec<u64>,
-        /// The conflicting writer's version: the intent holder's base version
-        /// for intent conflicts, the winning commit's version for OCC, or the
-        /// latest version for version-level checks at `begin_write`.
+        /// The conflicting writer's version: the winning committed transaction's
+        /// version for commit-time key/table conflicts; the current `latest_version`
+        /// for the begin_write version check; or `0` (sentinel—no committed
+        /// conflicting version exists; the holder is still in flight) for early-fail
+        /// intent conflicts.
         version: u64,
         /// `Some(waiter)` when blocking may resolve the conflict (intent holder
         /// in progress); `None` otherwise (writer finished, or version-level
