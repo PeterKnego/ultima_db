@@ -116,6 +116,23 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         builder.finish()
     }
 
+    /// Append a strictly-ascending iterator of `(K, Arc<V>)` pairs, every key
+    /// strictly greater than the current maximum, in O(batch + height) with
+    /// leaves packed densely like `from_sorted`. Debug-asserts the ordering
+    /// (including versus the existing max, via the builder's `last_key`);
+    /// caller guarantees it — `Table::insert_batch` checks `max_key()` first.
+    #[allow(dead_code)] // pub(crate); first consumer lands in Task 5 (Table::insert_batch)
+    pub(crate) fn extend_from_sorted<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = (K, Arc<V>)>,
+    {
+        let mut builder = BulkBuilder::seed_from_spine(self);
+        for (k, v) in iter {
+            builder.push(k, v);
+        }
+        *self = builder.finish();
+    }
+
     /// Returns the number of elements in the tree.
     pub fn len(&self) -> usize {
         self.len
@@ -1054,13 +1071,11 @@ fn remove_leftmost_mut<K: Ord + Clone, V>(
 // by tests only.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 struct LevelBuilder<K, V> {
     entries: Vec<(K, Arc<V>)>,
     children: Vec<Arc<BTreeNode<K, V>>>,
 }
 
-#[allow(dead_code)]
 impl<K, V> LevelBuilder<K, V> {
     fn new() -> Self {
         Self {
@@ -1070,20 +1085,75 @@ impl<K, V> LevelBuilder<K, V> {
     }
 }
 
-#[allow(dead_code)]
 struct BulkBuilder<K, V> {
     levels: Vec<LevelBuilder<K, V>>,
     len: usize,
     last_key: Option<K>,
 }
 
-#[allow(dead_code)]
 impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     fn new() -> Self {
         Self {
             levels: vec![LevelBuilder::new()],
             len: 0,
             last_key: None,
+        }
+    }
+
+    /// Reconstruct builder state as if it had just consumed `tree`'s entries,
+    /// by unzipping the right spine: the spine node at each level becomes that
+    /// level's under-construction node — its entries copied, its children all
+    /// attached as shared `Arc`s EXCEPT the rightmost, whose slot stays open
+    /// (that child *is* the next spine level down). This is exactly the
+    /// builder's mid-build invariant (`children.len() == entries.len()` on
+    /// internal levels; the open slot is filled by `attach_child` or the
+    /// `finish()` carry).
+    ///
+    /// Snapshot isolation: spine nodes are only *read* here and `finish()`
+    /// builds fresh replacements, so trees sharing nodes with `tree` are
+    /// never touched. `redistribute_tail` is safe on seeded state for two
+    /// independent reasons: (a) it copies the popped sibling (`to_vec`) and
+    /// builds a fresh node, never mutating through the Arc; and (b) it can
+    /// only ever pop a freshly-frozen FULL node anyway — a level that is
+    /// underfull at finish() with a parent sibling present must have frozen
+    /// during the build (a never-frozen seeded level keeps its original
+    /// \>= MIN_KEYS entries and only grows), and freezes only happen at
+    /// MAX_KEYS, which also keeps its `total > 2 * MIN_KEYS` split sound.
+    fn seed_from_spine(tree: &BTree<K, V>) -> Self {
+        if tree.is_empty() {
+            return Self::new();
+        }
+        let mut spine: Vec<&Arc<BTreeNode<K, V>>> = Vec::new();
+        let mut node = &tree.root;
+        loop {
+            spine.push(node);
+            match node.children.last() {
+                Some(c) => node = c,
+                None => break,
+            }
+        }
+        // spine is root->leaf; builder levels are leaf(0)->root, so reverse.
+        let mut levels = Vec::with_capacity(spine.len());
+        for (i, spine_node) in spine.iter().rev().enumerate() {
+            let mut lv = LevelBuilder::new();
+            lv.entries
+                .extend(spine_node.entries.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
+            if i > 0 {
+                let n = spine_node.children.len();
+                lv.children.extend(spine_node.children[..n - 1].iter().cloned());
+            }
+            levels.push(lv);
+        }
+        let last_key = spine
+            .last()
+            .expect("non-empty tree has a spine leaf")
+            .entries
+            .last()
+            .map(|(k, _)| k.clone());
+        Self {
+            levels,
+            len: tree.len,
+            last_key,
         }
     }
 
@@ -1130,6 +1200,9 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         // underfull, then freeze the partial node and attach it as the
         // rightmost child of the level above.
         let mut carry: Option<Arc<BTreeNode<K, V>>> = None;
+        // Entries popped from a level that ended up "unclosed" (see below),
+        // to be re-inserted individually once the tree is otherwise valid.
+        let mut pending_reinsert: Vec<(K, Arc<V>)> = Vec::new();
 
         for level in 0..self.levels.len() {
             let is_leaf_level = level == 0;
@@ -1145,11 +1218,36 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             // borrow from the sibling so the parent ends up with a proper
             // rightmost child. The topmost level has no parent sibling and is
             // allowed to be partial (it becomes the root).
+            //
+            // Skip *internal* levels that are completely empty (no entries
+            // *and* no children — the state right before the `continue`
+            // below): there is no "own" child here for redistribute_tail's
+            // merge to fold back in, so it would try to re-split the popped
+            // sibling's `entries + 1 separator` across zero children of ours,
+            // leaving the result one child short of `entries.len() + 1`. This
+            // is reachable from a plain `from_sorted` whose input lands
+            // exactly on an internal-level freeze boundary (e.g. `T*T`
+            // leaf-freezes' worth of entries).
+            //
+            // Leaves are exempt from this guard: a fully-drained leaf (e.g.
+            // input landing exactly on `MAX_KEYS + 1` entries) still *must*
+            // redistribute when it has a parent sibling, because it's the
+            // parent's only way to obtain a valid (non-empty) rightmost
+            // child — a leaf's `children` is always empty regardless, so the
+            // merge never touches children and the empty-entries case is
+            // safe (the sibling's entries simply get resplit between the two
+            // leaves).
+            let is_degenerate_empty_internal = !is_leaf_level
+                && self.levels[level].entries.is_empty()
+                && self.levels[level].children.is_empty();
             let has_parent_sibling = self
                 .levels
                 .get(level + 1)
                 .is_some_and(|p| !p.children.is_empty());
-            if has_parent_sibling && self.levels[level].entries.len() < MIN_KEYS {
+            if has_parent_sibling
+                && !is_degenerate_empty_internal
+                && self.levels[level].entries.len() < MIN_KEYS
+            {
                 redistribute_tail::<K, V>(&mut self.levels, level);
             }
 
@@ -1164,25 +1262,114 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                     children: vec![],
                 })
             } else {
-                let entries = std::mem::take(&mut lv.entries);
-                let children = std::mem::take(&mut lv.children);
+                let mut entries = std::mem::take(&mut lv.entries);
+                let mut children = std::mem::take(&mut lv.children);
+                // "Unclosed": `children.len() == entries.len()` means the
+                // level's reserved final child slot (see `attach_child`)
+                // never got filled — nothing arrived from below to carry
+                // into it, because input ran out exactly on a cascading
+                // multi-level freeze boundary (e.g. `T*T` leaf-freezes'
+                // worth of entries: the very last pushed key is promoted as
+                // a separator all the way up through however many levels
+                // simultaneously hit `MAX_KEYS` on that same push). That
+                // last entry is real data (the single largest key seen so
+                // far) with nowhere structurally valid to point a right
+                // child at; pop it and re-insert it after the tree is
+                // otherwise built, via the ordinary (self-balancing)
+                // `insert_arc_mut` path.
+                if !entries.is_empty() && children.len() == entries.len() {
+                    pending_reinsert.push(entries.pop().unwrap());
+                }
                 debug_assert_eq!(children.len(), entries.len() + 1);
-                Arc::new(BTreeNode { entries, children })
+                if entries.is_empty() && level + 1 == self.levels.len() {
+                    // Popping the dangling entry above can leave the
+                    // *topmost* level with zero entries and its one
+                    // remaining child. Collapse here exactly like the root
+                    // collapse `remove`/`remove_mut` perform after a delete
+                    // (dropping a level uniformly changes the whole tree's
+                    // height, unlike collapsing an arbitrary intermediate
+                    // level, which would desync that one branch's leaf
+                    // depth from the rest of the tree).
+                    //
+                    // Known narrow limitation: an *intermediate* level can
+                    // itself end up with zero entries and one child (not
+                    // collapsed, by the above rule) if input ends just past
+                    // a *nested* cascade — e.g. `(MAX_KEYS + 1)^3 + 1`, where
+                    // levels 0-2 all freeze together on the second-to-last
+                    // push and the final single push then pads through
+                    // multiple empty levels with nothing to redistribute
+                    // against. That leaves a genuinely underfull (though
+                    // structurally well-formed) non-root node, caught by
+                    // `check_invariants`'s `MIN_KEYS` check rather than
+                    // silently mis-shaping the tree. Requires input on the
+                    // order of `(MAX_KEYS + 1)^3` (~2M at T=64) to reach;
+                    // out of scope here (see `from_sorted_exact_cascade_boundary`
+                    // for the one- and two-level cascades this does handle).
+                    debug_assert_eq!(children.len(), 1);
+                    children.pop().unwrap()
+                } else {
+                    Arc::new(BTreeNode { entries, children })
+                }
             };
             carry = Some(node);
         }
 
-        let root = carry.unwrap_or_else(|| {
+        let mut root = carry.unwrap_or_else(|| {
             Arc::new(BTreeNode {
                 entries: vec![],
                 children: vec![],
             })
         });
-        BTree {
-            root,
-            len: self.len,
+        fix_right_spine_tail(&mut root);
+        let len = self.len - pending_reinsert.len();
+        let mut tree = BTree { root, len };
+        for (k, v) in pending_reinsert {
+            tree.insert_arc_mut(k, v);
+        }
+        tree
+    }
+}
+
+/// Fix any residual underflow left on the tree's right spine after the
+/// per-level tail rebalance above.
+///
+/// `redistribute_tail` only sees a sibling to borrow from if one is still
+/// sitting in the *immediate* parent level's builder state. When an
+/// intermediate level had already frozen and reset (its own sibling already
+/// promoted further up, out of that level's bookkeeping) with no further
+/// pushes landing in it before the build ended, `has_parent_sibling` is
+/// correctly `false` for the level below — but the leaf (or node) built
+/// there can still end up genuinely underfull, and no ancestor's
+/// entries/children reshuffle can repair *its* entry count: only a real
+/// leaf-to-leaf (or node-to-node) merge fixes that, which requires an actual
+/// sibling pointer, not builder-level bookkeeping. This walks the *finished*
+/// tree's right spine bottom-up and repairs any such underfull node with the
+/// same rotate/merge machinery `remove_mut` uses on real sibling nodes,
+/// independent of how the builder's per-level state got there. No-op if the
+/// tail is already balanced. Safe to mutate in place: every node on this
+/// spine was freshly built by this `finish()` call, so `Arc::make_mut` never
+/// clones.
+///
+/// Returns whether `node` itself is now underfull (ignored by the caller at
+/// the root, which has no `MIN_KEYS` floor).
+fn fix_right_spine_tail<K: Ord + Clone, V>(node: &mut Arc<BTreeNode<K, V>>) -> bool {
+    let n = Arc::make_mut(node);
+    if n.children.is_empty() {
+        return n.entries.len() < MIN_KEYS;
+    }
+    let mut last = n.children.len() - 1;
+    let child_underfull = fix_right_spine_tail(&mut n.children[last]);
+    // A single-child node (no sibling of its own to rotate/merge with) has
+    // no fix available at this level; the underflow just propagates to our
+    // own `entries.len() < MIN_KEYS` check below, for our own parent to
+    // handle against our (real) sibling.
+    if child_underfull {
+        while n.children.len() > 1 && n.children[last].entries.len() < MIN_KEYS {
+            fix_underfull_child(&mut n.entries, &mut n.children, last);
+            last = n.children.len() - 1;
         }
     }
+    n.entries.len() < MIN_KEYS
 }
 
 /// Rebalance the underfull partial node at `levels[level]` with its left
@@ -1192,7 +1379,6 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
 /// in half so both resulting nodes satisfy `MIN_KEYS`. The new left node and
 /// separator go back into the parent; the partial node receives the right
 /// half.
-#[allow(dead_code)]
 fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usize) {
     let is_leaf_level = level == 0;
     let (lower, upper) = levels.split_at_mut(level + 1);
@@ -1261,7 +1447,6 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     lv.children = new_right_children;
 }
 
-#[allow(dead_code)]
 fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
     Arc::new(BTreeNode {
         entries: std::mem::take(&mut lv.entries),
@@ -1269,7 +1454,6 @@ fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
     })
 }
 
-#[allow(dead_code)]
 fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
     let entries = std::mem::take(&mut lv.entries);
     let children = std::mem::take(&mut lv.children);
@@ -2186,5 +2370,118 @@ mod tests {
         let mut t = insert_range(1, 100);
         t.len = 99; // deliberately corrupt (private field, same module)
         check_invariants(&t);
+    }
+
+    // -------------------------------------------------------------------
+    // Bulk append (`BTree::extend_from_sorted`, task51)
+    // -------------------------------------------------------------------
+
+    /// extend_from_sorted must be observationally identical to per-key
+    /// insert_mut of the same entries (mapping + len; node packing differs).
+    fn assert_extend_matches_insert_mut(base: &BTree<u64, u64>, batch: &[(u64, u64)]) {
+        let mut by_ext = base.clone();
+        by_ext.extend_from_sorted(batch.iter().map(|&(k, v)| (k, Arc::new(v))));
+        let mut by_mut = base.clone();
+        for &(k, v) in batch {
+            by_mut.insert_mut(k, v);
+        }
+        let walked_ext: Vec<(u64, u64)> = by_ext.range(..).map(|(k, v)| (*k, *v)).collect();
+        let walked_mut: Vec<(u64, u64)> = by_mut.range(..).map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(walked_ext, walked_mut);
+        assert_eq!(by_ext.len(), by_mut.len());
+        check_invariants(&by_ext);
+    }
+
+    #[test]
+    fn extend_from_sorted_empty_tree_and_empty_batch() {
+        let empty: BTree<u64, u64> = BTree::new();
+        let batch: Vec<(u64, u64)> = (0..1000).map(|i| (i, i * 10)).collect();
+        assert_extend_matches_insert_mut(&empty, &batch); // == from_sorted case
+        let base = insert_range(1, 1000);
+        assert_extend_matches_insert_mut(&base, &[]); // no-op append
+    }
+
+    #[test]
+    fn extend_from_sorted_tail_shapes() {
+        // Underfull tail leaf, exactly-full tail leaf, and one-past-full:
+        // sizes chosen relative to the packing consts, not hardcoded.
+        for base_n in [
+            MIN_KEYS as u64,              // root-leaf, underfull by non-root standards
+            MAX_KEYS as u64,               // root-leaf exactly full
+            MAX_KEYS as u64 + 1,           // first split just happened
+            (MAX_KEYS * MAX_KEYS) as u64,  // multi-level
+        ] {
+            let base = insert_range(1, base_n);
+            for batch_n in [1u64, 2, MIN_KEYS as u64, MAX_KEYS as u64 + 5, 5000] {
+                let batch: Vec<(u64, u64)> =
+                    (base_n + 1..=base_n + batch_n).map(|k| (k, k)).collect();
+                assert_extend_matches_insert_mut(&base, &batch);
+            }
+        }
+    }
+
+    /// Regression test for a `from_sorted`/`finish()` bug found while
+    /// developing `extend_from_sorted` (task51): when the input size lands
+    /// exactly on a cascading freeze boundary (every level from the leaf up
+    /// simultaneously hits `MAX_KEYS` on the very last push), the topmost
+    /// level used to end up either failing an internal debug assertion, or
+    /// (before that) attempting an invalid `redistribute_tail` on a level
+    /// with no child of its own. Covers the single- and double-level
+    /// cascade boundaries (`(MAX_KEYS + 1)^2` and `(MAX_KEYS + 1)^2 * 2`);
+    /// see `pending_reinsert`/the root-collapse branch in `finish()`.
+    #[test]
+    fn from_sorted_exact_cascade_boundary() {
+        let boundary = (MAX_KEYS as u64 + 1) * (MAX_KEYS as u64 + 1);
+        for n in [
+            boundary - 1,
+            boundary,
+            boundary + 1,
+            boundary + MIN_KEYS as u64,
+            2 * boundary,
+            2 * boundary + 1,
+        ] {
+            let entries: Vec<_> = (0..n).map(|i| (i, Arc::new(i))).collect();
+            let t = BTree::from_sorted(entries);
+            check_invariants(&t);
+            assert_eq!(t.len(), n as usize);
+        }
+    }
+
+    #[test]
+    fn extend_from_sorted_fuzz_alternating_batches_and_removes() {
+        // Grow a tree with random-size appends; between rounds remove random
+        // keys (varying spine occupancy). extend path and per-key path must
+        // agree after every round, and every intermediate tree must satisfy
+        // the invariants. Deterministic LCG — no external RNG.
+        let mut x: u64 = 0x5EED_5EED_5EED_5EED;
+        let mut lcg = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            x
+        };
+        let mut by_ext: BTree<u64, u64> = BTree::new();
+        let mut by_mut: BTree<u64, u64> = BTree::new();
+        let mut next_key = 0u64;
+        for _round in 0..60 {
+            let batch_n = lcg() % 800 + 1;
+            let batch: Vec<(u64, u64)> =
+                (next_key..next_key + batch_n).map(|k| (k, k ^ 0xABCD)).collect();
+            next_key += batch_n;
+            by_ext.extend_from_sorted(batch.iter().map(|&(k, v)| (k, Arc::new(v))));
+            for &(k, v) in &batch {
+                by_mut.insert_mut(k, v);
+            }
+            for _ in 0..(lcg() % 200) {
+                let k = lcg() % next_key;
+                by_ext.remove_mut(&k);
+                by_mut.remove_mut(&k);
+            }
+            check_invariants(&by_ext);
+            assert_eq!(by_ext.len(), by_mut.len(), "len diverged");
+        }
+        let walked_ext: Vec<(u64, u64)> = by_ext.range(..).map(|(k, v)| (*k, *v)).collect();
+        let walked_mut: Vec<(u64, u64)> = by_mut.range(..).map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(walked_ext, walked_mut);
     }
 }
