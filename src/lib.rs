@@ -38,7 +38,7 @@ pub(crate) mod checkpoint;
 /// table, and transaction operations.
 pub mod error;
 /// BM25 full-text search over a table's records, gated by the `fulltext`
-/// cargo feature. See `docs/tasks/task43_fulltext_search.md`.
+/// cargo feature. See `docs/tasks/task43_unicode_tokenizer.md` for tokenization details.
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
 /// Secondary index infrastructure: unique, non-unique, and custom indexes

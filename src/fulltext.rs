@@ -72,8 +72,9 @@ impl<R: Record> FullTextIndex<R> {
 
     /// Overrides the BM25 term-frequency saturation (`k1`) and length
     /// normalization (`b`) parameters. Standard defaults are `k1 = 1.2`,
-    /// `b = 0.75`; must be set before indexing existing documents affects
-    /// their contribution to `total_doc_length`/`avgdl` used at query time.
+    /// `b = 0.75`. These parameters affect only how search results are scored
+    /// (in [`search_with_limit`](Self::search_with_limit)); they can be set any
+    /// time before searching and do not require re-indexing.
     pub fn with_bm25_params(mut self, k1: f64, b: f64) -> Self {
         self.k1 = k1;
         self.b = b;
