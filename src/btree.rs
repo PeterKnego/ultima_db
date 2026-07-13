@@ -136,6 +136,20 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         get_arc_in_node(&self.root, key)
     }
 
+    /// The largest key in the tree (rightmost leaf's last entry), or `None`
+    /// if empty. O(height); used by `Table::insert_batch` to verify the
+    /// append invariant before taking the bulk fast path.
+    #[allow(dead_code)]
+    pub(crate) fn max_key(&self) -> Option<&K> {
+        let mut node = &self.root;
+        loop {
+            match node.children.last() {
+                Some(c) => node = c,
+                None => return node.entries.last().map(|(k, _)| k),
+            }
+        }
+    }
+
     /// Insert or replace a key-value pair. Returns a new tree; `self` is
     /// unchanged.
     pub fn insert(&self, key: K, val: V) -> BTree<K, V> {
@@ -1495,6 +1509,21 @@ mod tests {
             .map(|(k, _)| *k)
             .collect();
         assert_eq!(results, vec![6, 7]);
+    }
+
+    #[test]
+    fn max_key_empty_and_single() {
+        let t: BTree<u64, u64> = BTree::new();
+        assert_eq!(t.max_key(), None);
+        let mut t = BTree::new();
+        t.insert_mut(7u64, 70u64);
+        assert_eq!(t.max_key(), Some(&7));
+    }
+
+    #[test]
+    fn max_key_multi_level() {
+        let t = insert_range(1, 100_000);
+        assert_eq!(t.max_key(), Some(&100_000));
     }
 
     // -------------------------------------------------------------------
