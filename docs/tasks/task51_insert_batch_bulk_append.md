@@ -125,7 +125,7 @@ phase-1 path built it.
 
 The equivalence/fuzz testing this task added (`extend_from_sorted_fuzz_alternating_batches_and_removes`)
 surfaced **two independent, pre-existing bugs in `BulkBuilder::finish()`** that shipped
-on `main` from earlier bulk-load work (Tasks 1/2) — **not specific to seeding**. Both
+on `main` from earlier bulk-load work (the task23 bulk-load work) — **not specific to seeding**. Both
 are reachable from a plain `BTree::from_sorted` call — and therefore from
 `Store::bulk_load` — at specific input sizes the pre-existing test suite never
 happened to hit. `extend_from_sorted`'s seeded levels start already near `MAX_KEYS`
@@ -187,22 +187,37 @@ once an intermediate level has already frozen and reset.
 
 ### Known accepted residual limitation (benign, documented, pinned)
 
-A **nested** cascade (`(MAX_KEYS + 1)^3 + delta` for `1 <= delta < MIN_KEYS`, ~2M
-entries at `T = 64`) can still leave one *intermediate* (non-root) node with 0 entries
-/ 1 child after the topmost-only collapse restriction above — structurally well-formed
-(no arity or depth corruption; reads, writes, and ordering are unaffected) but failing
-the `MIN_KEYS` floor `check_invariants` enforces. This is a **packing floor**
-limitation, not a correctness bug: a delete touching that leaf self-heals it back
-above `MIN_KEYS` via the existing rebalance machinery. Out of scope to fully close —
-it requires input on the order of 2 million exactly-aligned entries, far beyond
-anything realistic `insert_batch`/`bulk_load` usage reaches, or the fuzz coverage this
-task added. Documented with doc-comment caveats on `BTree::from_sorted` and
-`Store::bulk_load`, and pinned by a permanent regression test,
+A **nested** cascade (`m * (MAX_KEYS + 1)^3 + delta` for any multiple `m >= 1` and
+`1 <= delta < MIN_KEYS`; ~2M entries at `T = 64` for the smallest `m = 1`) can still
+leave one *intermediate* (non-root) node with 0 entries / 1 child after the
+topmost-only collapse restriction above — structurally well-formed (no arity or depth
+corruption; reads, writes, and ordering are unaffected) but failing the `MIN_KEYS`
+floor `check_invariants` enforces. This is a **packing floor** limitation, not a
+correctness bug: a delete touching that leaf self-heals it back above `MIN_KEYS` via
+the existing rebalance machinery. Out of scope to fully close — it requires input on
+the order of 2 million exactly-aligned entries, far beyond anything realistic
+`insert_batch`/`bulk_load` usage reaches, or the fuzz coverage this task added.
+Documented with doc-comment caveats on `BTree::from_sorted` and `Store::bulk_load`,
+and pinned by a permanent regression test,
 `from_sorted_nested_cascade_two_million_benign`, which builds the exact boundary size,
 confirms full read/order correctness *without* calling `check_invariants` (the
 documented deviation, not a bug), then deletes the top `2 * MAX_KEYS` keys and asserts
 `check_invariants` now passes (the self-heal claim). The two *fixed* boundaries (one-
 and two-level cascades) are separately pinned by `from_sorted_exact_cascade_boundary`.
+
+**Final-review addendum:** a related but distinct debug-assert family — `n = m *
+(MAX_KEYS + 1)^3 + j * (MAX_KEYS + 1)^2` for any multiple `m >= 1` and
+`1 <= j < MIN_KEYS` (smallest failing case `128^3 + 128^2 = 2_113_536` at `T = 64`) —
+was found during final review of this task and **fixed** (not merely documented): an
+internal level could reach `finish()` "unclosed" (`children.len() == entries.len()`, a
+dangling separator with no right child) *and* underfull with a parent sibling
+present, tripping `redistribute_tail`'s own arity `debug_assert_eq!` because its split
+math assumes a closed level. The fix pops the dangling separator into
+`pending_reinsert` before redistributing (the same `finish()` machinery as Bug 2
+above), verified to hold across the whole `j` range, and pinned by
+`from_sorted_unclosed_level_debug_assert_family`. With this fix in place, the only
+residual limitation described in this section is the benign, non-panicking packing
+deviation above.
 
 ## 4. Correctness
 

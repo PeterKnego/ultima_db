@@ -106,11 +106,11 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Debug-asserts strict ascending order and rejects duplicate keys.
     /// Caller is responsible for sort and dedup.
     ///
-    /// At exactly nested-cascade-aligned sizes (`(MAX_KEYS + 1)^3` plus
-    /// fewer than `MIN_KEYS` extra entries), the tail leaf may be packed
-    /// below `MIN_KEYS`; reads, writes, and ordering are unaffected, and a
-    /// delete touching that leaf restores the floor (see
-    /// `from_sorted_nested_cascade_two_million_benign`).
+    /// At exactly nested-cascade-aligned sizes (`m * (MAX_KEYS + 1)^3 +
+    /// delta` for any multiple `m >= 1` and `1 <= delta < MIN_KEYS`), the
+    /// tail leaf may be packed below `MIN_KEYS`; reads, writes, and ordering
+    /// are unaffected, and a delete touching that leaf restores the floor
+    /// (see `from_sorted_nested_cascade_two_million_benign`).
     pub(crate) fn from_sorted<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, Arc<V>)>,
@@ -1255,6 +1255,26 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                 && !is_degenerate_empty_internal
                 && self.levels[level].entries.len() < MIN_KEYS
             {
+                // An internal level can still reach here "unclosed"
+                // (`children.len() == entries.len()`, the steady mid-build
+                // state described in `attach_child`): its carry from the
+                // level below (taken at the top of this iteration) was
+                // `None`, because input ran out exactly on a nested cascade
+                // boundary where the level below finished completely empty.
+                // The level's last entry is then a dangling separator with
+                // no right child. `redistribute_tail`'s arity math assumes a
+                // *closed* level (`children.len() == entries.len() + 1`), so
+                // pop that dangling entry into `pending_reinsert` first — the
+                // sibling it borrows from is always a freshly-frozen FULL
+                // node (see `seed_from_spine`'s doc comment), so the merged
+                // total after the pop is always `>= MAX_KEYS + 1 >
+                // 2 * MIN_KEYS`, keeping the post-redistribute split sound.
+                if !is_leaf_level {
+                    let lv = &mut self.levels[level];
+                    if !lv.entries.is_empty() && lv.children.len() == lv.entries.len() {
+                        pending_reinsert.push(lv.entries.pop().unwrap());
+                    }
+                }
                 redistribute_tail::<K, V>(&mut self.levels, level);
             }
 
@@ -2592,6 +2612,42 @@ mod tests {
             next_key += batch_n;
             let after: Vec<(u64, u64)> = snap.range(..).map(|(k, v)| (*k, *v)).collect();
             assert_eq!(before, after, "snapshot mutated by append");
+            check_invariants(&t);
+        }
+    }
+
+    /// Regression test for a second `from_sorted`/`finish()` debug-assert
+    /// family found in final review of task51 (distinct from
+    /// `from_sorted_exact_cascade_boundary`'s single-/double-level cascade
+    /// and from the benign underfull-tail-leaf deviation in
+    /// `from_sorted_nested_cascade_two_million_benign`): for
+    /// `n = m * (MAX_KEYS + 1)^3 + j * (MAX_KEYS + 1)^2` with `m >= 1` and
+    /// `1 <= j < MIN_KEYS`, an internal level reaches `finish()` "unclosed"
+    /// (`children.len() == entries.len()`, a dangling separator with no
+    /// right child — see `attach_child`'s doc comment) *and* underfull with
+    /// a parent sibling present, so `redistribute_tail` used to run its
+    /// arity-assuming split math on a level one child short and trip its own
+    /// `debug_assert_eq!` (src/btree.rs, `redistribute_tail`). Fixed by
+    /// popping the dangling separator into `pending_reinsert` before
+    /// redistributing (see the comment at the `redistribute_tail` call site
+    /// in `finish()`). All four sizes below were confirmed to build with
+    /// zero underfull nodes post-fix, so this asserts full strict
+    /// `check_invariants` rather than falling back to the benign-deviation
+    /// safety checks.
+    #[test]
+    fn from_sorted_unclosed_level_debug_assert_family() {
+        let base = MAX_KEYS as u64 + 1;
+        let cube = base * base * base;
+        let sq = base * base;
+        for n in [
+            cube + sq,
+            cube + 2 * sq,
+            cube + (MIN_KEYS as u64 - 1) * sq,
+            2 * cube + sq,
+        ] {
+            let entries: Vec<_> = (0..n).map(|i| (i, Arc::new(i))).collect();
+            let t = BTree::from_sorted(entries);
+            assert_eq!(t.len(), n as usize);
             check_invariants(&t);
         }
     }
