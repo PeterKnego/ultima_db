@@ -2573,7 +2573,7 @@ mod tests {
         // append (many spine shapes, incl. tail-redistribute rounds) and
         // verify each snapshot afterwards. Catches any mutation of shared
         // nodes anywhere in seed/push/finish/redistribute.
-        let mut x: u64 = 0xB16_B00B5_CAFE_F00D;
+        let mut x: u64 = 0xB16B_00B5_CAFE_F00D;
         let mut lcg = move || {
             x = x
                 .wrapping_mul(6364136223846793005)
