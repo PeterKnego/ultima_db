@@ -414,6 +414,16 @@ impl<R: Record> Table<R> {
     ///
     /// Index updates are deferred until all records are inserted into the
     /// data tree, then applied in one pass per index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::Table;
+    ///
+    /// let mut table: Table<String> = Table::new();
+    /// let ids = table.insert_batch(vec!["a".into(), "b".into(), "c".into()]).unwrap();
+    /// assert_eq!(ids, vec![1, 2, 3]);
+    /// ```
     pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
         if records.is_empty() {
             return Ok(vec![]);
@@ -664,6 +674,21 @@ impl<R: Record> Table<R> {
     /// Define a secondary index. If the table already contains data, the index
     /// is backfilled. Returns an error if the index name is already taken or
     /// if backfilling hits a unique constraint violation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::{Table, IndexKind};
+    ///
+    /// let mut table: Table<String> = Table::new();
+    /// let id = table.insert("alice@example.com".to_string()).unwrap();
+    /// table
+    ///     .define_index("by_email", IndexKind::Unique, |email: &String| email.clone())
+    ///     .unwrap();
+    ///
+    /// let found = table.get_unique("by_email", &"alice@example.com".to_string()).unwrap();
+    /// assert_eq!(found, Some((id, &"alice@example.com".to_string())));
+    /// ```
     pub fn define_index<K: Ord + Clone + Send + Sync + 'static>(
         &mut self,
         name: &str,

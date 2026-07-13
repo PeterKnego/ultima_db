@@ -25,6 +25,22 @@ pub struct SearchResult {
 /// records. Maintains inverted postings (`term, doc_id -> term frequency`),
 /// per-term document frequency, and per-document token length, updated
 /// incrementally on insert/update/delete via the `CustomIndex` hooks.
+///
+/// # Examples
+///
+/// ```
+/// use ultima_db::{FullTextIndex, Table};
+///
+/// let mut table: Table<String> = Table::new();
+/// table
+///     .define_custom_index("search", FullTextIndex::new(|s: &String| s.clone()))
+///     .unwrap();
+/// let id = table.insert("Rust programming language".to_string()).unwrap();
+/// table.insert("Python scripting language".to_string()).unwrap();
+///
+/// let idx = table.custom_index::<FullTextIndex<String>>("search").unwrap();
+/// assert_eq!(idx.search("rust")[0].id, id);
+/// ```
 pub struct FullTextIndex<R: Record> {
     postings: BTree<(String, u64), u32>,
     doc_freq: BTree<String, u32>,
