@@ -1,0 +1,42 @@
+name: ci
+
+# Core build/test/lint gate for the root crate + ultima-vector.
+#   * test — gates PRs (and pushes to main): clippy, then three test passes.
+#     Default features are empty, so `--features persistence,fulltext,metrics`
+#     is load-bearing for the main gate (it's the only pass that exercises the
+#     persistence/fulltext/metrics code paths, incl. doc tests); `--lib` with
+#     no features keeps the in-memory-only default build green; the
+#     ultima-vector pass covers a workspace member that root `cargo test`
+#     does not reach. ultima-vector clippy is included alongside the root
+#     clippy pass since it currently passes clean with -D warnings.
+# Deliberately NOT run here:
+#   * compare_benches (RocksDB/Fjall/ReDB) — opt-in competitor tier, keeps
+#     those deps out of CI by design (see `make bench/compare-engines`).
+#   * --all-features — wal-iouring is not reliable on hosted runners.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (root crate)
+        run: make lint
+      - name: Clippy (ultima-vector)
+        run: cargo clippy -p ultima-vector -- -D warnings
+      - name: Tests (featured: persistence, fulltext, metrics)
+        run: cargo test --features persistence,fulltext,metrics
+      - name: Tests (no features)
+        run: cargo test --lib
+      - name: Tests (ultima-vector, persistence)
+        run: cargo test -p ultima-vector --features persistence
