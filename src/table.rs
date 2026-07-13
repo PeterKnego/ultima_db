@@ -153,6 +153,8 @@ pub struct TableDef<R: 'static> {
 }
 
 impl<R: 'static> TableDef<R> {
+    /// Binds `name` to record type `R` as a `const`-constructible table
+    /// definition, usable as a `static` handle for `open_table` call sites.
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
@@ -160,6 +162,7 @@ impl<R: 'static> TableDef<R> {
         }
     }
 
+    /// Returns the bound table name.
     pub const fn name(&self) -> &'static str {
         self.name
     }
@@ -167,6 +170,7 @@ impl<R: 'static> TableDef<R> {
 
 /// Trait for types that can identify a table and its record type.
 pub trait TableOpener<R> {
+    /// Returns the table name to open.
     fn table_name(&self) -> &str;
 }
 
@@ -182,6 +186,9 @@ impl<R: 'static> TableOpener<R> for TableDef<R> {
     }
 }
 
+/// A typed collection wrapping `BTree<u64, R>` with auto-incrementing ids,
+/// secondary indexes, and batch operations. `Clone` is O(1) (CoW via the
+/// backing B-tree's `Arc` sharing) and preserves `next_id`.
 pub struct Table<R> {
     data: BTree<u64, R>,
     next_id: u64,

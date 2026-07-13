@@ -79,24 +79,39 @@ impl WalPoison {
 /// A single mutation within a transaction.
 #[derive(Debug, Clone)]
 pub enum WalOp {
+    /// A new row was inserted.
     Insert {
+        /// Name of the table the row was inserted into.
         table: String,
+        /// Primary key of the inserted row.
         id: u64,
+        /// Bincode-serialized record bytes.
         data: Vec<u8>,
     },
+    /// An existing row was overwritten.
     Update {
+        /// Name of the table the row belongs to.
         table: String,
+        /// Primary key of the updated row.
         id: u64,
+        /// Bincode-serialized record bytes (the new value).
         data: Vec<u8>,
     },
+    /// A row was removed.
     Delete {
+        /// Name of the table the row was removed from.
         table: String,
+        /// Primary key of the deleted row.
         id: u64,
     },
+    /// A new (empty) table was created.
     CreateTable {
+        /// Name of the created table.
         name: String,
     },
+    /// A table was dropped.
     DeleteTable {
+        /// Name of the deleted table.
         name: String,
     },
     /// Marker recording that a bulk load replaced `tables` at this entry's
@@ -106,6 +121,7 @@ pub enum WalOp {
     /// state) and fail with [`Error::BulkLoadNotCheckpointed`] instead of
     /// silently producing a state no client ever observed.
     BulkLoad {
+        /// Names of the tables the bulk load replaced.
         tables: Vec<String>,
     },
 }
@@ -113,7 +129,10 @@ pub enum WalOp {
 /// A complete WAL entry for one committed transaction.
 #[derive(Debug, Clone)]
 pub struct WalEntry {
+    /// Commit version this entry belongs to; matches the `Snapshot` version
+    /// produced by the corresponding `WriteTx::commit`.
     pub version: u64,
+    /// The ordered row-level mutations that made up the transaction.
     pub ops: Vec<WalOp>,
 }
 

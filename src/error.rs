@@ -5,6 +5,9 @@ use thiserror::Error;
 
 use crate::intents::CommitWaiter;
 
+/// The crate-wide error type returned by fallible `Store`/`Table`/transaction
+/// operations. Each variant documents when it occurs and, where relevant,
+/// how a caller should react (retry, abort, recover).
 #[derive(Debug, Error)]
 pub enum Error {
     /// Requested key or version does not exist.
@@ -24,9 +27,18 @@ pub enum Error {
     ///    a key or deleted a table. `wait_for` is `None`; the winner is gone.
     #[error("write conflict on table '{table}', keys {keys:?} (conflicting version {version})")]
     WriteConflict {
+        /// Name of the table on which the conflict was detected.
         table: String,
+        /// The overlapping keys that caused the conflict.
         keys: Vec<u64>,
+        /// The conflicting writer's version: the intent holder's base
+        /// version for early-fail, or the winning commit's version for
+        /// commit-time OCC.
         version: u64,
+        /// `Some(waiter)` for early-fail (block on it, then retry once the
+        /// holder commits or aborts); `None` for commit-time OCC, where the
+        /// conflicting writer has already finished and there is nothing to
+        /// wait on.
         wait_for: Option<CommitWaiter>,
     },
     /// Returned when a `Serializable` WriteTx's read set was invalidated by a
@@ -34,7 +46,12 @@ pub enum Error {
     /// against a fresh base; there is no `wait_for` because the conflicting
     /// writer has already finished.
     #[error("serialization failure on table '{table}' (conflicting version {version})")]
-    SerializationFailure { table: String, version: u64 },
+    SerializationFailure {
+        /// Name of the table whose read set was invalidated.
+        table: String,
+        /// Version of the concurrent transaction that invalidated the read set.
+        version: u64,
+    },
     /// Returned when a MultiWriter commit contained index DDL
     /// (`define_index` / `define_custom_index`) on a table that a concurrent
     /// transaction committed to since this transaction's base snapshot. The
@@ -45,7 +62,10 @@ pub enum Error {
         "index DDL on table '{table}' conflicts with a concurrent commit; \
          retry the DDL in its own transaction when the table is quiet"
     )]
-    IndexDdlConflict { table: String },
+    IndexDdlConflict {
+        /// Name of the table the index DDL targeted.
+        table: String,
+    },
     /// Returned when `begin_write` is called while another write transaction
     /// is active in [`WriterMode::SingleWriter`](crate::WriterMode::SingleWriter) mode.
     #[error("another write transaction is active (SingleWriter mode)")]
@@ -110,6 +130,7 @@ pub enum Error {
     InvalidBulkLoadInput(String),
 }
 
+/// Crate-wide result alias: `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

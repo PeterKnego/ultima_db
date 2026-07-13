@@ -9,12 +9,22 @@ use crate::btree::BTree;
 use crate::index::CustomIndex;
 use crate::persistence::Record;
 
+/// One match from [`FullTextIndex::search`]/`search_with_limit`, sorted by
+/// descending `score`.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// Primary key of the matching record.
     pub id: u64,
+    /// BM25 relevance score for the query; higher is more relevant. Not
+    /// normalized to a fixed range — only meaningful relative to other
+    /// results of the same query.
     pub score: f64,
 }
 
+/// A [`CustomIndex`] providing BM25-ranked full-text search over a table's
+/// records. Maintains inverted postings (`term, doc_id -> term frequency`),
+/// per-term document frequency, and per-document token length, updated
+/// incrementally on insert/update/delete via the `CustomIndex` hooks.
 pub struct FullTextIndex<R: Record> {
     postings: BTree<(String, u64), u32>,
     doc_freq: BTree<String, u32>,
@@ -42,6 +52,11 @@ impl<R: Record> Clone for FullTextIndex<R> {
 }
 
 impl<R: Record> FullTextIndex<R> {
+    /// Creates an empty index. `extractor` pulls the searchable text out of
+    /// each record (e.g. concatenating title and body); it is called on
+    /// every insert/update/delete to (re)tokenize the record. Defaults to
+    /// the standard BM25 parameters `k1 = 1.2`, `b = 0.75`; override with
+    /// [`with_bm25_params`](Self::with_bm25_params).
     pub fn new(extractor: impl Fn(&R) -> String + Send + Sync + 'static) -> Self {
         Self {
             postings: BTree::new(),
@@ -55,16 +70,26 @@ impl<R: Record> FullTextIndex<R> {
         }
     }
 
+    /// Overrides the BM25 term-frequency saturation (`k1`) and length
+    /// normalization (`b`) parameters. Standard defaults are `k1 = 1.2`,
+    /// `b = 0.75`; must be set before indexing existing documents affects
+    /// their contribution to `total_doc_length`/`avgdl` used at query time.
     pub fn with_bm25_params(mut self, k1: f64, b: f64) -> Self {
         self.k1 = k1;
         self.b = b;
         self
     }
 
+    /// Tokenizes `query` and returns all matching documents ranked by
+    /// descending BM25 score (AND-of-terms is not enforced — any document
+    /// matching at least one token scores and is returned). Returns an
+    /// empty `Vec` if the query has no tokens or the index is empty.
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
         self.search_with_limit(query, usize::MAX)
     }
 
+    /// Like [`search`](Self::search), but truncates the ranked results to
+    /// at most `limit` entries.
     pub fn search_with_limit(&self, query: &str, limit: usize) -> Vec<SearchResult> {
         let tokens = tokenize(query);
         if tokens.is_empty() || self.total_docs == 0 {

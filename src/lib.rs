@@ -25,13 +25,24 @@
 //! Design documents for each subsystem live in `docs/tasks/` in the
 //! repository.
 
+#![warn(missing_docs)]
+
+/// The persistent copy-on-write B-tree (`BTree<K, V>`) that backs every
+/// `Table`. Mutations return a new tree sharing unchanged subtrees with the
+/// original via `Arc`, so old versions stay alive at O(1) clone cost.
 pub mod btree;
 pub mod bulk_load;
 #[cfg(feature = "persistence")]
 pub(crate) mod checkpoint;
+/// Crate-wide [`Error`] and [`Result`] types returned by fallible store,
+/// table, and transaction operations.
 pub mod error;
+/// BM25 full-text search over a table's records, gated by the `fulltext`
+/// cargo feature. See `docs/tasks/task43_fulltext_search.md`.
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
+/// Secondary index infrastructure: unique, non-unique, and custom indexes
+/// maintained automatically on insert/update/delete.
 pub mod index;
 pub(crate) mod intents;
 pub mod metrics;
@@ -41,8 +52,14 @@ pub mod persistence;
 #[cfg(feature = "persistence")]
 pub(crate) mod registry;
 pub mod snapshot_stream;
+/// [`Store`], `Snapshot`, and the [`ReadTx`]/[`WriteTx`] transaction types
+/// that implement the MVCC commit protocol.
 pub mod store;
+/// [`Table<R>`], a typed collection wrapping `BTree<u64, R>` with
+/// auto-incrementing ids, secondary indexes, and batch operations.
 pub mod table;
+/// Re-exports [`ReadTx`]/[`WriteTx`] (defined in `store` to avoid a circular
+/// module dependency) under a semantically clearer import path.
 pub mod transaction;
 #[cfg(feature = "persistence")]
 pub mod wal;
