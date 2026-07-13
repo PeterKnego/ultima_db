@@ -43,11 +43,16 @@ bench/smr-ab: ## SMR-apply/read-p99 fanout (T) A/B — the contended perf-gate w
 bench/fanout-micro: ## Fanout (T) read-vs-write asymmetry — warm+cold get/insert/update/remove @T 8..256
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fanout-micro
 
-bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench|fanout|smr-ab|fanout-micro) -> destroy
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|autobench|fanout|smr-ab|fanout-micro) -> destroy (destroy runs even if up/bench fail)
 	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|autobench|fanout|smr-ab|fanout-micro"; exit 1; fi
-	$(MAKE) up
-	cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET)
-	$(MAKE) destroy
+	@rc=0; \
+	( $(MAKE) up && cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET) ) || rc=$$?; \
+	if ! $(MAKE) destroy; then \
+	  echo "ERROR: destroy FAILED — billable resources may still be running; rerun 'make destroy' and check 'make status'"; \
+	  exit 1; \
+	fi; \
+	if [ $$rc -ne 0 ]; then echo "bench-oneshot: up/bench failed (rc=$$rc); host was destroyed."; fi; \
+	exit $$rc
 
 status: ## list instance + uptime (cost guard — nothing auto-reaps)
 	@$(TF) output -json nodes | jq -r '.[] | "\(.name)\t\(.public_ip)\t\(.role)"'
