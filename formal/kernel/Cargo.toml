@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "btree_kernel"
 version = "0.1.0"

@@ -419,12 +419,34 @@ impl<R: Record> Table<R> {
         let snap = self.snapshot();
 
         // Phase 1: Insert all records into the data BTree.
-        let mut ids = Vec::with_capacity(records.len());
-        for record in records {
-            let id = self.next_id;
-            self.data.insert_mut(id, record);
-            self.next_id += 1;
-            ids.push(id);
+        //
+        // Fast path (task51): batch ids are next_id.. and every existing key is
+        // < next_id (auto-increment; merge_keys_from maxes next_id across
+        // writers; bulk_load rebuilds it past the loaded max), so the batch is a
+        // pure append past the current max key — build it through the dense
+        // BulkBuilder in O(batch + height) instead of per-key descents. The
+        // max_key guard makes the invariant load-bearing instead of assumed;
+        // if it ever fails we take the legacy per-key path.
+        let start_id = self.next_id;
+        let n = records.len() as u64;
+        let ids: Vec<u64> = (start_id..start_id + n).collect();
+        if self.data.max_key().is_none_or(|k| *k < start_id) {
+            self.data.extend_from_sorted(
+                records
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| (start_id + i as u64, Arc::new(r))),
+            );
+            self.next_id = start_id + n;
+        } else {
+            // Defensive fallback — unreachable given the next_id invariant, but a
+            // violated invariant must degrade to the legacy per-key path, not UB
+            // in the packed builder. (No debug_assert here: the fallback test
+            // exercises this branch in debug builds.)
+            for (i, record) in records.into_iter().enumerate() {
+                self.data.insert_mut(start_id + i as u64, record);
+                self.next_id += 1;
+            }
         }
 
         // Phase 2: Update each index for all new records.
@@ -1186,6 +1208,47 @@ mod tests {
         let ids = table.insert_batch(vec![]).unwrap();
         assert!(ids.is_empty());
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn insert_batch_bulk_path_matches_per_key_semantics() {
+        // Interleave singles and batches; ids must stay sequential and every
+        // record retrievable — exercises repeated seeding of a grown tree.
+        let mut table: Table<String> = Table::new();
+        let mut expected_id = 1u64;
+        for round in 0..20 {
+            let n = 50 * (round % 4) + 1;
+            let ids = table
+                .insert_batch((0..n).map(|i| format!("r{round}-{i}")).collect())
+                .unwrap();
+            assert_eq!(ids.first().copied(), Some(expected_id));
+            assert_eq!(ids.len(), n as usize);
+            expected_id += n as u64;
+            let single = table.insert(format!("s{round}")).unwrap();
+            assert_eq!(single, expected_id);
+            expected_id += 1;
+        }
+        assert_eq!(table.len() as u64, expected_id - 1);
+        for id in 1..expected_id {
+            assert!(table.get(id).is_some(), "missing id {id}");
+        }
+    }
+
+    #[test]
+    fn insert_batch_falls_back_when_next_id_behind_max_key() {
+        // Corrupt next_id below the max key (unreachable in production; the
+        // guard exists exactly for this). The fallback must keep legacy
+        // per-key semantics: replace at colliding ids, table stays coherent.
+        let mut table: Table<String> = Table::new();
+        table
+            .insert_batch((0..100).map(|i| format!("v{i}")).collect())
+            .unwrap(); // ids 1..=100
+        table.next_id = 50;
+        let ids = table.insert_batch(vec!["x".into(), "y".into()]).unwrap();
+        assert_eq!(ids, vec![50, 51]);
+        assert_eq!(table.get(50), Some(&"x".to_string()));
+        assert_eq!(table.get(51), Some(&"y".to_string()));
+        assert_eq!(table.len(), 100); // replaced, not added
     }
 
     #[test]

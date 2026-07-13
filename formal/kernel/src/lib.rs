@@ -457,6 +457,18 @@ impl BTree {
             None => false,
         }
     }
+
+    /// Mirror of production `BTree::extend_from_sorted` (task51). The
+    /// production bulk-append (right-spine-seeded BulkBuilder) must be
+    /// observationally equal to folding the verified `insert` over the
+    /// batch — this fold IS the spec; the Lean proofs cover each `insert`.
+    /// Production-side equivalence is pinned by the extend_from_sorted
+    /// differential tests in src/btree.rs.
+    pub fn extend_from_sorted(&mut self, items: &[(u64, u64)]) {
+        for &(k, v) in items {
+            self.insert_mut(k, v);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +956,34 @@ mod tests {
             let want = model.get(&k).copied();
             assert_eq!(inp.get(k), want, "in-place vs std, key {k}");
             assert_eq!(inp.get(k), imm.get(k), "in-place vs immutable, key {k}");
+        }
+    }
+
+    #[test]
+    fn extend_from_sorted_matches_insert_and_std_btreemap() {
+        // Ascending appends atop a random base: the extend mirror, per-key
+        // insert, and std::BTreeMap must agree exactly.
+        let mut model = BTreeMap::new();
+        let mut ext = BTree::new();
+        let mut per_key = BTree::new();
+        let mut x: u64 = 0xFEED_FACE_DEAD_BEEF;
+        let mut next = 0u64;
+        for _ in 0..50 {
+            x = lcg(x);
+            let n = x % 200 + 1;
+            let batch: Vec<(u64, u64)> = (next..next + n).map(|k| (k, k ^ x)).collect();
+            next += n;
+            ext.extend_from_sorted(&batch);
+            for &(k, v) in &batch {
+                per_key.insert_mut(k, v);
+                model.insert(k, v);
+            }
+            assert_eq!(ext.len, per_key.len);
+            assert_eq!(ext.len, model.len());
+        }
+        for k in 0..next {
+            assert_eq!(ext.get(k), model.get(&k).copied(), "key {k}");
+            assert_eq!(ext.get(k), per_key.get(k), "key {k}");
         }
     }
 }
