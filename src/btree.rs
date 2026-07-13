@@ -2551,4 +2551,50 @@ mod tests {
         let walked_mut: Vec<(u64, u64)> = by_mut.range(..).map(|(k, v)| (*k, *v)).collect();
         assert_eq!(walked_ext, walked_mut);
     }
+
+    #[test]
+    fn extend_from_sorted_preserves_snapshots() {
+        let mut t: BTree<u64, u64> = BTree::new();
+        for i in 0..(MAX_KEYS as u64 * MAX_KEYS as u64) {
+            t.insert_mut(i, i);
+        }
+        let snap = t.clone(); // simulates an older MVCC snapshot
+        let before: Vec<(u64, u64)> = snap.range(..).map(|(k, v)| (*k, *v)).collect();
+        let start = MAX_KEYS as u64 * MAX_KEYS as u64;
+        t.extend_from_sorted((start..start + 10_000).map(|i| (i, Arc::new(i))));
+        let after: Vec<(u64, u64)> = snap.range(..).map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(before, after, "older snapshot observed the append");
+        assert_eq!(snap.len() as u64, start);
+        check_invariants(&snap);
+        check_invariants(&t);
+    }
+
+    #[test]
+    fn extend_from_sorted_fuzz_snapshot_per_round() {
+        // Stronger than a single constructed case: snapshot before EVERY
+        // append (many spine shapes, incl. tail-redistribute rounds) and
+        // verify each snapshot afterwards. Catches any mutation of shared
+        // nodes anywhere in seed/push/finish/redistribute.
+        let mut x: u64 = 0xB16_B00B5_CAFE_F00D;
+        let mut lcg = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            x
+        };
+        let mut t: BTree<u64, u64> = BTree::new();
+        let mut next_key = 0u64;
+        for _round in 0..40 {
+            let snap = t.clone();
+            let before: Vec<(u64, u64)> = snap.range(..).map(|(k, v)| (*k, *v)).collect();
+            let batch_n = lcg() % 300 + 1; // small batches maximize tail-redistribute hits
+            t.extend_from_sorted(
+                (next_key..next_key + batch_n).map(|k| (k, Arc::new(k))),
+            );
+            next_key += batch_n;
+            let after: Vec<(u64, u64)> = snap.range(..).map(|(k, v)| (*k, *v)).collect();
+            assert_eq!(before, after, "snapshot mutated by append");
+            check_invariants(&t);
+        }
+    }
 }
