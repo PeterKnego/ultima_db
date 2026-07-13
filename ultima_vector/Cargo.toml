@@ -10,7 +10,7 @@ repository = "https://github.com/PeterKnego/ultima_db"
 readme = "README.md"
 keywords = ["vector-search", "hnsw", "embedding", "simd", "database"]
 categories = ["database-implementations"]
-include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE"]
+include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE", "NOTICE"]
 
 [package.metadata.docs.rs]
 features = ["persistence"]

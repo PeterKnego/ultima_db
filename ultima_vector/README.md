@@ -20,9 +20,8 @@ let coll: VectorCollection<String, Cosine> =
 coll.upsert(vec![0.1, 0.2, 0.3], "doc-a".to_string())?;
 coll.upsert(vec![0.9, 0.1, 0.0], "doc-b".to_string())?;
 
-let hits = coll.search(&[0.1, 0.2, 0.25], 1, None, None)?;
+let hits = coll.search(&[0.1, 0.2, 0.25], 1, None, None).unwrap();
 assert_eq!(hits[0].0, 1); // id of the closest match, "doc-a"
-# Ok::<(), ultima_vector::Error>(())
 ```
 
 More in [`examples/`](examples/): quick search, filtered search, bulk
@@ -47,4 +46,4 @@ search, and restore.
 ## License
 
 Apache-2.0, part of the [`ultima_db`](https://github.com/PeterKnego/ultima_db)
-workspace. See [LICENSE](../LICENSE) and [NOTICE](../NOTICE).
+workspace. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

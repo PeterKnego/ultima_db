@@ -39,16 +39,15 @@ use ultima_db::Store;
 let store = Store::default();
 
 // Write a snapshot.
-let mut wtx = store.begin_write(None)?;
-let mut users = wtx.open_table::<String>("users")?;
-let id = users.insert("alice".to_string())?;
-let v1 = wtx.commit()?;
+let mut wtx = store.begin_write(None).unwrap();
+let mut users = wtx.open_table::<String>("users").unwrap();
+let id = users.insert("alice".to_string()).unwrap();
+let v1 = wtx.commit().unwrap();
 
 // Read it back — and keep reading it, even as later commits land.
-let rtx = store.begin_read(Some(v1))?;
-assert_eq!(rtx.open_table::<String>("users")?.get(id),
+let rtx = store.begin_read(Some(v1)).unwrap();
+assert_eq!(rtx.open_table::<String>("users").unwrap().get(id),
            Some(&"alice".to_string()));
-# Ok::<(), ultima_db::Error>(())
 ```
 
 More in [`examples/`](examples/): basic usage, multiple stores, concurrent
