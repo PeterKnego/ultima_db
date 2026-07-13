@@ -105,6 +105,12 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     ///
     /// Debug-asserts strict ascending order and rejects duplicate keys.
     /// Caller is responsible for sort and dedup.
+    ///
+    /// At exactly nested-cascade-aligned sizes (`(MAX_KEYS + 1)^3` plus
+    /// fewer than `MIN_KEYS` extra entries), the tail leaf may be packed
+    /// below `MIN_KEYS`; reads, writes, and ordering are unaffected, and a
+    /// delete touching that leaf restores the floor (see
+    /// `from_sorted_nested_cascade_two_million_benign`).
     pub(crate) fn from_sorted<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, Arc<V>)>,
@@ -1184,7 +1190,10 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         let lv = &mut self.levels[level];
         // On entry, `children.len() == entries.len()` (after the prior freeze
         // pushed a child up without yet attaching the separator). We append the
-        // new child first, then the separator, restoring `children.len() == entries.len() + 1`.
+        // new child first, then the separator; the steady mid-build state
+        // after that is still `children.len() == entries.len()`, with the
+        // rightmost child slot left open until the next freeze (or
+        // finish()'s carry) fills it.
         lv.children.push(child);
         if lv.entries.len() == MAX_KEYS {
             let frozen = freeze_internal(lv);
@@ -2445,6 +2454,64 @@ mod tests {
             check_invariants(&t);
             assert_eq!(t.len(), n as usize);
         }
+    }
+
+    /// Regression test for the narrow, verified-benign packing deviation
+    /// documented at the collapse site in `finish()`: for `n = (MAX_KEYS +
+    /// 1)^3 + d` with `1 <= d < MIN_KEYS`, an *intermediate* level can end up
+    /// with zero entries and one child — only the topmost level is collapsed
+    /// on a dangling reinsert, so an intermediate one that hits this is left
+    /// underfull (one tail leaf below `MIN_KEYS`) rather than collapsed.
+    ///
+    /// This pins the SAFETY claims at that scale — data correctness,
+    /// ordering, len, and structural well-formedness enough to support point
+    /// lookups and a full in-order walk — and NOT the strict `MIN_KEYS`
+    /// packing floor: `check_invariants` is deliberately *not* called on the
+    /// freshly-built tree, because it would fail on the underfull tail leaf.
+    /// It self-heals on delete: removing the top `2 * MAX_KEYS` keys touches
+    /// that leaf (and its ancestors), and the tree then passes the strict
+    /// invariant check.
+    #[test]
+    fn from_sorted_nested_cascade_two_million_benign() {
+        let base = MAX_KEYS as u64 + 1;
+        let cube = base * base * base;
+        let n = cube + 30; // (MAX_KEYS + 1)^3 + 30, i.e. 1 <= 30 < MIN_KEYS
+
+        let mut t = BTree::<u64, u64>::from_sorted((0..n).map(|i| (i, Arc::new(i))));
+        assert_eq!(t.len(), n as usize);
+
+        // Point lookups across the range, including several past the
+        // (MAX_KEYS + 1)^3 cascade boundary where the underfull tail leaf
+        // lives.
+        for k in [0, 1, n / 2, cube - 1, cube, cube + 1, cube + 15, cube + 29, n - 1] {
+            assert_eq!(t.get(&k).copied(), Some(k), "lookup mismatch at key {k}");
+        }
+        assert_eq!(t.get(&n), None);
+
+        // Full range(..) walk: exactly n entries, strictly ascending, 0..n.
+        // Track count + a running previous key rather than materializing a
+        // ~2M-entry Vec of tuples.
+        let mut count = 0usize;
+        let mut prev: Option<u64> = None;
+        for (k, v) in t.range(..) {
+            if let Some(p) = prev {
+                assert!(*k > p, "range walk not strictly ascending at key {k}");
+            }
+            assert_eq!(*v, *k);
+            prev = Some(*k);
+            count += 1;
+        }
+        assert_eq!(count, n as usize);
+        assert_eq!(prev, Some(n - 1));
+
+        // Self-heal: removing the top 2 * MAX_KEYS keys touches the
+        // underfull tail leaf (and its ancestors); the tree must then
+        // satisfy the strict MIN_KEYS packing floor.
+        for k in (n - 2 * MAX_KEYS as u64)..n {
+            assert!(t.remove_mut(&k), "expected key {k} to be present before removal");
+        }
+        assert_eq!(t.len(), (n - 2 * MAX_KEYS as u64) as usize);
+        check_invariants(&t);
     }
 
     #[test]

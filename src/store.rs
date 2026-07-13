@@ -1117,6 +1117,12 @@ impl Store {
     ///   middle of advancing `latest_version` since the load was built —
     ///   retry against the new state.
     ///
+    /// Built on `BTree::from_sorted`: at exactly nested-cascade-aligned row
+    /// counts (`(MAX_KEYS + 1)^3` plus fewer than `MIN_KEYS` extra rows) the
+    /// tail leaf may be packed below `MIN_KEYS`; reads, writes, and deletes
+    /// against the loaded table are unaffected, and a delete touching that
+    /// leaf restores the floor.
+    ///
     /// See `docs/tasks/task23_bulk_load.md`.
     pub fn bulk_load<R: Record>(
         &self,
