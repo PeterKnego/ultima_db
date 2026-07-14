@@ -11,7 +11,10 @@ and the fanout bump T=32→64 (PR #11). Prior doc: `competitor-nvme-2026-06-26.m
 - AWS local-NVMe host, 8 vCPU / 15.7 GB (c6id.2xlarge class), kernel 6.17.0-1019-aws,
   rustc 1.97.0, ultima_db git `e5ed2dc`.
 - UltimaDB strict arm = `standalone_fast` (`ConsistentInline` + `CoalescedPrealloc`),
-  same as June. Metric = criterion median of per-burst time, ms (lower is better).
+  same as June. Metric = criterion median time for one burst of **1,000 YCSB ops**,
+  ms (lower is better). Throughput columns are the reciprocal:
+  **ops/sec = 1,000,000 ÷ ms** (1,000 ops per burst ÷ seconds), higher is better.
+  Each op is its own transaction; strict-tier writes fsync per commit.
 - **Scope: YCSB only.** The bench-infra `competitor` target runs `make
   bench/ycsb/compare`; the June doc's SmallBank and MultiWriter sections were a wider
   one-off script and were not re-run — those June numbers remain the latest.
@@ -29,6 +32,17 @@ and the fanout bump T=32→64 (PR #11). Prior doc: `competitor-nvme-2026-06-26.m
 
 UltimaDB fastest on **all six durable workloads** — unchanged from June.
 
+Same data as throughput (**ops/sec = 1,000,000 ÷ ms**, higher is better):
+
+| Workload | **UltimaDB** | Fjall | ReDB | RocksDB |
+|---|--:|--:|--:|--:|
+| A update-heavy | **42,400** | 23,800 | 21,900 | 13,200 |
+| B read-mostly | **397,000** | 200,000 | 177,000 | 108,000 |
+| C read-only | **5,810,000** | 1,390,000 | 971,000 | 855,000 |
+| D read-latest | **386,000** | 176,000 | 119,000 | 109,000 |
+| E short-ranges | **336,000** | 24,100 | 62,100 | 32,900 |
+| F read-modify-write | **42,000** | 23,300 | 19,500 | 12,900 |
+
 ## YCSB — nondurable tier
 
 | Workload | UltimaDB | Fjall | ReDB | RocksDB | Fastest |
@@ -42,6 +56,17 @@ UltimaDB fastest on **all six durable workloads** — unchanged from June.
 
 Same pattern as June: Fjall edges the heaviest non-durable write mixes (A/F, where its
 LSM write path shines with no fsync to amortize); UltimaDB wins B–E.
+
+Same data as throughput (**ops/sec = 1,000,000 ÷ ms**, higher is better):
+
+| Workload | UltimaDB | Fjall | ReDB | RocksDB |
+|---|--:|--:|--:|--:|
+| A update-heavy | 238,000 | **341,000** | 64,500 | 282,000 |
+| B read-mostly | **1,680,000** | 1,060,000 | 386,000 | 735,000 |
+| C read-only | **5,680,000** | 1,410,000 | 990,000 | 885,000 |
+| D read-latest | **1,280,000** | 690,000 | 328,000 | 195,000 |
+| E short-ranges | **943,000** | 59,500 | 99,000 | 1,670 ⚠ |
+| F read-modify-write | 213,000 | **295,000** | 51,800 | 240,000 |
 
 ## vs June 2026-06-26
 
