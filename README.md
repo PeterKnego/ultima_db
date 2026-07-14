@@ -6,9 +6,24 @@ WAL/checkpoint durability; every commit produces a new immutable MVCC
 snapshot that shares unchanged subtrees with its predecessors, so
 point-in-time reads are zero-copy and old versions stay alive for free.
 
-On durable YCSB workloads it leads RocksDB, Fjall, and ReDB by 1.8–5.4×
-(our benchmark, AWS NVMe —
-[details](docs/benchmarks/competitor-nvme-2026-07-13.md)).
+## Performance
+
+Durable YCSB on an AWS local-NVMe host (8 vCPU), every operation its own
+fsync-acknowledged transaction. UltimaDB is fastest on all six workloads —
+1.8–5.4× ahead of the best of RocksDB, Fjall, and ReDB:
+
+| Workload | UltimaDB | vs. fastest competitor |
+|---|--:|--:|
+| Read-only | 5.81M ops/s | 4.2× |
+| Read-mostly (95/5) | 397k ops/s | 2.0× |
+| Read-latest | 386k ops/s | 2.2× |
+| Update-heavy (50/50) | 42.4k ops/s | 1.8× |
+| Read-modify-write | 42.0k ops/s | 1.8× |
+
+Single-host criterion medians from our benchmark — absolute numbers vary by
+machine; compare ratios, not raw values. Full results (both durability
+tiers, all four engines, ms and ops/sec, methodology):
+[docs/benchmarks/competitor-nvme-2026-07-13.md](docs/benchmarks/competitor-nvme-2026-07-13.md).
 
 ## Highlights
 
