@@ -44,12 +44,12 @@ Same data as throughput (**ops/sec = 1,000,000 ÷ ms**, higher is better):
 | E short-ranges | **336,000** | 24,100 | 62,100 | 32,900 |
 | F read-modify-write | **42,000** | 23,300 | 19,500 | 12,900 |
 
-## YCSB — nondurable tier
+## YCSB — eventual-durability tier
 
-Nondurable = `Durability::Eventual` (WAL still written to real disk, fsync happens
-async on the background thread; commit does not block on it) — **not** an in-memory
-`Persistence::None` config. Chosen to match the competitors' no-fsync write path, so
-both sides do the WAL write and neither blocks on the sync.
+Eventual durability = `Durability::Eventual` (WAL still written to real disk, fsync
+happens async on the background thread; commit does not block on it) — **not** an
+in-memory `Persistence::None` config. Chosen to match the competitors' no-fsync write
+path, so both sides do the WAL write and neither blocks on the sync.
 
 | Workload | UltimaDB | Fjall | ReDB | RocksDB | Fastest |
 |---|--:|--:|--:|--:|---|
@@ -60,8 +60,8 @@ both sides do the WAL write and neither blocks on the sync.
 | E short-ranges | **1.06** | 16.8 | 10.1 | 600 ⚠ | UltimaDB, 9.58× (vs ReDB) |
 | F read-modify-write | 4.70 | **3.39** | 19.3 | 4.17 | Fjall (UltimaDB 1.39× behind) |
 
-Same pattern as June: Fjall edges the heaviest non-durable write mixes (A/F, where its
-LSM write path shines with no fsync to amortize); UltimaDB wins B–E.
+Same pattern as June: Fjall edges the heaviest eventual-durability write mixes (A/F,
+where its LSM write path shines with no fsync to amortize); UltimaDB wins B–E.
 
 Same data as throughput (**ops/sec = 1,000,000 ÷ ms**, higher is better):
 
@@ -81,10 +81,10 @@ across runs (this is a different physical instance; absolute cross-run deltas ar
 noise). On that basis:
 
 - **No ranking changed on any row of either tier.** UltimaDB holds all 6 durable
-  workloads; Fjall holds nondurable A/F.
+  workloads; Fjall holds eventual-durability A/F.
 - Ratios moved modestly, mostly compressing: strict B 2.13→1.99×, D 2.34→2.20×,
-  E 6.05→5.40×, F 1.94→1.80×; nondurable B 1.97→1.59×, D 2.28→1.85×, E 10.5→9.6×.
-  Nondurable A widened against us (1.20×→1.43× behind Fjall). Read-only C is flat
+  E 6.05→5.40×, F 1.94→1.80×; eventual B 1.97→1.59×, D 2.28→1.85×, E 10.5→9.6×.
+  Eventual A widened against us (1.20×→1.43× behind Fjall). Read-only C is flat
   (4.2×/4.0×).
 - **The post-June engine wins were not expected to move YCSB, and didn't.**
   `insert_mut`/`remove_mut` pay off when many writes land in one transaction's
@@ -97,12 +97,12 @@ noise). On that basis:
 
 ## Anomalies / caveats
 
-- RocksDB nondurable-E remains a known outlier (600 ms; June 616 ms) — range-scan
+- RocksDB eventual-durability-E remains a known outlier (600 ms; June 616 ms) — range-scan
   path artifact, not new.
 - Fjall's strict-E worsened ~75% vs its own June number (23.7→41.5 ms), flipping
   Fjall/RocksDB in 3rd/4th on that row. Doesn't affect the leader or the
   best-competitor ratio (ReDB is 2nd both times); noise vs real Fjall regression is
   indistinguishable from one run.
-- Nondurable A/D drifted high for UltimaDB even as ratios (the valid signal) stayed
+- Eventual-durability A/D drifted high for UltimaDB even as ratios (the valid signal) stayed
   in the same regime; treat any single-row ratio move ≤ ~15% as within combined
   noise (host floor ±2.5–9% per arm).
