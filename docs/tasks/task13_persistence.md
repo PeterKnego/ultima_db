@@ -50,6 +50,21 @@ pub enum Persistence {
 | `Persistence::Standalone` | Yes | Yes | Single-node durable storage |
 | `Persistence::Smr` | No | Yes | State machine replication (consensus log owns durability) |
 
+### Performance: SMR vs Standalone write path
+
+Because SMR mode keeps no WAL, a commit does only the in-memory copy-on-write
+update — it sheds the per-commit record serialization, `WalOp`/`WalEntry`
+construction, and the handoff to (and I/O from) the WAL background thread that
+Standalone pays. On AWS local-NVMe (single writer, YCSB), SMR is **~32–35%
+faster on write-heavy workloads** (update-heavy A, read-modify-write F),
+12–27% on mixed workloads, and **statistically tied on read-only** — the
+speedup tracks the write fraction exactly, since reads never touch the WAL.
+This is not a free durability win: SMR loses everything since the last
+checkpoint on crash and is correct only where an external consensus log owns
+durability and replays missing commits (see task12 SMR determinism). Full
+methodology, per-workload numbers, and the reproducible `bench/smr-ycsb`
+target: `docs/benchmarks/smr-vs-eventual-nvme-2026-07-14.md`.
+
 ## Architecture
 
 ### Feature gating via Record trait
