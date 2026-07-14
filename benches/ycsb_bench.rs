@@ -44,15 +44,22 @@ impl UltimaEngine {
             Some(v) if !v.is_empty() => WalWrite::CoalescedPrealloc,
             _ => WalWrite::Coalesced,
         };
+        // UltimaDB-only toggle: `ULTIMA_BENCH_SMR` (any non-empty value) runs the
+        // store in checkpoint-only SMR mode (`Persistence::smr`) — no per-commit
+        // WAL: commits do only the in-memory CoW update, durability is assumed to
+        // come from an external consensus log. This overrides the WAL durability
+        // tier above (SMR has no WAL/fsync knob). No competitor equivalent, so it
+        // is not part of the shared `BenchDurability` matrix; it measures
+        // UltimaDB's leanest single-writer write path against its own Eventual arm.
+        let persistence = match std::env::var_os("ULTIMA_BENCH_SMR") {
+            Some(v) if !v.is_empty() => Persistence::smr(tmpdir.path().to_path_buf()),
+            _ => Persistence::standalone(tmpdir.path().to_path_buf(), durability, wal_write),
+        };
         let store = Store::new(
             StoreConfig::builder()
                 .num_snapshots_retained(2)
                 .auto_snapshot_gc(true)
-                .persistence(Persistence::standalone(
-                    tmpdir.path().to_path_buf(),
-                    durability,
-                    wal_write,
-                ))
+                .persistence(persistence)
                 .build(),
         )
         .unwrap();
