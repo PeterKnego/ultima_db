@@ -46,6 +46,11 @@ Same data as throughput (**ops/sec = 1,000,000 ÷ ms**, higher is better):
 
 ## YCSB — nondurable tier
 
+Nondurable = `Durability::Eventual` (WAL still written to real disk, fsync happens
+async on the background thread; commit does not block on it) — **not** an in-memory
+`Persistence::None` config. Chosen to match the competitors' no-fsync write path, so
+both sides do the WAL write and neither blocks on the sync.
+
 | Workload | UltimaDB | Fjall | ReDB | RocksDB | Fastest |
 |---|--:|--:|--:|--:|---|
 | A update-heavy | 4.20 | **2.93** | 15.5 | 3.55 | Fjall (UltimaDB 1.43× behind) |
