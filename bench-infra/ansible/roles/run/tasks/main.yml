@@ -60,6 +60,17 @@
     executable: /bin/bash
   changed_when: true
 
+- name: Run SMR vs Eventual YCSB A/B
+  when: bench_target == "smr-ycsb"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/smr-ycsb ULTIMA_BENCH_DIR={{ bench_dir }} 2>&1 | tee {{ remote_home }}/results/smr-ycsb.log
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Run B-tree fanout (T) A/B sweep
   when: bench_target == "fanout"
   ansible.builtin.shell: |
@@ -105,8 +116,8 @@
     executable: /bin/bash
   changed_when: true
 
-- name: Copy criterion output into results (competitor / wal-ab / fanout)
-  when: bench_target in ["competitor", "wal-ab", "fanout"]
+- name: Copy criterion output into results (competitor / wal-ab / smr-ycsb / fanout)
+  when: bench_target in ["competitor", "wal-ab", "smr-ycsb", "fanout"]
   ansible.builtin.shell: |
     set -e
     if [ -d {{ ud_src_dir }}/target/criterion ]; then
