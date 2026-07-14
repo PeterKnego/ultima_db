@@ -12,9 +12,10 @@ and the fanout bump T=32→64 (PR #11). Prior doc: `competitor-nvme-2026-06-26.m
   rustc 1.97.0, ultima_db git `e5ed2dc`.
 - UltimaDB strict arm = `standalone_fast` (`ConsistentInline` + `CoalescedPrealloc`),
   same as June. Metric = criterion median time for one burst of **1,000 YCSB ops**,
-  ms (lower is better). Throughput columns are the reciprocal:
-  **ops/sec = 1,000,000 ÷ ms** (1,000 ops per burst ÷ seconds), higher is better.
-  Each op is its own transaction; strict-tier writes fsync per commit.
+  in **milliseconds** (ms; lower is better). Throughput is that inverted:
+  `ops/sec = 1,000 ops ÷ (ms × 0.001 s) = 1,000,000 ÷ ms` (higher is better) — the
+  `1,000,000` being 1,000 ops/burst × 1,000 ms/s. Each op is its own transaction;
+  strict-tier writes fsync per commit.
 - **Scope: YCSB only.** The bench-infra `competitor` target runs `make
   bench/ycsb/compare`; the June doc's SmallBank and MultiWriter sections were a wider
   one-off script and were not re-run — those June numbers remain the latest.
