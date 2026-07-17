@@ -7,11 +7,15 @@ use std::sync::Arc;
 use crate::{Error, Result};
 
 // Minimum degree: every non-root node has at least T-1 keys, at most 2T-1 keys.
-// T=64 (MAX_KEYS=127) is the measured balance point on a 1M-key mixed workload:
-// once in-place rebalancing (task50 §5.1) removed the sibling-clone cost, the old
-// delete-at-high-fanout cliff flattened and T=64 beat T=32 on all axes (get -18%,
-// insert -8%, remove -19%). See docs/superpowers/specs/2026-07-08-btree-optimization-candidates.md §2.
-const T: usize = 64;
+// T=32: under the SMR apply regime (one op per commit, retained snapshots + live
+// readers, so every commit clones the full root-to-leaf path and make_mut never
+// fires) T=32 beat T=64 on apply p99 (-33%), apply throughput (+22%) and
+// read-p99-under-load (-30%) in a same-day A/B (autoresearch/smr-apply-jul17,
+// 2026-07-17). The opposite held on a 1M-key mixed workload where in-place
+// rebalancing (task50 §5.1) amortizes clone costs — there T=64 won all axes
+// (see docs/superpowers/specs/2026-07-08-btree-optimization-candidates.md §2);
+// revisit if that regime becomes the priority.
+const T: usize = 32;
 const MIN_KEYS: usize = T - 1;
 const MAX_KEYS: usize = 2 * T - 1;
 
