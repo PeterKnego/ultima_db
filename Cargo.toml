@@ -33,6 +33,10 @@ features = ["persistence", "fulltext", "metrics"]
 
 [features]
 default = []
+# Narrow B-tree fanout (T=8) for write-dominated SMR deployments: ~1.8x the
+# default's contended write throughput, at ~2x read-p99-under-load and +25%
+# uncontended gets. See docs/benchmarks/smr-fanout-fixedvec-nvme-2026-07-18.md.
+fanout-t8 = []
 fulltext = []
 metrics = ["dep:metrics"]
 persistence = ["dep:serde", "dep:bincode"]

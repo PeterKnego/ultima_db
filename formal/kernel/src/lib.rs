@@ -23,7 +23,7 @@
 //! - `remove` returns `Option<BTree>` (`None` == the `Err(KeyNotFound)` arm)
 //!   since the kernel has no `Error` type.
 
-pub const T: usize = 64;
+pub const T: usize = 32;
 pub const MAX_KEYS: usize = 2 * T - 1;
 /// Minimum entries in a non-root node (mirror of `src/btree.rs`).
 pub const MIN_KEYS: usize = T - 1;

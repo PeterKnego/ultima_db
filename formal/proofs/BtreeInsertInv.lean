@@ -129,7 +129,7 @@ theorem exists_cons_of_clist_ne_nil (c : Children) (h : clist c ≠ []) :
   exact (Aeneas.Std.WP.spec_ok _ (p := fun w => w = v)).mpr rfl
 
 unseal MAX_KEYS T in
-@[step] theorem MAX_KEYS_spec : MAX_KEYS ⦃ m => m.val = 127 ⦄ := by
+@[step] theorem MAX_KEYS_spec : MAX_KEYS ⦃ m => m.val = 63 ⦄ := by
   simp only [MAX_KEYS, T]
   step*
 
@@ -148,7 +148,7 @@ theorem maybe_split_spec {lo hi : Option Nat}
     (replaced : Bool)
     (hs : SortedE entries.val)
     (hb : ∀ e ∈ entries.val, InB lo hi e.1.val)
-    (hlen : entries.val.length ≤ 128)
+    (hlen : entries.val.length ≤ 64)
     (hch : children = Children.Nil ∨
       ∃ c cs, children = Children.Cons c cs ∧
         Aligned lo hi entries.val (c :: clist cs)) :
@@ -156,7 +156,7 @@ theorem maybe_split_spec {lo hi : Option Nat}
   rw [maybe_split]
   step*
   · -- Fit: entries still fit in one node
-    have hlen63 : entries.val.length ≤ 127 := by scalar_tac
+    have hlen63 : entries.val.length ≤ 63 := by scalar_tac
     rcases hch with rfl | ⟨c, cs, rfl, hal⟩
     · exact NodeInv.leaf entries hs hb hlen63
     · exact NodeInv.internal entries c cs hs hb hlen63 hal
@@ -166,10 +166,10 @@ theorem maybe_split_spec {lo hi : Option Nat}
     · have hl := hal.length_eq
       simp [clist] at hl ⊢
       scalar_tac
-  · -- Split: 128 entries, split at the median
-    have h64 : entries.val.length = 128 := by scalar_tac
-    have hmid : mid.val = 64 := by scalar_tac
-    have hi3 : i3.val = 65 := by scalar_tac
+  · -- Split: 64 entries, split at the median
+    have h64 : entries.val.length = 64 := by scalar_tac
+    have hmid : mid.val = 32 := by scalar_tac
+    have hi3 : i3.val = 33 := by scalar_tac
     have hmidlt : mid.val < entries.val.length := by scalar_tac
     have hmedian : median = entries.val[mid.val]'hmidlt := by
       rw [median_post]
@@ -185,9 +185,9 @@ theorem maybe_split_spec {lo hi : Option Nat}
       have h31 : i3.val = mid.val + 1 := by scalar_tac
       rw [h31]
       exact InB.of_drop entries.val mid.val hmidlt hs hb
-    have hll : left_entries.val.length ≤ 127 := by
+    have hll : left_entries.val.length ≤ 63 := by
       rw [left_entries_post]; simp; scalar_tac
-    have hrl : right_entries.val.length ≤ 127 := by
+    have hrl : right_entries.val.length ≤ 63 := by
       rw [right_entries_post]; simp; scalar_tac
     have hmb : InB lo hi median.1.val := by
       rw [hmedian]; exact hb _ (entries.val.getElem_mem hmidlt)
@@ -218,7 +218,7 @@ theorem maybe_split_spec {lo hi : Option Nat}
         have hmid1 : mid.val + 1 = i3.val := by scalar_tac
         obtain ⟨halL, halR⟩ := hal.split mid.val hmidlt
         -- left children: take i3 of a 129-element list is a nonempty cons
-        have hlcl : (clist lc).length = 65 := by
+        have hlcl : (clist lc).length = 33 := by
           rw [hlcv, hcl]
           simp only [List.length_take]
           omega
@@ -231,7 +231,7 @@ theorem maybe_split_spec {lo hi : Option Nat}
           have : clist (Children.Cons c1 cs1) = c1 :: clist cs1 := by simp [clist]
           rw [← this, hlcv, hcl, hmid1]
         -- right children
-        have hrcl : (clist rc).length = 64 := by
+        have hrcl : (clist rc).length = 32 := by
           rw [hrcv, hcl]
           simp only [List.length_drop]
           omega
