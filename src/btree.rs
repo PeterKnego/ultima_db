@@ -48,7 +48,14 @@ struct FixedVec<E, const N: usize> {
 }
 
 impl<E, const N: usize> FixedVec<E, N> {
+    // `len` is a u8, so capacities above 255 would silently wrap and corrupt
+    // the tree (observed as bogus results in the T=128 fanout sweep, where
+    // MAX_KEYS + 1 = 256). Reject them at compile time.
+    const _CAP_FITS_U8: () = assert!(N <= u8::MAX as usize);
+
     fn new() -> Self {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::_CAP_FITS_U8;
         FixedVec {
             items: [const { None }; N],
             len: 0,
