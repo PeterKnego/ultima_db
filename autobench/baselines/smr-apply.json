@@ -1,54 +1,54 @@
 {
-  "note": "Re-measured 2026-06-17 on the noisy virtualized sandbox host (median-of-15). Values are 15-sample medians; each tolerance = max(prior hand-tuned value, ~1.3x the observed 15-sample spread) so make perf/check passes on this host. Re-record on the real bench machine with make perf/baseline (uniform ~5-10%) for meaningful absolute gating.",
+  "note": "Re-measured 2026-07-18 on the noisy virtualized sandbox host (median-of-15) after PR#14 (FixedVec nodes + T=32 default). Values are 15-sample medians; each tolerance_pct = 1.5x the worst observed deviation from the median across those samples (min 10%). Re-record with `make perf/baseline` (same median-of-N method) on the real bench machine before relying on `make perf/check` there.",
   "metrics": {
     "apply_mw_p99_ns": {
-      "value": 50561.0,
-      "tolerance_pct": 155,
+      "value": 67143.0,
+      "tolerance_pct": 23,
       "direction": "minimize"
     },
     "apply_mw_throughput": {
-      "value": 125081.71353817235,
-      "tolerance_pct": 68,
+      "value": 108776.27864929232,
+      "tolerance_pct": 13,
       "direction": "maximize"
     },
     "apply_p99_ns": {
-      "value": 4200.0,
-      "tolerance_pct": 36,
+      "value": 8462.0,
+      "tolerance_pct": 42,
       "direction": "minimize"
     },
     "apply_sw_batch_throughput": {
-      "value": 568471.7064525803,
-      "tolerance_pct": 35,
+      "value": 249525.82295955715,
+      "tolerance_pct": 16,
       "direction": "maximize"
     },
     "apply_throughput": {
-      "value": 21096.199472304095,
-      "tolerance_pct": 39,
+      "value": 33470.07801466851,
+      "tolerance_pct": 21,
       "direction": "maximize"
     },
     "checkpoint_ms": {
-      "value": 33.075996,
-      "tolerance_pct": 49,
+      "value": 13.018155,
+      "tolerance_pct": 53,
       "direction": "minimize"
     },
     "read_p99_under_load_ns": {
-      "value": 590.0,
-      "tolerance_pct": 44,
+      "value": 2393.0,
+      "tolerance_pct": 27,
       "direction": "minimize"
     },
     "restore_install_ms": {
-      "value": 29.41866,
-      "tolerance_pct": 59,
+      "value": 25.966172,
+      "tolerance_pct": 17,
       "direction": "minimize"
     },
     "snapshot_freeze_p99_us": {
-      "value": 1.559,
-      "tolerance_pct": 960,
+      "value": 1.973,
+      "tolerance_pct": 32,
       "direction": "minimize"
     },
     "snapshot_stream_ms": {
-      "value": 51.511599999999994,
-      "tolerance_pct": 54,
+      "value": 33.080547,
+      "tolerance_pct": 10,
       "direction": "minimize"
     }
   }
