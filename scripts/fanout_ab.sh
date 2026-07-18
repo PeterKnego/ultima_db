@@ -37,7 +37,7 @@ TARGET_DIR="$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 CRIT_DIR="$TARGET_DIR/criterion"
 
-T_SWEEP="${T_SWEEP:-8 16 32 64 128}"
+T_SWEEP="${T_SWEEP:-8 16 32 64}"
 N="${N:-1000000}"
 NORM_T="${NORM_T:-32}"          # baseline the table is normalized against
 QUICK_ARG=""; [ -n "${QUICK:-}" ] && QUICK_ARG="--quick"
