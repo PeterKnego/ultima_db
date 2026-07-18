@@ -57,11 +57,13 @@ Authoritative same-host NVMe numbers
 
 ## Follow-ups
 
-- **Formal model re-sync** (`formal/`): the Lean kernel models the old
-  Vec-node layout at T=64; `make formal/drift-check` fires on this change
-  and must be resolved by re-instantiating the model (T-scaling recipe known)
-  — not by `ACK_NO_FORMAL`, since the verified insert/get/remove surface
-  changed representation.
+- ~~Formal model re-sync~~ **done**: re-instantiated at T=32 (all 10
+  theorems axiom-clean; drift gate passes). The kernel stays a Vec-based
+  behavioral model of `FixedVec` — boundary documented in `formal/README.md`.
+  Remaining: the `fanout-t8` config (T=8) is not separately instantiated;
+  the durable fix is a **T-parametric development** (`2 ≤ T ≤ 127`, upper
+  bound from the u8-len guard). Feasibility gate: charon/aeneas const-generic
+  support; fallback is a second concrete instantiation.
 - Re-record autobench baselines (`make perf/baseline`) post-merge; committed
   baselines predate both changes.
 - Fix `extend_from_sorted` small-T underfull bug.
