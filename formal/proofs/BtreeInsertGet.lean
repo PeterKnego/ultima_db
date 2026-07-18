@@ -174,7 +174,7 @@ theorem maybe_split_get {k v : Std.U64}
     (replaced : Bool) (hs : SortedE entries.val)
     (j : Nat) (hj : j < entries.val.length)
     (hkv : entries.val[j]'hj = (k, v))
-    (hlen : entries.val.length ≤ 128)
+    (hlen : entries.val.length ≤ 64)
     (hch : (clist children).length ≤ Std.Usize.max) :
     maybe_split entries children replaced ⦃ r => GetPost k v r ⦄ := by
   have hkey : (entries.val[j]'hj).1 = k := by rw [hkv]
@@ -185,8 +185,8 @@ theorem maybe_split_get {k v : Std.U64}
     show get_in_node (Node.mk entries children) k = ok (some v)
     rw [get_found entries children k hs j hj hkey, hval]
   · -- Split at the median
-    have h64 : entries.val.length = 128 := by scalar_tac
-    have hmid : mid.val = 64 := by scalar_tac
+    have h64 : entries.val.length = 64 := by scalar_tac
+    have hmid : mid.val = 32 := by scalar_tac
     have hmidlt : mid.val < entries.val.length := by scalar_tac
     have hmedian : median = entries.val[mid.val]'hmidlt := by rw [median_post]
     split
@@ -297,7 +297,7 @@ theorem maybe_split_get_descend {k v : Std.U64}
     (hgt : ∀ i, (h : i < entries.val.length) → q ≤ i →
       k.val < (entries.val[i]'h).1.val)
     (hcl : (clist children).length = entries.val.length + 1)
-    (hlen : entries.val.length ≤ 128)
+    (hlen : entries.val.length ≤ 64)
     (hsmall : entries.val.length < Std.Usize.max)
     (hgv : get_in_node ((clist children)[q]'(by rw [hcl]; omega)) k = ok (some v)) :
     maybe_split entries children replaced ⦃ r => GetPost k v r ⦄ := by
@@ -308,8 +308,8 @@ theorem maybe_split_get_descend {k v : Std.U64}
     rw [get_descend' entries children k hs q hq hlt hgt hcl hsmall]
     exact hgv
   · -- Split at the median
-    have h64 : entries.val.length = 128 := by scalar_tac
-    have hmid : mid.val = 64 := by scalar_tac
+    have h64 : entries.val.length = 64 := by scalar_tac
+    have hmid : mid.val = 32 := by scalar_tac
     have hmidlt : mid.val < entries.val.length := by scalar_tac
     have hmedian : median = entries.val[mid.val]'hmidlt := by rw [median_post]
     have hi3 : i3.val = mid.val + 1 := by scalar_tac

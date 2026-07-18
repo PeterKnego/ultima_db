@@ -6,15 +6,15 @@
    kernel legitimately fails. That is exactly why the `remove_*` theorems in
    `RemoveInv`/`RemoveGet`/`RemoveFrame` are stated conditional on `= ok`.
 
-   A real B-tree keeps every non-root node at `MIN_KEYS = 63` entries or more.
-   Totality does not actually need the full `63` lower bound: `fix_underfull_child`
+   A real B-tree keeps every non-root node at `MIN_KEYS = 31` entries or more.
+   Totality does not actually need the full `31` lower bound: `fix_underfull_child`
    returns `ok` given only that the node it repairs is nonempty and its children
    are correctly aligned (rotation only fires against a sibling with
    `> MIN_KEYS ≥ 1` entries; a merge only reads the separator). So we split the
    invariant in two:
 
    * `NE`  — every node in the subtree has `≥ 1` entry (the *consumed* fact);
-   * `MinArity` — every node has `≥ MIN_KEYS = 63` entries (the honest B-tree
+   * `MinArity` — every node has `≥ MIN_KEYS = 31` entries (the honest B-tree
      invariant, used as the public hypothesis; `MinArity → NE`).
 
    Both are relaxed at the root (a root may legitimately hold fewer entries, even
@@ -113,13 +113,13 @@ theorem NERoot.children_ne_of_internal {n : Node}
   · exact absurd hnil hne
   · exact hcs
 
-/-! ## `MinArity` — the honest B-tree balance invariant (≥ MIN_KEYS = 63) -/
+/-! ## `MinArity` — the honest B-tree balance invariant (≥ MIN_KEYS = 31) -/
 
 mutual
-/-- Every node in the subtree has at least `MIN_KEYS = 63` entries. -/
+/-- Every node in the subtree has at least `MIN_KEYS = 31` entries. -/
 inductive MinArity : Node → Prop where
   | mk : ∀ (entries : alloc.vec.Vec (Std.U64 × Std.U64)) (cs : Children),
-      63 ≤ entries.val.length → ChildrenMinArity cs → MinArity (Node.mk entries cs)
+      31 ≤ entries.val.length → ChildrenMinArity cs → MinArity (Node.mk entries cs)
 
 /-- Every node in the children cons-list satisfies `MinArity`. -/
 inductive ChildrenMinArity : Children → Prop where
@@ -144,7 +144,7 @@ theorem ChildrenMinArity.allMinArity {cs : Children} (h : ChildrenMinArity cs) :
       · exact hc
       · exact ih hrest n hn
 
-/-- `MinArity` (≥ 63) implies `NE` (≥ 1). Proved by induction on subtree size,
+/-- `MinArity` (≥ 31) implies `NE` (≥ 1). Proved by induction on subtree size,
     since the mutual eliminator gives no induction hypothesis for a child. -/
 private theorem MinArity_toNE_fuel (fuel : Nat) : ∀ (n : Node),
     Node.size n ≤ fuel → MinArity n → NE n := by

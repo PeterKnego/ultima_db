@@ -19,7 +19,7 @@ all sorry-free, `#print axioms` = `propext, Classical.choice, Quot.sound` only:
 | `BTree.remove_frame` (`RemoveFrame.lean`) | `get k'` is unchanged for every `k' ≠ k` |
 | `BTree.remove_total` (`RemoveTotal.lean`) | `remove` never fails on a well-formed nonempty tree (`∃ r, remove k = ok r`) |
 | `BTree.remove_spec` (`RemoveTotal.lean`) | unconditional: `remove k` reports the key absent, or returns a valid balanced tree with `k` gone |
-| `BTree.remove_minkeys` (`MinKeysPreserve.lean`) | `remove` **preserves** the MIN_KEYS balance invariant: the rotate/merge rebalancers restore every non-root node to ≥ `T−1 = 63` entries after a delete drops one to 62 |
+| `BTree.remove_minkeys` (`MinKeysPreserve.lean`) | `remove` **preserves** the MIN_KEYS balance invariant: the rotate/merge rebalancers restore every non-root node to ≥ `T−1 = 31` entries after a delete drops one to 30 |
 | `BTree.remove_balanced_spec` (`MinKeysPreserve.lean`) | capstone: absent, or a valid tree that is well-formed, height-uniform, **and MIN_KEYS-balanced**, with `k` gone |
 
 Together: **insert behaves exactly as a map update, and remove exactly as a map
@@ -37,14 +37,14 @@ Two notes on the remove proofs:
   returning `ok`, because `NodeInv ∧ HeightInv` still admit pathological 0-entry
   internal nodes on which `delete` legitimately fails. `remove_total`
   (`MinKeysInvariant.lean`) closes that gap: under the MIN_KEYS balance invariant
-  (every non-root node ≥ 63 entries), `remove` provably returns `ok`, and
+  (every non-root node ≥ 31 entries), `remove` provably returns `ok`, and
   `remove_spec` packages this with the properties into an unconditional statement.
 - `remove_total` shows the balance invariant is *strong enough* for `remove` to
   succeed; `remove_minkeys` (`MinKeysPreserve.lean`) closes the other direction —
   the invariant is *preserved*, so the balanced class is closed under `remove`.
   The proof carries an "almost-balanced" post-condition through the recursion
   (`AlmostMinArity`: the returned subtree root may be underfull by one, but every
-  proper descendant is ≥ 63) and shows each rebalancer restores ≥ 63; this is the
+  proper descendant is ≥ 31) and shows each rebalancer restores ≥ 31; this is the
   arithmetic-heavy direction. `remove_balanced_spec` bundles it with `remove_spec`.
 
 The remove-preserves-lookups proofs go through an in-order `flatten`
@@ -64,6 +64,20 @@ Aeneas scope; needs hand-written protocol models).
   (`cargo test --manifest-path formal/kernel/Cargo.toml`, or
   `make test/formal-kernel`). Excluded from the cargo workspace so Charon
   owns its build.
+
+  **Node-storage abstraction (task52):** production nodes store entries and
+  children in `FixedVec` inline slot arrays; the kernel keeps `Vec`. This is
+  deliberate: the kernel is a *behavioral* model of the node's sequence
+  semantics, which `FixedVec` implements Vec-compatibly for the initialized
+  prefix. Representation-level risks the model therefore does not see (slot
+  bookkeeping, the `u8` length) are covered by a compile-time capacity guard
+  (`T ≤ 127`) and the `FixedVec` unit tests in `src/btree.rs`.
+
+  **Fanout coverage:** this instantiation proves the default `T = 32`. The
+  opt-in `fanout-t8` configuration (T = 8) is the same algorithm with the
+  same by-role constants and is *not* separately instantiated; closing that
+  gap properly means making the development T-parametric (`2 ≤ T ≤ 127`) —
+  tracked as a follow-up in `docs/tasks/task52_btree_fixedvec_fanout.md`.
 - `proofs/` — the lake package: `BtreeKernel.lean` (generated),
   `BtreeInvariant.lean` + `BalancedInvariant.lean` + `MinKeysInvariant.lean`
   (invariant definitions), helper-lemma modules (`FindPosSpec`, `EntrySpecs`,
