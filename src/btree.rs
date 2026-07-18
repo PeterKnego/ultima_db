@@ -7,17 +7,20 @@ use std::sync::Arc;
 use crate::{Error, Result};
 
 // Minimum degree: every non-root node has at least T-1 keys, at most 2T-1 keys.
-// T=8: under the SMR apply regime (one op per commit, retained snapshots + live
-// readers, so every commit clones the full root-to-leaf path and make_mut never
-// fires) smaller nodes cut per-clone memcpy + Arc-refcount bumps: same-day A/B
-// gradient 2026-07-17 (autoresearch/smr-apply-jul17) measured apply p99
-// 13118 ns (T=64) -> 8712 (T=32) -> 5568 (T=16) -> 4706 (T=8), with throughput and
-// read-p99-under-load improving alongside. The opposite held on a 1M-key mixed
-// workload where in-place rebalancing (task50 §5.1) amortizes clone costs —
-// there T=64 won all axes (see
-// docs/superpowers/specs/2026-07-08-btree-optimization-candidates.md §2);
-// revisit if that regime becomes the priority.
+//
+// T=32 default / T=8 behind `fanout-t8`, per the 2026-07-18 NVMe A/B
+// (docs/benchmarks/smr-fanout-fixedvec-nvme-2026-07-18.md): with the FixedVec
+// inline node layout, T=32 is the balanced point — vs the old T=64 default it
+// gives 1.6x contended write throughput and better read-p99-under-load, at
+// +11% on uncontended gets. Smaller T keeps winning contended writes (T=8 is
+// 2.85x) because the CoW commit path clones the full root-to-leaf path and
+// clone cost scales with node width, but T=8 costs ~2x on reads under load
+// and +25% on uncontended gets — a specialist trade for write-dominated SMR
+// deployments, so it ships as an opt-in feature, not the default.
+#[cfg(feature = "fanout-t8")]
 const T: usize = 8;
+#[cfg(not(feature = "fanout-t8"))]
+const T: usize = 32;
 const MIN_KEYS: usize = T - 1;
 const MAX_KEYS: usize = 2 * T - 1;
 
