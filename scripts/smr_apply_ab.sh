@@ -25,7 +25,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BTREE="$REPO_ROOT/src/btree.rs"
-T_SWEEP="${T_SWEEP:-32 64}"
+T_SWEEP="${T_SWEEP:-8 16 32 64}"
 RUNS="${RUNS:-7}"
 NORM_T="${NORM_T:-32}"
 
