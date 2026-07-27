@@ -1,39 +1,39 @@
 {
-  "note": "Re-measured 2026-07-18 on the noisy virtualized sandbox host (median-of-15) after PR#14 (FixedVec nodes + T=32 default). Values are 15-sample medians; each tolerance_pct = 1.5x the worst observed deviation from the median across those samples (min 10%). Re-record with `make perf/baseline` (same median-of-N method) on the real bench machine before relying on `make perf/check` there.",
+  "note": "Recorded 2026-07-26 on an AWS c6id.2xlarge local-NVMe bench host (bench-infra, `make bench/autobench-median SAMPLES=15`) at git b48295e. Values are 15-sample medians; each tolerance_pct = max(10, ceil(1.5x the worst observed deviation from the median)), computed by scripts/baselines_from_samples.py. Raw samples: bench-infra/bench-out/dist/20260726T165243Z/autobench-samples/. NVMe-host values: `make perf/check` on the noisy virtualized sandbox WILL fail by design (different host shape, not a regression) \u2014 re-record locally with `make perf/baseline` if you need a sandbox gate. Tail metrics (read_p99_under_load_ns, apply_p99_ns, snapshot_freeze_p99_us) carry wide tolerances because the max-deviation rule is anti-robust on p99s.",
   "metrics": {
     "mw_commit_p99_ns": {
-      "value": 193448.0,
-      "tolerance_pct": 10,
+      "value": 258828.0,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "mw_commit_throughput": {
-      "value": 21418.957701523723,
-      "tolerance_pct": 10,
+      "value": 16048.789974547994,
+      "tolerance_pct": 10.0,
       "direction": "maximize"
     },
     "mw_conflict_rate": {
-      "value": 1.42075,
-      "tolerance_pct": 13,
+      "value": 1.4999375,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "mw_disjoint_throughput": {
-      "value": 22602.512860077575,
-      "tolerance_pct": 10,
+      "value": 16861.332613461218,
+      "tolerance_pct": 10.0,
       "direction": "maximize"
     },
     "mw_scaling_8x": {
-      "value": 20235.51141698399,
-      "tolerance_pct": 10,
+      "value": 13316.156800482795,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "mw_scaling_efficiency": {
-      "value": 0.559663668711399,
-      "tolerance_pct": 10,
+      "value": 0.4349731374250801,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "read_p99_under_load_ns": {
-      "value": 5597.0,
-      "tolerance_pct": 12,
+      "value": 1057.0,
+      "tolerance_pct": 106,
       "direction": "minimize"
     }
   }

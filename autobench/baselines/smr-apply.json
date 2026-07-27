@@ -1,54 +1,54 @@
 {
-  "note": "Re-measured 2026-07-18 on the noisy virtualized sandbox host (median-of-15) after PR#14 (FixedVec nodes + T=32 default). Values are 15-sample medians; each tolerance_pct = 1.5x the worst observed deviation from the median across those samples (min 10%). Re-record with `make perf/baseline` (same median-of-N method) on the real bench machine before relying on `make perf/check` there.",
+  "note": "Recorded 2026-07-26 on an AWS c6id.2xlarge local-NVMe bench host (bench-infra, `make bench/autobench-median SAMPLES=15`) at git b48295e. Values are 15-sample medians; each tolerance_pct = max(10, ceil(1.5x the worst observed deviation from the median)), computed by scripts/baselines_from_samples.py. Raw samples: bench-infra/bench-out/dist/20260726T165243Z/autobench-samples/. NVMe-host values: `make perf/check` on the noisy virtualized sandbox WILL fail by design (different host shape, not a regression) \u2014 re-record locally with `make perf/baseline` if you need a sandbox gate. Tail metrics (read_p99_under_load_ns, apply_p99_ns, snapshot_freeze_p99_us) carry wide tolerances because the max-deviation rule is anti-robust on p99s.",
   "metrics": {
     "apply_mw_p99_ns": {
-      "value": 67143.0,
-      "tolerance_pct": 23,
+      "value": 101117.0,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "apply_mw_throughput": {
-      "value": 108776.27864929232,
-      "tolerance_pct": 13,
+      "value": 74594.9378321126,
+      "tolerance_pct": 10.0,
       "direction": "maximize"
     },
     "apply_p99_ns": {
-      "value": 8462.0,
-      "tolerance_pct": 42,
+      "value": 19099.0,
+      "tolerance_pct": 11,
       "direction": "minimize"
     },
     "apply_sw_batch_throughput": {
-      "value": 249525.82295955715,
-      "tolerance_pct": 16,
+      "value": 233340.19547958206,
+      "tolerance_pct": 10.0,
       "direction": "maximize"
     },
     "apply_throughput": {
-      "value": 33470.07801466851,
-      "tolerance_pct": 21,
+      "value": 24659.463626655554,
+      "tolerance_pct": 10.0,
       "direction": "maximize"
     },
     "checkpoint_ms": {
-      "value": 13.018155,
-      "tolerance_pct": 53,
+      "value": 22.696983,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "read_p99_under_load_ns": {
-      "value": 2393.0,
-      "tolerance_pct": 27,
+      "value": 547.0,
+      "tolerance_pct": 39,
       "direction": "minimize"
     },
     "restore_install_ms": {
-      "value": 25.966172,
-      "tolerance_pct": 17,
+      "value": 34.14072,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     },
     "snapshot_freeze_p99_us": {
-      "value": 1.973,
-      "tolerance_pct": 32,
+      "value": 1.807,
+      "tolerance_pct": 61,
       "direction": "minimize"
     },
     "snapshot_stream_ms": {
-      "value": 33.080547,
-      "tolerance_pct": 10,
+      "value": 44.476112,
+      "tolerance_pct": 10.0,
       "direction": "minimize"
     }
   }

@@ -106,11 +106,27 @@ make perf/check      # run both microbench binaries in --check mode (~3-6 min)
 make perf/baseline   # re-record baselines from the current build
 ```
 
-**Important:** the committed baseline JSONs (`autobench/baselines/*.json`) were
-recorded on a noisy virtualized sandbox host — tolerances were widened
-substantially (some metrics ±60–275%). Re-record with `make perf/baseline` on
-the real bench machine before relying on `make perf/check` as a regression
-gate. Each baseline JSON carries a `"note"` field that says the same.
+**Important:** since 2026-07-26 the committed baseline JSONs
+(`autobench/baselines/*.json`) are **NVMe-host values** — 15-sample medians
+recorded on an AWS c6id.2xlarge via `bench-infra`'s `make bench/autobench-median
+SAMPLES=15`, reduced by `scripts/baselines_from_samples.py` (tolerance_pct =
+max(10, ceil(1.5 × worst deviation from the median))). Most metrics sit at the
+10% floor.
+
+Consequence: **`make perf/check` fails on the noisy virtualized sandbox by
+design** — different host shape, not a regression. Run the gate on a bench host,
+or re-record locally with `make perf/baseline` if you need a sandbox gate (that
+records a single sample at a flat 5%, so prefer the median path above). Each
+baseline JSON carries a `"note"` field recording host, method, and git rev.
+
+Two known wrinkles:
+
+- Tail metrics (`read_p99_under_load_ns`, `apply_p99_ns`,
+  `snapshot_freeze_p99_us`) get wide tolerances because the max-deviation rule
+  is anti-robust on p99s — more samples can *widen* them.
+- `baseline::infer_direction` keys only on the substring `throughput`, so
+  `mw_scaling_8x` and `mw_scaling_efficiency` are recorded as `minimize` when
+  higher is actually better. Pre-existing; those two gate the wrong way.
 
 ## Subagent/model dispatch
 
