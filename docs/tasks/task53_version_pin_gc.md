@@ -50,12 +50,12 @@ the prefix and are re-visited each run — O(#pins).
 ## Testing
 
 - Characterization test `gc_prefix_skips_referenced_snapshot_mid_window`
-  (passes against both old and new `gc_inner`) guards the rewrite; the four
+  (passes against both old and new `gc_inner`) guards the rewrite; the five
   pre-existing gc tests pin the retention/latest/reference semantics.
-- Six pin tests cover: survival past the retention window, collectability
+- Seven pin tests cover: survival past the retention window, collectability
   after the last drop, clone semantics, `VersionNotFound`, `None` = latest,
-  and the cross-thread SMR handoff under per-commit auto-GC (also the
-  compile-time `Send` proof).
+  `None` on a fresh store pinning version 0, and the cross-thread SMR
+  handoff under per-commit auto-GC (also the compile-time `Send` proof).
 
 ## Design history
 

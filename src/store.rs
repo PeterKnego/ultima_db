@@ -126,7 +126,8 @@ pub struct StoreConfig {
     /// How many most-recent snapshots to retain during [`Store::gc()`]. Default: 10.
     /// The latest snapshot is always retained regardless of this value.
     /// To keep a specific older version alive, prefer [`Store::pin_version`]
-    /// over a large retention window — pins are O(1); retention is a window.
+    /// over a large retention window — a pin retains exactly one snapshot,
+    /// while a large window retains N snapshots' memory.
     pub num_snapshots_retained: usize,
     /// Whether [`Store::gc()`] runs automatically after each [`WriteTx::commit()`]. Default: true.
     pub auto_snapshot_gc: bool,
@@ -585,6 +586,17 @@ impl Store {
     /// capture version *before* publishing its number, and the serializer
     /// thread opens its own read transaction on arrival.
     ///
+    /// Pinning is *not* atomic with commit, though. Between a commit
+    /// returning `v` (or a call to [`Store::latest_version`] returning `v`)
+    /// and a subsequent `pin_version(Some(v))`, the store lock is released —
+    /// so under concurrent committers with a small retention window, `v` can
+    /// already have been evicted by auto-GC, and `pin_version` returns
+    /// [`Error::VersionNotFound`]. Callers in that setting should handle or
+    /// retry the error, or keep enough [`StoreConfig::num_snapshots_retained`]
+    /// slack to cover the gap. In a single-applier loop (the SMR pattern this
+    /// API targets) there is no interleaved committer, so the direct call is
+    /// safe.
+    ///
     /// # Examples
     ///
     /// ```
@@ -593,8 +605,8 @@ impl Store {
     /// let store = Store::default();
     /// store.begin_write(None).unwrap().commit().unwrap();
     ///
-    /// // Writer side: pin the capture version, then hand it off.
-    /// let pin = store.pin_version(Some(store.latest_version())).unwrap();
+    /// // Pin the latest version — one lock acquisition, race-free.
+    /// let pin = store.pin_version(None).unwrap();
     ///
     /// let serializer = std::thread::spawn({
     ///     let store = store.clone();
@@ -1827,6 +1839,9 @@ impl std::fmt::Debug for VersionPin {
 /// Multiple `ReadTx` instances can coexist.  Each holds an `Arc<Snapshot>`
 /// that keeps that version alive in memory even after the store advances to
 /// newer versions.
+///
+/// See also [`VersionPin`] for a `Send`-able handle that keeps a version
+/// alive across threads without holding a `ReadTx`.
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
     metrics: Arc<StoreMetrics>,
@@ -4469,6 +4484,13 @@ mod tests {
         store.begin_write(None).unwrap().commit().unwrap(); // v1
         let pin = store.pin_version(None).unwrap();
         assert_eq!(pin.version(), 1);
+    }
+
+    #[test]
+    fn pin_version_none_on_fresh_store_pins_version_zero() {
+        let store = Store::default();
+        let pin = store.pin_version(None).unwrap();
+        assert_eq!(pin.version(), 0);
     }
 
     #[test]
