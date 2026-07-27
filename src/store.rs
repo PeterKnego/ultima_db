@@ -125,6 +125,8 @@ pub enum IsolationLevel {
 pub struct StoreConfig {
     /// How many most-recent snapshots to retain during [`Store::gc()`]. Default: 10.
     /// The latest snapshot is always retained regardless of this value.
+    /// To keep a specific older version alive, prefer [`Store::pin_version`]
+    /// over a large retention window — pins are O(1); retention is a window.
     pub num_snapshots_retained: usize,
     /// Whether [`Store::gc()`] runs automatically after each [`WriteTx::commit()`]. Default: true.
     pub auto_snapshot_gc: bool,
@@ -716,10 +718,12 @@ impl Store {
         })
     }
 
-    /// Garbage collect old snapshots that are no longer referenced by any [`ReadTx`].
+    /// Garbage collect old snapshots that are no longer referenced.
     /// Always keeps the `num_snapshots_retained` most recent snapshots, plus any
-    /// snapshot held by an active [`ReadTx`]. The latest snapshot is always kept
-    /// even if `num_snapshots_retained` is 0.
+    /// snapshot held by an active [`ReadTx`] or [`VersionPin`]. The latest
+    /// snapshot is always kept even if `num_snapshots_retained` is 0.
+    /// Cost is O(evictable + pinned), not O(retained): only versions older than
+    /// the retention window are visited.
     pub fn gc(&self) {
         let mut inner = self.inner.write();
         gc_inner(&mut inner);
