@@ -1698,29 +1698,31 @@ fn gc_inner(inner: &mut StoreInner) {
     let retain_count = inner.config.num_snapshots_retained.max(1);
 
     // Fast path: nothing to collect.
-    if inner.snapshots.len() <= retain_count {
+    let len = inner.snapshots.len();
+    if len <= retain_count {
         inner.metrics.inc_gc_run();
         return;
     }
 
-    // The cutoff is the oldest version still inside the newest-retain_count window.
-    // BTreeMap keys are sorted ascending, so nth_back(retain_count - 1) gives the
-    // (retain_count)-th key from the end — the minimum version we keep unconditionally.
-    // SAFETY: len > retain_count >= 1 guarantees nth_back returns Some.
-    let cutoff = *inner
+    // Only the oldest `len - retain_count` entries lie outside the
+    // newest-retain_count window (BTreeMap iterates in ascending key order),
+    // so visit exactly those instead of scanning the whole map — O(evictable)
+    // per run, not O(retained). Snapshots with outstanding references
+    // (a ReadTx or VersionPin holds the Arc) are kept regardless of age.
+    let evictable = len - retain_count;
+    let doomed: Vec<u64> = inner
         .snapshots
-        .keys()
-        .nth_back(retain_count - 1)
-        .expect("len > retain_count guarantees a key exists");
-
-    let before = inner.snapshots.len();
-    inner
-        .snapshots
-        .retain(|&v, snapshot| v >= cutoff || Arc::strong_count(snapshot) > 1);
-    let removed = (before - inner.snapshots.len()) as u64;
+        .iter()
+        .take(evictable)
+        .filter(|(_, snapshot)| Arc::strong_count(snapshot) == 1)
+        .map(|(&v, _)| v)
+        .collect();
+    for v in &doomed {
+        inner.snapshots.remove(v);
+    }
     inner.metrics.inc_gc_run();
-    if removed > 0 {
-        inner.metrics.inc_snapshots_collected(removed);
+    if !doomed.is_empty() {
+        inner.metrics.inc_snapshots_collected(doomed.len() as u64);
     }
 }
 
@@ -4207,6 +4209,42 @@ mod tests {
         assert_eq!(store.snapshot_count(), 2);
         assert!(store.has_snapshot(1));
         assert!(store.has_snapshot(2));
+    }
+
+    #[test]
+    fn gc_prefix_skips_referenced_snapshot_mid_window() {
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 2,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        // Commit v1..v5. Snapshots: 0,1,2,3,4,5. Latest is 5.
+        for _ in 0..5 {
+            store.begin_write(None).unwrap().commit().unwrap();
+        }
+        assert_eq!(store.snapshot_count(), 6);
+
+        // Hold a reader on v2 — inside the evictable prefix {0,1,2,3}, not at
+        // either end of it.
+        let rtx2 = store.begin_read(Some(2)).unwrap();
+
+        store.gc();
+        // Kept: 4,5 (newest N=2) and 2 (referenced). Dropped: 0,1,3.
+        assert_eq!(store.snapshot_count(), 3);
+        assert!(store.has_snapshot(2));
+        assert!(store.has_snapshot(4));
+        assert!(store.has_snapshot(5));
+        assert!(!store.has_snapshot(0));
+        assert!(!store.has_snapshot(1));
+        assert!(!store.has_snapshot(3));
+
+        drop(rtx2);
+        store.gc();
+        // v2's reference is gone; only the window {4,5} remains.
+        assert_eq!(store.snapshot_count(), 2);
+        assert!(store.has_snapshot(4));
+        assert!(store.has_snapshot(5));
     }
 
     #[test]
