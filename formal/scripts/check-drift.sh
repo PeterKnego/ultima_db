@@ -26,6 +26,18 @@ FORMAL_PREFIX="formal/"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# Portability guard: lake-manifest.json records a path dependency's dir at
+# generation time, and editing the lakefile's `require ... from` does not
+# regenerate it. A manifest generated against an absolute local checkout
+# resolves nowhere else and breaks the weekly lean job — which PRs never run,
+# so catch it here.
+MANIFEST="formal/proofs/lake-manifest.json"
+if grep -nE '"dir":[[:space:]]*"/' "$MANIFEST" >&2; then
+  echo "formal drift-check FAILED: $MANIFEST pins a path dependency to an absolute directory (above)." >&2
+  echo "  Use a path relative to formal/proofs, e.g. ../.toolchain/backends/lean." >&2
+  exit 1
+fi
+
 base="${1:-${BASE:-}}"
 if [ -z "$base" ]; then
   if git rev-parse --verify --quiet origin/main >/dev/null; then
