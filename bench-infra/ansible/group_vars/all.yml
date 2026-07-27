@@ -10,5 +10,8 @@ ud_local_path: "{{ playbook_dir }}/../../"
 # --- Which workload the run role executes: competitor | wal-ab | autobench ---
 bench_target: "competitor"
 
+# --- Samples per metric for bench_target=autobench-median (median + derived tolerance) ---
+autobench_samples: 5
+
 # --- Results pulled back to the control machine (bench-infra/bench-out/dist/<ts>/) ---
 results_local_dir: "{{ playbook_dir }}/../bench-out/dist"
