@@ -570,6 +570,53 @@ impl Store {
         })
     }
 
+    /// Pin `version` (latest if `None`) so [`Store::gc`] — including
+    /// per-commit auto-GC — cannot collect it while the returned
+    /// [`VersionPin`] (or any clone of it) is alive.
+    ///
+    /// Returns [`Error::VersionNotFound`] if the requested version does not
+    /// exist.
+    ///
+    /// Unlike [`ReadTx`], a [`VersionPin`] is `Send`, so it can travel to
+    /// another thread. This closes the SMR snapshot-handoff race without
+    /// inflating [`StoreConfig::num_snapshots_retained`]: the writer pins the
+    /// capture version *before* publishing its number, and the serializer
+    /// thread opens its own read transaction on arrival.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::Store;
+    ///
+    /// let store = Store::default();
+    /// store.begin_write(None).unwrap().commit().unwrap();
+    ///
+    /// // Writer side: pin the capture version, then hand it off.
+    /// let pin = store.pin_version(Some(store.latest_version())).unwrap();
+    ///
+    /// let serializer = std::thread::spawn({
+    ///     let store = store.clone();
+    ///     move || {
+    ///         // While `pin` is alive this cannot fail with VersionNotFound,
+    ///         // no matter how far the writer has committed past it.
+    ///         let rtx = store.begin_read(Some(pin.version())).unwrap();
+    ///         // ... stream the snapshot from `rtx`, then drop both ...
+    ///         drop(rtx);
+    ///     }
+    /// });
+    /// serializer.join().unwrap();
+    /// ```
+    pub fn pin_version(&self, version: Option<u64>) -> Result<VersionPin> {
+        let inner = self.inner.read();
+        let v = version.unwrap_or(inner.latest_version);
+        let snapshot = inner
+            .snapshots
+            .get(&v)
+            .ok_or(Error::VersionNotFound(v))?
+            .clone();
+        Ok(VersionPin { snapshot })
+    }
+
     /// Open a write transaction.
     ///
     /// - `version: None` — auto-assign the next available version.
@@ -1729,6 +1776,41 @@ fn gc_inner(inner: &mut StoreInner) {
 impl Default for Store {
     fn default() -> Self {
         Self::new(StoreConfig::default()).expect("default StoreConfig cannot fail")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VersionPin — a Send-able handle that keeps one version alive across GC
+// ---------------------------------------------------------------------------
+
+/// Keeps one snapshot version alive across [`Store::gc`] runs.
+///
+/// Created by [`Store::pin_version`]. Holds a strong reference to the
+/// snapshot, which is the same mechanism GC uses to protect versions held by
+/// an active [`ReadTx`] — a pinned version is never collected, regardless of
+/// [`StoreConfig::num_snapshots_retained`]. Dropping the last pin (and any
+/// clones) makes the version collectable again.
+///
+/// `VersionPin` is `Send + Sync + Clone`, unlike [`ReadTx`]: use it to hand a
+/// version across threads, then open a [`ReadTx`] on the receiving thread via
+/// [`Store::begin_read`]`(Some(pin.version()))`.
+#[derive(Clone)]
+pub struct VersionPin {
+    snapshot: Arc<Snapshot>,
+}
+
+impl VersionPin {
+    /// The pinned version number.
+    pub fn version(&self) -> u64 {
+        self.snapshot.version
+    }
+}
+
+impl std::fmt::Debug for VersionPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionPin")
+            .field("version", &self.snapshot.version)
+            .finish()
     }
 }
 
@@ -4297,6 +4379,126 @@ mod tests {
         }
         // No auto GC — all 6 snapshots remain (v0..v5)
         assert_eq!(store.snapshot_count(), 6);
+    }
+
+    // --- VersionPin tests ---
+
+    #[test]
+    fn pinned_version_survives_gc_past_retention_window() {
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        store.begin_write(None).unwrap().commit().unwrap(); // v1
+        let pin = store.pin_version(Some(1)).unwrap();
+        store.begin_write(None).unwrap().commit().unwrap(); // v2
+        store.begin_write(None).unwrap().commit().unwrap(); // v3
+
+        store.gc();
+        // Kept: 3 (latest, window N=1) and 1 (pinned). Dropped: 0, 2.
+        assert_eq!(pin.version(), 1);
+        assert!(store.has_snapshot(1));
+        assert!(store.has_snapshot(3));
+        assert!(!store.has_snapshot(0));
+        assert!(!store.has_snapshot(2));
+        // The pinned version is still readable.
+        assert!(store.begin_read(Some(1)).is_ok());
+    }
+
+    #[test]
+    fn dropping_last_pin_makes_version_collectable() {
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        store.begin_write(None).unwrap().commit().unwrap(); // v1
+        let pin = store.pin_version(Some(1)).unwrap();
+        store.begin_write(None).unwrap().commit().unwrap(); // v2
+
+        store.gc();
+        assert!(store.has_snapshot(1));
+
+        drop(pin);
+        store.gc();
+        assert!(!store.has_snapshot(1));
+    }
+
+    #[test]
+    fn cloned_pin_keeps_version_alive() {
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            auto_snapshot_gc: false,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        store.begin_write(None).unwrap().commit().unwrap(); // v1
+        let pin = store.pin_version(Some(1)).unwrap();
+        let pin2 = pin.clone();
+        store.begin_write(None).unwrap().commit().unwrap(); // v2
+
+        drop(pin);
+        store.gc();
+        assert!(store.has_snapshot(1), "clone still holds the pin");
+        assert_eq!(pin2.version(), 1);
+
+        drop(pin2);
+        store.gc();
+        assert!(!store.has_snapshot(1));
+    }
+
+    #[test]
+    fn pin_version_missing_errors() {
+        let store = Store::default();
+        assert!(matches!(
+            store.pin_version(Some(99)),
+            Err(Error::VersionNotFound(99))
+        ));
+    }
+
+    #[test]
+    fn pin_version_none_pins_latest() {
+        let store = Store::default();
+        store.begin_write(None).unwrap().commit().unwrap(); // v1
+        let pin = store.pin_version(None).unwrap();
+        assert_eq!(pin.version(), 1);
+    }
+
+    #[test]
+    fn pin_crosses_threads_smr_handoff() {
+        // The motivating pattern: writer pins a capture version, hands the pin
+        // to a serializer thread, and keeps committing with auto-GC on and a
+        // minimal retention window. The serializer's begin_read must succeed.
+        let store = Store::new(StoreConfig {
+            num_snapshots_retained: 1,
+            ..StoreConfig::default() // auto_snapshot_gc: true
+        })
+        .unwrap();
+        store.begin_write(None).unwrap().commit().unwrap(); // v1
+        let pin = store.pin_version(Some(1)).unwrap();
+
+        // Commit far past the retention window; auto-GC runs on every commit.
+        for _ in 0..64 {
+            store.begin_write(None).unwrap().commit().unwrap();
+        }
+
+        let store2 = store.clone();
+        let seen = std::thread::spawn(move || {
+            // `pin` moved into this thread — compile-time proof VersionPin: Send.
+            let rtx = store2.begin_read(Some(pin.version())).unwrap();
+            drop(rtx);
+            pin.version()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, 1);
+
+        // Pin dropped with the thread; the version is collectable now.
+        store.gc();
+        assert!(!store.has_snapshot(1));
     }
 
     // --- Readable trait coverage ---

@@ -84,7 +84,7 @@ pub use persistence::{Durability, Persistence, Record, WalWrite};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;
 pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};
-pub use store::{IsolationLevel, Readable, Store, StoreConfig, WriterMode};
+pub use store::{IsolationLevel, Readable, Store, StoreConfig, VersionPin, WriterMode};
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};
 
