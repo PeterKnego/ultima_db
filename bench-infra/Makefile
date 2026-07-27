@@ -12,7 +12,9 @@ TFVARS  ?= terraform.tfvars
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS) 2>/dev/null)
 
-.PHONY: init up inventory bench/competitor bench/wal-ab bench/smr-ycsb bench/autobench bench/fanout bench/smr-ab bench/fanout-micro bench-oneshot status ssh destroy
+SAMPLES ?= 5
+
+.PHONY: init up inventory bench/competitor bench/wal-ab bench/smr-ycsb bench/autobench bench/autobench-median bench/fanout bench/smr-ab bench/fanout-micro bench-oneshot status ssh destroy
 
 init: ## terraform init
 	$(TF) init
@@ -37,6 +39,9 @@ bench/smr-ycsb: ## SMR (checkpoint-only) vs Eventual YCSB A/B (ultima-only) on N
 bench/autobench: ## autobench Gate-A microbenches + baseline record
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=autobench
 
+bench/autobench-median: ## autobench Gate-A microbenches x SAMPLES (default 5) — raw samples for median baselines
+	cd ansible && $(ANSIBLE) bench.yml -e bench_target=autobench-median -e autobench_samples=$(SAMPLES)
+
 bench/fanout: ## B-tree fanout (T) A/B sweep — get/insert/remove @1M random keys
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fanout
 
@@ -46,8 +51,8 @@ bench/smr-ab: ## SMR-apply/read-p99 fanout (T) A/B — the contended perf-gate w
 bench/fanout-micro: ## Fanout (T) read-vs-write asymmetry — warm+cold get/insert/update/remove @T 8..256
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fanout-micro
 
-bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|smr-ycsb|autobench|fanout|smr-ab|fanout-micro) -> destroy (destroy runs even if up/bench fail)
-	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|smr-ycsb|autobench|fanout|smr-ab|fanout-micro"; exit 1; fi
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro) -> destroy (destroy runs even if up/bench fail)
+	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro"; exit 1; fi
 	@rc=0; \
 	( $(MAKE) up && cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET) ) || rc=$$?; \
 	if ! $(MAKE) destroy; then \

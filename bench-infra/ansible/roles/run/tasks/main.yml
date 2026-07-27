@@ -116,6 +116,26 @@
     executable: /bin/bash
   changed_when: true
 
+- name: Run autobench Gate-A microbenches N times (median baseline sampling)
+  when: bench_target == "autobench-median"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    cargo build -p ultima-autobench --release --bins 2>&1 \
+      | tee {{ remote_home }}/results/autobench-median-build.log
+    out={{ remote_home }}/results/autobench-samples
+    mkdir -p "$out"
+    rm -f "$out"/smr-apply.jsonl "$out"/multiwriter-commit.jsonl
+    for i in $(seq 1 {{ autobench_samples }}); do
+      echo "=== sample $i/{{ autobench_samples }} ===" >&2
+      ./target/release/smr-apply-microbench --json >> "$out"/smr-apply.jsonl
+      ./target/release/mw-commit-microbench --json >> "$out"/multiwriter-commit.jsonl
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Copy criterion output into results (competitor / wal-ab / smr-ycsb / fanout)
   when: bench_target in ["competitor", "wal-ab", "smr-ycsb", "fanout"]
   ansible.builtin.shell: |
