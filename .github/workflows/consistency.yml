@@ -16,6 +16,10 @@ name: consistency
 
 on:
   pull_request:
+  # Also gate main directly: work merged locally and pushed (rather than via a
+  # PR) would otherwise skip this check until the next Monday cron.
+  push:
+    branches: [main]
   schedule:
     - cron: '41 4 * * 1' # Mondays 04:41 UTC (offset from formal.yml's 04:17)
   workflow_dispatch:
@@ -28,7 +32,9 @@ jobs:
     # PR gate (and on-demand). Bounded history keeps the run fast and elle-cli's
     # cycle-search well clear of an 'unknown' verdict while still exercising
     # enough contention to surface write skew under SI (classification gate).
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'pull_request' || github.event_name == 'push'
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

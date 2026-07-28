@@ -9,6 +9,18 @@ name: formal
 
 on:
   pull_request:
+  # Also gate main directly: work merged locally and pushed (rather than via a
+  # PR) would otherwise skip this check until the next Monday cron. Path-scoped
+  # because `lean` is a ~30-minute proof build — only worth running on main when
+  # something it actually verifies changed. (`drift` stays PR-only: it diffs
+  # against the PR base, and on a main-push checkout its default base
+  # `origin/main` equals HEAD, so it would pass vacuously.)
+  push:
+    branches: [main]
+    paths:
+      - 'src/btree.rs'
+      - 'formal/**'
+      - '.github/workflows/formal.yml'
   schedule:
     - cron: '17 4 * * 1' # Mondays 04:17 UTC
   workflow_dispatch:
