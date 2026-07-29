@@ -1919,13 +1919,33 @@ impl Readable for ReadTx {
 // WriteTx — write transaction with lazy CoW table copies
 // ---------------------------------------------------------------------------
 
+/// A table opened for writing, plus the per-table handles that stay valid for
+/// the whole transaction.
+///
+/// Caching the handles here is what keeps [`WriteTx::open_table`] cheap on
+/// repeat calls: deriving them costs a metrics-registry lookup (an `RwLock`
+/// read, a hash lookup and an `Arc` clone) and a `String` allocation, and a
+/// transaction that touches several tables per operation re-opens on every
+/// switch — `open_table` borrows the transaction mutably, so only one table
+/// can be open at a time. Paying that once per table per transaction instead
+/// of once per call takes it off the hot path.
+struct DirtyEntry {
+    table: Box<dyn MergeableTable>,
+    /// Per-table counter handle, resolved on first open.
+    table_metrics: Arc<crate::metrics::TableMetrics>,
+    /// The table name as a shared handle, so each `open_table` hands out a
+    /// refcount bump rather than a fresh allocation.
+    name: Arc<str>,
+}
+
 /// A write transaction.  Tables are lazily copied from the base snapshot on
 /// first access (O(1) per table via BTree root `Arc` clone).  Changes are
 /// not visible to any `ReadTx` until [`WriteTx::commit`] is called.
 pub struct WriteTx {
     base: Arc<Snapshot>,
-    /// Mutable working copies of tables opened for writing.
-    dirty: BTreeMap<String, Box<dyn MergeableTable>>,
+    /// Mutable working copies of tables opened for writing, with their
+    /// per-transaction handles (see [`DirtyEntry`]).
+    dirty: BTreeMap<String, DirtyEntry>,
     /// The version number that will be assigned to the new snapshot on commit.
     version: u64,
     /// True when the caller passed an explicit version to `begin_write`
@@ -2009,7 +2029,9 @@ pub struct TableWriter<'tx, R: Record> {
     metrics: Arc<StoreMetrics>,
     /// Cached per-table counter handle (see `TableReader::table_metrics`).
     table_metrics: Arc<crate::metrics::TableMetrics>,
-    table_name: String,
+    /// Shared with the transaction's [`DirtyEntry`], so a repeat `open_table`
+    /// hands out a refcount bump rather than a fresh allocation.
+    table_name: Arc<str>,
     /// `Some` in MultiWriter mode: bundles the shared intent map with the
     /// caller-writer's id and waiter, so `update`/`delete` can perform
     /// early-fail conflict detection without re-plumbing three separate
@@ -2062,7 +2084,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             Err(holder_waiter) => {
                 self.metrics.inc_write_conflict();
                 Err(Error::WriteConflict {
-                    table: self.table_name.clone(),
+                    table: self.table_name.to_string(),
                     keys: vec![id],
                     // Early-fail has no "conflicting committed version"; the
                     // holder is still in flight. Use 0 as a sentinel.
@@ -2322,7 +2344,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         // Only a *successful* DDL taints the commit (task41) — a rejected
         // define (kind mismatch, name collision) changed nothing.
         if let Some(ddl) = self.ddl_tables {
-            ddl.borrow_mut().insert(self.table_name.clone());
+            ddl.borrow_mut().insert(self.table_name.to_string());
         }
         Ok(())
     }
@@ -2382,7 +2404,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         self.table.define_custom_index(name, index)?;
         // Only a *successful* DDL taints the commit (task41).
         if let Some(ddl) = self.ddl_tables {
-            ddl.borrow_mut().insert(self.table_name.clone());
+            ddl.borrow_mut().insert(self.table_name.to_string());
         }
         Ok(())
     }
@@ -2686,6 +2708,9 @@ impl WriteTx {
         opener: impl TableOpener<R>,
     ) -> Result<TableWriter<'_, R>> {
         let name = opener.table_name();
+        // Everything that allocates or hits a shared registry happens here, on
+        // the first open of this table in this transaction. Repeat opens are a
+        // map lookup plus two refcount bumps.
         if !self.dirty.contains_key(name) {
             let table: Table<R> = if self.deleted_tables.contains(name) {
                 Table::new()
@@ -2700,18 +2725,30 @@ impl WriteTx {
                 }
             };
             self.deleted_tables.remove(name);
-            self.dirty.insert(name.to_string(), Box::new(table));
+            let entry = DirtyEntry {
+                table: Box::new(table),
+                table_metrics: self.metrics.register_table(name),
+                name: Arc::from(name),
+            };
+            self.dirty.insert(name.to_string(), entry);
         }
-        let name_str = name.to_string();
-        let table = self
-            .dirty
-            .get_mut(&name_str)
-            .unwrap()
+        let entry = self.dirty.get_mut(name).expect("inserted above");
+        let table_metrics = Arc::clone(&entry.table_metrics);
+        let table_name = Arc::clone(&entry.name);
+        let table = entry
+            .table
             .as_any_mut()
             .downcast_mut::<Table<R>>()
-            .ok_or_else(|| Error::TypeMismatch(name_str.clone()))?;
+            .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
         let write_set = match self.writer_mode {
-            WriterMode::MultiWriter => Some(self.write_set.entry(name_str.clone()).or_default()),
+            WriterMode::MultiWriter => {
+                // Same first-open-only allocation rule as `dirty` above; the
+                // `entry` API would force an owned key on every call.
+                if !self.write_set.contains_key(name) {
+                    self.write_set.insert(name.to_string(), BTreeSet::new());
+                }
+                Some(self.write_set.get_mut(name).expect("inserted above"))
+            }
             WriterMode::SingleWriter => None,
         };
         let intent_ctx = match (self.intents.as_deref(), self.waiter.as_ref()) {
@@ -2722,11 +2759,10 @@ impl WriteTx {
             }),
             _ => None,
         };
-        let table_metrics = self.metrics.register_table(&name_str);
         #[cfg(feature = "persistence")]
         let wal_ops = if self.wal_enabled {
             Some(WalOpsWriter {
-                table_name: name_str.clone(),
+                table_name: name.to_string(),
                 ops: &mut self.wal_ops,
             })
         } else {
@@ -2737,7 +2773,7 @@ impl WriteTx {
             write_set,
             metrics: Arc::clone(&self.metrics),
             table_metrics,
-            table_name: name_str,
+            table_name,
             intent_ctx,
             #[cfg(feature = "persistence")]
             wal_ops,
@@ -2869,7 +2905,7 @@ impl WriteTx {
             .collect();
         let dirty = std::mem::take(&mut self.dirty);
         for (name, my_dirty) in dirty {
-            new_tables.insert(name, Arc::from(my_dirty));
+            new_tables.insert(name, Arc::from(my_dirty.table));
         }
         for name in &self.deleted_tables {
             new_tables.remove(name);
@@ -2983,6 +3019,9 @@ impl WriteTx {
         let dirty = std::mem::take(&mut self.dirty);
         let mut merged_tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
         for (name, my_dirty) in dirty {
+            // Only the table itself matters from here on; the cached per-table
+            // handles die with the transaction.
+            let my_dirty = my_dirty.table;
             let has_concurrent = concurrent_flags.get(&name).copied().unwrap_or(false);
 
             if !has_concurrent {
