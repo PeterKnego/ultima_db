@@ -1872,11 +1872,11 @@ mod tests {
             .unwrap();
             t.delete(2).unwrap();
         }
-        assert_eq!(wtx.wal_ops.len(), 4);
-        assert!(matches!(&wtx.wal_ops[0], WalOp::Insert { table, id: 1, .. } if table == "users"));
-        assert!(matches!(&wtx.wal_ops[1], WalOp::Insert { table, id: 2, .. } if table == "users"));
-        assert!(matches!(&wtx.wal_ops[2], WalOp::Update { table, id: 1, .. } if table == "users"));
-        assert!(matches!(&wtx.wal_ops[3], WalOp::Delete { table, id: 2 } if table == "users"));
+        assert_eq!(wtx.wal_ops.borrow().len(), 4);
+        assert!(matches!(&wtx.wal_ops.borrow()[0], WalOp::Insert { table, id: 1, .. } if table == "users"));
+        assert!(matches!(&wtx.wal_ops.borrow()[1], WalOp::Insert { table, id: 2, .. } if table == "users"));
+        assert!(matches!(&wtx.wal_ops.borrow()[2], WalOp::Update { table, id: 1, .. } if table == "users"));
+        assert!(matches!(&wtx.wal_ops.borrow()[3], WalOp::Delete { table, id: 2 } if table == "users"));
     }
 
     #[test]
@@ -1895,8 +1895,8 @@ mod tests {
         }
         let mut wtx = store.begin_write(None).unwrap();
         wtx.delete_table("users");
-        assert_eq!(wtx.wal_ops.len(), 1);
-        assert!(matches!(&wtx.wal_ops[0], WalOp::DeleteTable { name } if name == "users"));
+        assert_eq!(wtx.wal_ops.borrow().len(), 1);
+        assert!(matches!(&wtx.wal_ops.borrow()[0], WalOp::DeleteTable { name } if name == "users"));
     }
 
     #[test]
@@ -1918,7 +1918,7 @@ mod tests {
             .unwrap();
             t.delete_batch(&[1, 2]).unwrap();
         }
-        assert_eq!(wtx.wal_ops.len(), 4); // 2 inserts + 2 deletes
+        assert_eq!(wtx.wal_ops.borrow().len(), 4); // 2 inserts + 2 deletes
     }
 
     #[test]
