@@ -128,6 +128,11 @@ pub enum Error {
     /// across delta buckets, AutoId used in Delta, etc.).
     #[error("invalid bulk-load input: {0}")]
     InvalidBulkLoadInput(String),
+    /// A multi-table opener (`open_tables2`/`open_tables3`) was given the same
+    /// table name twice. Two writers to one table would alias; use a single
+    /// writer for that table instead.
+    #[error("table '{0}' opened more than once in one open_tables call")]
+    DuplicateTableOpen(String),
 }
 
 /// Crate-wide result alias: `std::result::Result<T, Error>`.

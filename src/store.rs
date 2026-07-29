@@ -716,7 +716,7 @@ impl Store {
             waiter,
             table_locks,
             #[cfg(feature = "persistence")]
-            wal_ops: Vec::new(),
+            wal_ops: std::cell::RefCell::new(Vec::new()),
             #[cfg(feature = "persistence")]
             wal_enabled: inner.wal_handle.is_some(),
             read_set: match (isolation_level, writer_mode) {
@@ -1991,7 +1991,11 @@ pub struct WriteTx {
     table_locks: Option<Arc<TableLockTable>>,
     /// WAL operations accumulated during this transaction (persistence only).
     #[cfg(feature = "persistence")]
-    pub(crate) wal_ops: Vec<crate::wal::WalOp>,
+    /// `RefCell` (not `&mut`) so several concurrently-held `TableWriter`s from
+    /// one `open_tables*` call can each push through a shared reference — the
+    /// same pattern `read_set` and `ddl_tables` use. `WriteTx` is
+    /// `!Send + !Sync`, so the `borrow_mut` on each push never contends.
+    pub(crate) wal_ops: std::cell::RefCell<Vec<crate::wal::WalOp>>,
     /// Whether WAL tracking is active (true only when a WAL handle exists).
     #[cfg(feature = "persistence")]
     wal_enabled: bool,
@@ -2061,7 +2065,78 @@ struct IntentCtx<'tx> {
 #[cfg(feature = "persistence")]
 struct WalOpsWriter<'tx> {
     table_name: String,
-    ops: &'tx mut Vec<crate::wal::WalOp>,
+    ops: &'tx std::cell::RefCell<Vec<crate::wal::WalOp>>,
+}
+
+/// Downcast a dirty entry to `Table<R>` and read its cached handles. Shared
+/// between `open_table` and the tuple openers so the type check and handle
+/// extraction live in one place.
+fn entry_writer_parts<'tx, R: Record>(
+    name: &str,
+    entry: &'tx mut DirtyEntry,
+) -> Result<(
+    Arc<str>,
+    &'tx mut Table<R>,
+    Arc<crate::metrics::TableMetrics>,
+)> {
+    let table_name = Arc::clone(&entry.name);
+    let table_metrics = Arc::clone(&entry.table_metrics);
+    let table = entry
+        .table
+        .as_any_mut()
+        .downcast_mut::<Table<R>>()
+        .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
+    Ok((table_name, table, table_metrics))
+}
+
+/// Build a [`TableWriter`] from already-borrowed transaction pieces. Taking the
+/// pieces as explicit args (rather than `&self`) is what lets the tuple openers
+/// construct several writers at once: each field is borrowed from a *distinct*
+/// field of the transaction, so none alias the `dirty`/`write_set` `&mut`s.
+#[allow(clippy::too_many_arguments)]
+fn assemble_writer<'tx, R: Record>(
+    table_name: Arc<str>,
+    table: &'tx mut Table<R>,
+    write_set: Option<&'tx mut BTreeSet<u64>>,
+    metrics: Arc<StoreMetrics>,
+    table_metrics: Arc<crate::metrics::TableMetrics>,
+    intents: Option<&'tx IntentMap>,
+    writer_id: u64,
+    waiter: Option<&'tx Arc<IntentWaiter>>,
+    read_set: Option<&'tx std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
+    ddl_tables: Option<&'tx std::cell::RefCell<BTreeSet<String>>>,
+    #[cfg(feature = "persistence")] wal_enabled: bool,
+    #[cfg(feature = "persistence")] wal_ops_cell: &'tx std::cell::RefCell<Vec<crate::wal::WalOp>>,
+) -> TableWriter<'tx, R> {
+    let intent_ctx = match (intents, waiter) {
+        (Some(intents), Some(waiter)) => Some(IntentCtx {
+            intents,
+            writer_id,
+            waiter,
+        }),
+        _ => None,
+    };
+    #[cfg(feature = "persistence")]
+    let wal_ops = if wal_enabled {
+        Some(WalOpsWriter {
+            table_name: table_name.to_string(),
+            ops: wal_ops_cell,
+        })
+    } else {
+        None
+    };
+    TableWriter {
+        table,
+        write_set,
+        metrics,
+        table_metrics,
+        table_name,
+        intent_ctx,
+        #[cfg(feature = "persistence")]
+        wal_ops,
+        read_set,
+        ddl_tables,
+    }
 }
 
 impl<'tx, R: Record> TableWriter<'tx, R> {
@@ -2106,7 +2181,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             if let Some(ws) = &mut self.write_set {
                 ws.insert(id);
             }
-            w.ops.push(crate::wal::WalOp::Insert {
+            w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
                 table: w.table_name.clone(),
                 id,
                 data,
@@ -2132,7 +2207,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             if let Some(ws) = &mut self.write_set {
                 ws.insert(id);
             }
-            w.ops.push(crate::wal::WalOp::Update {
+            w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                 table: w.table_name.clone(),
                 id,
                 data,
@@ -2157,7 +2232,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            w.ops.push(crate::wal::WalOp::Delete {
+            w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                 table: w.table_name.clone(),
                 id,
             });
@@ -2179,7 +2254,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 ws.extend(ids.iter().copied());
             }
             for (id, data) in ids.iter().zip(data_list) {
-                w.ops.push(crate::wal::WalOp::Insert {
+                w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
                     table: w.table_name.clone(),
                     id: *id,
                     data,
@@ -2216,7 +2291,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                 ws.extend(ids.iter());
             }
             for (id, data) in ops_data {
-                w.ops.push(crate::wal::WalOp::Update {
+                w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
                     id,
                     data,
@@ -2244,7 +2319,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             for &id in ids {
-                w.ops.push(crate::wal::WalOp::Delete {
+                w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                     table: w.table_name.clone(),
                     id,
                 });
@@ -2458,7 +2533,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
                     data,
                 }
             };
-            w.ops.push(op);
+            w.ops.borrow_mut().push(op);
         }
         if had_prior {
             self.table_metrics.inc_updates(1);
@@ -2708,9 +2783,293 @@ impl WriteTx {
         opener: impl TableOpener<R>,
     ) -> Result<TableWriter<'_, R>> {
         let name = opener.table_name();
-        // Everything that allocates or hits a shared registry happens here, on
-        // the first open of this table in this transaction. Repeat opens are a
-        // map lookup plus two refcount bumps.
+        self.ensure_dirty_entry::<R>(name)?;
+        let mw = matches!(self.writer_mode, WriterMode::MultiWriter);
+        if mw {
+            self.ensure_write_set(name);
+        }
+        // Distinct-field borrows (all coexist with the two &mut below because
+        // they name different fields of `self`): the shared handles a
+        // `TableWriter` carries.
+        let metrics = Arc::clone(&self.metrics);
+        let read_set = self.read_set.as_ref();
+        let ddl_tables = if mw { Some(&self.ddl_tables) } else { None };
+        let intents = self.intents.as_deref();
+        let waiter = self.waiter.as_ref();
+        let writer_id = self.writer_id;
+        #[cfg(feature = "persistence")]
+        let wal_enabled = self.wal_enabled;
+        #[cfg(feature = "persistence")]
+        let wal_ops_cell = &self.wal_ops;
+        // The two exclusive borrows: one dirty entry, one write-set entry.
+        // Single `get_mut` on each map — no aliasing, so no `unsafe` here (the
+        // tuple openers below need it because they take several entries at once).
+        let entry = self.dirty.get_mut(name).expect("ensured above");
+        let table_metrics = Arc::clone(&entry.table_metrics);
+        let table_name = Arc::clone(&entry.name);
+        let table = entry
+            .table
+            .as_any_mut()
+            .downcast_mut::<Table<R>>()
+            .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
+        let write_set = if mw {
+            Some(self.write_set.get_mut(name).expect("ensured above"))
+        } else {
+            None
+        };
+        Ok(assemble_writer(
+            table_name,
+            table,
+            write_set,
+            metrics,
+            table_metrics,
+            intents,
+            writer_id,
+            waiter,
+            read_set,
+            ddl_tables,
+            #[cfg(feature = "persistence")]
+            wal_enabled,
+            #[cfg(feature = "persistence")]
+            wal_ops_cell,
+        ))
+    }
+
+    /// Open two tables for writing at once, returning both writers.
+    ///
+    /// Unlike calling [`open_table`](Self::open_table) twice (which the borrow
+    /// checker forbids — each call borrows the transaction mutably), this hands
+    /// out both writers together, so a transaction that interleaves work across
+    /// two tables per operation opens each table once instead of on every
+    /// switch. Returns [`Error::DuplicateTableOpen`] if the two names are equal
+    /// (two writers to one table would alias — use a single writer instead).
+    pub fn open_tables2<A: Record, B: Record>(
+        &mut self,
+        a: impl TableOpener<A>,
+        b: impl TableOpener<B>,
+    ) -> Result<(TableWriter<'_, A>, TableWriter<'_, B>)> {
+        let na = a.table_name();
+        let nb = b.table_name();
+        if na == nb {
+            return Err(Error::DuplicateTableOpen(na.to_string()));
+        }
+        self.ensure_dirty_entry::<A>(na)?;
+        self.ensure_dirty_entry::<B>(nb)?;
+        let mw = matches!(self.writer_mode, WriterMode::MultiWriter);
+        if mw {
+            self.ensure_write_set(na);
+            self.ensure_write_set(nb);
+        }
+        let metrics = Arc::clone(&self.metrics);
+        let read_set = self.read_set.as_ref();
+        let ddl_tables = if mw { Some(&self.ddl_tables) } else { None };
+        let intents = self.intents.as_deref();
+        let waiter = self.waiter.as_ref();
+        let writer_id = self.writer_id;
+        #[cfg(feature = "persistence")]
+        let wal_enabled = self.wal_enabled;
+        #[cfg(feature = "persistence")]
+        let wal_ops_cell = &self.wal_ops;
+
+        // `iter_mut` hands out disjoint `&mut` to distinct keys in one borrow —
+        // the safe way to get two entries at once (`BTreeMap` has no
+        // `get_disjoint_mut`, and it must stay a `BTreeMap` because commit locks
+        // tables in canonical sorted order). `na != nb` (checked above)
+        // guarantees each is found exactly once. O(#dirty tables), which is tiny.
+        let (mut ea, mut eb) = (None, None);
+        for (k, v) in self.dirty.iter_mut() {
+            if k.as_str() == na {
+                ea = Some(v);
+            } else if k.as_str() == nb {
+                eb = Some(v);
+            }
+        }
+        let (ea, eb) = (ea.expect("ensured"), eb.expect("ensured"));
+        let (wsa, wsb) = if mw {
+            let (mut wa, mut wb) = (None, None);
+            for (k, v) in self.write_set.iter_mut() {
+                if k.as_str() == na {
+                    wa = Some(v);
+                } else if k.as_str() == nb {
+                    wb = Some(v);
+                }
+            }
+            (Some(wa.expect("ensured")), Some(wb.expect("ensured")))
+        } else {
+            (None, None)
+        };
+        let (na_h, ta, tma) = entry_writer_parts::<A>(na, ea)?;
+        let (nb_h, tb, tmb) = entry_writer_parts::<B>(nb, eb)?;
+        Ok((
+            assemble_writer(
+                na_h,
+                ta,
+                wsa,
+                Arc::clone(&metrics),
+                tma,
+                intents,
+                writer_id,
+                waiter,
+                read_set,
+                ddl_tables,
+                #[cfg(feature = "persistence")]
+                wal_enabled,
+                #[cfg(feature = "persistence")]
+                wal_ops_cell,
+            ),
+            assemble_writer(
+                nb_h,
+                tb,
+                wsb,
+                metrics,
+                tmb,
+                intents,
+                writer_id,
+                waiter,
+                read_set,
+                ddl_tables,
+                #[cfg(feature = "persistence")]
+                wal_enabled,
+                #[cfg(feature = "persistence")]
+                wal_ops_cell,
+            ),
+        ))
+    }
+
+    /// Open three tables for writing at once. See [`open_tables2`](Self::open_tables2).
+    /// Returns [`Error::DuplicateTableOpen`] if any two of the names are equal.
+    #[allow(clippy::type_complexity)]
+    pub fn open_tables3<A: Record, B: Record, C: Record>(
+        &mut self,
+        a: impl TableOpener<A>,
+        b: impl TableOpener<B>,
+        c: impl TableOpener<C>,
+    ) -> Result<(TableWriter<'_, A>, TableWriter<'_, B>, TableWriter<'_, C>)> {
+        let na = a.table_name();
+        let nb = b.table_name();
+        let nc = c.table_name();
+        if na == nb || na == nc {
+            return Err(Error::DuplicateTableOpen(na.to_string()));
+        }
+        if nb == nc {
+            return Err(Error::DuplicateTableOpen(nb.to_string()));
+        }
+        self.ensure_dirty_entry::<A>(na)?;
+        self.ensure_dirty_entry::<B>(nb)?;
+        self.ensure_dirty_entry::<C>(nc)?;
+        let mw = matches!(self.writer_mode, WriterMode::MultiWriter);
+        if mw {
+            self.ensure_write_set(na);
+            self.ensure_write_set(nb);
+            self.ensure_write_set(nc);
+        }
+        let metrics = Arc::clone(&self.metrics);
+        let read_set = self.read_set.as_ref();
+        let ddl_tables = if mw { Some(&self.ddl_tables) } else { None };
+        let intents = self.intents.as_deref();
+        let waiter = self.waiter.as_ref();
+        let writer_id = self.writer_id;
+        #[cfg(feature = "persistence")]
+        let wal_enabled = self.wal_enabled;
+        #[cfg(feature = "persistence")]
+        let wal_ops_cell = &self.wal_ops;
+
+        // Pairwise-distinct names (checked above) → each found once. Disjoint
+        // `&mut` via `iter_mut`, no `unsafe`; see `open_tables2`.
+        let (mut ea, mut eb, mut ec) = (None, None, None);
+        for (k, v) in self.dirty.iter_mut() {
+            if k.as_str() == na {
+                ea = Some(v);
+            } else if k.as_str() == nb {
+                eb = Some(v);
+            } else if k.as_str() == nc {
+                ec = Some(v);
+            }
+        }
+        let (ea, eb, ec) = (
+            ea.expect("ensured"),
+            eb.expect("ensured"),
+            ec.expect("ensured"),
+        );
+        let (wsa, wsb, wsc) = if mw {
+            let (mut wa, mut wb, mut wc) = (None, None, None);
+            for (k, v) in self.write_set.iter_mut() {
+                if k.as_str() == na {
+                    wa = Some(v);
+                } else if k.as_str() == nb {
+                    wb = Some(v);
+                } else if k.as_str() == nc {
+                    wc = Some(v);
+                }
+            }
+            (
+                Some(wa.expect("ensured")),
+                Some(wb.expect("ensured")),
+                Some(wc.expect("ensured")),
+            )
+        } else {
+            (None, None, None)
+        };
+        let (na_h, ta, tma) = entry_writer_parts::<A>(na, ea)?;
+        let (nb_h, tb, tmb) = entry_writer_parts::<B>(nb, eb)?;
+        let (nc_h, tc, tmc) = entry_writer_parts::<C>(nc, ec)?;
+        Ok((
+            assemble_writer(
+                na_h,
+                ta,
+                wsa,
+                Arc::clone(&metrics),
+                tma,
+                intents,
+                writer_id,
+                waiter,
+                read_set,
+                ddl_tables,
+                #[cfg(feature = "persistence")]
+                wal_enabled,
+                #[cfg(feature = "persistence")]
+                wal_ops_cell,
+            ),
+            assemble_writer(
+                nb_h,
+                tb,
+                wsb,
+                Arc::clone(&metrics),
+                tmb,
+                intents,
+                writer_id,
+                waiter,
+                read_set,
+                ddl_tables,
+                #[cfg(feature = "persistence")]
+                wal_enabled,
+                #[cfg(feature = "persistence")]
+                wal_ops_cell,
+            ),
+            assemble_writer(
+                nc_h,
+                tc,
+                wsc,
+                metrics,
+                tmc,
+                intents,
+                writer_id,
+                waiter,
+                read_set,
+                ddl_tables,
+                #[cfg(feature = "persistence")]
+                wal_enabled,
+                #[cfg(feature = "persistence")]
+                wal_ops_cell,
+            ),
+        ))
+    }
+
+    /// Ensure a dirty working copy of `name` exists (copying O(1) from the base
+    /// snapshot on first open) and type-check it. Idempotent after the first
+    /// call in a transaction. This is where the per-table allocation and
+    /// metrics-registry hit happen, once per table per transaction.
+    fn ensure_dirty_entry<R: Record>(&mut self, name: &str) -> Result<()> {
         if !self.dirty.contains_key(name) {
             let table: Table<R> = if self.deleted_tables.contains(name) {
                 Table::new()
@@ -2731,58 +3090,25 @@ impl WriteTx {
                 name: Arc::from(name),
             };
             self.dirty.insert(name.to_string(), entry);
-        }
-        let entry = self.dirty.get_mut(name).expect("inserted above");
-        let table_metrics = Arc::clone(&entry.table_metrics);
-        let table_name = Arc::clone(&entry.name);
-        let table = entry
-            .table
-            .as_any_mut()
-            .downcast_mut::<Table<R>>()
-            .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
-        let write_set = match self.writer_mode {
-            WriterMode::MultiWriter => {
-                // Same first-open-only allocation rule as `dirty` above; the
-                // `entry` API would force an owned key on every call.
-                if !self.write_set.contains_key(name) {
-                    self.write_set.insert(name.to_string(), BTreeSet::new());
-                }
-                Some(self.write_set.get_mut(name).expect("inserted above"))
-            }
-            WriterMode::SingleWriter => None,
-        };
-        let intent_ctx = match (self.intents.as_deref(), self.waiter.as_ref()) {
-            (Some(intents), Some(waiter)) => Some(IntentCtx {
-                intents,
-                writer_id: self.writer_id,
-                waiter,
-            }),
-            _ => None,
-        };
-        #[cfg(feature = "persistence")]
-        let wal_ops = if self.wal_enabled {
-            Some(WalOpsWriter {
-                table_name: name.to_string(),
-                ops: &mut self.wal_ops,
-            })
         } else {
-            None
-        };
-        Ok(TableWriter {
-            table,
-            write_set,
-            metrics: Arc::clone(&self.metrics),
-            table_metrics,
-            table_name,
-            intent_ctx,
-            #[cfg(feature = "persistence")]
-            wal_ops,
-            read_set: self.read_set.as_ref(),
-            ddl_tables: match self.writer_mode {
-                WriterMode::MultiWriter => Some(&self.ddl_tables),
-                WriterMode::SingleWriter => None,
-            },
-        })
+            // Already present: verify the type matches the requested one, so a
+            // mismatched re-open fails the same way a first open would.
+            self.dirty
+                .get(name)
+                .expect("present")
+                .table
+                .as_any()
+                .downcast_ref::<Table<R>>()
+                .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Ensure the MultiWriter write-set slot for `name` exists. Idempotent.
+    fn ensure_write_set(&mut self, name: &str) {
+        if !self.write_set.contains_key(name) {
+            self.write_set.insert(name.to_string(), BTreeSet::new());
+        }
     }
 
     /// Commit this transaction, creating a new snapshot in the store.
@@ -2833,7 +3159,7 @@ impl WriteTx {
         // WAL submit under lock (preserves ordering with snapshot promote).
         #[cfg(feature = "persistence")]
         let waiter = if let Some(wal) = &inner.wal_handle {
-            let ops = std::mem::take(&mut self.wal_ops);
+            let ops = std::mem::take(&mut *self.wal_ops.borrow_mut());
             if !ops.is_empty() {
                 let entry = crate::wal::WalEntry {
                     version: self.version,
@@ -3082,7 +3408,7 @@ impl WriteTx {
         // Submit WAL entry to background thread (no fsync yet).
         #[cfg(feature = "persistence")]
         let waiter = if let Some(wal) = &inner.wal_handle {
-            let ops = std::mem::take(&mut self.wal_ops);
+            let ops = std::mem::take(&mut *self.wal_ops.borrow_mut());
             if !ops.is_empty() {
                 let entry = crate::wal::WalEntry {
                     version: self.version,
@@ -3276,7 +3602,7 @@ impl WriteTx {
         }
         #[cfg(feature = "persistence")]
         if existed && self.wal_enabled {
-            self.wal_ops.push(crate::wal::WalOp::DeleteTable {
+            self.wal_ops.borrow_mut().push(crate::wal::WalOp::DeleteTable {
                 name: name.to_string(),
             });
         }
@@ -6220,4 +6546,183 @@ mod tests {
         let res: Result<u64> = store.install_after_delta_check::<String>("t", new_table, v0);
         assert!(matches!(res, Err(Error::WriteConflict { .. })));
     }
+
+    // --- open_tables2 / open_tables3 (multi-table writer, #20) ---
+
+    #[test]
+    fn open_tables2_writes_both_tables() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        let (uid, cid) = {
+            let (mut users, mut counts) =
+                wtx.open_tables2::<String, u64>("users", "counts").unwrap();
+            let uid = users.insert("alice".to_string()).unwrap();
+            let cid = counts.insert(42).unwrap();
+            (uid, cid)
+        };
+        wtx.commit().unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        assert_eq!(
+            *rtx.open_table::<String>("users").unwrap().get(uid).unwrap(),
+            "alice"
+        );
+        assert_eq!(
+            *rtx.open_table::<u64>("counts").unwrap().get(cid).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn open_tables2_matches_sequential_opens() {
+        // One tuple-opened transaction must produce the same state as the same
+        // writes done through two separate single-open transactions.
+        let seq = Store::default();
+        {
+            let mut wtx = seq.begin_write(None).unwrap();
+            wtx.open_table::<String>("users")
+                .unwrap()
+                .insert("a".into())
+                .unwrap();
+            wtx.commit().unwrap();
+            let mut wtx = seq.begin_write(None).unwrap();
+            wtx.open_table::<u64>("counts").unwrap().insert(7).unwrap();
+            wtx.commit().unwrap();
+        }
+        let tup = Store::default();
+        {
+            let mut wtx = tup.begin_write(None).unwrap();
+            {
+                let (mut u, mut c) = wtx.open_tables2::<String, u64>("users", "counts").unwrap();
+                u.insert("a".into()).unwrap();
+                c.insert(7).unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+        let rs = seq.begin_read(None).unwrap();
+        let rt = tup.begin_read(None).unwrap();
+        assert_eq!(
+            *rs.open_table::<String>("users").unwrap().get(1).unwrap(),
+            *rt.open_table::<String>("users").unwrap().get(1).unwrap()
+        );
+        assert_eq!(
+            *rs.open_table::<u64>("counts").unwrap().get(1).unwrap(),
+            *rt.open_table::<u64>("counts").unwrap().get(1).unwrap()
+        );
+    }
+
+    #[test]
+    fn open_tables3_writes_all_three_interleaved() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let (mut a, mut b, mut c) = wtx.open_tables3::<u64, u64, u64>("a", "b", "c").unwrap();
+            // Interleave across all three — the shape the API exists for.
+            for i in 0..5u64 {
+                a.insert(i).unwrap();
+                b.insert(i * 10).unwrap();
+                c.insert(i * 100).unwrap();
+            }
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        assert_eq!(*rtx.open_table::<u64>("a").unwrap().get(5).unwrap(), 4);
+        assert_eq!(*rtx.open_table::<u64>("b").unwrap().get(5).unwrap(), 40);
+        assert_eq!(*rtx.open_table::<u64>("c").unwrap().get(5).unwrap(), 400);
+    }
+
+    #[test]
+    fn open_tables2_duplicate_name_errors() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        assert!(matches!(
+            wtx.open_tables2::<u64, u64>("dup", "dup"),
+            Err(Error::DuplicateTableOpen(n)) if n == "dup"
+        ));
+    }
+
+    #[test]
+    fn open_tables3_duplicate_name_errors() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        // First-vs-third collision.
+        assert!(matches!(
+            wtx.open_tables3::<u64, u64, u64>("x", "y", "x"),
+            Err(Error::DuplicateTableOpen(n)) if n == "x"
+        ));
+        // Second-vs-third collision.
+        assert!(matches!(
+            wtx.open_tables3::<u64, u64, u64>("p", "q", "q"),
+            Err(Error::DuplicateTableOpen(n)) if n == "q"
+        ));
+    }
+
+    #[test]
+    fn open_tables2_type_mismatch_errors() {
+        let store = Store::default();
+        // Create "users" as String.
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("users")
+            .unwrap()
+            .insert("a".into())
+            .unwrap();
+        wtx.commit().unwrap();
+        // Re-open it via the tuple as u64 — must fail like a single mis-typed open.
+        let mut wtx = store.begin_write(None).unwrap();
+        assert!(matches!(
+            wtx.open_tables2::<u64, u64>("users", "counts"),
+            Err(Error::TypeMismatch(n)) if n == "users"
+        ));
+    }
+
+    #[test]
+    fn open_tables2_multiwriter_conflict_and_disjoint() {
+        // The tuple path must integrate with MultiWriter conflict detection:
+        // writers touching different keys both commit (tracking isn't
+        // spuriously conflicting), writers touching the same key conflict.
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        // Seed users {1, 2} and counts {1}.
+        let mut seed = store.begin_write(None).unwrap();
+        {
+            let (mut u, mut c) = seed.open_tables2::<u64, u64>("users", "counts").unwrap();
+            u.insert(1).unwrap(); // id 1
+            u.insert(2).unwrap(); // id 2
+            c.insert(1).unwrap();
+        }
+        seed.commit().unwrap();
+
+        // Disjoint keys (users/1 vs users/2): both commit.
+        let mut a = store.begin_write(None).unwrap();
+        let mut b = store.begin_write(None).unwrap();
+        {
+            let (mut ua, _ca) = a.open_tables2::<u64, u64>("users", "counts").unwrap();
+            ua.update(1, 10).unwrap();
+        }
+        {
+            let (mut ub, _cb) = b.open_tables2::<u64, u64>("users", "counts").unwrap();
+            ub.update(2, 20).unwrap();
+        }
+        a.commit().unwrap();
+        b.commit().unwrap();
+
+        // Same key (users/1) with both writers live: the second write conflicts
+        // via intent early-fail — proving the tuple path claims intents.
+        let mut c = store.begin_write(None).unwrap();
+        let mut d = store.begin_write(None).unwrap();
+        {
+            let (mut uc, _cc) = c.open_tables2::<u64, u64>("users", "counts").unwrap();
+            uc.update(1, 100).unwrap();
+        }
+        let (mut ud, _cd) = d.open_tables2::<u64, u64>("users", "counts").unwrap();
+        assert!(matches!(
+            ud.update(1, 200),
+            Err(Error::WriteConflict { .. })
+        ));
+    }
+
 }
