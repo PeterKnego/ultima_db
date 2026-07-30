@@ -8,7 +8,12 @@ use crate::intents::CommitWaiter;
 /// The crate-wide error type returned by fallible `Store`/`Table`/transaction
 /// operations. Each variant documents when it occurs and, where relevant,
 /// how a caller should react (retry, abort, recover).
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in any release
+/// without a major version bump, so downstream `match` expressions must
+/// include a wildcard (`_`) arm. Matching within this crate is unaffected.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Requested key or version does not exist.
     #[error("key not found")]
