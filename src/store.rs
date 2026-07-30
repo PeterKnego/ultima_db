@@ -1304,8 +1304,11 @@ impl Store {
                     .max(base_typed.next_id());
 
                 let index_defs = base_typed.empty_index_defs()?;
+                // widened in task 7: bulk-load is still `u64`-keyed, so the
+                // `Option<K>` id counter `from_bulk` now takes is always
+                // `Some` here.
                 let new_table: crate::table::Table<R> =
-                    crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
+                    crate::table::Table::from_bulk(mat.rows, Some(next_id), index_defs)?;
 
                 // 3. Conflict check + install. If `latest_version` advanced
                 //    since `base_version`, abort with WriteConflict.
@@ -1419,8 +1422,9 @@ impl Store {
             };
 
         // 3. Build off-lock.
+        // widened in task 7: see `bulk_load`'s note on the `Option<K>` counter.
         let new_table: crate::table::Table<R> =
-            crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
+            crate::table::Table::from_bulk(mat.rows, Some(next_id), index_defs)?;
         Ok(new_table)
     }
 
@@ -2228,7 +2232,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             let data = Self::serialize_record(&record)?;
-            self.table.update(id, record)?;
+            self.table.update(&id, record)?;
             if let Some(ws) = &mut self.write_set {
                 ws.insert(id);
             }
@@ -2240,7 +2244,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             self.table_metrics.inc_updates(1);
             return Ok(());
         }
-        self.table.update(id, record)?;
+        self.table.update(&id, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
@@ -2251,7 +2255,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// Delete a record by its ID. Returns the deleted record.
     pub fn delete(&mut self, id: u64) -> Result<Arc<R>> {
         self.claim_intent(id)?;
-        let old = self.table.delete(id)?;
+        let old = self.table.delete(&id)?;
         if let Some(ws) = &mut self.write_set {
             ws.insert(id);
         }
@@ -2366,7 +2370,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     pub fn get(&self, id: u64) -> Option<&R> {
         record_point_read(self.read_set, &self.table_name, id);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.get(id)
+        self.table.get(&id)
     }
 
     /// Returns an iterator over records within the specified ID range.
@@ -2376,7 +2380,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_scans();
-        self.table.range(range)
+        self.table.range(range).map(|(&k, v)| (k, v))
     }
 
     /// Returns the number of records in the table.
@@ -2397,28 +2401,28 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     pub fn contains(&self, id: u64) -> bool {
         record_point_read(self.read_set, &self.table_name, id);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.contains(id)
+        self.table.contains(&id)
     }
 
     /// Returns the first (lowest ID) record, or `None` if empty.
     pub fn first(&self) -> Option<(u64, &R)> {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.first()
+        self.table.first().map(|(&k, v)| (k, v))
     }
 
     /// Returns the last (highest ID) record, or `None` if empty.
     pub fn last(&self) -> Option<(u64, &R)> {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.last()
+        self.table.last().map(|(&k, v)| (k, v))
     }
 
     /// Iterate over all records in ID order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_scans();
-        self.table.iter()
+        self.table.iter().map(|(&k, v)| (k, v))
     }
 
     /// Look up multiple records by ID.
@@ -2531,7 +2535,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// by [`Self::bulk_load`] to ingest rows with caller-supplied IDs.
     fn upsert(&mut self, id: u64, record: R) -> Result<()> {
         self.claim_intent(id)?;
-        let had_prior = self.table.contains(id);
+        let had_prior = self.table.contains(&id);
         #[cfg(feature = "persistence")]
         let data = if self.wal_ops.is_some() {
             Some(Self::serialize_record(&record)?)
@@ -2675,7 +2679,7 @@ impl<'tx, R: Record> TableReader<'tx, R> {
     /// Look up a record by its ID.
     pub fn get(&self, id: u64) -> Option<&R> {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.get(id)
+        self.table.get(&id)
     }
 
     /// Returns an iterator over records within the specified ID range.
@@ -2684,7 +2688,7 @@ impl<'tx, R: Record> TableReader<'tx, R> {
         range: impl std::ops::RangeBounds<u64> + 'a,
     ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
         self.table_metrics.inc_primary_key_scans();
-        self.table.range(range)
+        self.table.range(range).map(|(&k, v)| (k, v))
     }
 
     /// Returns the number of records in the table.
@@ -2702,25 +2706,25 @@ impl<'tx, R: Record> TableReader<'tx, R> {
     /// Returns true if the table contains a record with the given ID.
     pub fn contains(&self, id: u64) -> bool {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.contains(id)
+        self.table.contains(&id)
     }
 
     /// Returns the first (lowest ID) record, or `None` if empty.
     pub fn first(&self) -> Option<(u64, &R)> {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.first()
+        self.table.first().map(|(&k, v)| (k, v))
     }
 
     /// Returns the last (highest ID) record, or `None` if empty.
     pub fn last(&self) -> Option<(u64, &R)> {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.last()
+        self.table.last().map(|(&k, v)| (k, v))
     }
 
     /// Iterate over all records in ID order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
         self.table_metrics.inc_primary_key_scans();
-        self.table.iter()
+        self.table.iter().map(|(&k, v)| (k, v))
     }
 
     /// Look up multiple records by ID.
@@ -3389,7 +3393,13 @@ impl WriteTx {
                     // Drop handles active-writer cleanup on error
                     // (needs_cleanup still true). Table locks drop at
                     // end of scope.
-                    merged.merge_keys_from(&*my_dirty, keys)?;
+                    //
+                    // widened in task 6: `keys` is the `u64` write set, which
+                    // coerces to the erased `&dyn Any` the merge downcasts to
+                    // `&BTreeSet<K>`. Task 6 splits the write set into a hashed
+                    // conflict set plus a per-table exact `BTreeSet<K>` and
+                    // passes that instead.
+                    merged.merge_keys_from(&*my_dirty, keys as &dyn std::any::Any)?;
                     merged_tables.insert(name, Arc::from(merged));
                 }
                 (Some(_), _) => {
@@ -6559,7 +6569,7 @@ mod tests {
         use crate::table::Table;
         let store = Store::default();
         let v0 = store.latest_version();
-        let new_table: Table<String> = Table::from_bulk(vec![], 1, vec![]).unwrap();
+        let new_table: Table<String> = Table::from_bulk(vec![], Some(1), vec![]).unwrap();
 
         // Manually bump latest_version under the write lock to simulate a
         // concurrent commit that landed between Phase-3 build and install.

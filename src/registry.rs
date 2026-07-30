@@ -138,14 +138,14 @@ impl TableRegistry {
                         let (record, _): (R, _) =
                             bincode::serde::decode_from_slice(data, bincode::config::standard())
                                 .map_err(|e| Error::Persistence(e.to_string()))?;
-                        table.update(id, record)?;
+                        table.update(&id, record)?;
                         Ok(())
                     }),
                     replay_delete: Box::new(|table_any, id| {
                         let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
                             Error::TypeMismatch("replay_delete downcast failed".into())
                         })?;
-                        table.delete(id)?;
+                        table.delete(&id)?;
                         Ok(())
                     }),
                     build_from_raw_rows: Box::new(|raw_rows, existing| {
@@ -187,7 +187,11 @@ impl TableRegistry {
                             .map(|t| t.empty_index_defs())
                             .transpose()?
                             .unwrap_or_default();
-                        let table = Table::<R>::from_bulk(sorted, next_id, index_defs)?;
+                        // widened in task 4: `from_bulk` now takes an
+                        // `Option<K>` counter (`None` for explicitly-keyed
+                        // tables). This path is still `u64`-only, so the
+                        // counter is always `Some`.
+                        let table = Table::<R>::from_bulk(sorted, Some(next_id), index_defs)?;
                         Ok(Box::new(table))
                     }),
                 });
@@ -369,14 +373,14 @@ mod tests {
         let recovered = any.as_any().downcast_ref::<Table<TestUser>>().unwrap();
         assert_eq!(recovered.len(), 2);
         assert_eq!(
-            recovered.get(1).unwrap(),
+            recovered.get(&1).unwrap(),
             &TestUser {
                 name: "Alice".into(),
                 age: 30
             }
         );
         assert_eq!(
-            recovered.get(2).unwrap(),
+            recovered.get(&2).unwrap(),
             &TestUser {
                 name: "Bob".into(),
                 age: 25
@@ -484,7 +488,7 @@ mod tests {
             .downcast_ref::<Table<TestUser>>()
             .unwrap();
         assert_eq!(table.len(), 1);
-        assert_eq!(table.get(1).unwrap().name, "Alice");
+        assert_eq!(table.get(&1).unwrap().name, "Alice");
 
         // Replay update
         let updated = TestUser {
@@ -498,7 +502,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Table<TestUser>>()
             .unwrap();
-        assert_eq!(table.get(1).unwrap().name, "Alice Updated");
+        assert_eq!(table.get(&1).unwrap().name, "Alice Updated");
 
         // Replay delete
         (info.replay_delete)(table_box.as_any_mut(), 1).unwrap();
@@ -652,7 +656,7 @@ mod tests {
                 age: 2,
             })
             .unwrap();
-        table.delete(2).unwrap(); // next_id stays at 3
+        table.delete(&2).unwrap(); // next_id stays at 3
 
         let info = reg.get("users").unwrap();
         let bytes = (info.serialize_table)(&table).unwrap();

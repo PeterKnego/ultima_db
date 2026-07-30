@@ -321,14 +321,14 @@ mod tests {
             .unwrap();
         assert_eq!(table.len(), 2);
         assert_eq!(
-            table.get(1).unwrap(),
+            table.get(&1).unwrap(),
             &User {
                 name: "Alice".into(),
                 age: 30
             }
         );
         assert_eq!(
-            table.get(2).unwrap(),
+            table.get(&2).unwrap(),
             &User {
                 name: "Bob".into(),
                 age: 25
@@ -657,8 +657,8 @@ mod tests {
             .downcast_ref::<Table<Order>>()
             .unwrap();
         assert_eq!(orders.len(), 2);
-        assert_eq!(orders.get(1).unwrap().item, "Widget");
-        assert_eq!(orders.get(2).unwrap().qty, 3);
+        assert_eq!(orders.get(&1).unwrap().item, "Widget");
+        assert_eq!(orders.get(&2).unwrap().qty, 3);
     }
 
     #[test]

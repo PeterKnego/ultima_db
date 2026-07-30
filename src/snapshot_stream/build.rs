@@ -17,6 +17,7 @@ use super::codec::{
     FILE_FORMAT_V, FILE_MAGIC, FileHeader, IndexDef, TableHeader, encode_file_header,
     encode_table_header,
 };
+use crate::primary_key::PrimaryKey;
 use crate::registry::TableRegistry;
 use crate::store::Snapshot;
 
@@ -154,7 +155,16 @@ impl SnapshotReader {
                         type_id: 0,
                     })?;
 
-                let serialized_rows = table_arc.collect_serialized_rows(serialize_fn)?;
+                // widened in task 7: `collect_serialized_rows` now hands back
+                // order-preserving encoded key bytes, but the stream format
+                // still carries fixed 8-byte little-endian `u64` keys, so
+                // decode back to `u64` here. Task 7 makes the format
+                // key-generic and this adapter goes away.
+                let serialized_rows: Vec<(u64, Vec<u8>)> = table_arc
+                    .collect_serialized_rows(serialize_fn)?
+                    .into_iter()
+                    .map(|(key_bytes, val)| u64::decode(&key_bytes).map(|k| (k, val)))
+                    .collect::<crate::Result<Vec<_>>>()?;
 
                 // Build index definitions for the table header.
                 let index_list = table_arc.index_list();

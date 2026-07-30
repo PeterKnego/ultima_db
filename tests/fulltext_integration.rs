@@ -277,7 +277,7 @@ fn fulltext_skips_records_with_no_indexable_tokens() {
 
     // Deleting the all-punctuation row hits the empty-tokens early-return
     // in remove_doc and must leave search results stable.
-    table.delete(id_empty).unwrap();
+    table.delete(&id_empty).unwrap();
     let idx = table
         .custom_index::<FullTextIndex<Article>>("search")
         .unwrap();
