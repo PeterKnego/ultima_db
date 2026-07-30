@@ -2,9 +2,21 @@
 
 > **Follow-up:** the table-level OCC described below was superseded by
 > per-key OCC in [task19_key_level_occ.md](task19_key_level_occ.md). The
-> Send+Sync infrastructure, `WriteTx: !Send`, and the rebase-on-latest
-> commit path from this task are still current — only the conflict
-> granularity changed.
+> Send+Sync infrastructure and the rebase-on-latest commit path from this
+> task are still current — only the conflict granularity changed.
+>
+> **Superseded:** the `WriteTx: !Send` / `ReadTx: !Send` decision described
+> below was reversed by [task55_send_audit.md](task55_send_audit.md). The
+> audit found the `PhantomData<*const ()>` marker was a footgun guard, not a
+> correctness requirement — no thread affinity exists on the write path.
+> Both types are now `Send` (`WriteTx` stays `!Sync` via its `RefCell`s).
+> Every "`WriteTx` is `!Send + !Sync`" statement in this and other task docs
+> (task21, task23, task24, task54) should be read as "`!Sync`" — that is the
+> half the `RefCell` reasoning actually depends on. The one exception is
+> [task53](task53_version_pin_gc.md), whose motivation depends on the
+> `!Send` half specifically (`ReadTx` being `!Send` created the SMR handoff
+> race window `VersionPin` was built to close) — see the supersede note at
+> the top of that doc.
 
 ## Motivation
 
@@ -49,7 +61,7 @@ Trait objects that flow into snapshots picked up `+ Send + Sync`:
 
 All other supporting traits (`Record`, `IndexMaintainer`, `KeyExtractor`, `CustomIndex`, `FullTextIndex` extractor, registry closures) already required `Send + Sync`. The `R: Send + Sync + 'static` bound on `Table<R>` was also already in place.
 
-The module-level `#![allow(clippy::arc_with_non_send_sync)]` in `src/store.rs` is gone. A compile-time `const fn _assert_store_is_thread_safe()` enforces `Store: Send + Sync`.
+The module-level `#![allow(clippy::arc_with_non_send_sync)]` in `src/store.rs` is gone. A compile-time `const fn _assert_thread_bounds()` (named `_assert_store_is_thread_safe` at the time this task landed; renamed in task55) enforces `Store: Send + Sync`.
 
 ### `WriteTx` / `ReadTx` are `!Send`
 

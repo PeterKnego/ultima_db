@@ -1,5 +1,15 @@
 # Task 53: VersionPin API + O(evicted) snapshot GC
 
+> **Superseded (partially):** the motivation below rests on `ReadTx` being
+> `!Send`. That was reversed by [task55_send_audit.md](task55_send_audit.md):
+> `ReadTx` is now `Send + Sync`, so a `ReadTx` could be sent to a serializer
+> thread directly. `VersionPin` still earns its place for the reasons given in
+> task55's "Consequences" section — it is a bare `Arc<Snapshot>` handle with
+> no table-map access or metrics registration, it is `Clone`, and it makes "I
+> am holding this version alive" explicit at the call site rather than a side
+> effect of holding a read view. The O(evicted) `gc()` change below is
+> unaffected by the reversal.
+
 ## Motivation
 
 An external benchmark (hi-perf-cmp smr-collections, 2026-07-27, rev b48295e)
