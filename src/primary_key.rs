@@ -34,6 +34,19 @@ pub trait PrimaryKey: Ord + Clone + Send + Sync + 'static {
         self.encode().hash(&mut h);
         h.finish()
     }
+
+    /// Advance an auto-increment counter past `self`, if this key type has
+    /// one. Default: no-op — only [`AutoKey`] types maintain a counter.
+    ///
+    /// [`Table::put`](crate::table::Table::put) calls this after writing an
+    /// explicit key so that a later
+    /// [`Table::insert`](crate::table::Table::insert) on the same table
+    /// cannot hand out an id that is already occupied.
+    fn advance_auto_counter(&self, _counter: &mut Option<Self>)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 /// A primary key the table can assign automatically. Implemented only for
@@ -58,20 +71,29 @@ fn malformed_escape() -> Error {
     Error::InvalidBulkLoadInput("primary key decode: malformed escape sequence".to_string())
 }
 
+/// The `ENCODED_LEN`/`encode`/`decode` trio shared by every unsigned integer
+/// key. Split out of `impl_unsigned_key!` so `u64` — the one `AutoKey` type —
+/// can spell its own impl block and add `advance_auto_counter` to it.
+macro_rules! unsigned_key_body {
+    ($t:ty) => {
+        const ENCODED_LEN: Option<usize> = Some(std::mem::size_of::<$t>());
+        fn encode(&self) -> Vec<u8> {
+            self.to_be_bytes().to_vec()
+        }
+        fn decode(bytes: &[u8]) -> Result<Self> {
+            const N: usize = std::mem::size_of::<$t>();
+            let arr: [u8; N] = bytes
+                .try_into()
+                .map_err(|_| truncated(N, bytes.len()))?;
+            Ok(<$t>::from_be_bytes(arr))
+        }
+    };
+}
+
 macro_rules! impl_unsigned_key {
     ($($t:ty),*) => {$(
         impl PrimaryKey for $t {
-            const ENCODED_LEN: Option<usize> = Some(std::mem::size_of::<$t>());
-            fn encode(&self) -> Vec<u8> {
-                self.to_be_bytes().to_vec()
-            }
-            fn decode(bytes: &[u8]) -> Result<Self> {
-                const N: usize = std::mem::size_of::<$t>();
-                let arr: [u8; N] = bytes
-                    .try_into()
-                    .map_err(|_| truncated(N, bytes.len()))?;
-                Ok(<$t>::from_be_bytes(arr))
-            }
+            unsigned_key_body!($t);
         }
     )*};
 }
@@ -97,7 +119,23 @@ macro_rules! impl_signed_key {
     )*};
 }
 
-impl_unsigned_key!(u8, u16, u32, u64, u128);
+impl_unsigned_key!(u8, u16, u32, u128);
+
+impl PrimaryKey for u64 {
+    unsigned_key_body!(u64);
+
+    /// `u64` is the only [`AutoKey`], so it is the only key type that carries
+    /// a counter to advance. Writing an explicit key at or past the counter
+    /// pushes it one beyond, which is what keeps `put`-then-`insert` from
+    /// colliding. A key of `u64::MAX` clears the counter (there is no next
+    /// id); the `AutoKey` methods panic on a cleared counter rather than
+    /// reissue an occupied id.
+    fn advance_auto_counter(&self, counter: &mut Option<Self>) {
+        if counter.as_ref().is_none_or(|n| self >= n) {
+            *counter = self.checked_add(1);
+        }
+    }
+}
 impl_signed_key!(i8 => u8, i16 => u16, i32 => u32, i64 => u64, i128 => u128);
 
 impl PrimaryKey for String {
@@ -380,6 +418,35 @@ mod tests {
     fn hash64_is_stable_and_differs_across_values() {
         assert_eq!(1u64.hash64(), 1u64.hash64());
         assert_ne!(1u64.hash64(), 2u64.hash64());
+    }
+
+    #[test]
+    fn advance_auto_counter_moves_only_for_u64() {
+        // `u64` is the one `AutoKey`: an explicitly written key installs the
+        // counter and pushes it one past the key.
+        let mut c: Option<u64> = None;
+        7u64.advance_auto_counter(&mut c);
+        assert_eq!(c, Some(8));
+        // A key below the counter leaves it alone.
+        3u64.advance_auto_counter(&mut c);
+        assert_eq!(c, Some(8));
+        // A key *at* the counter moves it past — this is the collision the
+        // guard exists for.
+        8u64.advance_auto_counter(&mut c);
+        assert_eq!(c, Some(9));
+        // No next id at the top of the range: the counter is cleared, and the
+        // `AutoKey` methods panic rather than reissue an occupied id.
+        u64::MAX.advance_auto_counter(&mut c);
+        assert_eq!(c, None);
+
+        // No other key type maintains a counter — the default is a no-op, so
+        // an explicitly-keyed table never grows one.
+        let mut c32: Option<u32> = None;
+        7u32.advance_auto_counter(&mut c32);
+        assert_eq!(c32, None);
+        let mut cs: Option<String> = None;
+        "k".to_string().advance_auto_counter(&mut cs);
+        assert_eq!(cs, None);
     }
 
     #[test]

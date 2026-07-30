@@ -283,7 +283,10 @@ fn serialize_table<R: Record>(table: &Table<R>) -> Result<Vec<u8>> {
 
     // entries: id + record
     for (id, record) in table.iter() {
-        bincode::encode_into_std_write(id, &mut buf, config)
+        // `*id`, not `id`: `Table::iter` yields `&u64` now, and bincode's
+        // blanket `Encode for &T` would silently accept the reference. This
+        // is a wire-format site — encode the value explicitly.
+        bincode::encode_into_std_write(*id, &mut buf, config)
             .map_err(|e| Error::Persistence(e.to_string()))?;
         bincode::serde::encode_into_std_write(record, &mut buf, config)
             .map_err(|e| Error::Persistence(e.to_string()))?;

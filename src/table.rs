@@ -216,10 +216,23 @@ impl<R: 'static, K> TableOpener<R> for TableDef<R, K> {
 /// else are built with [`Table::new_keyed`] and written with [`Table::put`].
 pub struct Table<R, K = u64> {
     data: BTree<K, R>,
-    /// `Some` only for `AutoKey` tables; `None` for explicitly-keyed ones.
-    /// `insert`'s `AutoKey` block may unwrap it: `new()` is the only
-    /// constructor reachable under an `AutoKey` bound and it always sets
-    /// `Some`.
+    /// The auto-increment counter: `Some` for a table built with
+    /// [`Table::new`], `None` for an explicitly-keyed one built with
+    /// [`Table::new_keyed`].
+    ///
+    /// `None` is reachable under an `AutoKey` bound. `u64` is both `AutoKey`
+    /// and `PrimaryKey`, so `Table::<R, u64>::new_keyed()` compiles from safe
+    /// public code and produces a `u64` table with no counter. The `AutoKey`
+    /// methods therefore *unwrap* and panic on `None` rather than assume:
+    /// silently starting the counter at 1 would hand out ids colliding with
+    /// rows a `put` already placed at 1.., which is worse than a panic. See
+    /// the `# Panics` sections on [`Table::insert`], [`Table::insert_batch`]
+    /// and [`Table::next_id`].
+    ///
+    /// Writing a key through [`Table::put`] (or the internal `upsert_arc`)
+    /// installs/advances the counter past that key via
+    /// [`PrimaryKey::advance_auto_counter`], so a `u64` table created with
+    /// `new_keyed` does support `insert` once it has been written to.
     next_id: Option<K>,
     indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, K>>>,
 }
@@ -299,9 +312,13 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// type — this is how explicitly-keyed tables are written.
     ///
     /// Secondary indexes are maintained (routing to the insert or the update
-    /// path depending on whether a record already exists at `key`). On an
-    /// auto-increment table `put` does **not** advance the id counter; use
-    /// [`Table::insert_with_id`] there if later `insert`s must not collide.
+    /// path depending on whether a record already exists at `key`).
+    ///
+    /// On an auto-increment table this also advances the id counter past
+    /// `key` (see [`PrimaryKey::advance_auto_counter`]), so a following
+    /// [`Table::insert`] cannot reissue the id just written. Unlike
+    /// [`Table::insert_with_id`], `put` replaces an existing row instead of
+    /// returning [`Error::DuplicateKey`].
     pub fn put(&mut self, key: K, record: R) -> Result<()> {
         self.upsert_arc(key, Arc::new(record))
     }
@@ -345,8 +362,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
 
     /// Insert-or-replace at an explicit key, reusing an existing `Arc<R>`.
     /// Maintains secondary indexes (routing to `on_insert` or `on_update`
-    /// depending on whether a prior record exists at the key). Does NOT
-    /// bump `next_id`. Used at commit by the per-key merge path.
+    /// depending on whether a prior record exists at the key), and advances
+    /// the auto-increment counter past the key on `AutoKey` tables so a later
+    /// `insert` cannot reissue it. Used at commit by the per-key merge path.
     pub(crate) fn upsert_arc(&mut self, key: K, arc: Arc<R>) -> Result<()> {
         let prior = self.data.get_arc(&key);
         let new_ref: &R = &arc;
@@ -385,6 +403,10 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             }
         }
 
+        // Keep the auto-increment counter (if this key type has one) past any
+        // explicitly written key, so a later `insert` cannot reissue an id a
+        // `put`/`upsert` already occupies. No-op for every non-`AutoKey` key.
+        key.advance_auto_counter(&mut self.next_id);
         self.data.insert_arc_mut(key, arc);
         Ok(())
     }
@@ -764,9 +786,16 @@ impl<R: Record, K: AutoKey> Table<R, K> {
 
     /// Insert a record. Returns the auto-assigned ID, or an error if a unique
     /// index constraint is violated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the table has no id counter — i.e. it was built with
+    /// [`Table::new_keyed`] and no key has been written through
+    /// [`Table::put`] yet (`u64` satisfies both `PrimaryKey` and `AutoKey`,
+    /// so that combination is reachable). Panicking beats inventing a counter
+    /// that would collide with keys `put` may already have placed. Also
+    /// panics on id overflow.
     pub fn insert(&mut self, record: R) -> Result<K> {
-        // `next_id` is always `Some` here: `new()` is the only constructor
-        // reachable under an `AutoKey` bound.
         let id = self.next_id.clone().expect("AutoKey table has next_id");
         let next = id.next();
         assert!(next.is_some(), "Table ID overflow");
@@ -803,6 +832,11 @@ impl<R: Record, K: AutoKey> Table<R, K> {
     ///
     /// Index updates are deferred until all records are inserted into the
     /// data tree, then applied in one pass per index.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`Table::insert`]: no id counter (see [`Table::new_keyed`]) or
+    /// id overflow.
     ///
     /// # Examples
     ///
@@ -880,6 +914,11 @@ impl<R: Record, K: AutoKey> Table<R, K> {
     }
 
     /// Returns the next auto-increment ID (the ID that the next `insert` will assign).
+    ///
+    /// # Panics
+    ///
+    /// Same as [`Table::insert`]: panics if the table has no id counter (see
+    /// [`Table::new_keyed`]).
     pub fn next_id(&self) -> K {
         self.next_id.clone().expect("AutoKey table has next_id")
     }
@@ -1055,6 +1094,72 @@ mod tests {
         assert_eq!(auto.next_id_opt(), Some(1));
     }
 
+    // --- `put`/`insert` id-counter interaction (review Important 2) ---
+
+    #[test]
+    fn put_then_insert_does_not_collide() {
+        // `put` at the id `insert` was about to hand out must not let the
+        // next `insert` overwrite the put row.
+        let mut t: Table<String> = Table::new();
+        t.put(1, "put-value".to_string()).unwrap();
+        let id = t.insert("insert-value".to_string()).unwrap();
+
+        assert_eq!(id, 2, "insert must not reissue the key `put` occupied");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.get(&1), Some(&"put-value".to_string()));
+        assert_eq!(t.get(&2), Some(&"insert-value".to_string()));
+    }
+
+    #[test]
+    fn put_at_a_high_key_moves_the_counter_past_it() {
+        let mut t: Table<String> = Table::new();
+        t.insert("a".to_string()).unwrap(); // id 1
+        t.put(500, "far".to_string()).unwrap();
+        assert_eq!(t.next_id(), 501);
+        assert_eq!(t.insert("b".to_string()).unwrap(), 501);
+
+        // A put *below* the counter leaves it alone.
+        t.put(2, "low".to_string()).unwrap();
+        assert_eq!(t.next_id(), 502);
+        assert_eq!(t.insert("c".to_string()).unwrap(), 502);
+        assert_eq!(t.len(), 5);
+    }
+
+    #[test]
+    fn put_on_a_keyed_u64_table_installs_the_counter() {
+        // `Table::<R, u64>::new_keyed()` starts with no counter; writing a
+        // key installs one past that key, so `insert` then works.
+        let mut t: Table<String, u64> = Table::new_keyed();
+        assert_eq!(t.next_id_opt(), None);
+        t.put(7, "seven".to_string()).unwrap();
+        assert_eq!(t.next_id_opt(), Some(8));
+        assert_eq!(t.insert("eight".to_string()).unwrap(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "AutoKey table has next_id")]
+    fn insert_on_an_unwritten_keyed_u64_table_panics() {
+        // `u64` is both `PrimaryKey` and `AutoKey`, so `new_keyed` is
+        // reachable for it and leaves no counter. Handing out id 1 here could
+        // silently overwrite a row a later `put` places at 1 — panic instead.
+        let mut t: Table<String, u64> = Table::new_keyed();
+        let _ = t.insert("boom".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "AutoKey table has next_id")]
+    fn insert_batch_on_an_unwritten_keyed_u64_table_panics() {
+        let mut t: Table<String, u64> = Table::new_keyed();
+        let _ = t.insert_batch(vec!["boom".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "AutoKey table has next_id")]
+    fn next_id_on_an_unwritten_keyed_u64_table_panics() {
+        let t: Table<String, u64> = Table::new_keyed();
+        let _ = t.next_id();
+    }
+
     #[test]
     fn keyed_table_maintains_secondary_indexes() {
         // Index maintenance has to route through the row key type, not `u64`.
@@ -1075,6 +1180,67 @@ mod tests {
 
         t.delete(&"alice@x.com".to_string()).unwrap();
         assert_eq!(t.get_unique("by_name", &"Alice".to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn keyed_table_index_key_differs_from_row_key() {
+        // IK = u32 (age), K = String (email). With `IK == K` a swapped
+        // `UniqueStorage<K, IK>` / `NonUniqueStorage<K, IK>` argument pair
+        // would still typecheck *and* pass; here it cannot.
+        let mut t: Table<User, String> = Table::new_keyed();
+        t.define_index("by_age", IndexKind::NonUnique, |u: &User| u.age)
+            .unwrap();
+        t.define_index("by_name", IndexKind::Unique, |u: &User| u.name.clone())
+            .unwrap();
+
+        for (email, age, name) in [
+            ("a@x.com", 30u32, "Ann"),
+            ("b@x.com", 30, "Bob"),
+            ("c@x.com", 41, "Cat"),
+        ] {
+            t.put(
+                email.to_string(),
+                User {
+                    email: email.to_string(),
+                    age,
+                    name: name.to_string(),
+                },
+            )
+            .unwrap();
+        }
+
+        // Non-unique u32 index key -> String row keys, in row-key order.
+        let thirty: Vec<String> = t
+            .get_by_index("by_age", &30u32)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(thirty, vec!["a@x.com".to_string(), "b@x.com".to_string()]);
+
+        // Unique String index key -> String row key (different value space).
+        let (row_key, rec) = t.get_unique("by_name", &"Cat".to_string()).unwrap().unwrap();
+        assert_eq!(row_key, "c@x.com".to_string());
+        assert_eq!(rec.age, 41);
+
+        // Range over the u32 index key.
+        let older: Vec<String> = t
+            .index_range("by_age", 31u32..)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(older, vec!["c@x.com".to_string()]);
+
+        // Deleting by row key cleans the u32-keyed index.
+        t.delete(&"a@x.com".to_string()).unwrap();
+        let thirty: Vec<String> = t
+            .get_by_index("by_age", &30u32)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(thirty, vec!["b@x.com".to_string()]);
     }
 
     #[test]

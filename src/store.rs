@@ -4056,6 +4056,31 @@ mod tests {
 
     // --- WriteTx tests ---
 
+    /// `TableWriter::upsert` (reachable from safe code through the in-tx
+    /// `bulk_load`) writes caller-supplied ids. The id counter must move past
+    /// them, or a following `insert` in the same transaction silently
+    /// overwrites an upserted row. (Task 3 review, Important 2.)
+    #[test]
+    fn write_tx_upsert_advances_the_id_counter() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            let rows: Vec<(u64, String)> = vec![(1, "one".to_string()), (2, "two".to_string())];
+            t.bulk_load(crate::bulk_load::BulkLoadInput::Replace(
+                crate::bulk_load::BulkSource::sorted_vec(rows),
+            ))
+            .unwrap();
+
+            let id = t.insert("next".to_string()).unwrap();
+            assert_eq!(id, 3, "insert must not reissue an upserted id");
+            assert_eq!(t.len(), 3);
+            assert_eq!(t.get(1), Some(&"one".to_string()));
+            assert_eq!(t.get(3), Some(&"next".to_string()));
+        }
+        wtx.commit().unwrap();
+    }
+
     #[test]
     fn write_tx_open_new_table_creates_empty() {
         let store = Store::default();
