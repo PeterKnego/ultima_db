@@ -142,7 +142,7 @@ The work is in the layers that assumed `u64`:
 **Unchanged:** the B-tree, MVCC, the commit protocol, SSI, and the snapshot
 streaming wire structure (its ordering is already "sorted by key").
 
-**Version impact:** 0.2.0, breaking, on account of the WAL format.
+**Version impact:** 0.3.0, breaking, on account of the WAL format.
 
 ### 2b. `Send` transactions — an audit, not a promised feature
 
@@ -178,20 +178,39 @@ either a one-line change or a paragraph of documentation.
 
 ### Release
 
-**Ship 0.1.2 first, ahead of the key work.** Fifty-three commits including two
-new public APIs and the FixedVec/fanout change are unreleased. It is small,
-self-contained, and has an existing checklist from the 0.1.0 release; it must
-not queue behind a multi-week API change.
+**Ship the pending release first, ahead of the key work.** Fifty-three commits
+including two new public APIs and the FixedVec/fanout change are unreleased. It
+is small, self-contained, and has an existing checklist from the 0.1.0 release;
+it must not queue behind a multi-week API change.
 
-Keys then land as **0.2.0**, breaking, with the WAL format bump.
+**It is 0.2.0, not 0.1.2.** `Error::DuplicateTableOpen` was added to `pub enum
+Error`, which is not `#[non_exhaustive]` — task44 sealed every other public
+config enum and missed this one. Adding a variant to an exhaustive public enum
+breaks downstream exhaustive `match`es, so a patch number would be a semver
+violation. **`Error` gains `#[non_exhaustive]` in this same release**: it is a
+break either way, so this is the last time it ever is, and arbitrary primary
+keys will need new error variants.
 
-**0.1.2 is a quiet release, not the public moment.** No announcement, no
+Everything else since `v0.1.1` is purely additive (`pin_version`, `VersionPin`,
+`open_tables2/3`, the `fanout-t8` feature; `TableWriter`'s changed fields are
+all private).
+
+**`ultima-vector` is republished at 0.2.0 too**, despite having no source
+changes since `v0.1.1`. For `0.x` versions cargo reads `^0.1.0` as `>=0.1.0,
+<0.2.0`, so the published vector 0.1.0 would pin consumers to `ultima-db` 0.1.x
+and conflict with 0.2.0. Its manifest's dependency requirement moves to
+`version = "0.2.0"` and it ships as a version-only release. (This is a
+consequence of choosing a minor bump; it would not have applied to a patch.)
+
+Keys then land as **0.3.0**, breaking, with the WAL format bump.
+
+**0.2.0 is a quiet release, not the public moment.** No announcement, no
 positioning push — a crates.io publish only, so that anyone who stumbles on the
 crate gets the current engine rather than July's. Its release notes must state
-that an on-disk format break is coming in 0.2.0.
+that an on-disk format break is coming in 0.3.0.
 
-**The public moment is 0.2.0**, after the format break has landed. Going public
-on 0.1.x would recruit exactly the early adopters the break would then burn, and
+**The public moment is 0.3.0**, after the format break has landed. Going public
+earlier would recruit exactly the early adopters the break would then burn, and
 a rebuild-your-data notice is a bad first impression to trade for feedback from
 a handful of readers.
 
@@ -215,8 +234,9 @@ The smallest set that does the job:
 
 ## 4. Sequence
 
-1. **Release 0.1.2, quietly.** Days, near-zero risk, existing checklist. No
-   announcement; release notes flag the coming format break.
+1. **Release 0.2.0, quietly.** Days, near-zero risk, existing checklist. Seals
+   `Error` with `#[non_exhaustive]`. No announcement; release notes flag the
+   coming format break.
 2. **`Send` audit.** One day, independent. Deliberately placed *before* the key
    work: if the audit finds the marker removable only via an API change, that
    change belongs in the same breaking release as the WAL break rather than
@@ -227,7 +247,7 @@ The smallest set that does the job:
 4. **Documentation pass**, written once against the final API: README
    restructure, `lib.rs` crate docs, `examples/time_travel.rs`,
    `examples/durable_store.rs`, `docs/guide.md`.
-5. **Release 0.2.0 and go public.**
+5. **Release 0.3.0 and go public.**
 
 ### Plan decomposition
 
@@ -238,7 +258,7 @@ its own plan; step 4 is planned once step 3 has settled the API it documents.
 
 ### Accepted trade-off
 
-Nothing reaches an audience until 0.2.0, so **the key design gets no external
+Nothing reaches an audience until 0.3.0, so **the key design gets no external
 validation before it is built.** If arbitrary primary keys turn out not to be
 what users actually want, weeks are spent before anyone says so.
 
