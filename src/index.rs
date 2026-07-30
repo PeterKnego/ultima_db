@@ -353,26 +353,15 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
         &'a self,
         range: impl std::ops::RangeBounds<IK> + 'a,
     ) -> impl Iterator<Item = (&'a IK, K)> + 'a {
-        use std::cmp::Ordering;
-        use std::ops::Bound;
         let start = range.start_bound().cloned();
         let end = range.end_bound().cloned();
-        // Monotone: `(ik, _)` sorts by `ik` first, and a bound comparison on
-        // `ik` is itself monotone — an entire `ik` group is classified alike,
-        // so `Excluded` drops the whole group rather than part of it.
+        // Monotone: `(ik, _)` sorts by `ik` first, and `classify` on `ik` is
+        // itself monotone — an entire `ik` group is classified alike, so
+        // `Excluded` drops the whole group rather than part of it. Shares
+        // `classify` with `BTree::range`'s own bound handling so the two
+        // cannot drift apart.
         self.tree
-            .range_by(move |(ik, _): &(IK, K)| {
-                match &start {
-                    Bound::Included(s) if ik < s => return Ordering::Less,
-                    Bound::Excluded(s) if ik <= s => return Ordering::Less,
-                    _ => {}
-                }
-                match &end {
-                    Bound::Included(e) if ik > e => Ordering::Greater,
-                    Bound::Excluded(e) if ik >= e => Ordering::Greater,
-                    _ => Ordering::Equal,
-                }
-            })
+            .range_by(move |(ik, _): &(IK, K)| crate::btree::classify(&start, &end, ik))
             .map(|((ik, id), _)| (ik, id.clone()))
     }
 }
@@ -653,7 +642,7 @@ mod tests {
             email: "charlie@example.com".to_string(),
             age: 25,
         };
-        idx.on_insert(1, &u1).unwrap();
+        idx.on_insert(1u64, &u1).unwrap();
         idx.on_insert(2, &u2).unwrap();
         idx.on_insert(3, &u3).unwrap();
         let ids_30: Vec<u64> = idx.storage().get_ids(&30).collect();
@@ -677,7 +666,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &old).unwrap();
+        idx.on_insert(1u64, &old).unwrap();
         let new = User {
             email: "alice@example.com".to_string(),
             age: 31,
@@ -705,7 +694,7 @@ mod tests {
             email: "bob@example.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &u1).unwrap();
+        idx.on_insert(1u64, &u1).unwrap();
         idx.on_insert(2, &u2).unwrap();
         idx.on_delete(1, &u1);
         let ids_30: Vec<u64> = idx.storage().get_ids(&30).collect();

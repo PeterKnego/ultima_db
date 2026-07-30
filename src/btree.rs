@@ -544,7 +544,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Iterate over every entry the monotone `locate` predicate reports as
     /// [`Ordering::Equal`], in ascending key order.
     ///
-    /// # Safety contract
+    /// # Contract
     ///
     /// `locate` **must be monotone with respect to key order**: `Less` for
     /// every key before the range, `Equal` for every key inside it, `Greater`
@@ -619,9 +619,15 @@ impl<K: Ord + Clone, V> Default for BTree<K, V> {
 // Range iterator
 // ---------------------------------------------------------------------------
 
-/// Describes where a key sits relative to the range being scanned: `Less`
-/// before it, `Equal` inside it, `Greater` after it. Monotone with respect to
-/// key order (see [`BTree::range_by`]).
+/// Describes where a key sits relative to the range being scanned: before it,
+/// inside it, or after it. Monotone with respect to key order (see
+/// [`BTree::range_by`]).
+///
+/// Queried through two *directional* predicates rather than one merged
+/// three-way classification, because the descent and the per-item checks each
+/// only ever care about one side. Merging them would cost a second key
+/// comparison per yielded item, and would turn an `Unbounded` side from zero
+/// comparisons into one.
 ///
 /// The `RangeBounds` case is a concrete variant rather than just another
 /// boxed closure so that [`BTree::range`] — every index lookup and table scan
@@ -633,23 +639,66 @@ enum Locator<'a, K> {
     Pred(Box<dyn Fn(&K) -> Ordering + Send + Sync + 'a>),
 }
 
+/// Is `x` before the range's start bound? One key comparison, or none when
+/// the bound is `Unbounded`.
+#[inline]
+fn before_start<T: Ord>(start: &Bound<T>, x: &T) -> bool {
+    match start {
+        Bound::Unbounded => false,
+        Bound::Included(s) => x < s,
+        Bound::Excluded(s) => x <= s,
+    }
+}
+
+/// Is `x` past the range's end bound? One key comparison, or none when the
+/// bound is `Unbounded`.
+#[inline]
+fn after_end<T: Ord>(end: &Bound<T>, x: &T) -> bool {
+    match end {
+        Bound::Unbounded => false,
+        Bound::Included(e) => x > e,
+        Bound::Excluded(e) => x >= e,
+    }
+}
+
+/// Classify `x` against a `Bound` pair: `Less` before the range, `Equal`
+/// inside, `Greater` after. Monotone in `x` by construction, so it is a valid
+/// [`BTree::range_by`] locator — see `NonUniqueStorage::range_ids`, which
+/// applies it to one half of a composite key.
+///
+/// Callers that only need one side must use [`before_start`] / [`after_end`]
+/// directly: this evaluates *both* bounds, and the iteration path is walked
+/// once per yielded item.
+#[inline]
+pub(crate) fn classify<T: Ord>(start: &Bound<T>, end: &Bound<T>, x: &T) -> Ordering {
+    if before_start(start, x) {
+        Ordering::Less
+    } else if after_end(end, x) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
 impl<K: Ord> Locator<'_, K> {
+    /// Is `key` before the range? For `Bounds` this consults the *start* bound
+    /// only — the whole point of keeping the two directions separate, since
+    /// merging them would cost a second key comparison on every yielded item
+    /// (and turn an `Unbounded` side from zero comparisons into one).
     #[inline]
-    fn locate(&self, key: &K) -> Ordering {
+    fn is_before_start(&self, key: &K) -> bool {
         match self {
-            Locator::Bounds(start, end) => {
-                match start {
-                    Bound::Included(s) if key < s => return Ordering::Less,
-                    Bound::Excluded(s) if key <= s => return Ordering::Less,
-                    _ => {}
-                }
-                match end {
-                    Bound::Included(e) if key > e => Ordering::Greater,
-                    Bound::Excluded(e) if key >= e => Ordering::Greater,
-                    _ => Ordering::Equal,
-                }
-            }
-            Locator::Pred(f) => f(key),
+            Locator::Bounds(start, _) => before_start(start, key),
+            Locator::Pred(f) => f(key) == Ordering::Less,
+        }
+    }
+
+    /// Is `key` past the range? For `Bounds` this consults the *end* bound only.
+    #[inline]
+    fn is_after_end(&self, key: &K) -> bool {
+        match self {
+            Locator::Bounds(_, end) => after_end(end, key),
+            Locator::Pred(f) => f(key) == Ordering::Greater,
         }
     }
 }
@@ -682,7 +731,7 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
         let entry_start = {
             let locate = &self.locate;
             n.entries
-                .partition_point(|(ek, _)| locate.locate(ek) == Ordering::Less)
+                .partition_point(|(ek, _)| locate.is_before_start(ek))
         };
         self.stack.push((n, entry_start));
         if !n.children.is_empty() && entry_start < n.children.len() {
@@ -700,7 +749,7 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     fn in_end_bound(&self, key: &K) -> bool {
-        self.locate.locate(key) != Ordering::Greater
+        !self.locate.is_after_end(key)
     }
 
     /// Push back_stack frames for the rightmost path that is not past the range.
@@ -710,7 +759,7 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
         let entry_end = {
             let locate = &self.locate;
             n.entries
-                .partition_point(|(ek, _)| locate.locate(ek) != Ordering::Greater)
+                .partition_point(|(ek, _)| !locate.is_after_end(ek))
         };
         self.back_stack.push((n, entry_end));
         if !n.children.is_empty() && entry_end < n.children.len() {
@@ -728,7 +777,7 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     fn in_start_bound(&self, key: &K) -> bool {
-        self.locate.locate(key) != Ordering::Less
+        !self.locate.is_before_start(key)
     }
 }
 
