@@ -49,6 +49,7 @@ pub mod metrics;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 pub mod persistence;
+pub mod primary_key;
 #[cfg(feature = "persistence")]
 pub(crate) mod registry;
 pub mod snapshot_stream;
@@ -81,6 +82,7 @@ pub use index::{CustomIndex, IndexKind};
 pub use intents::CommitWaiter;
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
 pub use persistence::{Durability, Persistence, Record, WalWrite};
+pub use primary_key::{AutoKey, PrimaryKey};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;
 pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};
