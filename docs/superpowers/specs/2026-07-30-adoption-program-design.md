@@ -185,6 +185,16 @@ not queue behind a multi-week API change.
 
 Keys then land as **0.2.0**, breaking, with the WAL format bump.
 
+**0.1.2 is a quiet release, not the public moment.** No announcement, no
+positioning push — a crates.io publish only, so that anyone who stumbles on the
+crate gets the current engine rather than July's. Its release notes must state
+that an on-disk format break is coming in 0.2.0.
+
+**The public moment is 0.2.0**, after the format break has landed. Going public
+on 0.1.x would recruit exactly the early adopters the break would then burn, and
+a rebuild-your-data notice is a bad first impression to trade for feedback from
+a handful of readers.
+
 ### Documentation deliverables
 
 The smallest set that does the job:
@@ -205,33 +215,39 @@ The smallest set that does the job:
 
 ## 4. Sequence
 
-1. **Release 0.1.2.** Days, near-zero risk, existing checklist.
-2. **Positioning pass** — README, `lib.rs` crate docs, `examples/time_travel.rs`,
-   `examples/durable_store.rs`. Cheap, and the step most likely to produce
-   feedback before weeks are committed to the key work.
-3. **`Send` audit.** One day, independent, and its outcome determines what the
-   guide can say about async.
-4. **`Table<R, K = u64>`** → 0.2.0. Internal order: `PrimaryKey` trait +
-   generic `Table` → indexes → `bulk_load`/`snapshot_stream` → WAL/checkpoint
+1. **Release 0.1.2, quietly.** Days, near-zero risk, existing checklist. No
+   announcement; release notes flag the coming format break.
+2. **`Send` audit.** One day, independent. Deliberately placed *before* the key
+   work: if the audit finds the marker removable only via an API change, that
+   change belongs in the same breaking release as the WAL break rather than
+   forcing a second one later.
+3. **`Table<R, K = u64>`.** The large piece. Internal order: `PrimaryKey` trait
+   + generic `Table` → indexes → `bulk_load`/`snapshot_stream` → WAL/checkpoint
    format bump → migration note.
-5. **`docs/guide.md`**, written against the 0.2.0 API so it is not written
-   twice.
+4. **Documentation pass**, written once against the final API: README
+   restructure, `lib.rs` crate docs, `examples/time_travel.rs`,
+   `examples/durable_store.rs`, `docs/guide.md`.
+5. **Release 0.2.0 and go public.**
 
 ### Plan decomposition
 
 This spec covers a program, not a single change. **Each numbered step gets its
-own implementation plan**, written when that step starts rather than up front —
-steps 4 and 5 in particular should be planned only after step 2 has had a
-chance to produce feedback. Steps 1–3 are small and independent enough to be
-planned together.
+own implementation plan**, written when that step starts rather than up front.
+Steps 1–2 are small and independent enough to be planned together; step 3 gets
+its own plan; step 4 is planned once step 3 has settled the API it documents.
 
 ### Accepted trade-off
 
-The WAL format break in step 4 lands *after* 0.1.2 has been announced in step
-2. Any early adopter with persisted data will have to rebuild it. Pre-1.0 with
-a documented break, this is acceptable; the alternative — keys first, silence
-until 0.2.0 — trades feedback for tidiness. **The 0.1.2 release notes must say
-that an on-disk format break is coming in 0.2.0.**
+Nothing reaches an audience until 0.2.0, so **the key design gets no external
+validation before it is built.** If arbitrary primary keys turn out not to be
+what users actually want, weeks are spent before anyone says so.
+
+This is accepted knowingly. The mitigation is that the design is not
+speculative: every alternative in the target slot (redb, sled, fjall) is an
+arbitrary-key store, so the gap is established by competitive analysis rather
+than guessed at. The countervailing cost — recruiting early adopters onto a
+storage format that is about to break, then telling them to rebuild — is a
+worse first impression than a delay nobody observes.
 
 ---
 
