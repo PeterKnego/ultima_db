@@ -265,6 +265,11 @@ Verification run: `cargo test`, `cargo test --features persistence`,
 Docs updated for the reversal: `docs/ARCHITECTURE.md` (the `ReadTx`/`WriteTx`
 struct listings, the writer-modes thread-safety paragraph, and the trade-off
 table row), `docs/isolation-levels.md`, `CLAUDE.md`, and a "superseded" banner
-on [task18](task18_concurrent_writes.md). Task docs 21, 23, and 24 still say
-"`!Send + !Sync`" in passing; they are historical records, and in every case
-the reasoning depends only on the `!Sync` half, which is unchanged.
+on [task18](task18_concurrent_writes.md). Task docs 21, 23, 24, and 54 still
+say "`!Send + !Sync`" in passing; they are historical records, and in each of
+those cases the reasoning depends only on the `!Sync` half, which is
+unchanged. [task53](task53_version_pin_gc.md) is the exception: its
+motivation depends on the `!Send` half specifically — `ReadTx` being `!Send`
+is what created the SMR snapshot-handoff race window `VersionPin` was built
+to close — so it carries its own supersede note rather than being folded into
+the "`!Sync`-only" group above.

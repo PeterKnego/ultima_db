@@ -86,8 +86,9 @@ Set aside 2026-07-30. Correctness and robustness work for a stable release.
 - **YCSB workloads D/E** grow the dataset across iterations, so absolute
   numbers drift between runs. Cross-engine comparisons stay fair (all engines
   see the same drift). Fix only if absolute D/E numbers are ever published.
-- **Post-restore `current_version()`** is 1 where it was previously 2. Matters
-  only if a caller resumes writes into a restored store.
+- **`hi-perf-cmp`** (sibling repo): post-restore `UltimaBook::current_version()`
+  is 1 where it was previously 2. Matters only if a caller resumes writes into
+  a restored store.
 - **`hi-perf-cmp`** (sibling repo): no `apply_batch <= warmup` validation, so a
   large-batch sweep silently runs zero warmup batches — fix before any
   `SMRC_APPLY_BATCH` sweep. Empty-book (hwm=0) restore is untested.

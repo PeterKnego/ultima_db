@@ -19,6 +19,7 @@ include = [
     "examples/**",
     "tests/**",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE",
     "!examples/profile_commit.rs",

@@ -6,7 +6,8 @@
 //! YCSB-style benchmarks for multi-writer OCC, using real OS threads.
 //!
 //! `Store: Send + Sync`, so each thread holds a clone and opens its own
-//! `WriteTx` locally. `WriteTx` itself is `!Send` and never crosses a thread.
+//! `WriteTx` locally. `WriteTx` is `Send` (though `!Sync`) but never crosses
+//! a thread in this bench.
 //! Includes Ultima-specific scenarios (baseline, no-contention) plus the
 //! shared multi-writer suite via `MultiWriterEngine`.
 
