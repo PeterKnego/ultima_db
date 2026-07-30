@@ -107,9 +107,35 @@ where UltimaDB is not merely *different* from the alternatives but *harder to
 model in*.
 
 **The defaulted type parameter is the core of the design.** `Table<R, K = u64>`
-and `TableDef<R, K = u64>` leave every existing call site
-(`open_table::<User>("users")`, `Table<R>`, `TableDef<R>`) compiling unchanged.
-`BTree<K, V>` is already generic, so the storage layer needs nothing.
+and `TableDef<R, K = u64>` leave every existing *type* reference (`Table<R>`,
+`TableDef<R>`) compiling unchanged. `BTree<K, V>` is already generic, so the
+storage layer needs nothing.
+
+> **Amended 2026-07-30, after the implementation plan was grounded in the
+> code.** Two claims in the original draft of this section were wrong. Both
+> corrections are additive — the user-facing feature and the version impact are
+> unchanged — and the plan at
+> `docs/superpowers/plans/2026-07-30-arbitrary-primary-keys.md` is authoritative
+> on the details.
+>
+> 1. **Turbofish call sites do NOT survive.** This section originally listed
+>    `open_table::<User>("users")` as compiling unchanged. It would not: Rust
+>    has no default type parameters on *functions*, and supplying a prefix of a
+>    function's type arguments is a hard error (`E0107`, verified with a probe).
+>    So `open_table`, `register_table`, and `open_tables2`/`open_tables3` **keep
+>    their exact current signatures and stay `u64`-only**, and non-`u64` keys go
+>    through new additive `open_table_keyed<R, K>` / `register_table_keyed<R, K>`
+>    / `bulk_load_keyed<R, K>` entry points. No existing call site changes.
+> 2. **`dyn MergeableTable` cannot be parameterized over `K`.** A `Snapshot`
+>    holds `HashMap<String, Arc<dyn MergeableTable>>` with heterogeneous key
+>    types, so `K` must not appear in the trait's signature. Its two `u64`-typed
+>    methods are reworked instead: `merge_keys_from` takes the key set as
+>    `&dyn Any` (a `&BTreeSet<K>` the impl downcasts), and
+>    `collect_serialized_rows` returns `Vec<(Vec<u8>, Vec<u8>)>` — encoded key
+>    bytes. A consequence is that the write set splits in two (see the OCC
+>    bullet below). This also means `src/registry.rs`, the type-erasure
+>    boundary, is the real center of gravity for this change rather than
+>    `src/table.rs`.
 
 The work is in the layers that assumed `u64`:
 
@@ -128,12 +154,20 @@ The work is in the layers that assumed `u64`:
   key. A hash collision produces a *spurious* conflict, never a missed one, so
   the detector stays sound and the entire OCC / intents / SSI path is
   untouched. This is the largest cost avoidance in the design, and the
-  false-conflict behavior must be documented.
+  false-conflict behavior must be documented. **Amended:** because hashes are
+  lossy, the commit *merge* cannot use them — it needs exact keys to replay. So
+  each `DirtyEntry` additionally carries the writer's `BTreeSet<K>`,
+  type-erased as `Box<dyn Any + Send + Sync>`. Two structures, each with one
+  job: digests for cross-table conflict detection, exact keys for the merge.
 - **WAL/checkpoint format.** `WalOp::{Insert, Update, Delete}` carry encoded
   key bytes instead of `id: u64`. This is a format break. Bump the format
   version and have recovery reject older files with an actionable error rather
-  than carrying a v1 compatibility branch — at 0.1.x, pre-1.0, a clean break
-  costs less than the branch.
+  than carrying a v1 compatibility branch — pre-1.0, a clean break costs less
+  than the branch. **Amended:** the checkpoint side of this break lives in
+  `src/registry.rs`'s `serialize_table`/`deserialize_table`, whose v1 layout
+  (`[next_id: u64][count: u64][id: u64, record_bytes]*`) assumes a fixed-width
+  key. Format v2 adds explicit key lengths and makes `next_id` optional, since
+  an explicitly-keyed table has no id counter.
 - **Indexes.** `UniqueStorage`'s `BTree<IK, u64>` becomes `BTree<IK, K>`;
   `NonUniqueStorage`'s composite `(IK, u64)` becomes `(IK, K)`. Mechanical, but
   it reaches `rebuild_from_sorted_data` and therefore `bulk_load` and
