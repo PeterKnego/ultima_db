@@ -2,9 +2,17 @@
 
 > **Follow-up:** the table-level OCC described below was superseded by
 > per-key OCC in [task19_key_level_occ.md](task19_key_level_occ.md). The
-> Send+Sync infrastructure, `WriteTx: !Send`, and the rebase-on-latest
-> commit path from this task are still current — only the conflict
-> granularity changed.
+> Send+Sync infrastructure and the rebase-on-latest commit path from this
+> task are still current — only the conflict granularity changed.
+>
+> **Superseded:** the `WriteTx: !Send` / `ReadTx: !Send` decision described
+> below was reversed by [task55_send_audit.md](task55_send_audit.md). The
+> audit found the `PhantomData<*const ()>` marker was a footgun guard, not a
+> correctness requirement — no thread affinity exists on the write path.
+> Both types are now `Send` (`WriteTx` stays `!Sync` via its `RefCell`s).
+> Every "`WriteTx` is `!Send + !Sync`" statement in this and other task docs
+> (task21, task23, task24) should be read as "`!Sync`" — that is the half
+> the `RefCell` reasoning actually depends on.
 
 ## Motivation
 

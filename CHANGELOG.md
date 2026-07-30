@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `ReadTx` is now `Send + Sync` and `WriteTx` is now `Send` (still `!Sync`).
+  The `PhantomData<*const ()>` marker that pinned both to their creating
+  thread was removed after an audit found no thread affinity anywhere on the
+  read or write path — it was a footgun guard, not a correctness requirement.
+  A transaction can now be moved between threads and held across an `.await`.
+  Additive, so no downstream code breaks. Two caveats the compiler no longer
+  enforces: an open `WriteTx` holds the SingleWriter slot (or its MultiWriter
+  intents), and `commit()` blocks — on an async runtime it belongs in
+  `spawn_blocking`. See `docs/tasks/task55_send_audit.md`.
+
 ## 0.2.0 — 2026-07-30
 
 **Heads-up: an on-disk format break is coming in 0.3.0.** Arbitrary primary

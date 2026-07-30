@@ -96,7 +96,7 @@ struct ReadSetEntry {
 }
 ```
 
-The `RefCell` is required because `WriteTx`'s read methods on `TableWriter` take `&self`, but tracking mutates the read set. `WriteTx` is `!Send + !Sync`, so no `Mutex` is needed.
+The `RefCell` is required because `WriteTx`'s read methods on `TableWriter` take `&self`, but tracking mutates the read set. `WriteTx` is `!Sync`, so no `Mutex` is needed.
 
 ### Two granularities of tracking
 

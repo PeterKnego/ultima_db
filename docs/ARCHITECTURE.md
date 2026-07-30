@@ -245,7 +245,6 @@ The downcast to `Table<R>` happens at `open_table` time, returning `Error::TypeM
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
     metrics: Arc<StoreMetrics>,
-    _not_send: PhantomData<*const ()>,  // pinned to creating thread
 }
 ```
 
@@ -274,8 +273,8 @@ pub struct WriteTx {
     table_locks: Option<Arc<DashMap<String, Arc<Mutex<()>>>>>,
     isolation_level: IsolationLevel,
     read_set: Option<RefCell<BTreeMap<String, ReadSetEntry>>>,  // Serializable + MultiWriter only
+    ddl_tables: RefCell<BTreeSet<String>>,       // task41
     // ... persistence-feature fields: wal_ops, wal_enabled
-    _not_send: PhantomData<*const ()>,
 }
 ```
 
@@ -329,7 +328,9 @@ See [isolation-levels.md](isolation-levels.md) for a detailed treatment of:
 - **`SingleWriter`** (default): at most one active `WriteTx` at a time. `begin_write` returns `Error::WriterBusy` if another is already active. No OCC tracking overhead.
 - **`MultiWriter`**: multiple concurrent `WriteTx` allowed. Key-level OCC: two writers conflict only if their modified rows overlap on the same table. Disjoint rows in the same table both commit; the second commit's per-key merge pulls only its edited keys onto the current latest snapshot via the `MergeableTable` trait. Fast path: if no concurrent writer touched a given dirty table, install it wholesale (single Arc swap). See [task19_key_level_occ.md](tasks/task19_key_level_occ.md).
 
-`Store`, `ReadTx`, and `Snapshot` are all `Send + Sync`, so the `Store` handle can be cloned across threads. `WriteTx` and `ReadTx` are deliberately `!Send` (via `PhantomData<*const ()>`) — a transaction must be opened and committed on the same thread. The intended pattern is: clone the `Store` into each thread, and call `begin_write`/`begin_read` locally.
+`Store`, `Snapshot`, `VersionPin`, and `ReadTx` are all `Send + Sync`, so the `Store` handle can be cloned across threads. `WriteTx` is `Send` but `!Sync` — it can be *moved* between threads (including held across an `.await`), but never used from two threads at once; the `RefCell`-backed write/read/DDL sets are what make it `!Sync`. No store bookkeeping is keyed by thread, so a transaction opened on one thread can be committed on another. The audit establishing this is [task55](tasks/task55_send_audit.md), and `tests/send_bounds.rs` asserts the bounds.
+
+The intended pattern is still: clone the `Store` into each thread, and call `begin_write`/`begin_read` locally. Moving a transaction across threads is *allowed*, but an open `WriteTx` holds the SingleWriter slot (or its MultiWriter intents), and `commit` blocks — so on an async runtime it belongs in `spawn_blocking`.
 
 ---
 
@@ -414,7 +415,7 @@ This gives users a semantically clear import path (`use ultima_db::WriteTx` or `
 | `Arc<BTreeNode<R>>` for children | `Box<BTreeNode<R>>` | Structural sharing — unchanged subtrees are shared across versions |
 | `Arc<dyn MergeableTable>` in Snapshot | `Box<dyn MergeableTable>` | Must be cloneable (O(1) per table at commit time); `Box` is not `Clone`. `MergeableTable: Any + Send + Sync` so existing downcasts still work via `.as_any()` |
 | `Box<dyn MergeableTable>` in WriteTx dirty | `Arc<dyn MergeableTable>` | Need `&mut` access for table mutations; `Box` provides `downcast_mut` through `.as_any_mut()` |
-| `WriteTx` / `ReadTx` are `!Send` via `PhantomData<*const ()>` | Make them `Send` | A transaction is not designed to split work across threads; pinning to the creating thread prevents a footgun. Clone `Store` across threads instead |
+| `WriteTx` / `ReadTx` are `Send` (`WriteTx` is `!Sync` via its `RefCell`s) | Keep the `PhantomData<*const ()>` `!Send` marker | The marker was a footgun guard, not a correctness requirement: no thread-local, thread-id-keyed, or non-`Send` state exists on the write path, so it only cost async users the ability to hold a transaction across an `.await`. See [task55](tasks/task55_send_audit.md) |
 | Key-level OCC in MultiWriter mode | Table-level OCC | Fewer spurious conflicts on same-table disjoint-key writes. Cost: commit clones latest table + replays writer's keys via `upsert_arc` (index-preserving). Fast-path wholesale install when no concurrent writer touched the table keeps single-writer commits cheap |
 | `WriteTx::commit` rebases onto latest + per-key merge | Whole-table swap from dirty | Preserves non-conflicting concurrent commits in the final snapshot. Merge uses Arc-level record sharing (no `R: Clone` bound) via `BTree::insert_arc` |
 | Auto-assigned commit version bumped to `latest + 1` | Keep pre-assigned version | Pre-assigned versions can land out of commit order under MultiWriter; rebase chain would lose updates. SMR explicit versions are left alone |

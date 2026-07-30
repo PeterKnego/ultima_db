@@ -2,7 +2,6 @@
 // Copyright 2026 Peter Knego
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use parking_lot::{ArcMutexGuard, Condvar, Mutex, RwLock};
@@ -566,11 +565,7 @@ impl Store {
             .ok_or(Error::VersionNotFound(v))?
             .clone();
         let metrics = Arc::clone(&inner.metrics);
-        Ok(ReadTx {
-            snapshot,
-            metrics,
-            _not_send: PhantomData,
-        })
+        Ok(ReadTx { snapshot, metrics })
     }
 
     /// Pin `version` (latest if `None`) so [`Store::gc`] — including
@@ -726,7 +721,6 @@ impl Store {
                 _ => None,
             },
             isolation_level,
-            _not_send: PhantomData,
         })
     }
 
@@ -1840,14 +1834,14 @@ impl std::fmt::Debug for VersionPin {
 /// that keeps that version alive in memory even after the store advances to
 /// newer versions.
 ///
-/// See also [`VersionPin`] for a `Send`-able handle that keeps a version
-/// alive across threads without holding a `ReadTx`.
+/// `ReadTx` is `Send + Sync`: it can be moved to another thread or shared by
+/// reference, and it keeps its version alive from wherever it is held. See
+/// [`VersionPin`] for a lighter handle that pins a version without holding a
+/// whole read view, and `docs/tasks/task55_send_audit.md` for the audit
+/// behind these bounds (`tests/send_bounds.rs` asserts them).
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
     metrics: Arc<StoreMetrics>,
-    /// Pins `ReadTx` to its creating thread. Users who need a read view on
-    /// another thread should call `store.begin_read(Some(version))` there.
-    _not_send: PhantomData<*const ()>,
 }
 
 /// Read-only access to a snapshot.
@@ -1941,6 +1935,25 @@ struct DirtyEntry {
 /// A write transaction.  Tables are lazily copied from the base snapshot on
 /// first access (O(1) per table via BTree root `Arc` clone).  Changes are
 /// not visible to any `ReadTx` until [`WriteTx::commit`] is called.
+///
+/// `WriteTx` is `Send` but `!Sync` (the `RefCell` fields below): it can be
+/// moved to another thread — including held across an `.await` in an async
+/// task — but never used from two threads at once. Moving it does not move
+/// any of the store's bookkeeping, which is keyed by writer id, not by
+/// thread.
+///
+/// Two hazards survive the type system and are on you, not the compiler:
+/// an open `WriteTx` holds the single-writer slot in
+/// [`WriterMode::SingleWriter`] (every other `begin_write` gets
+/// [`Error::WriterBusy`]) and holds its intents in
+/// [`WriterMode::MultiWriter`], so parking one on a `.await` for a long time
+/// stalls other writers. And [`WriteTx::commit`] blocks — on locks, on the
+/// promotion gate, and on the WAL fsync under `Durability::Consistent` — so
+/// in an async runtime it belongs in `spawn_blocking`, not on a worker
+/// thread.
+///
+/// See `docs/tasks/task55_send_audit.md`; `tests/send_bounds.rs` asserts the
+/// bounds.
 pub struct WriteTx {
     base: Arc<Snapshot>,
     /// Mutable working copies of tables opened for writing, with their
@@ -1965,7 +1978,8 @@ pub struct WriteTx {
     /// with `IndexDdlConflict` if any of these tables saw a concurrent
     /// commit since our base (task41). `RefCell` for the same reason as
     /// `read_set`: recorded through a shared reference held by
-    /// `TableWriter`; `WriteTx` is `!Send + !Sync`.
+    /// `TableWriter`; `WriteTx` is `!Sync` (this field is one of the reasons
+    /// why), so the `borrow_mut` can never race.
     ddl_tables: std::cell::RefCell<BTreeSet<String>>,
     /// Tables ever deleted during this tx (not cleared on re-open).
     /// Used for conflict detection in MultiWriter mode.
@@ -1993,8 +2007,9 @@ pub struct WriteTx {
     #[cfg(feature = "persistence")]
     /// `RefCell` (not `&mut`) so several concurrently-held `TableWriter`s from
     /// one `open_tables*` call can each push through a shared reference — the
-    /// same pattern `read_set` and `ddl_tables` use. `WriteTx` is
-    /// `!Send + !Sync`, so the `borrow_mut` on each push never contends.
+    /// same pattern `read_set` and `ddl_tables` use. `WriteTx` is `!Sync`
+    /// (this field is one of the reasons why), so the `borrow_mut` on each
+    /// push never contends.
     pub(crate) wal_ops: std::cell::RefCell<Vec<crate::wal::WalOp>>,
     /// Whether WAL tracking is active (true only when a WAL handle exists).
     #[cfg(feature = "persistence")]
@@ -2008,11 +2023,6 @@ pub struct WriteTx {
     /// Cached isolation level — copied from the store config at `begin_write`
     /// so the commit path doesn't re-read the config under a lock.
     isolation_level: IsolationLevel,
-    /// Pins `WriteTx` to its creating thread. A transaction must complete on
-    /// the thread that opened it — the write-set tracking is not designed to
-    /// be split across threads. Users who want concurrent writers should
-    /// `store.clone()` and call `begin_write` on each thread.
-    _not_send: PhantomData<*const ()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3829,15 +3839,21 @@ impl Drop for WriteTx {
 // Unit tests
 // ---------------------------------------------------------------------------
 
-// Compile-time assertion: `Store` is thread-safe. `WriteTx` and `ReadTx` are
-// deliberately `!Send` via `PhantomData<*const ()>` so a transaction stays on
-// its creating thread; that's verified by a trybuild-style negative test in
-// `tests/store_integration.rs`.
+// Compile-time assertions for this module's thread-safety contract. The
+// public-API mirror lives in `tests/send_bounds.rs`; the reasoning behind
+// the transaction bounds is in `docs/tasks/task55_send_audit.md`.
+//
+// `WriteTx` is `Send` (movable between threads) but `!Sync` (the `RefCell`
+// fields) — adding a thread-affine field to either transaction type, such as
+// a `parking_lot` guard or an `Rc`, will fail this assertion.
 #[cfg(test)]
 #[allow(dead_code)]
-const fn _assert_store_is_thread_safe() {
+const fn _assert_thread_bounds() {
     const fn send_sync<T: Send + Sync>() {}
+    const fn send<T: Send>() {}
     send_sync::<Store>();
+    send_sync::<ReadTx>();
+    send::<WriteTx>();
 }
 
 #[cfg(test)]
