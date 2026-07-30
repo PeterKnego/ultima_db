@@ -4,7 +4,7 @@ exclude = ["formal/kernel"]
 
 [package]
 name = "ultima-db"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "High-performance transactional embedded database"
