@@ -1405,7 +1405,7 @@ impl Store {
             inner.snapshots[&inner.latest_version].clone()
         };
 
-        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R>>> =
+        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R, u64>>> =
             if let Some(existing) = base_snapshot.tables.get(name) {
                 let typed = existing
                     .as_any()

@@ -6,15 +6,16 @@ use std::sync::Arc;
 
 use crate::btree::BTree;
 use crate::persistence::Record;
+use crate::primary_key::PrimaryKey;
 use crate::{Error, Result};
 
 /// Whether an index enforces uniqueness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
-    /// Rejects a second record with the same key; backed by `BTree<K, u64>`.
+    /// Rejects a second record with the same key; backed by `BTree<IK, K>`.
     Unique,
     /// Allows multiple records to share a key; backed by
-    /// `BTree<(K, u64), ()>` (id folded into the key for multi-value storage).
+    /// `BTree<(IK, K), ()>` (row key folded into the key for multi-value storage).
     NonUnique,
     /// User-supplied index implementing [`CustomIndex`] (e.g. full-text);
     /// storage shape is opaque to the generic maintainer.
@@ -25,79 +26,79 @@ pub enum IndexKind {
 // IndexMaintainer trait — object-safe interface for type-erased indexes
 // ---------------------------------------------------------------------------
 
-pub(crate) trait IndexMaintainer<R>: Send + Sync {
+pub(crate) trait IndexMaintainer<R, K: PrimaryKey>: Send + Sync {
     /// Called when a record is inserted into the table.
-    fn on_insert(&mut self, id: u64, record: &R) -> Result<()>;
+    fn on_insert(&mut self, key: K, record: &R) -> Result<()>;
     /// Called when a record in the table is updated.
-    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()>;
+    fn on_update(&mut self, key: K, old: &R, new: &R) -> Result<()>;
     /// Called when a record is deleted from the table.
-    fn on_delete(&mut self, id: u64, record: &R);
+    fn on_delete(&mut self, key: K, record: &R);
     /// Returns the kind of this index (Unique or NonUnique).
     fn kind(&self) -> IndexKind;
     /// Returns the name of this index.
     fn name(&self) -> &str;
     /// Returns a boxed clone of this index maintainer.
-    fn clone_box(&self) -> Box<dyn IndexMaintainer<R>>;
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R, K>>;
     /// Clone the index *definition* (extractor, name, kind, storage shape)
     /// with empty storage. Used by bulk-load to rebuild the index against
     /// freshly-loaded data via [`rebuild_from_sorted_data`]. The returned
     /// box must be ready to receive a full backfill. Custom indexes have no
     /// generic "make empty" hook and return `Err` — bulk loads over them
     /// are rejected rather than silently dropping the index.
-    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R>>>;
+    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, K>>>;
     /// Returns a reference to the underlying index as `Any`.
     fn as_any(&self) -> &dyn Any;
 
     /// Rebuild the index from a fully-built data tree using a sorted
     /// bottom-up build. Default impl falls back to per-row `on_insert`
     /// over an in-order walk; concrete implementations override for speed.
-    fn rebuild_from_sorted_data(&mut self, data: &BTree<u64, R>) -> Result<()> {
-        for (&id, record) in data.range(..) {
-            self.on_insert(id, record)?;
+    fn rebuild_from_sorted_data(&mut self, data: &BTree<K, R>) -> Result<()> {
+        for (key, record) in data.range(..) {
+            self.on_insert(key.clone(), record)?;
         }
         Ok(())
     }
 }
 
-/// Extracts an index key of type `K` from a record of type `R`. Implemented
-/// generically for any `Fn(&R) -> K + Send + Sync`, so a plain closure
+/// Extracts an index key of type `IK` from a record of type `R`. Implemented
+/// generically for any `Fn(&R) -> IK + Send + Sync`, so a plain closure
 /// passed to `define_index` satisfies this trait.
-pub trait KeyExtractor<R, K>: Send + Sync {
+pub trait KeyExtractor<R, IK>: Send + Sync {
     /// Computes the index key for `record`.
-    fn extract(&self, record: &R) -> K;
+    fn extract(&self, record: &R) -> IK;
 }
 
-impl<R, K, F> KeyExtractor<R, K> for F
+impl<R, IK, F> KeyExtractor<R, IK> for F
 where
-    F: Fn(&R) -> K + Send + Sync,
+    F: Fn(&R) -> IK + Send + Sync,
 {
-    fn extract(&self, record: &R) -> K {
+    fn extract(&self, record: &R) -> IK {
         self(record)
     }
 }
 
-pub(crate) trait IndexStorage<K>: Send + Sync {
-    fn insert(&mut self, key: K, id: u64, name: &str) -> Result<()>;
-    fn delete(&mut self, key: K, id: u64);
+pub(crate) trait IndexStorage<IK, K>: Send + Sync {
+    fn insert(&mut self, key: IK, row_key: K, name: &str) -> Result<()>;
+    fn delete(&mut self, key: IK, row_key: K);
 }
 
-pub(crate) struct ManagedIndex<R, K, S> {
-    extractor: Arc<dyn KeyExtractor<R, K>>,
+pub(crate) struct ManagedIndex<R, IK, S> {
+    extractor: Arc<dyn KeyExtractor<R, IK>>,
     storage: S,
     name: String,
     kind: IndexKind,
 }
 
-impl<R, K, S> ManagedIndex<R, K, S>
+impl<R, IK, S> ManagedIndex<R, IK, S>
 where
-    K: Ord + Clone + 'static,
-    S: IndexStorage<K> + 'static,
+    IK: Ord + Clone + 'static,
+    S: 'static,
     R: 'static,
 {
     pub fn new(
         name: String,
         kind: IndexKind,
-        extractor: Arc<dyn KeyExtractor<R, K>>,
+        extractor: Arc<dyn KeyExtractor<R, IK>>,
         storage: S,
     ) -> Self {
         Self {
@@ -113,31 +114,32 @@ where
     }
 }
 
-impl<R, K> IndexMaintainer<R> for ManagedIndex<R, K, UniqueStorage<K>>
+impl<R, IK, K> IndexMaintainer<R, K> for ManagedIndex<R, IK, UniqueStorage<IK, K>>
 where
-    K: Ord + Clone + Send + Sync + 'static,
+    IK: Ord + Clone + Send + Sync + 'static,
+    K: PrimaryKey,
     R: Record,
 {
-    fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
-        let key = self.extractor.extract(record);
-        self.storage.insert(key, id, &self.name)
+    fn on_insert(&mut self, key: K, record: &R) -> Result<()> {
+        let idx_key = self.extractor.extract(record);
+        self.storage.insert(idx_key, key, &self.name)
     }
 
-    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()> {
+    fn on_update(&mut self, key: K, old: &R, new: &R) -> Result<()> {
         let old_key = self.extractor.extract(old);
         let new_key = self.extractor.extract(new);
         if old_key != new_key {
             // Insert new key first — if it fails (e.g. unique constraint),
             // old_key is still intact and no rollback is needed.
-            self.storage.insert(new_key, id, &self.name)?;
-            self.storage.delete(old_key, id);
+            self.storage.insert(new_key, key.clone(), &self.name)?;
+            self.storage.delete(old_key, key);
         }
         Ok(())
     }
 
-    fn on_delete(&mut self, id: u64, record: &R) {
-        let key = self.extractor.extract(record);
-        self.storage.delete(key, id);
+    fn on_delete(&mut self, key: K, record: &R) {
+        let idx_key = self.extractor.extract(record);
+        self.storage.delete(idx_key, key);
     }
 
     fn kind(&self) -> IndexKind {
@@ -148,7 +150,7 @@ where
         &self.name
     }
 
-    fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R, K>> {
         Box::new(Self {
             extractor: Arc::clone(&self.extractor),
             storage: self.storage.clone(),
@@ -157,10 +159,10 @@ where
         })
     }
 
-    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R>>> {
+    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, K>>> {
         Ok(Box::new(Self {
             extractor: Arc::clone(&self.extractor),
-            storage: UniqueStorage::<K>::new(),
+            storage: UniqueStorage::<IK, K>::new(),
             name: self.name.clone(),
             kind: self.kind,
         }))
@@ -170,11 +172,11 @@ where
         self
     }
 
-    fn rebuild_from_sorted_data(&mut self, data: &BTree<u64, R>) -> Result<()> {
-        // 1. Extract (key, id) pairs in data order.
-        let mut pairs: Vec<(K, u64)> = data
+    fn rebuild_from_sorted_data(&mut self, data: &BTree<K, R>) -> Result<()> {
+        // 1. Extract (index key, row key) pairs in data order.
+        let mut pairs: Vec<(IK, K)> = data
             .range(..)
-            .map(|(&id, rec)| (self.extractor.extract(rec), id))
+            .map(|(key, rec)| (self.extractor.extract(rec), key.clone()))
             .collect();
         // 2. Sort by key. Detect collisions for unique storage.
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -184,38 +186,39 @@ where
             }
         }
         // 3. Bulk-build the index B-tree.
-        let arc_pairs = pairs.into_iter().map(|(k, id)| (k, Arc::new(id)));
-        let new_tree: BTree<K, u64> = BTree::from_sorted(arc_pairs);
+        let arc_pairs = pairs.into_iter().map(|(ik, key)| (ik, Arc::new(key)));
+        let new_tree: BTree<IK, K> = BTree::from_sorted(arc_pairs);
         self.storage = UniqueStorage::from_btree(new_tree);
         Ok(())
     }
 }
 
-impl<R, K> IndexMaintainer<R> for ManagedIndex<R, K, NonUniqueStorage<K>>
+impl<R, IK, K> IndexMaintainer<R, K> for ManagedIndex<R, IK, NonUniqueStorage<IK, K>>
 where
-    K: Ord + Clone + Send + Sync + 'static,
+    IK: Ord + Clone + Send + Sync + 'static,
+    K: PrimaryKey,
     R: Record,
 {
-    fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
-        let key = self.extractor.extract(record);
-        self.storage.insert(key, id, &self.name)
+    fn on_insert(&mut self, key: K, record: &R) -> Result<()> {
+        let idx_key = self.extractor.extract(record);
+        self.storage.insert(idx_key, key, &self.name)
     }
 
-    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()> {
+    fn on_update(&mut self, key: K, old: &R, new: &R) -> Result<()> {
         let old_key = self.extractor.extract(old);
         let new_key = self.extractor.extract(new);
         if old_key != new_key {
             // Insert new key first — if it fails (e.g. unique constraint),
             // old_key is still intact and no rollback is needed.
-            self.storage.insert(new_key, id, &self.name)?;
-            self.storage.delete(old_key, id);
+            self.storage.insert(new_key, key.clone(), &self.name)?;
+            self.storage.delete(old_key, key);
         }
         Ok(())
     }
 
-    fn on_delete(&mut self, id: u64, record: &R) {
-        let key = self.extractor.extract(record);
-        self.storage.delete(key, id);
+    fn on_delete(&mut self, key: K, record: &R) {
+        let idx_key = self.extractor.extract(record);
+        self.storage.delete(idx_key, key);
     }
 
     fn kind(&self) -> IndexKind {
@@ -226,7 +229,7 @@ where
         &self.name
     }
 
-    fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R, K>> {
         Box::new(Self {
             extractor: Arc::clone(&self.extractor),
             storage: self.storage.clone(),
@@ -235,10 +238,10 @@ where
         })
     }
 
-    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R>>> {
+    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, K>>> {
         Ok(Box::new(Self {
             extractor: Arc::clone(&self.extractor),
-            storage: NonUniqueStorage::<K>::new(),
+            storage: NonUniqueStorage::<IK, K>::new(),
             name: self.name.clone(),
             kind: self.kind,
         }))
@@ -248,62 +251,70 @@ where
         self
     }
 
-    fn rebuild_from_sorted_data(&mut self, data: &BTree<u64, R>) -> Result<()> {
-        // (key, id) is already strictly ordered when sorted because id is unique.
-        let mut pairs: Vec<((K, u64), ())> = data
+    fn rebuild_from_sorted_data(&mut self, data: &BTree<K, R>) -> Result<()> {
+        // (index key, row key) is already strictly ordered when sorted
+        // because the row key is unique.
+        let mut pairs: Vec<((IK, RowBound<K>), ())> = data
             .range(..)
-            .map(|(&id, rec)| ((self.extractor.extract(rec), id), ()))
+            .map(|(key, rec)| {
+                (
+                    (self.extractor.extract(rec), RowBound::Row(key.clone())),
+                    (),
+                )
+            })
             .collect();
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let arc_pairs = pairs.into_iter().map(|(k, _)| (k, Arc::new(())));
-        let new_tree: BTree<(K, u64), ()> = BTree::from_sorted(arc_pairs);
+        let new_tree: BTree<(IK, RowBound<K>), ()> = BTree::from_sorted(arc_pairs);
         self.storage = NonUniqueStorage::from_btree(new_tree);
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// UniqueStorage — maps K -> u64 (one primary ID per key)
+// UniqueStorage — maps IK -> K (one primary key per index key)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub(crate) struct UniqueStorage<K: Ord + Clone> {
-    tree: BTree<K, u64>,
+pub(crate) struct UniqueStorage<IK: Ord + Clone, K: PrimaryKey> {
+    tree: BTree<IK, K>,
 }
 
-impl<K: Ord + Clone + 'static> UniqueStorage<K> {
+impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
     /// Creates a new, empty unique index storage.
     pub fn new() -> Self {
         Self { tree: BTree::new() }
     }
 
     /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
-    pub(crate) fn from_btree(tree: BTree<K, u64>) -> Self {
+    pub(crate) fn from_btree(tree: BTree<IK, K>) -> Self {
         Self { tree }
     }
 
-    pub fn get(&self, key: &K) -> Option<u64> {
-        self.tree.get(key).copied()
+    pub fn get(&self, key: &IK) -> Option<K> {
+        self.tree.get(key).cloned()
     }
 
     pub fn range_ids<'a>(
         &'a self,
-        range: impl std::ops::RangeBounds<K> + 'a,
-    ) -> impl Iterator<Item = (&'a K, u64)> + 'a {
-        self.tree.range(range).map(|(k, v)| (k, *v))
+        range: impl std::ops::RangeBounds<IK> + 'a,
+    ) -> impl Iterator<Item = (&'a IK, K)> + 'a {
+        self.tree.range(range).map(|(k, v)| (k, v.clone()))
     }
 }
 
-impl<K: Ord + Clone + Send + Sync + 'static> IndexStorage<K> for UniqueStorage<K> {
-    fn insert(&mut self, key: K, id: u64, name: &str) -> Result<()> {
+impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> IndexStorage<IK, K>
+    for UniqueStorage<IK, K>
+{
+    fn insert(&mut self, key: IK, row_key: K, name: &str) -> Result<()> {
         if self.tree.get(&key).is_some() {
             return Err(Error::DuplicateKey(name.to_string()));
         }
-        self.tree = self.tree.insert(key, id);
+        self.tree = self.tree.insert(key, row_key);
         Ok(())
     }
 
-    fn delete(&mut self, key: K, _id: u64) {
+    fn delete(&mut self, key: IK, _row_key: K) {
         match self.tree.remove(&key) {
             Ok(new_tree) => self.tree = new_tree,
             Err(_) => debug_assert!(false, "UniqueStorage::delete called for absent key"),
@@ -312,61 +323,83 @@ impl<K: Ord + Clone + Send + Sync + 'static> IndexStorage<K> for UniqueStorage<K
 }
 
 // ---------------------------------------------------------------------------
-// NonUniqueStorage — maps (K, u64) -> () (composite key for multi-value)
+// NonUniqueStorage — maps (IK, K) -> () (composite key for multi-value)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-pub(crate) struct NonUniqueStorage<K: Ord + Clone> {
-    tree: BTree<(K, u64), ()>,
+/// Sentinel wrapper for the row-key half of `NonUniqueStorage`'s composite
+/// tree key. Real entries always wrap `Row(k)`; `NegInf`/`PosInf` exist only
+/// as synthetic range endpoints, so a group of rows sharing an index key can
+/// be scanned in O(log n + k) without requiring a min/max bound on the
+/// arbitrary row-key type `K` (`PrimaryKey` guarantees `Ord`, not a bounded
+/// range). `#[derive(Ord)]` on an enum orders by declaration order, so
+/// `NegInf < Row(_) < PosInf` falls out for free.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RowBound<K> {
+    NegInf,
+    Row(K),
+    PosInf,
 }
 
-impl<K: Ord + Clone + 'static> NonUniqueStorage<K> {
+#[derive(Clone)]
+pub(crate) struct NonUniqueStorage<IK: Ord + Clone, K: PrimaryKey> {
+    tree: BTree<(IK, RowBound<K>), ()>,
+}
+
+impl<IK: Ord + Clone + 'static, K: PrimaryKey> NonUniqueStorage<IK, K> {
     /// Creates a new, empty non-unique index storage.
     pub fn new() -> Self {
         Self { tree: BTree::new() }
     }
 
     /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
-    pub(crate) fn from_btree(tree: BTree<(K, u64), ()>) -> Self {
+    pub(crate) fn from_btree(tree: BTree<(IK, RowBound<K>), ()>) -> Self {
         Self { tree }
     }
 
-    pub fn get_ids(&self, key: &K) -> impl Iterator<Item = u64> + '_ {
+    pub fn get_ids(&self, key: &IK) -> impl Iterator<Item = K> + '_ {
         self.tree
-            .range((key.clone(), 0u64)..=(key.clone(), u64::MAX))
-            .map(|((_, id), _)| *id)
+            .range((key.clone(), RowBound::NegInf)..=(key.clone(), RowBound::PosInf))
+            .filter_map(|((_, row), _)| match row {
+                RowBound::Row(k) => Some(k.clone()),
+                _ => None,
+            })
     }
 
     pub fn range_ids(
         &self,
-        start: std::ops::Bound<&K>,
-        end: std::ops::Bound<&K>,
-    ) -> impl Iterator<Item = (&K, u64)> + '_ {
+        start: std::ops::Bound<&IK>,
+        end: std::ops::Bound<&IK>,
+    ) -> impl Iterator<Item = (&IK, K)> + '_ {
         use std::ops::Bound;
         let range_start = match start {
-            Bound::Included(k) => Bound::Included((k.clone(), 0u64)),
-            Bound::Excluded(k) => Bound::Excluded((k.clone(), u64::MAX)),
+            Bound::Included(k) => Bound::Included((k.clone(), RowBound::NegInf)),
+            Bound::Excluded(k) => Bound::Excluded((k.clone(), RowBound::PosInf)),
             Bound::Unbounded => Bound::Unbounded,
         };
         let range_end = match end {
-            Bound::Included(k) => Bound::Included((k.clone(), u64::MAX)),
-            Bound::Excluded(k) => Bound::Excluded((k.clone(), 0u64)),
+            Bound::Included(k) => Bound::Included((k.clone(), RowBound::PosInf)),
+            Bound::Excluded(k) => Bound::Excluded((k.clone(), RowBound::NegInf)),
             Bound::Unbounded => Bound::Unbounded,
         };
         self.tree
             .range((range_start, range_end))
-            .map(|((k, id), _)| (k, *id))
+            .filter_map(|((k, row), _)| match row {
+                RowBound::Row(id) => Some((k, id.clone())),
+                _ => None,
+            })
     }
 }
 
-impl<K: Ord + Clone + Send + Sync + 'static> IndexStorage<K> for NonUniqueStorage<K> {
-    fn insert(&mut self, key: K, id: u64, _name: &str) -> Result<()> {
-        self.tree = self.tree.insert((key, id), ());
+impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> IndexStorage<IK, K>
+    for NonUniqueStorage<IK, K>
+{
+    fn insert(&mut self, key: IK, row_key: K, _name: &str) -> Result<()> {
+        self.tree = self.tree.insert((key, RowBound::Row(row_key)), ());
         Ok(())
     }
 
-    fn delete(&mut self, key: K, id: u64) {
-        match self.tree.remove(&(key, id)) {
+    fn delete(&mut self, key: IK, row_key: K) {
+        match self.tree.remove(&(key, RowBound::Row(row_key))) {
             Ok(new_tree) => self.tree = new_tree,
             Err(_) => debug_assert!(false, "NonUniqueStorage::delete called for absent key"),
         }
@@ -432,7 +465,12 @@ impl<R: Record, I: CustomIndex<R>> CustomIndexAdapter<R, I> {
     }
 }
 
-impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R> for CustomIndexAdapter<R, I> {
+// `CustomIndex` (the public API) is not yet generic over the row-key type —
+// widening it is out of scope for this task. The adapter therefore implements
+// `IndexMaintainer<R, u64>` specifically; `Table` still instantiates all of
+// its indexes at `K = u64`, so this stays consistent with the rest of the
+// crate until `CustomIndex` itself is widened.
+impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R, u64> for CustomIndexAdapter<R, I> {
     fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
         self.inner.on_insert(id, record)
     }
@@ -453,7 +491,7 @@ impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R> for CustomIndexA
         &self.name
     }
 
-    fn clone_box(&self) -> Box<dyn IndexMaintainer<R>> {
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R, u64>> {
         Box::new(CustomIndexAdapter {
             inner: self.inner.clone(),
             name: self.name.clone(),
@@ -461,7 +499,7 @@ impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R> for CustomIndexA
         })
     }
 
-    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R>>> {
+    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, u64>>> {
         // Custom indexes have user-defined internal state with no generic
         // "make empty" hook; the bulk-load primitives don't yet support
         // them. Until a `CustomIndex::empty` requirement (or similar)
@@ -700,7 +738,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &user).unwrap();
+        idx.on_insert(1u64, &user).unwrap();
 
         let cloned = idx.clone_box();
         // Mutate original
@@ -708,12 +746,12 @@ mod tests {
             email: "bob@example.com".to_string(),
             age: 25,
         };
-        idx.on_insert(2, &user2).unwrap();
+        idx.on_insert(2u64, &user2).unwrap();
 
         // Clone should not see the new insert
         let cloned = cloned
             .as_any()
-            .downcast_ref::<ManagedIndex<User, String, UniqueStorage<String>>>()
+            .downcast_ref::<ManagedIndex<User, String, UniqueStorage<String, u64>>>()
             .unwrap();
         assert_eq!(cloned.storage().get(&"bob@example.com".to_string()), None);
         assert_eq!(
@@ -879,7 +917,7 @@ mod tests {
         };
 
         let extractor = Arc::new(|r: &Row| r.name.clone());
-        let mut incr: ManagedIndex<Row, String, UniqueStorage<String>> = ManagedIndex::new(
+        let mut incr: ManagedIndex<Row, String, UniqueStorage<String, u64>> = ManagedIndex::new(
             "idx".into(),
             IndexKind::Unique,
             extractor.clone(),
@@ -889,7 +927,7 @@ mod tests {
             incr.on_insert(*id, row).unwrap();
         }
 
-        let mut bulk: ManagedIndex<Row, String, UniqueStorage<String>> = ManagedIndex::new(
+        let mut bulk: ManagedIndex<Row, String, UniqueStorage<String, u64>> = ManagedIndex::new(
             "idx".into(),
             IndexKind::Unique,
             extractor,
@@ -924,7 +962,7 @@ mod tests {
         };
 
         let extractor = Arc::new(|r: &Row| r.age);
-        let mut incr: ManagedIndex<Row, u32, NonUniqueStorage<u32>> = ManagedIndex::new(
+        let mut incr: ManagedIndex<Row, u32, NonUniqueStorage<u32, u64>> = ManagedIndex::new(
             "idx".into(),
             IndexKind::NonUnique,
             extractor.clone(),
@@ -934,7 +972,7 @@ mod tests {
             incr.on_insert(*id, row).unwrap();
         }
 
-        let mut bulk: ManagedIndex<Row, u32, NonUniqueStorage<u32>> = ManagedIndex::new(
+        let mut bulk: ManagedIndex<Row, u32, NonUniqueStorage<u32, u64>> = ManagedIndex::new(
             "idx".into(),
             IndexKind::NonUnique,
             extractor,
@@ -966,7 +1004,7 @@ mod tests {
             t = t.insert(2, Row { name: "dup".into() });
             t
         };
-        let mut idx: ManagedIndex<Row, String, UniqueStorage<String>> = ManagedIndex::new(
+        let mut idx: ManagedIndex<Row, String, UniqueStorage<String, u64>> = ManagedIndex::new(
             "idx".into(),
             IndexKind::Unique,
             Arc::new(|r: &Row| r.name.clone()),
@@ -1010,5 +1048,42 @@ mod tests {
             idx.on_insert(2, &user_dup),
             Err(Error::DuplicateKey(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // task 2: index storage generic over the row key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unique_index_over_string_primary_key() {
+        // Index key is u32 (an age); row key is String (an email).
+        let mut storage: UniqueStorage<u32, String> = UniqueStorage::new();
+        storage.insert(30u32, "a@x.com".to_string(), "by_age").unwrap();
+        storage.insert(40u32, "b@x.com".to_string(), "by_age").unwrap();
+
+        assert_eq!(storage.get(&30), Some("a@x.com".to_string()));
+        assert_eq!(storage.get(&40), Some("b@x.com".to_string()));
+        assert_eq!(storage.get(&50), None);
+
+        // A second row at the same index key is rejected.
+        let err = storage
+            .insert(30u32, "c@x.com".to_string(), "by_age")
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn non_unique_index_over_string_primary_key() {
+        let mut storage: NonUniqueStorage<u32, String> = NonUniqueStorage::new();
+        storage.insert(30u32, "a@x.com".to_string(), "by_age").unwrap();
+        storage.insert(30u32, "b@x.com".to_string(), "by_age").unwrap();
+        storage.insert(40u32, "c@x.com".to_string(), "by_age").unwrap();
+
+        let mut at_30: Vec<String> = storage.get_ids(&30).collect();
+        at_30.sort();
+        assert_eq!(at_30, vec!["a@x.com".to_string(), "b@x.com".to_string()]);
+
+        let at_40: Vec<String> = storage.get_ids(&40).collect();
+        assert_eq!(at_40, vec!["c@x.com".to_string()]);
     }
 }

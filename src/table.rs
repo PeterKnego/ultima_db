@@ -192,14 +192,14 @@ impl<R: 'static> TableOpener<R> for TableDef<R> {
 pub struct Table<R> {
     data: BTree<u64, R>,
     next_id: u64,
-    indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>>,
+    indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, u64>>>,
 }
 
 /// Captured table state for atomic batch rollback.
 struct TableSnapshot<R> {
     data: BTree<u64, R>,
     next_id: u64,
-    indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>>,
+    indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, u64>>>,
 }
 
 impl<R: Record> Table<R> {
@@ -221,7 +221,7 @@ impl<R: Record> Table<R> {
     pub(crate) fn from_bulk(
         sorted_rows: Vec<(u64, Arc<R>)>,
         next_id: u64,
-        mut index_defs: Vec<Box<dyn IndexMaintainer<R>>>,
+        mut index_defs: Vec<Box<dyn IndexMaintainer<R, u64>>>,
     ) -> Result<Self> {
         // Debug-assert ascending unique ids.
         debug_assert!(
@@ -231,7 +231,7 @@ impl<R: Record> Table<R> {
 
         let data: BTree<u64, R> = BTree::from_sorted(sorted_rows);
 
-        let mut indexes: BTreeMap<String, Box<dyn IndexMaintainer<R>>> = BTreeMap::new();
+        let mut indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, u64>>> = BTreeMap::new();
         for mut idx in index_defs.drain(..) {
             idx.rebuild_from_sorted_data(&data)?;
             indexes.insert(idx.name().to_string(), idx);
@@ -246,7 +246,7 @@ impl<R: Record> Table<R> {
 
     /// Clone each index's *definition* (extractor, name, kind, storage type)
     /// with empty storage. Used by bulk-load to rebuild indexes from new data.
-    pub(crate) fn empty_index_defs(&self) -> Result<Vec<Box<dyn IndexMaintainer<R>>>> {
+    pub(crate) fn empty_index_defs(&self) -> Result<Vec<Box<dyn IndexMaintainer<R, u64>>>> {
         self.indexes.values().map(|i| i.empty_clone()).collect()
     }
 
@@ -269,7 +269,7 @@ impl<R: Record> Table<R> {
         // 2. The HashMap is not structurally modified (no insert/remove) during
         //    this loop — only the index values themselves are mutated in place.
         // 3. Each pointer is dereferenced at most once per loop iteration.
-        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R, u64>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
         for (applied, ptr) in ptrs.iter().enumerate() {
             let idx = unsafe { &mut **ptr };
@@ -300,7 +300,7 @@ impl<R: Record> Table<R> {
 
         // Update all indexes; rollback on failure.
         // SAFETY: Same invariants as `insert` — see comment there.
-        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R, u64>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
         for (applied, ptr) in ptrs.iter().enumerate() {
             let idx = unsafe { &mut **ptr };
@@ -333,7 +333,7 @@ impl<R: Record> Table<R> {
         let prior = self.data.get_arc(&id);
         let new_ref: &R = &arc;
         // SAFETY: same invariants as `insert` — see comment there.
-        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R, u64>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
 
         match &prior {
@@ -468,7 +468,7 @@ impl<R: Record> Table<R> {
 
         // Phase 2: Update each index for all new records.
         // SAFETY: Same invariants as single-record `insert` — see comment there.
-        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R, u64>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
         for ptr in &ptrs {
             let idx = unsafe { &mut **ptr };
@@ -523,7 +523,7 @@ impl<R: Record> Table<R> {
 
         // Phase 2: Update each index for all deduplicated records.
         // SAFETY: Same invariants as single-record `insert` — see comment there.
-        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R, u64>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
         for ptr in &ptrs {
             let idx = unsafe { &mut **ptr };
@@ -604,7 +604,7 @@ impl<R: Record> Table<R> {
 
         // Update all indexes; rollback on failure.
         // SAFETY: Same invariants as `insert` — see comment there.
-        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R>>> =
+        let ptrs: Vec<*mut Box<dyn IndexMaintainer<R, u64>>> =
             self.indexes.values_mut().map(|v| v as *mut _).collect();
         for (applied, ptr) in ptrs.iter().enumerate() {
             let idx = unsafe { &mut **ptr };
@@ -704,14 +704,14 @@ impl<R: Record> Table<R> {
             return Ok(());
         }
         let extractor = Arc::new(extractor);
-        let mut index: Box<dyn IndexMaintainer<R>> = match kind {
-            IndexKind::Unique => Box::new(ManagedIndex::<R, K, UniqueStorage<K>>::new(
+        let mut index: Box<dyn IndexMaintainer<R, u64>> = match kind {
+            IndexKind::Unique => Box::new(ManagedIndex::<R, K, UniqueStorage<K, u64>>::new(
                 name.to_string(),
                 kind,
                 extractor,
                 UniqueStorage::new(),
             )),
-            IndexKind::NonUnique => Box::new(ManagedIndex::<R, K, NonUniqueStorage<K>>::new(
+            IndexKind::NonUnique => Box::new(ManagedIndex::<R, K, NonUniqueStorage<K, u64>>::new(
                 name.to_string(),
                 kind,
                 extractor,
@@ -739,7 +739,7 @@ impl<R: Record> Table<R> {
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
         let managed = idx
             .as_any()
-            .downcast_ref::<ManagedIndex<R, K, UniqueStorage<K>>>()
+            .downcast_ref::<ManagedIndex<R, K, UniqueStorage<K, u64>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
         match managed.storage().get(key) {
             Some(id) => Ok(self.data.get(&id).map(|r| (id, r))),
@@ -759,7 +759,7 @@ impl<R: Record> Table<R> {
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
         let managed = idx
             .as_any()
-            .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K>>>()
+            .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K, u64>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
         Ok(managed
             .storage()
@@ -782,7 +782,7 @@ impl<R: Record> Table<R> {
         // Try unique first, then non-unique.
         if let Some(managed) = idx
             .as_any()
-            .downcast_ref::<ManagedIndex<R, K, UniqueStorage<K>>>()
+            .downcast_ref::<ManagedIndex<R, K, UniqueStorage<K, u64>>>()
         {
             return Ok(managed
                 .storage()
@@ -793,7 +793,7 @@ impl<R: Record> Table<R> {
         }
         let managed = idx
             .as_any()
-            .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K>>>()
+            .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K, u64>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
         Ok(managed
             .storage()
@@ -816,7 +816,7 @@ impl<R: Record> Table<R> {
         // Try unique first, then non-unique.
         if let Some(managed) = idx
             .as_any()
-            .downcast_ref::<ManagedIndex<R, K, UniqueStorage<K>>>()
+            .downcast_ref::<ManagedIndex<R, K, UniqueStorage<K, u64>>>()
         {
             return Ok(managed
                 .storage()
@@ -826,7 +826,7 @@ impl<R: Record> Table<R> {
         }
         let managed = idx
             .as_any()
-            .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K>>>()
+            .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K, u64>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
         let start = range.start_bound();
         let end = range.end_bound();
@@ -3004,15 +3004,15 @@ mod tests {
         }
 
         // Build empty index defs to hand to from_bulk.
-        let unique_idx: Box<dyn IndexMaintainer<U>> =
-            Box::new(ManagedIndex::<U, String, UniqueStorage<String>>::new(
+        let unique_idx: Box<dyn IndexMaintainer<U, u64>> =
+            Box::new(ManagedIndex::<U, String, UniqueStorage<String, u64>>::new(
                 "by_email".into(),
                 IndexKind::Unique,
                 Arc::new(|u: &U| u.email.clone()),
                 UniqueStorage::new(),
             ));
-        let nonunique_idx: Box<dyn IndexMaintainer<U>> =
-            Box::new(ManagedIndex::<U, u32, NonUniqueStorage<u32>>::new(
+        let nonunique_idx: Box<dyn IndexMaintainer<U, u64>> =
+            Box::new(ManagedIndex::<U, u32, NonUniqueStorage<u32, u64>>::new(
                 "by_age".into(),
                 IndexKind::NonUnique,
                 Arc::new(|u: &U| u.age),
@@ -3061,8 +3061,8 @@ mod tests {
             email: String,
         }
 
-        let unique_idx: Box<dyn IndexMaintainer<U>> =
-            Box::new(ManagedIndex::<U, String, UniqueStorage<String>>::new(
+        let unique_idx: Box<dyn IndexMaintainer<U, u64>> =
+            Box::new(ManagedIndex::<U, String, UniqueStorage<String, u64>>::new(
                 "by_email".into(),
                 IndexKind::Unique,
                 Arc::new(|u: &U| u.email.clone()),
