@@ -575,11 +575,16 @@ impl Store {
     /// Returns [`Error::VersionNotFound`] if the requested version does not
     /// exist.
     ///
-    /// Unlike [`ReadTx`], a [`VersionPin`] is `Send`, so it can travel to
-    /// another thread. This closes the SMR snapshot-handoff race without
+    /// A [`VersionPin`] closes the SMR snapshot-handoff race without
     /// inflating [`StoreConfig::num_snapshots_retained`]: the writer pins the
     /// capture version *before* publishing its number, and the serializer
     /// thread opens its own read transaction on arrival.
+    ///
+    /// A [`ReadTx`] is also `Send` and also keeps its version alive, so it
+    /// could be handed over directly. Prefer a pin: it is a bare
+    /// `Arc<Snapshot>` handle — no table map, no metrics registration — it is
+    /// `Clone`, and it says "keep this version alive" explicitly at the call
+    /// site rather than as a side effect of holding a read view.
     ///
     /// Pinning is *not* atomic with commit, though. Between a commit
     /// returning `v` (or a call to [`Store::latest_version`] returning `v`)
@@ -1942,15 +1947,25 @@ struct DirtyEntry {
 /// any of the store's bookkeeping, which is keyed by writer id, not by
 /// thread.
 ///
-/// Two hazards survive the type system and are on you, not the compiler:
-/// an open `WriteTx` holds the single-writer slot in
-/// [`WriterMode::SingleWriter`] (every other `begin_write` gets
-/// [`Error::WriterBusy`]) and holds its intents in
-/// [`WriterMode::MultiWriter`], so parking one on a `.await` for a long time
-/// stalls other writers. And [`WriteTx::commit`] blocks — on locks, on the
-/// promotion gate, and on the WAL fsync under `Durability::Consistent` — so
-/// in an async runtime it belongs in `spawn_blocking`, not on a worker
-/// thread.
+/// Three hazards survive the type system and are on you, not the compiler:
+///
+/// 1. **An open transaction holds resources.** In
+///    [`WriterMode::SingleWriter`] it holds the only writer slot — every
+///    other `begin_write` gets [`Error::WriterBusy`]. In
+///    [`WriterMode::MultiWriter`] it holds its intents, so conflicting
+///    writers park on it. Parking one on a `.await` for a long time stalls
+///    other writers.
+/// 2. **[`WriteTx::commit`] blocks** — on locks, on the promotion gate, and
+///    on the WAL fsync under `Durability::Consistent`.
+/// 3. **Dropping a `WriteTx` blocks too.** `Drop` takes the store's write
+///    lock to release the writer slot and the transaction's intents. That
+///    includes every *implicit* drop: an early `?` return, a panic unwind,
+///    or an async task cancelled mid-transaction. There is no way to abort a
+///    transaction without touching that lock.
+///
+/// None of it is async-aware, so on an async runtime the whole
+/// open/use/commit-or-drop sequence belongs inside `spawn_blocking`, not on
+/// a worker thread.
 ///
 /// See `docs/tasks/task55_send_audit.md`; `tests/send_bounds.rs` asserts the
 /// bounds.
@@ -3814,6 +3829,13 @@ impl WriteTx {
 /// or called `rollback`), decrements `active_writer_count` and, in `MultiWriter`
 /// mode, removes the base version from tracking and prunes the write-set log.
 /// Skipped after a successful `commit` (which sets `needs_cleanup = false`).
+///
+/// This is a **blocking** drop: it takes `store_inner.write()` and, in
+/// MultiWriter, wakes every writer parked on this transaction's intents. It
+/// is correct from any thread (nothing here is thread-keyed), but since
+/// `WriteTx` is `Send` an implicit drop can now land on an async worker
+/// thread — see the hazard list on [`WriteTx`] and
+/// `docs/tasks/task55_send_audit.md`.
 impl Drop for WriteTx {
     fn drop(&mut self) {
         if self.needs_cleanup {

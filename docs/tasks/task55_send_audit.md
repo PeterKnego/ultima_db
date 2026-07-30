@@ -100,9 +100,9 @@ inside one synchronous call — never a `WriteTx` field.
 - `begin_write` (`src/store.rs:641-729`) records nothing thread-specific:
   it bumps `active_writer_count`, pushes `base_version`, and hands the
   transaction its `writer_id` and `waiter`.
-- `Drop for WriteTx` (`src/store.rs:3820-3837`) takes `store_inner.write()`
+- `Drop for WriteTx` (`src/store.rs:3839-3858`) takes `store_inner.write()`
   and calls `intents.release_all_for(self.writer_id, waiter)` — correct from
-  any thread.
+  any thread, though *blocking* from any thread; see hazard 3 below.
 
 The only genuine affinity is *inside* `commit()`: it acquires per-table
 guards, parks on the promote gate, and (under `Durability::Consistent`)
@@ -166,7 +166,7 @@ on another, and can be held across an `.await` in an async task. A `ReadTx`
 can be moved to another thread, and — being `Sync` — shared by reference for
 parallel scans of one snapshot.
 
-**Two hazards survive the type system.** They are documented on `WriteTx`
+**Three hazards survive the type system.** They are documented on `WriteTx`
 itself (`src/store.rs`, the struct doc comment) because the compiler no longer
 enforces them:
 
@@ -184,9 +184,21 @@ enforces them:
    `PromoteGate`, and under `Durability::Consistent` parks until the WAL
    background thread fsyncs (`src/store.rs:3214-3236`); under
    `ConsistentInline` the calling thread performs the fsync itself. None of
-   that is async-aware. **On an async runtime, `commit()` belongs in
-   `spawn_blocking`.** So does `begin_write` on a contended store — it takes
-   the store write lock.
+   that is async-aware.
+3. **Dropping a `WriteTx` blocks too, and there is no non-blocking escape.**
+   `Drop for WriteTx` (`src/store.rs:3839-3858`) unconditionally takes
+   `self.store_inner.write()` to give back the writer slot, and in MultiWriter
+   calls `release_all_for`, which wakes every writer parked on this
+   transaction's intents. That covers every *implicit* drop: an early `?`
+   return, a panic unwind, and — newly relevant — an async task cancelled
+   mid-transaction. This hazard is a direct consequence of the change: a
+   `!Send` transaction could not live inside a `Send` future at all, so the
+   cancellation path did not previously exist. `rollback()` is the same code
+   path; there is no way to abandon a transaction without touching that lock.
+
+**On an async runtime, the whole open/use/commit-or-drop sequence belongs
+inside `spawn_blocking`** — not just `commit()`. `begin_write` takes the store
+write lock, and the drop is blocking whether or not you reach a commit.
 
 The recommended pattern is unchanged: clone the `Store` into each thread and
 open transactions locally. `Send` removes a compile-time barrier; it is not
@@ -210,7 +222,34 @@ effect of holding a read view.
 - `write_tx_commits_on_a_different_thread` — a runtime proof, not just a
   bound: a transaction is opened and written on the main thread, moved into a
   `std::thread::spawn`, committed there, and the resulting version is then
-  read back through a `ReadTx` moved to a *third* thread.
+  read back through a `ReadTx` moved to a *third* thread. This is the *easy*
+  configuration, though — `Store::default()` is SingleWriter with
+  `Persistence::None`, so the intent map, the promotion gate and the WAL park
+  are all inert. The next two cover the paths the verdict actually rests on.
+- `multi_writer_tx_commits_on_a_foreign_thread_and_wakes_a_parked_writer` —
+  writer A takes the intent on key 1 on the main thread; writer B collides
+  from thread 2, drops its own transaction (the drop-before-wait convention)
+  and parks on A's `CommitWaiter`; A is then moved to thread 3 and committed
+  there. B must wake, observe A's value on rebase, and commit at a higher
+  version. Every handshake is bounded (10 s), so a lost wakeup fails rather
+  than hangs.
+- `durable_commit_survives_moving_the_tx_to_another_thread` (persistence
+  only) — the same move, but the commit that runs on the foreign thread is a
+  durable one, under both `Durability::Consistent` (parks on the WAL
+  background thread) and `Durability::ConsistentInline` (fsyncs on the
+  calling thread, which is now a *different* thread from the opener). The
+  acked version is then proved real by reopening the directory and recovering.
+
+Both new tests were mutation-checked rather than assumed to have teeth:
+
+- Neutering `release_all_for` in *both* the commit and drop paths makes the
+  MultiWriter test fail in 10.0 s with "A committed on another thread but
+  never released its intent".
+- Replacing the fsync park (`w.wait()?`) with a no-op makes the durability
+  test fail with `ConsistentInline: recovered version mismatch, left: 0,
+  right: 1` — an actually-lost commit. Worth noting that the `Consistent`
+  half survived that mutation (the WAL background thread still flushed at
+  shutdown); covering both durability variants is what gave the test teeth.
 
 `src/store.rs`'s in-crate `#[cfg(test)] const fn _assert_thread_bounds()`
 (formerly `_assert_store_is_thread_safe`, whose comment carried the false

@@ -1,19 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- `ReadTx` is now `Send + Sync` and `WriteTx` is now `Send` (still `!Sync`).
-  The `PhantomData<*const ()>` marker that pinned both to their creating
-  thread was removed after an audit found no thread affinity anywhere on the
-  read or write path — it was a footgun guard, not a correctness requirement.
-  A transaction can now be moved between threads and held across an `.await`.
-  Additive, so no downstream code breaks. Two caveats the compiler no longer
-  enforces: an open `WriteTx` holds the SingleWriter slot (or its MultiWriter
-  intents), and `commit()` blocks — on an async runtime it belongs in
-  `spawn_blocking`. See `docs/tasks/task55_send_audit.md`.
-
 ## 0.2.0 — 2026-07-30
 
 **Heads-up: an on-disk format break is coming in 0.3.0.** Arbitrary primary
@@ -44,6 +30,24 @@ files written by earlier versions. Do not build long-lived persisted data on
 
 ### Changed (ultima-db)
 
+- Transactions are no longer pinned to the thread that opened them. `ReadTx`
+  is now `Send + Sync` and `WriteTx` is now `Send` (it stays `!Sync`, so it
+  can be moved between threads but never shared by two at once). The
+  `PhantomData<*const ()>` marker that enforced the old restriction was
+  removed after an audit found no thread affinity anywhere on the read or
+  write path — it was a footgun guard, not a correctness requirement. This is
+  additive, so no existing code breaks, and it makes the crate usable from
+  async code, where a transaction may now be held across an `.await`.
+
+  Three things the compiler no longer catches, all of which matter on an
+  async runtime: an open `WriteTx` holds the SingleWriter slot (or, in
+  MultiWriter, its intents), so parking one on a long `.await` stalls other
+  writers; `commit()` blocks, on locks, on the promotion gate, and on the WAL
+  fsync under `Durability::Consistent`; and *dropping* a `WriteTx` blocks
+  too, since it takes the store write lock to release its writer slot and
+  intents — which includes the implicit drop on an early return or a
+  cancelled task. Run transaction work inside `spawn_blocking`. See
+  `docs/tasks/task55_send_audit.md`.
 - B-tree nodes use inline fixed-capacity storage, making a copy-on-write node
   clone a single allocation; default fanout retuned from T=64 to T=32.
 - `Store::gc()` is now O(evicted + pins) per run rather than O(retained), so a

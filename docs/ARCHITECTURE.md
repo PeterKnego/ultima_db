@@ -330,7 +330,7 @@ See [isolation-levels.md](isolation-levels.md) for a detailed treatment of:
 
 `Store`, `Snapshot`, `VersionPin`, and `ReadTx` are all `Send + Sync`, so the `Store` handle can be cloned across threads. `WriteTx` is `Send` but `!Sync` — it can be *moved* between threads (including held across an `.await`), but never used from two threads at once; the `RefCell`-backed write/read/DDL sets are what make it `!Sync`. No store bookkeeping is keyed by thread, so a transaction opened on one thread can be committed on another. The audit establishing this is [task55](tasks/task55_send_audit.md), and `tests/send_bounds.rs` asserts the bounds.
 
-The intended pattern is still: clone the `Store` into each thread, and call `begin_write`/`begin_read` locally. Moving a transaction across threads is *allowed*, but an open `WriteTx` holds the SingleWriter slot (or its MultiWriter intents), and `commit` blocks — so on an async runtime it belongs in `spawn_blocking`.
+The intended pattern is still: clone the `Store` into each thread, and call `begin_write`/`begin_read` locally. Moving a transaction across threads is *allowed*, but an open `WriteTx` holds the SingleWriter slot (or its MultiWriter intents); `commit` blocks; and so does `Drop`, which takes the store write lock to release the writer slot and intents — including on an early return, a panic, or a cancelled async task. On an async runtime the whole open/use/commit-or-drop sequence belongs in `spawn_blocking`.
 
 ---
 
