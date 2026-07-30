@@ -828,11 +828,9 @@ impl<R: Record> Table<R> {
             .as_any()
             .downcast_ref::<ManagedIndex<R, K, NonUniqueStorage<K, u64>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
-        let start = range.start_bound();
-        let end = range.end_bound();
         Ok(managed
             .storage()
-            .range_ids(start, end)
+            .range_ids(range)
             .filter_map(|(_, id)| self.data.get(&id).map(|r| (id, r)))
             .collect())
     }

@@ -254,18 +254,13 @@ where
     fn rebuild_from_sorted_data(&mut self, data: &BTree<K, R>) -> Result<()> {
         // (index key, row key) is already strictly ordered when sorted
         // because the row key is unique.
-        let mut pairs: Vec<((IK, RowBound<K>), ())> = data
+        let mut pairs: Vec<((IK, K), ())> = data
             .range(..)
-            .map(|(key, rec)| {
-                (
-                    (self.extractor.extract(rec), RowBound::Row(key.clone())),
-                    (),
-                )
-            })
+            .map(|(key, rec)| ((self.extractor.extract(rec), key.clone()), ()))
             .collect();
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let arc_pairs = pairs.into_iter().map(|(k, _)| (k, Arc::new(())));
-        let new_tree: BTree<(IK, RowBound<K>), ()> = BTree::from_sorted(arc_pairs);
+        let new_tree: BTree<(IK, K), ()> = BTree::from_sorted(arc_pairs);
         self.storage = NonUniqueStorage::from_btree(new_tree);
         Ok(())
     }
@@ -326,67 +321,59 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> IndexStorage<IK, K>
 // NonUniqueStorage — maps (IK, K) -> () (composite key for multi-value)
 // ---------------------------------------------------------------------------
 
-/// Sentinel wrapper for the row-key half of `NonUniqueStorage`'s composite
-/// tree key. Real entries always wrap `Row(k)`; `NegInf`/`PosInf` exist only
-/// as synthetic range endpoints, so a group of rows sharing an index key can
-/// be scanned in O(log n + k) without requiring a min/max bound on the
-/// arbitrary row-key type `K` (`PrimaryKey` guarantees `Ord`, not a bounded
-/// range). `#[derive(Ord)]` on an enum orders by declaration order, so
-/// `NegInf < Row(_) < PosInf` falls out for free.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum RowBound<K> {
-    NegInf,
-    Row(K),
-    PosInf,
-}
-
 #[derive(Clone)]
 pub(crate) struct NonUniqueStorage<IK: Ord + Clone, K: PrimaryKey> {
-    tree: BTree<(IK, RowBound<K>), ()>,
+    tree: BTree<(IK, K), ()>,
 }
 
-impl<IK: Ord + Clone + 'static, K: PrimaryKey> NonUniqueStorage<IK, K> {
+impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK, K> {
     /// Creates a new, empty non-unique index storage.
     pub fn new() -> Self {
         Self { tree: BTree::new() }
     }
 
     /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
-    pub(crate) fn from_btree(tree: BTree<(IK, RowBound<K>), ()>) -> Self {
+    pub(crate) fn from_btree(tree: BTree<(IK, K), ()>) -> Self {
         Self { tree }
     }
 
-    pub fn get_ids(&self, key: &IK) -> impl Iterator<Item = K> + '_ {
-        self.tree
-            .range((key.clone(), RowBound::NegInf)..=(key.clone(), RowBound::PosInf))
-            .filter_map(|((_, row), _)| match row {
-                RowBound::Row(k) => Some(k.clone()),
-                _ => None,
-            })
+    /// Row keys sharing the index key `key`, ascending. O(log n + k) — the
+    /// prefix group is located by descent, not by filtering a wider scan.
+    pub fn get_ids<'a>(&'a self, key: &'a IK) -> impl Iterator<Item = K> + 'a {
+        self.tree.range_prefix(key).map(|((_, k), _)| k.clone())
     }
 
-    pub fn range_ids(
-        &self,
-        start: std::ops::Bound<&IK>,
-        end: std::ops::Bound<&IK>,
-    ) -> impl Iterator<Item = (&IK, K)> + '_ {
+    /// Row keys whose index key falls in `range`, ascending by `(IK, K)`.
+    ///
+    /// The bounds are on `IK` alone, which cannot be expressed as a
+    /// `RangeBounds<(IK, K)>` (that would need a min/max value for the
+    /// arbitrary row-key type `K`), so this goes through `BTree::range_by`
+    /// with a locator that looks only at the index-key half of the composite.
+    pub fn range_ids<'a>(
+        &'a self,
+        range: impl std::ops::RangeBounds<IK> + 'a,
+    ) -> impl Iterator<Item = (&'a IK, K)> + 'a {
+        use std::cmp::Ordering;
         use std::ops::Bound;
-        let range_start = match start {
-            Bound::Included(k) => Bound::Included((k.clone(), RowBound::NegInf)),
-            Bound::Excluded(k) => Bound::Excluded((k.clone(), RowBound::PosInf)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let range_end = match end {
-            Bound::Included(k) => Bound::Included((k.clone(), RowBound::PosInf)),
-            Bound::Excluded(k) => Bound::Excluded((k.clone(), RowBound::NegInf)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
+        let start = range.start_bound().cloned();
+        let end = range.end_bound().cloned();
+        // Monotone: `(ik, _)` sorts by `ik` first, and a bound comparison on
+        // `ik` is itself monotone — an entire `ik` group is classified alike,
+        // so `Excluded` drops the whole group rather than part of it.
         self.tree
-            .range((range_start, range_end))
-            .filter_map(|((k, row), _)| match row {
-                RowBound::Row(id) => Some((k, id.clone())),
-                _ => None,
+            .range_by(move |(ik, _): &(IK, K)| {
+                match &start {
+                    Bound::Included(s) if ik < s => return Ordering::Less,
+                    Bound::Excluded(s) if ik <= s => return Ordering::Less,
+                    _ => {}
+                }
+                match &end {
+                    Bound::Included(e) if ik > e => Ordering::Greater,
+                    Bound::Excluded(e) if ik >= e => Ordering::Greater,
+                    _ => Ordering::Equal,
+                }
             })
+            .map(|((ik, id), _)| (ik, id.clone()))
     }
 }
 
@@ -394,12 +381,12 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> IndexStorage<IK, K>
     for NonUniqueStorage<IK, K>
 {
     fn insert(&mut self, key: IK, row_key: K, _name: &str) -> Result<()> {
-        self.tree = self.tree.insert((key, RowBound::Row(row_key)), ());
+        self.tree = self.tree.insert((key, row_key), ());
         Ok(())
     }
 
     fn delete(&mut self, key: IK, row_key: K) {
-        match self.tree.remove(&(key, RowBound::Row(row_key))) {
+        match self.tree.remove(&(key, row_key)) {
             Ok(new_tree) => self.tree = new_tree,
             Err(_) => debug_assert!(false, "NonUniqueStorage::delete called for absent key"),
         }
@@ -546,7 +533,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &user).unwrap();
+        idx.on_insert(1u64, &user).unwrap();
         assert_eq!(idx.storage().get(&"alice@example.com".to_string()), Some(1));
         assert_eq!(idx.storage().get(&"bob@example.com".to_string()), None);
     }
@@ -568,7 +555,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             age: 25,
         };
-        idx.on_insert(1, &u1).unwrap();
+        idx.on_insert(1u64, &u1).unwrap();
         assert!(matches!(idx.on_insert(2, &u2), Err(Error::DuplicateKey(_))));
     }
 
@@ -585,7 +572,7 @@ mod tests {
             email: "alice@old.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &old).unwrap();
+        idx.on_insert(1u64, &old).unwrap();
         let new = User {
             email: "alice@new.com".to_string(),
             age: 30,
@@ -612,7 +599,7 @@ mod tests {
             email: "bob@example.com".to_string(),
             age: 25,
         };
-        idx.on_insert(1, &u1).unwrap();
+        idx.on_insert(1u64, &u1).unwrap();
         idx.on_insert(2, &u2).unwrap();
         // Try to update bob's email to alice's — should fail
         let u2_new = User {
@@ -640,7 +627,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &user).unwrap();
+        idx.on_insert(1u64, &user).unwrap();
         idx.on_delete(1, &user);
         assert_eq!(idx.storage().get(&"alice@example.com".to_string()), None);
     }
@@ -1028,7 +1015,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             age: 30,
         };
-        idx.on_insert(1, &user).unwrap();
+        idx.on_insert(1u64, &user).unwrap();
 
         assert_eq!(
             idx.storage().get(&(30, "alice@example.com".to_string())),
@@ -1085,5 +1072,33 @@ mod tests {
 
         let at_40: Vec<String> = storage.get_ids(&40).collect();
         assert_eq!(at_40, vec!["c@x.com".to_string()]);
+    }
+
+    #[test]
+    fn non_unique_range_ids_over_string_primary_key() {
+        use std::ops::Bound;
+        let mut storage: NonUniqueStorage<u32, String> = NonUniqueStorage::new();
+        storage.insert(10u32, "a@x.com".to_string(), "by_age").unwrap();
+        storage.insert(20u32, "b@x.com".to_string(), "by_age").unwrap();
+        storage.insert(20u32, "c@x.com".to_string(), "by_age").unwrap();
+        storage.insert(30u32, "d@x.com".to_string(), "by_age").unwrap();
+
+        let mut got: Vec<String> = storage
+            .range_ids((Bound::Included(20u32), Bound::Included(30u32)))
+            .map(|(_, k)| k)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["b@x.com".to_string(), "c@x.com".to_string(), "d@x.com".to_string()]
+        );
+
+        // Excluding the lower bound must drop that whole group, not part of it.
+        let mut got: Vec<String> = storage
+            .range_ids((Bound::Excluded(20u32), Bound::Unbounded))
+            .map(|(_, k)| k)
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["d@x.com".to_string()]);
     }
 }
