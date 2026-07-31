@@ -391,27 +391,27 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> IndexStorage<IK, K>
 /// Implementors have full control over their internal data structure and query
 /// API. The `Clone` bound is required for CoW snapshot cloning — use
 /// [`BTree<K, V>`](crate::btree::BTree) internally for O(1) clone.
-pub trait CustomIndex<R: Record>: Send + Sync + Clone + 'static {
+pub trait CustomIndex<R: Record, K: PrimaryKey = u64>: Send + Sync + Clone + 'static {
     /// Called when a record is inserted. Return `Err` to veto the mutation.
-    fn on_insert(&mut self, id: u64, record: &R) -> Result<()>;
+    fn on_insert(&mut self, key: K, record: &R) -> Result<()>;
 
     /// Called when a record is updated. Return `Err` to veto the mutation.
-    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()>;
+    fn on_update(&mut self, key: K, old: &R, new: &R) -> Result<()>;
 
     /// Called when a record is deleted.
-    fn on_delete(&mut self, id: u64, record: &R);
+    fn on_delete(&mut self, key: K, record: &R);
 
-    /// Rebuild the entire index from an iterator of `(id, record)` pairs.
+    /// Rebuild the entire index from an iterator of `(key, record)` pairs.
     ///
     /// Used for backfilling when the index is defined on a non-empty table,
     /// and for recovery from persistence. The default implementation iterates
     /// and calls [`on_insert`](Self::on_insert) for each entry.
-    fn rebuild<'a>(&mut self, data: impl Iterator<Item = (u64, &'a R)>) -> Result<()>
+    fn rebuild<'a>(&mut self, data: impl Iterator<Item = (K, &'a R)>) -> Result<()>
     where
         R: 'a,
     {
-        for (id, record) in data {
-            self.on_insert(id, record)?;
+        for (key, record) in data {
+            self.on_insert(key, record)?;
         }
         Ok(())
     }
@@ -421,13 +421,13 @@ pub trait CustomIndex<R: Record>: Send + Sync + Clone + 'static {
 // CustomIndexAdapter — bridges CustomIndex into IndexMaintainer
 // ---------------------------------------------------------------------------
 
-pub(crate) struct CustomIndexAdapter<R: Record, I: CustomIndex<R>> {
+pub(crate) struct CustomIndexAdapter<R: Record, K: PrimaryKey, I: CustomIndex<R, K>> {
     inner: I,
     name: String,
-    _phantom: std::marker::PhantomData<R>,
+    _phantom: std::marker::PhantomData<(R, K)>,
 }
 
-impl<R: Record, I: CustomIndex<R>> CustomIndexAdapter<R, I> {
+impl<R: Record, K: PrimaryKey, I: CustomIndex<R, K>> CustomIndexAdapter<R, K, I> {
     pub fn new(name: String, index: I) -> Self {
         Self {
             inner: index,
@@ -441,22 +441,19 @@ impl<R: Record, I: CustomIndex<R>> CustomIndexAdapter<R, I> {
     }
 }
 
-// `CustomIndex` (the public API) is not yet generic over the row-key type —
-// widening it is out of scope for this task. The adapter therefore implements
-// `IndexMaintainer<R, u64>` specifically; `Table` still instantiates all of
-// its indexes at `K = u64`, so this stays consistent with the rest of the
-// crate until `CustomIndex` itself is widened.
-impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R, u64> for CustomIndexAdapter<R, I> {
-    fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
-        self.inner.on_insert(id, record)
+impl<R: Record, K: PrimaryKey, I: CustomIndex<R, K> + 'static> IndexMaintainer<R, K>
+    for CustomIndexAdapter<R, K, I>
+{
+    fn on_insert(&mut self, key: K, record: &R) -> Result<()> {
+        self.inner.on_insert(key, record)
     }
 
-    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()> {
-        self.inner.on_update(id, old, new)
+    fn on_update(&mut self, key: K, old: &R, new: &R) -> Result<()> {
+        self.inner.on_update(key, old, new)
     }
 
-    fn on_delete(&mut self, id: u64, record: &R) {
-        self.inner.on_delete(id, record)
+    fn on_delete(&mut self, key: K, record: &R) {
+        self.inner.on_delete(key, record)
     }
 
     fn kind(&self) -> IndexKind {
@@ -467,7 +464,7 @@ impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R, u64> for CustomI
         &self.name
     }
 
-    fn clone_box(&self) -> Box<dyn IndexMaintainer<R, u64>> {
+    fn clone_box(&self) -> Box<dyn IndexMaintainer<R, K>> {
         Box::new(CustomIndexAdapter {
             inner: self.inner.clone(),
             name: self.name.clone(),
@@ -475,7 +472,7 @@ impl<R: Record, I: CustomIndex<R> + 'static> IndexMaintainer<R, u64> for CustomI
         })
     }
 
-    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, u64>>> {
+    fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, K>>> {
         // Custom indexes have user-defined internal state with no generic
         // "make empty" hook; the bulk-load primitives don't yet support
         // them. Until a `CustomIndex::empty` requirement (or similar)
@@ -790,7 +787,7 @@ mod tests {
 
         let inner = adapter
             .as_any()
-            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .downcast_ref::<CustomIndexAdapter<User, u64, SumIndex>>()
             .unwrap()
             .inner();
         assert_eq!(inner.total(), 30);
@@ -803,7 +800,7 @@ mod tests {
 
         let inner = adapter
             .as_any()
-            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .downcast_ref::<CustomIndexAdapter<User, u64, SumIndex>>()
             .unwrap()
             .inner();
         assert_eq!(inner.total(), 50);
@@ -816,7 +813,7 @@ mod tests {
 
         let inner = adapter
             .as_any()
-            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .downcast_ref::<CustomIndexAdapter<User, u64, SumIndex>>()
             .unwrap()
             .inner();
         assert_eq!(inner.total(), 55);
@@ -825,7 +822,7 @@ mod tests {
 
         let inner = adapter
             .as_any()
-            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .downcast_ref::<CustomIndexAdapter<User, u64, SumIndex>>()
             .unwrap()
             .inner();
         assert_eq!(inner.total(), 35);
@@ -854,14 +851,14 @@ mod tests {
 
         let cloned_inner = cloned
             .as_any()
-            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .downcast_ref::<CustomIndexAdapter<User, u64, SumIndex>>()
             .unwrap()
             .inner();
         assert_eq!(cloned_inner.total(), 30);
 
         let orig_inner = adapter
             .as_any()
-            .downcast_ref::<CustomIndexAdapter<User, SumIndex>>()
+            .downcast_ref::<CustomIndexAdapter<User, u64, SumIndex>>()
             .unwrap()
             .inner();
         assert_eq!(orig_inner.total(), 50);

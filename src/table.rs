@@ -768,6 +768,38 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .filter_map(|key| self.get(key).map(|r| (key.clone(), r)))
             .collect()
     }
+
+    /// Define a custom index. If the table already contains data, the index
+    /// is backfilled via [`CustomIndex::rebuild`]. Returns an error if any
+    /// index (built-in or custom) with the same name already exists.
+    pub fn define_custom_index<I: CustomIndex<R, K>>(
+        &mut self,
+        name: &str,
+        mut index: I,
+    ) -> Result<()> {
+        if self.indexes.contains_key(name) {
+            return Err(Error::IndexAlreadyExists(name.to_string()));
+        }
+        index.rebuild(self.data.range(..).map(|(id, r)| (id.clone(), r)))?;
+        let adapter = CustomIndexAdapter::new(name.to_string(), index);
+        self.indexes.insert(name.to_string(), Box::new(adapter));
+        Ok(())
+    }
+
+    /// Retrieve a reference to a custom index by name, downcast to the
+    /// concrete index type. Returns `IndexNotFound` if the name doesn't
+    /// exist, or `IndexTypeMismatch` if the type doesn't match.
+    pub fn custom_index<I: CustomIndex<R, K>>(&self, name: &str) -> Result<&I> {
+        let idx = self
+            .indexes
+            .get(name)
+            .ok_or_else(|| Error::IndexNotFound(name.to_string()))?;
+        let adapter = idx
+            .as_any()
+            .downcast_ref::<CustomIndexAdapter<R, K, I>>()
+            .ok_or_else(|| Error::IndexTypeMismatch(name.to_string()))?;
+        Ok(adapter.inner())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -966,45 +998,6 @@ impl<R: Record, K: AutoKey> Table<R, K> {
     /// counter after deserializing table state.
     pub fn set_next_id(&mut self, next_id: K) {
         self.next_id = Some(next_id);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Custom indexes — `u64`-keyed tables only for now: the public `CustomIndex`
-// trait still hard-codes `id: u64`.
-// ---------------------------------------------------------------------------
-
-impl<R: Record> Table<R, u64> {
-    /// Define a custom index. If the table already contains data, the index
-    /// is backfilled via [`CustomIndex::rebuild`]. Returns an error if any
-    /// index (built-in or custom) with the same name already exists.
-    pub fn define_custom_index<I: CustomIndex<R>>(
-        &mut self,
-        name: &str,
-        mut index: I,
-    ) -> Result<()> {
-        if self.indexes.contains_key(name) {
-            return Err(Error::IndexAlreadyExists(name.to_string()));
-        }
-        index.rebuild(self.data.range(..).map(|(&id, r)| (id, r)))?;
-        let adapter = CustomIndexAdapter::new(name.to_string(), index);
-        self.indexes.insert(name.to_string(), Box::new(adapter));
-        Ok(())
-    }
-
-    /// Retrieve a reference to a custom index by name, downcast to the
-    /// concrete index type. Returns `IndexNotFound` if the name doesn't
-    /// exist, or `IndexTypeMismatch` if the type doesn't match.
-    pub fn custom_index<I: CustomIndex<R>>(&self, name: &str) -> Result<&I> {
-        let idx = self
-            .indexes
-            .get(name)
-            .ok_or_else(|| Error::IndexNotFound(name.to_string()))?;
-        let adapter = idx
-            .as_any()
-            .downcast_ref::<CustomIndexAdapter<R, I>>()
-            .ok_or_else(|| Error::IndexTypeMismatch(name.to_string()))?;
-        Ok(adapter.inner())
     }
 }
 
@@ -2984,6 +2977,26 @@ mod tests {
         }
     }
 
+    // `K` defaults to `u64` on `CustomIndex`, but any `PrimaryKey` works —
+    // this second impl, keyed by `String`, is what `custom_index_on_a_
+    // string_keyed_table` below exercises.
+    impl CustomIndex<User, String> for SumIndex {
+        fn on_insert(&mut self, _key: String, record: &User) -> Result<()> {
+            self.total += (self.field_extractor)(record);
+            Ok(())
+        }
+
+        fn on_update(&mut self, _key: String, old: &User, new: &User) -> Result<()> {
+            self.total -= (self.field_extractor)(old);
+            self.total += (self.field_extractor)(new);
+            Ok(())
+        }
+
+        fn on_delete(&mut self, _key: String, record: &User) {
+            self.total -= (self.field_extractor)(record);
+        }
+    }
+
     #[test]
     fn define_custom_index_and_query() {
         let mut table = Table::<User>::new();
@@ -3071,6 +3084,46 @@ mod tests {
             .unwrap();
         let res = table.custom_index::<SumIndex>("by_email");
         assert!(matches!(res, Err(Error::IndexTypeMismatch(_))));
+    }
+
+    #[test]
+    fn custom_index_on_a_string_keyed_table() {
+        // `define_custom_index`/`custom_index` used to be pinned to
+        // `Table<R, u64>` because `CustomIndex` hard-coded `id: u64`. Now
+        // that `CustomIndex<R, K = u64>` carries the row-key type, a
+        // `new_keyed` (non-`AutoKey`) table can define one too.
+        let mut table: Table<User, String> = Table::new_keyed();
+        table
+            .define_custom_index("age_sum", SumIndex::new(|u| u.age as u64))
+            .unwrap();
+
+        table
+            .put(
+                "alice".to_string(),
+                User {
+                    email: "a@x.com".to_string(),
+                    age: 30,
+                    name: "Alice".to_string(),
+                },
+            )
+            .unwrap();
+        table
+            .put(
+                "bob".to_string(),
+                User {
+                    email: "b@x.com".to_string(),
+                    age: 20,
+                    name: "Bob".to_string(),
+                },
+            )
+            .unwrap();
+
+        let idx = table.custom_index::<SumIndex>("age_sum").unwrap();
+        assert_eq!(idx.total(), 50);
+
+        table.delete(&"bob".to_string()).unwrap();
+        let idx = table.custom_index::<SumIndex>("age_sum").unwrap();
+        assert_eq!(idx.total(), 30);
     }
 
     #[test]
