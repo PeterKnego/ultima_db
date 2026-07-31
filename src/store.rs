@@ -1011,8 +1011,8 @@ impl Store {
                         }
                         for op in &entry.ops {
                             match op {
-                                crate::wal::WalOp::Insert { table, id, data }
-                                | crate::wal::WalOp::Update { table, id, data } => {
+                                crate::wal::WalOp::Insert { table, key, data }
+                                | crate::wal::WalOp::Update { table, key, data } => {
                                     let info = inner
                                         .registry
                                         .get(table)
@@ -1035,18 +1035,16 @@ impl Store {
                                         })?
                                         .as_any_mut();
 
-                                    // The registry closures address rows by
-                                    // encoded key bytes; WAL ops still carry
-                                    // `u64` ids, whose encoding is their
-                                    // big-endian form.
-                                    let key = crate::primary_key::PrimaryKey::encode(id);
+                                    // The WAL and the registry closures speak
+                                    // the same language since 0.3.0: encoded
+                                    // primary-key bytes, straight through.
                                     if matches!(op, crate::wal::WalOp::Insert { .. }) {
-                                        (info.replay_insert)(table_mut, &key, data)?;
+                                        (info.replay_insert)(table_mut, key, data)?;
                                     } else {
-                                        (info.replay_update)(table_mut, &key, data)?;
+                                        (info.replay_update)(table_mut, key, data)?;
                                     }
                                 }
-                                crate::wal::WalOp::Delete { table, id } => {
+                                crate::wal::WalOp::Delete { table, key } => {
                                     let info = inner
                                         .registry
                                         .get(table)
@@ -1057,8 +1055,7 @@ impl Store {
                                                 "table Arc has multiple references during replay".into()
                                             ))?
                                             .as_any_mut();
-                                        let key = crate::primary_key::PrimaryKey::encode(id);
-                                        (info.replay_delete)(table_mut, &key)?;
+                                        (info.replay_delete)(table_mut, key)?;
                                     }
                                 }
                                 crate::wal::WalOp::CreateTable { .. } => {}
@@ -2237,7 +2234,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             }
             w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
                 table: w.table_name.clone(),
-                id,
+                key: crate::primary_key::PrimaryKey::encode(&id),
                 data,
             });
             self.table_metrics.inc_inserts(1);
@@ -2263,7 +2260,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             }
             w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                 table: w.table_name.clone(),
-                id,
+                key: crate::primary_key::PrimaryKey::encode(&id),
                 data,
             });
             self.table_metrics.inc_updates(1);
@@ -2288,7 +2285,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         if let Some(w) = &mut self.wal_ops {
             w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                 table: w.table_name.clone(),
-                id,
+                key: crate::primary_key::PrimaryKey::encode(&id),
             });
         }
         self.table_metrics.inc_deletes(1);
@@ -2310,7 +2307,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             for (id, data) in ids.iter().zip(data_list) {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
                     table: w.table_name.clone(),
-                    id: *id,
+                    key: crate::primary_key::PrimaryKey::encode(id),
                     data,
                 });
             }
@@ -2347,7 +2344,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             for (id, data) in ops_data {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
-                    id,
+                    key: crate::primary_key::PrimaryKey::encode(&id),
                     data,
                 });
             }
@@ -2375,7 +2372,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             for &id in ids {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                     table: w.table_name.clone(),
-                    id,
+                    key: crate::primary_key::PrimaryKey::encode(&id),
                 });
             }
         }
@@ -2574,16 +2571,17 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             let data = data.expect("serialized when wal_ops is Some");
+            let key = crate::primary_key::PrimaryKey::encode(&id);
             let op = if had_prior {
                 crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
-                    id,
+                    key,
                     data,
                 }
             } else {
                 crate::wal::WalOp::Insert {
                     table: w.table_name.clone(),
-                    id,
+                    key,
                     data,
                 }
             };

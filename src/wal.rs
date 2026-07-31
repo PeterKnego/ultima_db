@@ -7,6 +7,9 @@
 //! `Standalone` persistence mode, WAL entries are written to disk on commit.
 //!
 //! File format: append-only sequence of `[len: u32][WalEntry bytes][crc32: u32]`.
+//! Each `WalEntry` payload opens with `[magic: u8 = 0xFF][format: u8 = 2]` — see
+//! [`WAL_ENTRY_MAGIC`] for why that pair cannot be confused with a pre-0.3.0
+//! (v1) payload, which had no marker at all.
 
 #![allow(dead_code)]
 
@@ -83,8 +86,9 @@ pub enum WalOp {
     Insert {
         /// Name of the table the row was inserted into.
         table: String,
-        /// Primary key of the inserted row.
-        id: u64,
+        /// Encoded primary key of the inserted row
+        /// ([`PrimaryKey::encode`](crate::PrimaryKey::encode)).
+        key: Vec<u8>,
         /// Bincode-serialized record bytes.
         data: Vec<u8>,
     },
@@ -92,8 +96,9 @@ pub enum WalOp {
     Update {
         /// Name of the table the row belongs to.
         table: String,
-        /// Primary key of the updated row.
-        id: u64,
+        /// Encoded primary key of the updated row
+        /// ([`PrimaryKey::encode`](crate::PrimaryKey::encode)).
+        key: Vec<u8>,
         /// Bincode-serialized record bytes (the new value).
         data: Vec<u8>,
     },
@@ -101,8 +106,9 @@ pub enum WalOp {
     Delete {
         /// Name of the table the row was removed from.
         table: String,
-        /// Primary key of the deleted row.
-        id: u64,
+        /// Encoded primary key of the deleted row
+        /// ([`PrimaryKey::encode`](crate::PrimaryKey::encode)).
+        key: Vec<u8>,
     },
     /// A new (empty) table was created.
     CreateTable {
@@ -140,6 +146,70 @@ pub struct WalEntry {
 // Binary serialization (using bincode for WalEntry)
 // ---------------------------------------------------------------------------
 
+/// Leading byte of every v2 entry payload.
+///
+/// The WAL file itself has no header — it is a bare concatenation of
+/// `[len][payload][crc]` records, and both the preallocating sink (which
+/// reconstructs its write head by scanning) and the prune-by-rewrite path
+/// depend on that. So the format marker lives at the front of each *payload*
+/// instead.
+///
+/// `0xFF` is the byte that makes the two formats provably distinguishable. A
+/// v1 (pre-0.3.0) payload opened with the entry's `version: u64` encoded by
+/// `bincode::config::standard()`, i.e. a varint whose leading byte is either a
+/// literal `0..=250` or a width marker `251..=253` (`254` is u128-only, `255`
+/// is not a legal tag at all — see `bincode-2.0.1/src/varint/mod.rs:25-29`).
+/// So no v1 payload can begin with `0xFF`, and no v2 payload can be mistaken
+/// for a v1 one. This mirrors the `TABLE_MAGIC_V2` decision in
+/// [`crate::registry`], and for the same reason: a bare version byte would
+/// have collided with a small varint.
+const WAL_ENTRY_MAGIC: u8 = 0xFF;
+
+/// On-disk WAL entry format version.
+///
+/// v1 (pre-0.3.0, implicit — it carried no marker) addressed rows by `u64`
+/// id. v2 carries [`PrimaryKey::encode`](crate::PrimaryKey::encode) bytes.
+/// There is no compatibility branch: a v1 WAL is rejected by
+/// [`check_entry_header`].
+const WAL_FORMAT_VERSION: u8 = 2;
+
+/// Validate an entry payload's `[magic][version]` prefix, returning the offset
+/// of the first byte after it.
+///
+/// Called by [`deserialize_entry`] *and* directly by [`scan_wal`], because a
+/// version rejection must be a hard error even in tail-tolerant mode: a
+/// CRC-valid record is by definition not a torn write into preallocated zeros,
+/// so silently treating it as end-of-log would discard a real (v1) log.
+fn check_entry_header(data: &[u8]) -> Result<usize> {
+    if data.len() < 2 {
+        return Err(Error::WalCorrupted(
+            "entry payload shorter than the 2-byte format header".into(),
+        ));
+    }
+    if data[0] != WAL_ENTRY_MAGIC {
+        return Err(Error::WalCorrupted(format!(
+            "WAL format version 1 (pre-0.3.0: no version marker, leading byte 0x{:02X}) is not \
+             supported by this build (expected {WAL_FORMAT_VERSION}). 0.3.0 changed the on-disk \
+             row-key encoding from fixed u64 ids to encoded primary keys, and pre-0.3.0 \
+             checkpoints are rejected too — so checkpointing with the old build does not migrate \
+             the data. To migrate: with the previous UltimaDB version, `Store::recover()` the old \
+             directory, read the rows out through a `ReadTx`, and load them into a 0.3.0+ store \
+             with `Store::bulk_load` / `Store::bulk_load_batch`. To discard the old data instead, \
+             delete the WAL and checkpoint files in the persistence directory.",
+            data[0]
+        )));
+    }
+    if data[1] != WAL_FORMAT_VERSION {
+        return Err(Error::WalCorrupted(format!(
+            "WAL format version {} is not supported by this build (expected \
+             {WAL_FORMAT_VERSION}): the WAL was written by a newer UltimaDB — upgrade the binary \
+             to read it.",
+            data[1]
+        )));
+    }
+    Ok(2)
+}
+
 /// Tag bytes for WalOp variants.
 const TAG_INSERT: u8 = 1;
 const TAG_UPDATE: u8 = 2;
@@ -152,6 +222,8 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     let mut buf = Vec::new();
 
+    buf.push(WAL_ENTRY_MAGIC);
+    buf.push(WAL_FORMAT_VERSION);
     bincode::encode_into_std_write(entry.version, &mut buf, config)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     bincode::encode_into_std_write(entry.ops.len() as u32, &mut buf, config)
@@ -159,29 +231,29 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
 
     for op in &entry.ops {
         match op {
-            WalOp::Insert { table, id, data } => {
+            WalOp::Insert { table, key, data } => {
                 buf.push(TAG_INSERT);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                bincode::encode_into_std_write(*id, &mut buf, config)
+                bincode::encode_into_std_write(key.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
                 bincode::encode_into_std_write(data.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
-            WalOp::Update { table, id, data } => {
+            WalOp::Update { table, key, data } => {
                 buf.push(TAG_UPDATE);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                bincode::encode_into_std_write(*id, &mut buf, config)
+                bincode::encode_into_std_write(key.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
                 bincode::encode_into_std_write(data.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
-            WalOp::Delete { table, id } => {
+            WalOp::Delete { table, key } => {
                 buf.push(TAG_DELETE);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                bincode::encode_into_std_write(*id, &mut buf, config)
+                bincode::encode_into_std_write(key.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
             WalOp::CreateTable { name } => {
@@ -207,7 +279,7 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
 
 fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
     let config = bincode::config::standard();
-    let mut offset = 0;
+    let mut offset = check_entry_header(data)?;
 
     let (version, read): (u64, _) = bincode::decode_from_slice(&data[offset..], config)
         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
@@ -234,7 +306,7 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     bincode::decode_from_slice(&data[offset..], config)
                         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (id, read): (u64, _) = bincode::decode_from_slice(&data[offset..], config)
+                let (key, read): (Vec<u8>, _) = bincode::decode_from_slice(&data[offset..], config)
                     .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
                 let (blob, read): (Vec<u8>, _) =
@@ -244,13 +316,13 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                 if tag == TAG_INSERT {
                     ops.push(WalOp::Insert {
                         table,
-                        id,
+                        key,
                         data: blob,
                     });
                 } else {
                     ops.push(WalOp::Update {
                         table,
-                        id,
+                        key,
                         data: blob,
                     });
                 }
@@ -260,10 +332,10 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     bincode::decode_from_slice(&data[offset..], config)
                         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (id, read): (u64, _) = bincode::decode_from_slice(&data[offset..], config)
+                let (key, read): (Vec<u8>, _) = bincode::decode_from_slice(&data[offset..], config)
                     .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                ops.push(WalOp::Delete { table, id });
+                ops.push(WalOp::Delete { table, key });
             }
             TAG_CREATE_TABLE => {
                 let (name, read): (String, _) = bincode::decode_from_slice(&data[offset..], config)
@@ -355,7 +427,8 @@ fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
 /// `tail_tolerant`, a CRC mismatch or undecodable frame is *also* treated as
 /// end-of-log (a torn write into preallocated zero space looks complete); when
 /// not, a CRC mismatch is a hard `WalCorrupted` error (strict corruption
-/// detection for the non-preallocated path).
+/// detection for the non-preallocated path). An unreadable *format version* in
+/// a CRC-valid record is a hard error either way — see [`check_entry_header`].
 pub(crate) fn scan_wal(path: &Path, tail_tolerant: bool) -> Result<(Vec<WalEntry>, u64)> {
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -388,6 +461,11 @@ pub(crate) fn scan_wal(path: &Path, tail_tolerant: bool) -> Result<(Vec<WalEntry
                 "CRC mismatch at entry starting at byte {offset}"
             )));
         }
+        // Format-version rejection is a hard error in BOTH modes. The CRC just
+        // verified, so this record is not a torn write into preallocated zeros
+        // — it is a real record in a format this build cannot read (a v1 WAL).
+        // Treating it as end-of-log would silently discard the whole log.
+        check_entry_header(data)?;
         match deserialize_entry(data) {
             Ok(entry) => entries.push(entry),
             Err(e) if tail_tolerant => {
@@ -1762,7 +1840,206 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Store;
+    use crate::{PrimaryKey, Store};
+
+    /// Encoded-key helper for fixtures that used to spell a bare `u64` id.
+    /// `u64::encode` is big-endian, so this is exactly what the store writes.
+    fn k(id: u64) -> Vec<u8> {
+        id.encode()
+    }
+
+    // -----------------------------------------------------------------------
+    // v1 (pre-0.3.0) format rejection
+    // -----------------------------------------------------------------------
+
+    /// Byte-for-byte reproduction of the pre-0.3.0 `serialize_entry`: no format
+    /// header, and row keys written as a bincode varint `u64` id. This is the
+    /// artifact an operator has on disk when they upgrade, so the rejection
+    /// tests run against the real thing rather than a hand-waved stand-in.
+    fn v1_serialize_entry(version: u64, ops: &[(u8, &str, u64, &[u8])]) -> Vec<u8> {
+        let config = bincode::config::standard();
+        let mut buf = Vec::new();
+        bincode::encode_into_std_write(version, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(ops.len() as u32, &mut buf, config).unwrap();
+        for (tag, table, id, data) in ops {
+            buf.push(*tag);
+            bincode::encode_into_std_write(*table, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(*id, &mut buf, config).unwrap();
+            if *tag != TAG_DELETE {
+                bincode::encode_into_std_write(*data, &mut buf, config).unwrap();
+            }
+        }
+        buf
+    }
+
+    /// Frame a raw payload the way the v1 (and v2) file format does. The
+    /// framing itself did not change, so a v1 file is a well-formed, CRC-valid
+    /// record sequence — which is exactly why the payload must self-identify.
+    fn v1_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&crc32(payload).to_le_bytes());
+        out
+    }
+
+    /// The whole rejection scheme rests on this: bincode's varint (which is how
+    /// a v1 payload's leading `version` field was written) never emits `0xFF`
+    /// as a first byte. Values `0..=250` are literal; `251..=253` are the u16/
+    /// u32/u64 width markers; `254` is u128-only and `255` is not a legal tag.
+    /// So no v1 payload can be mistaken for a v2 one.
+    #[test]
+    fn a_v1_payload_can_never_begin_with_the_v2_magic() {
+        let config = bincode::config::standard();
+        let interesting: Vec<u64> = vec![
+            0,
+            1,
+            2,
+            249,
+            250,
+            251,
+            252,
+            253,
+            254,
+            255,
+            u16::MAX as u64 - 1,
+            u16::MAX as u64,
+            u32::MAX as u64 - 1,
+            u32::MAX as u64,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for v in interesting.into_iter().chain(0..5_000u64) {
+            let enc = bincode::encode_to_vec(v, config).unwrap();
+            assert_ne!(
+                enc[0], WAL_ENTRY_MAGIC,
+                "bincode varint for {v} starts with the v2 magic byte"
+            );
+        }
+    }
+
+    /// A genuine v1 WAL file must be rejected with an actionable error, not
+    /// silently misread. `read_wal` (strict) is the recovery path for the
+    /// PerEntry/Coalesced sinks.
+    #[test]
+    fn strict_scan_rejects_a_genuine_v1_wal() {
+        let dir = crate::test_scratch::scratch_dir();
+        let path = dir.path().join(WAL_FILENAME);
+        let mut bytes = v1_frame(&v1_serialize_entry(1, &[(TAG_INSERT, "users", 1, &[10, 20])]));
+        bytes.extend_from_slice(&v1_frame(&v1_serialize_entry(
+            2,
+            &[(TAG_DELETE, "users", 1, &[])],
+        )));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = read_wal(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("format version 1"), "message was: {msg}");
+        assert!(msg.contains("Store::bulk_load"), "message was: {msg}");
+    }
+
+    /// The dangerous case. The preallocating sink scans tail-tolerantly, where
+    /// an undecodable record means "end of log". A v1 record is CRC-valid, so
+    /// it is NOT a torn tail — silently stopping there would report an empty
+    /// WAL and throw away every committed transaction. Both the recovery scan
+    /// and `PreallocFileSink::open` must hard-error instead.
+    #[test]
+    fn tolerant_scan_rejects_a_genuine_v1_wal_instead_of_reporting_end_of_log() {
+        let dir = crate::test_scratch::scratch_dir();
+        let path = dir.path().join(WAL_FILENAME);
+        let mut bytes = v1_frame(&v1_serialize_entry(1, &[(TAG_INSERT, "users", 1, &[10, 20])]));
+        bytes.extend_from_slice(&[0u8; 4096]); // preallocated zero tail
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = scan_wal(&path, true).unwrap_err();
+        assert!(
+            err.to_string().contains("format version 1"),
+            "message was: {err}"
+        );
+        assert!(PreallocFileSink::open_with_chunk(dir.path(), 4096).is_err());
+    }
+
+    /// The concrete silent misread the marker prevents.
+    ///
+    /// Without a format marker, this exact v1 record decodes with **no error**
+    /// into `Insert { table: "t", key: [4], data: [65, 66, 67] }` — wrong key,
+    /// wrong payload, no complaint. (Verified during development by making
+    /// `check_entry_header` a no-op and printing the result.) The v1 `id`
+    /// varint is consumed as the v2 key's *length* prefix, so a v1 record whose
+    /// following bytes happen to line up round-trips into a plausible-looking
+    /// lie. It must be rejected.
+    #[test]
+    fn a_v1_record_that_would_otherwise_decode_cleanly_is_rejected() {
+        let payload = v1_serialize_entry(1, &[(TAG_INSERT, "t", 1, &[3, 65, 66, 67])]);
+        assert_eq!(
+            payload,
+            vec![0x01, 0x01, 0x01, 0x01, b't', 0x01, 0x04, 0x03, 65, 66, 67],
+            "fixture no longer reproduces the misreading record"
+        );
+        let err = deserialize_entry(&payload).unwrap_err();
+        assert!(
+            err.to_string().contains("format version 1"),
+            "message was: {err}"
+        );
+    }
+
+    /// A v1 payload whose leading varint byte collides with the *version*
+    /// number (2) is the trap a bare version byte would have fallen into: it
+    /// must still be rejected, because the magic comes first.
+    #[test]
+    fn a_v1_payload_whose_first_byte_is_two_is_still_rejected() {
+        let payload = v1_serialize_entry(2, &[(TAG_INSERT, "t", 1, &[9])]);
+        assert_eq!(
+            payload[0], WAL_FORMAT_VERSION,
+            "fixture no longer exercises the version-byte collision"
+        );
+        let err = check_entry_header(&payload).unwrap_err();
+        assert!(
+            err.to_string().contains("format version 1"),
+            "message was: {err}"
+        );
+    }
+
+    /// A WAL written by a *newer* build is rejected too, naming its version.
+    #[test]
+    fn a_newer_format_version_is_rejected() {
+        let mut payload = serialize_entry(&WalEntry {
+            version: 1,
+            ops: vec![WalOp::CreateTable { name: "t".into() }],
+        })
+        .unwrap();
+        payload[1] = WAL_FORMAT_VERSION + 1;
+        let err = check_entry_header(&payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("format version 3"), "message was: {msg}");
+        assert!(msg.contains("newer UltimaDB"), "message was: {msg}");
+    }
+
+    /// Pins the v2 payload prefix so a later edit that shifts it breaks a test
+    /// naming the field rather than silently changing the on-disk format.
+    #[test]
+    fn v2_payload_starts_with_magic_then_version() {
+        let payload = serialize_entry(&WalEntry {
+            version: 7,
+            ops: vec![WalOp::CreateTable { name: "t".into() }],
+        })
+        .unwrap();
+        assert_eq!(payload[0], 0xFF);
+        assert_eq!(payload[1], 2);
+        // The entry version follows immediately, still a bincode varint.
+        assert_eq!(payload[2], 7);
+        assert_eq!(check_entry_header(&payload).unwrap(), 2);
+    }
+
+    /// A payload too short to hold the header errors rather than panicking on
+    /// an out-of-range index.
+    #[test]
+    fn a_truncated_header_errors_not_panics() {
+        assert!(check_entry_header(&[]).is_err());
+        assert!(check_entry_header(&[WAL_ENTRY_MAGIC]).is_err());
+        assert!(deserialize_entry(&[WAL_ENTRY_MAGIC]).is_err());
+    }
 
     #[test]
     fn scan_wal_returns_durable_offset_and_strict_wrapper_matches() {
@@ -1812,8 +2089,8 @@ mod tests {
     fn frame_entry_concatenation_reads_back_via_read_wal() {
         let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
-        let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), id: 1, data: vec![1, 2, 3] }] };
-        let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), id: 1 }] };
+        let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), key: k(1), data: vec![1, 2, 3] }] };
+        let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), key: k(1) }] };
 
         let mut bytes = frame_entry(&e1).unwrap();
         bytes.extend_from_slice(&frame_entry(&e2).unwrap());
@@ -1873,10 +2150,10 @@ mod tests {
             t.delete(2).unwrap();
         }
         assert_eq!(wtx.wal_ops.borrow().len(), 4);
-        assert!(matches!(&wtx.wal_ops.borrow()[0], WalOp::Insert { table, id: 1, .. } if table == "users"));
-        assert!(matches!(&wtx.wal_ops.borrow()[1], WalOp::Insert { table, id: 2, .. } if table == "users"));
-        assert!(matches!(&wtx.wal_ops.borrow()[2], WalOp::Update { table, id: 1, .. } if table == "users"));
-        assert!(matches!(&wtx.wal_ops.borrow()[3], WalOp::Delete { table, id: 2 } if table == "users"));
+        assert!(matches!(&wtx.wal_ops.borrow()[0], WalOp::Insert { table, key, .. } if table == "users" && *key == k(1)));
+        assert!(matches!(&wtx.wal_ops.borrow()[1], WalOp::Insert { table, key, .. } if table == "users" && *key == k(2)));
+        assert!(matches!(&wtx.wal_ops.borrow()[2], WalOp::Update { table, key, .. } if table == "users" && *key == k(1)));
+        assert!(matches!(&wtx.wal_ops.borrow()[3], WalOp::Delete { table, key } if table == "users" && *key == k(2)));
     }
 
     #[test]
@@ -1928,17 +2205,17 @@ mod tests {
             ops: vec![
                 WalOp::Insert {
                     table: "users".into(),
-                    id: 1,
+                    key: k(1),
                     data: vec![1, 2, 3],
                 },
                 WalOp::Update {
                     table: "users".into(),
-                    id: 1,
+                    key: k(1),
                     data: vec![4, 5, 6],
                 },
                 WalOp::Delete {
                     table: "users".into(),
-                    id: 1,
+                    key: k(1),
                 },
                 WalOp::CreateTable {
                     name: "orders".into(),
@@ -1952,6 +2229,48 @@ mod tests {
         let recovered = deserialize_entry(&data).unwrap();
         assert_eq!(recovered.version, 42);
         assert_eq!(recovered.ops.len(), 5);
+        assert!(matches!(&recovered.ops[0], WalOp::Insert { key, .. } if *key == k(1)));
+        assert!(matches!(&recovered.ops[1], WalOp::Update { key, .. } if *key == k(1)));
+        assert!(matches!(&recovered.ops[2], WalOp::Delete { key, .. } if *key == k(1)));
+    }
+
+    /// The point of the v2 format: a key that is neither 8 bytes nor a valid
+    /// varint round-trips byte-for-byte, including an embedded NUL and a
+    /// leading 0xFF (which is the entry magic — it must not confuse framing).
+    #[test]
+    fn variable_length_keys_roundtrip_through_the_wal_file() {
+        let dir = crate::test_scratch::scratch_dir();
+        let path = dir.path().join(WAL_FILENAME);
+        let keys: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"alice@example.com".to_vec(),
+            vec![0x00, 0xFF, 0x00],
+            vec![0xFF; 300],
+        ];
+        let entry = WalEntry {
+            version: 3,
+            ops: keys
+                .iter()
+                .map(|key| WalOp::Insert {
+                    table: "emails".into(),
+                    key: key.clone(),
+                    data: vec![7],
+                })
+                .collect(),
+        };
+        std::fs::write(&path, frame_entry(&entry).unwrap()).unwrap();
+
+        let read = read_wal(&path).unwrap();
+        assert_eq!(read.len(), 1);
+        let got: Vec<Vec<u8>> = read[0]
+            .ops
+            .iter()
+            .map(|op| match op {
+                WalOp::Insert { key, .. } => key.clone(),
+                other => panic!("unexpected op: {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, keys);
     }
 
     #[test]
@@ -1966,7 +2285,7 @@ mod tests {
                 version: 1,
                 ops: vec![WalOp::Insert {
                     table: "t".into(),
-                    id: 1,
+                    key: k(1),
                     data: vec![10],
                 }],
             };
@@ -1974,7 +2293,7 @@ mod tests {
                 version: 2,
                 ops: vec![WalOp::Delete {
                     table: "t".into(),
-                    id: 1,
+                    key: k(1),
                 }],
             };
             write_entry_to_file(&mut file, &e1).unwrap();
@@ -2067,7 +2386,7 @@ mod tests {
                 version: 1,
                 ops: vec![WalOp::Insert {
                     table: "t".into(),
-                    id: 1,
+                    key: k(1),
                     data: vec![10],
                 }],
             };
@@ -2475,9 +2794,10 @@ mod tests {
         // Write a valid entry, then manually craft one with a bad op tag.
         {
             let mut file = File::create(&path).unwrap();
-            // Craft a minimal entry: version=1, op_count=1, tag=0xFF (invalid).
+            // Craft a minimal entry: v2 header, version=1, op_count=1,
+            // tag=0xFF (invalid).
             let config = bincode::config::standard();
-            let mut data = Vec::new();
+            let mut data = vec![WAL_ENTRY_MAGIC, WAL_FORMAT_VERSION];
             bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
             bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // op_count
             data.push(0xFF); // invalid tag
@@ -2503,7 +2823,7 @@ mod tests {
         {
             let mut file = File::create(&path).unwrap();
             let config = bincode::config::standard();
-            let mut data = Vec::new();
+            let mut data = vec![WAL_ENTRY_MAGIC, WAL_FORMAT_VERSION];
             bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
             bincode::encode_into_std_write(2u32, &mut data, config).unwrap(); // op_count = 2
             // Only write one op (CreateTable).
@@ -2691,7 +3011,7 @@ mod tests {
         {
             let mut sink = BufferedFileSink::open(dir.path(), true).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![v as u8; 32] }] }).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -2706,7 +3026,7 @@ mod tests {
         {
             let mut sink = BufferedFileSink::open(dir.path(), false).unwrap(); // sync_all
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![v as u8; 32] }] }).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -2736,7 +3056,7 @@ mod tests {
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![v as u8; 32] }] }).unwrap();
             }
             sink.sync().unwrap();
         } // Drop truncates to logical length + syncs
@@ -2754,7 +3074,7 @@ mod tests {
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=n {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), id: v, data: vec![0u8; 16 * 1024] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![0u8; 16 * 1024] }] }).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -2774,7 +3094,7 @@ mod tests {
                     version: v,
                     ops: vec![WalOp::Insert {
                         table: "t".into(),
-                        id: v,
+                        key: k(v),
                         data: vec![v as u8; 32],
                     }],
                 })

@@ -53,7 +53,11 @@ const KINDS: &[(&str, WalSinkKind)] = &[
 fn make_entry(version: u64, payload: usize) -> WalEntry {
     WalEntry {
         version,
-        ops: vec![WalOp::Insert { table: "bench".to_string(), id: version, data: vec![0u8; payload] }],
+        ops: vec![WalOp::Insert {
+            table: "bench".to_string(),
+            key: ultima_db::PrimaryKey::encode(&version),
+            data: vec![0u8; payload],
+        }],
     }
 }
 

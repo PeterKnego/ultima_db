@@ -1326,3 +1326,157 @@ fn checkpoint_concurrent_with_commits_loses_no_acknowledged_commit() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Arbitrary primary keys: end-to-end WAL recovery of a String-keyed table
+// ---------------------------------------------------------------------------
+
+// TASK 6 removes the `cfg(any())` and the `#[ignore]` below.
+//
+// This test needs `Store::begin_write` -> `WriteTx::open_table_keyed` and
+// `ReadTx::open_table_keyed`, which Task 6 delivers; `Store::register_table_keyed`
+// (Task 4) already exists. `#[ignore]` alone is not enough — an ignored test is
+// still compiled — so the body is additionally gated off with `cfg(any())`
+// (always false, and unlike a made-up feature name it raises no
+// `unexpected_cfgs` warning). Deleting the two attribute lines is all Task 6's
+// Step 5 has to do. The test is deliberately NOT weakened to run today: the
+// WAL-level coverage for variable-length keys lives in
+// `src/wal.rs::variable_length_keys_roundtrip_through_the_wal_file`, and this
+// is the end-to-end counterpart.
+#[cfg(any())]
+#[ignore = "needs open_table_keyed on the tx types (Task 6)"]
+#[test]
+fn string_keyed_table_survives_wal_recovery() {
+    let dir = common::test_scratch::scratch_dir();
+
+    {
+        let store = Store::new(
+            StoreConfig::builder()
+                .persistence(Persistence::standalone(
+                    dir.path().to_path_buf(),
+                    Durability::Consistent,
+                    WalWrite::PerEntry,
+                ))
+                .build(),
+        )
+        .unwrap();
+        store
+            .register_table_keyed::<String, String>("emails")
+            .unwrap();
+
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
+        t.put("alice@x.com".to_string(), "Alice".to_string()).unwrap();
+        t.put("bob@x.com".to_string(), "Bob".to_string()).unwrap();
+        drop(t);
+        wtx.commit().unwrap();
+    }
+
+    let store = Store::new(
+        StoreConfig::builder()
+            .persistence(Persistence::standalone(
+                dir.path().to_path_buf(),
+                Durability::Consistent,
+                WalWrite::PerEntry,
+            ))
+            .build(),
+    )
+    .unwrap();
+    store
+        .register_table_keyed::<String, String>("emails")
+        .unwrap();
+    store.recover().unwrap();
+
+    let rtx = store.begin_read(None).unwrap();
+    let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+    assert_eq!(t.get(&"alice@x.com".to_string()), Some(&"Alice".to_string()));
+    assert_eq!(t.get(&"bob@x.com".to_string()), Some(&"Bob".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// Pre-0.3.0 (v1) WAL rejection
+// ---------------------------------------------------------------------------
+
+/// CRC-32/ISO-HDLC, bitwise. The WAL uses `crc32fast`, which is byte-identical;
+/// spelling it out here keeps this fixture independent of the crate's internals,
+/// so it stays a genuine "bytes an operator has on disk" artifact.
+fn crc32_iso_hdlc(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// One complete pre-0.3.0 WAL record: `[len u32 LE][payload][crc32 u32 LE]`
+/// around a v1 payload — no format header, and the row key written as a
+/// bincode varint `u64` id. Hand-assembled byte by byte so it cannot drift
+/// with the current encoder.
+fn v1_wal_bytes() -> Vec<u8> {
+    let payload: Vec<u8> = vec![
+        0x01, // entry version = 1 (bincode varint)
+        0x01, // op count = 1 (bincode varint u32)
+        0x01, // TAG_INSERT
+        0x05, b'u', b's', b'e', b'r', b's', // table name "users"
+        0x01, // row id = 1 (bincode varint u64) -- the v1 key encoding
+        0x02, 10, 20, // record bytes (bincode length-prefixed slice)
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc32_iso_hdlc(&payload).to_le_bytes());
+    out
+}
+
+/// A WAL written before 0.3.0 must be refused with a message that names the
+/// format version and a migration path — never silently misread, and never
+/// silently treated as an empty log.
+///
+/// Both durability/write modes are covered because they scan differently:
+/// `PerEntry`/`Coalesced` recovery is strict, while `CoalescedPrealloc` is
+/// tail-tolerant (an undecodable record normally means "end of log"). The
+/// tolerant path is the dangerous one: without an explicit version check it
+/// would report zero entries and drop every committed transaction on the floor.
+#[test]
+fn recovery_rejects_a_pre_0_3_0_wal() {
+    for wal_write in [WalWrite::PerEntry, WalWrite::CoalescedPrealloc] {
+        let dir = common::test_scratch::scratch_dir();
+        std::fs::write(dir.path().join("wal.bin"), v1_wal_bytes()).unwrap();
+
+        let config = StoreConfig::builder()
+            .persistence(Persistence::standalone(
+                dir.path().to_path_buf(),
+                Durability::Consistent,
+                wal_write,
+            ))
+            .build();
+
+        // The prealloc sink scans at open time, so the refusal can surface from
+        // either `Store::new` or `recover()`; both are acceptable, silence is not.
+        let err = match Store::new(config) {
+            Err(e) => e,
+            Ok(store) => {
+                store.register_table::<User>("users").unwrap();
+                store
+                    .recover()
+                    .expect_err("a v1 WAL must not recover silently")
+            }
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("format version 1"),
+            "{wal_write:?}: message was: {msg}"
+        );
+        assert!(
+            msg.contains("Store::bulk_load"),
+            "{wal_write:?}: message was: {msg}"
+        );
+    }
+}
