@@ -12,8 +12,10 @@
 
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::persistence::Record;
+use crate::primary_key::{AutoKey, PrimaryKey};
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
 
@@ -22,25 +24,30 @@ use crate::{Error, Result};
 // closures take `&mut dyn Any` because callers pass through
 // `MergeableTable::as_any_mut()` — keeping `dyn Any` here avoids pulling
 // MergeableTable into every closure's body.
+//
+// Row keys cross this boundary as `PrimaryKey::encode` bytes, never as
+// `u64`: the concrete key type is erased here, and the encoding is
+// order-preserving, so byte order is key order for every caller that needs
+// to sort or range over them.
 type SerializeAnyFn = Box<dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync>;
 type DeserializeRecordFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>> + Send + Sync>;
 type DeserializeTableFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn MergeableTable>> + Send + Sync>;
-type ReplayInsertFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
-type ReplayUpdateFn = Box<dyn Fn(&mut dyn Any, u64, &[u8]) -> Result<()> + Send + Sync>;
-type ReplayDeleteFn = Box<dyn Fn(&mut dyn Any, u64) -> Result<()> + Send + Sync>;
+type ReplayInsertFn = Box<dyn Fn(&mut dyn Any, &[u8], &[u8]) -> Result<()> + Send + Sync>;
+type ReplayUpdateFn = Box<dyn Fn(&mut dyn Any, &[u8], &[u8]) -> Result<()> + Send + Sync>;
+type ReplayDeleteFn = Box<dyn Fn(&mut dyn Any, &[u8]) -> Result<()> + Send + Sync>;
 type NewEmptyTableFn = Box<dyn Fn() -> Box<dyn MergeableTable> + Send + Sync>;
-/// Build a `Table<R>` from a list of raw (key, bincode-bytes) pairs and wrap
-/// it as `Box<dyn MergeableTable>`. Used by `install_snapshot_stream` to
-/// reconstruct a table from the wire format without a `R: 'static` bound at
-/// the call site.
+/// Build a `Table<R, K>` from a list of raw (encoded-key, bincode-bytes) pairs
+/// and wrap it as `Box<dyn MergeableTable>`. Used by `install_snapshot_stream`
+/// to reconstruct a table from the wire format without `R`/`K` bounds at the
+/// call site.
 ///
 /// `existing` is the destination's current table by the same name, if any. The
-/// closure downcasts it to `&Table<R>` and clones its `empty_index_defs()` so
-/// secondary indexes survive the install (they're rebuilt from the new rows
+/// closure downcasts it to `&Table<R, K>` and clones its `empty_index_defs()`
+/// so secondary indexes survive the install (they're rebuilt from the new rows
 /// via `Table::from_bulk`'s `rebuild_from_sorted_data` pass). When `None`
 /// (fresh receiver with no prior table), the new table has no indexes.
 type BuildFromRawRowsFn = Box<
-    dyn Fn(Vec<(u64, Vec<u8>)>, Option<&dyn MergeableTable>) -> Result<Box<dyn MergeableTable>>
+    dyn Fn(Vec<(Vec<u8>, Vec<u8>)>, Option<&dyn MergeableTable>) -> Result<Box<dyn MergeableTable>>
         + Send
         + Sync,
 >;
@@ -54,19 +61,22 @@ pub(crate) struct TableTypeInfo {
     pub serialize_record: SerializeAnyFn,
     /// Deserialize bytes to a single record (`Box<dyn Any + Send + Sync>` wrapping `R`).
     pub deserialize_record: DeserializeRecordFn,
-    /// Serialize an entire `Table<R>` (as `&dyn Any`) to bytes.
+    /// Serialize an entire `Table<R, K>` (as `&dyn Any`) to bytes.
     pub serialize_table: SerializeAnyFn,
-    /// Deserialize bytes to a `Table<R>` (as `Box<dyn MergeableTable>`).
+    /// Deserialize bytes to a `Table<R, K>` (as `Box<dyn MergeableTable>`).
     pub deserialize_table: DeserializeTableFn,
-    /// Create a new empty `Table<R>` as `Box<dyn Any + Send + Sync>`.
+    /// Create a new empty `Table<R, K>` as `Box<dyn Any + Send + Sync>`.
     pub new_empty_table: NewEmptyTableFn,
-    /// Insert a serialized record into a `Table<R>` (as `&mut dyn Any`) at a specific ID.
+    /// Insert a serialized record into a `Table<R, K>` (as `&mut dyn Any`) at
+    /// an encoded key.
     pub replay_insert: ReplayInsertFn,
-    /// Update a record in a `Table<R>` (as `&mut dyn Any`) with serialized data.
+    /// Update a record in a `Table<R, K>` (as `&mut dyn Any`) with serialized
+    /// data, addressed by encoded key.
     pub replay_update: ReplayUpdateFn,
-    /// Delete a record from a `Table<R>` (as `&mut dyn Any`) by ID.
+    /// Delete a record from a `Table<R, K>` (as `&mut dyn Any`) by encoded key.
     pub replay_delete: ReplayDeleteFn,
-    /// Deserialize raw `(key, bytes)` pairs and build a fresh `Table<R>`.
+    /// Deserialize raw `(encoded key, bytes)` pairs and build a fresh
+    /// `Table<R, K>`.
     /// If a destination table by the same name already exists, its index
     /// definitions are cloned and rebuilt over the new rows so secondary
     /// indexes survive the install.
@@ -81,10 +91,38 @@ pub(crate) struct TableRegistry {
     entries: BTreeMap<String, TableTypeInfo>,
 }
 
+/// The auto-increment counter a fresh table of key type `K` starts with:
+/// `Some(1)` for `u64` — the one [`AutoKey`] — and `None` for every
+/// explicitly-keyed type.
+///
+/// A `PrimaryKey`-only bound cannot spell `AutoKey::first()`, and Rust has no
+/// specialization, so recover it by type identity instead: `K: 'static`, so
+/// this is a plain downcast of a `u64` to `K`, which succeeds exactly when
+/// `K == u64`. Keeping the seed here (rather than pushing an `AutoKey` bound
+/// out to every caller) is what lets the type-erased closures build an empty
+/// table for any key type while preserving the
+/// `next_id_opt() == None` ⟺ explicitly-keyed invariant.
+fn auto_counter_seed<K: PrimaryKey>() -> Option<K> {
+    let first = <u64 as AutoKey>::first();
+    (&first as &dyn Any).downcast_ref::<K>().cloned()
+}
+
+/// Hex-render a key for an error message. `K` carries no `Debug`/`Display`
+/// bound; the order-preserving encoding is the one printable form every key
+/// type has (`Table::insert_with_id` reports duplicates the same way).
+fn hex<K: PrimaryKey>(key: &K) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("0x");
+    for b in key.encode() {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 impl TableRegistry {
     /// Register a table type. Stores closures that can serialize/deserialize
-    /// records and full tables for the given record type `R`.
-    pub fn register<R: Record>(&mut self, name: &str) -> Result<()> {
+    /// records and full tables for the record type `R` keyed by `K`.
+    pub fn register<R: Record, K: PrimaryKey>(&mut self, name: &str) -> Result<()> {
         use std::collections::btree_map::Entry;
         match self.entries.entry(name.to_string()) {
             Entry::Occupied(e) => {
@@ -112,86 +150,107 @@ impl TableRegistry {
                     }),
                     serialize_table: Box::new(|any| {
                         let table = any
-                            .downcast_ref::<Table<R>>()
+                            .downcast_ref::<Table<R, K>>()
                             .ok_or_else(|| Error::TypeMismatch("table downcast failed".into()))?;
                         serialize_table(table)
                     }),
                     deserialize_table: Box::new(|bytes| {
-                        let table = deserialize_table::<R>(bytes)?;
+                        let table = deserialize_table::<R, K>(bytes)?;
                         Ok(Box::new(table))
                     }),
-                    new_empty_table: Box::new(|| Box::new(Table::<R>::new())),
-                    replay_insert: Box::new(|table_any, id, data| {
-                        let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
+                    new_empty_table: Box::new(|| {
+                        Box::new(Table::<R, K>::empty_with_counter(auto_counter_seed::<K>()))
+                    }),
+                    replay_insert: Box::new(|table_any, key, data| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
                             Error::TypeMismatch("replay_insert downcast failed".into())
                         })?;
+                        let key = K::decode(key)?;
                         let (record, _): (R, _) =
                             bincode::serde::decode_from_slice(data, bincode::config::standard())
                                 .map_err(|e| Error::Persistence(e.to_string()))?;
-                        table.insert_with_id(id, record)?;
+                        // `Table::insert_with_id` carries an `AutoKey` bound
+                        // (it advances the id counter), so the erased path
+                        // spells its duplicate check itself and writes through
+                        // `put`, which maintains indexes and advances the
+                        // counter only on `AutoKey` tables.
+                        if table.get(&key).is_some() {
+                            return Err(Error::DuplicateKey(format!("key {}", hex(&key))));
+                        }
+                        table.put(key, record)?;
                         Ok(())
                     }),
-                    replay_update: Box::new(|table_any, id, data| {
-                        let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
+                    replay_update: Box::new(|table_any, key, data| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
                             Error::TypeMismatch("replay_update downcast failed".into())
                         })?;
+                        let key = K::decode(key)?;
                         let (record, _): (R, _) =
                             bincode::serde::decode_from_slice(data, bincode::config::standard())
                                 .map_err(|e| Error::Persistence(e.to_string()))?;
-                        table.update(&id, record)?;
+                        table.update(&key, record)?;
                         Ok(())
                     }),
-                    replay_delete: Box::new(|table_any, id| {
-                        let table = table_any.downcast_mut::<Table<R>>().ok_or_else(|| {
+                    replay_delete: Box::new(|table_any, key| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
                             Error::TypeMismatch("replay_delete downcast failed".into())
                         })?;
-                        table.delete(&id)?;
+                        let key = K::decode(key)?;
+                        table.delete(&key)?;
                         Ok(())
                     }),
                     build_from_raw_rows: Box::new(|raw_rows, existing| {
                         let config = bincode::config::standard();
-                        let mut sorted: Vec<(u64, std::sync::Arc<R>)> =
-                            Vec::with_capacity(raw_rows.len());
-                        for (key, bytes) in raw_rows {
+                        let mut sorted: Vec<(K, Arc<R>)> = Vec::with_capacity(raw_rows.len());
+                        for (key_bytes, bytes) in raw_rows {
+                            let key = K::decode(&key_bytes)?;
                             let (record, _): (R, _) =
                                 bincode::serde::decode_from_slice(&bytes, config)
                                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                            sorted.push((key, std::sync::Arc::new(record)));
+                            sorted.push((key, Arc::new(record)));
                         }
                         // Validate strictly-ascending unique keys at this trust
                         // boundary. `BTree::from_sorted` only debug-asserts, so
                         // a malformed wire payload would silently corrupt the
                         // tree in release builds.
-                        for w in sorted.windows(2) {
+                        for (i, w) in sorted.windows(2).enumerate() {
                             if w[0].0 >= w[1].0 {
                                 return Err(Error::Persistence(format!(
-                                    "rows not strictly sorted: key {} >= {}",
-                                    w[0].0, w[1].0
+                                    "rows not strictly sorted: key {} at row {i} >= key {} at \
+                                     row {}",
+                                    hex(&w[0].0),
+                                    hex(&w[1].0),
+                                    i + 1
                                 )));
                             }
                         }
-                        // `id + 1` would panic in debug / wrap to 0 in release
-                        // for `id == u64::MAX`. Fail loudly instead.
-                        let next_id = match sorted.last() {
-                            Some((id, _)) => id.checked_add(1).ok_or_else(|| {
-                                Error::Persistence(
-                                    "last row id is u64::MAX; next_id would overflow".into(),
-                                )
-                            })?,
-                            None => 1,
-                        };
+                        // Auto-increment counter: seed with the `AutoKey` start
+                        // value (`u64` only) and advance it past the highest
+                        // key. `advance_auto_counter` is a no-op for every
+                        // explicitly-keyed type, so those tables land on `None`
+                        // — the invariant the v2 `has_next_id` byte encodes.
+                        let mut next_id = auto_counter_seed::<K>();
+                        let has_counter = next_id.is_some();
+                        if let Some((last, _)) = sorted.last() {
+                            last.advance_auto_counter(&mut next_id);
+                        }
+                        // The counter is cleared only when the highest key has
+                        // no successor (`u64::MAX`). Dropping the `Some`
+                        // invariant would turn a later `insert` into a panic —
+                        // fail loudly here instead.
+                        if has_counter && next_id.is_none() {
+                            return Err(Error::Persistence(
+                                "last row id is u64::MAX; next_id would overflow".into(),
+                            ));
+                        }
                         // Preserve secondary indexes by cloning the destination's
                         // existing index definitions. Empty for a fresh receiver.
                         let index_defs = existing
-                            .and_then(|t| t.as_any().downcast_ref::<Table<R>>())
+                            .and_then(|t| t.as_any().downcast_ref::<Table<R, K>>())
                             .map(|t| t.empty_index_defs())
                             .transpose()?
                             .unwrap_or_default();
-                        // widened in task 4: `from_bulk` now takes an
-                        // `Option<K>` counter (`None` for explicitly-keyed
-                        // tables). This path is still `u64`-only, so the
-                        // counter is always `Some`.
-                        let table = Table::<R>::from_bulk(sorted, Some(next_id), index_defs)?;
+                        let table = Table::<R, K>::from_bulk(sorted, next_id, index_defs)?;
                         Ok(Box::new(table))
                     }),
                 });
@@ -257,7 +316,7 @@ impl TableRegistry {
     pub fn build_table_from_raw(
         &self,
         name: &str,
-        raw_rows: Vec<(u64, Vec<u8>)>,
+        raw_rows: Vec<(Vec<u8>, Vec<u8>)>,
         existing: Option<&dyn MergeableTable>,
     ) -> Option<Result<Box<dyn MergeableTable>>> {
         let info = self.entries.get(name)?;
@@ -265,64 +324,164 @@ impl TableRegistry {
     }
 }
 
-/// Serialize a `Table<R>` to bytes.
+// ---------------------------------------------------------------------------
+// Table serialization — format v2
+// ---------------------------------------------------------------------------
+
+/// Leading byte of a v2 payload, and the reason v1 can never be mistaken for
+/// v2.
 ///
-/// Format: `[next_id: u64][num_entries: u64][id: u64, record_bytes: ...]*`
-fn serialize_table<R: Record>(table: &Table<R>) -> Result<Vec<u8>> {
+/// A v1 payload opened with bincode's *varint* encoding of `next_id`, so its
+/// first byte is the varint tag: `0..=250` for a small `next_id`, or one of
+/// the width markers `251..=254`. `0xFF` is not a legal bincode varint tag, so
+/// no v1 payload can start with it. A bare version byte of `2` would not have
+/// been enough — a v1 table whose `next_id` was `2` (any table that took
+/// exactly one insert) encodes its first byte as `0x02`.
+const TABLE_MAGIC_V2: u8 = 0xFF;
+
+/// Format version carried in the second header byte.
+const TABLE_FORMAT_V2: u8 = 2;
+
+/// Serialize a `Table<R, K>` to bytes.
+///
+/// Format v2:
+/// `[magic: u8 = 0xFF][version: u8 = 2][has_next_id: u8]`
+/// `[next_id_len: u32-be, next_id_bytes]?`
+/// `[num_entries: u64-be]`
+/// `[key_len: u32-be, key_bytes, rec_len: u32-be, rec_bytes]*`
+///
+/// All lengths are big-endian and explicit: `PrimaryKey::encode` is variable-
+/// length for `String`, `Vec<u8>` and tuples, so the v1 assumption of a fixed
+/// 8-byte row id no longer holds. `has_next_id` is `0` exactly for an
+/// explicitly-keyed table (`next_id_opt() == None`) and `1` for an
+/// auto-increment one.
+///
+/// v1 (`[next_id: u64][count: u64][id: u64, rec]*`, all bincode-varint) is
+/// rejected on read — see [`TABLE_MAGIC_V2`].
+fn serialize_table<R: Record, K: PrimaryKey>(table: &Table<R, K>) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     let mut buf = Vec::new();
 
-    // next_id
-    bincode::encode_into_std_write(table.next_id(), &mut buf, config)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+    buf.push(TABLE_MAGIC_V2);
+    buf.push(TABLE_FORMAT_V2);
 
-    // num entries
-    let count = table.len() as u64;
-    bincode::encode_into_std_write(count, &mut buf, config)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
+    match table.next_id_opt() {
+        Some(id) => {
+            buf.push(1u8);
+            let enc = id.encode();
+            buf.extend_from_slice(&(enc.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&enc);
+        }
+        None => buf.push(0u8),
+    }
 
-    // entries: id + record
-    for (id, record) in table.iter() {
-        // `*id`, not `id`: `Table::iter` yields `&u64` now, and bincode's
-        // blanket `Encode for &T` would silently accept the reference. This
-        // is a wire-format site — encode the value explicitly.
-        bincode::encode_into_std_write(*id, &mut buf, config)
+    buf.extend_from_slice(&(table.len() as u64).to_be_bytes());
+
+    // `Table::iter` walks the B-tree in ascending key order, which is what
+    // `from_bulk` needs on the way back in.
+    for (key, record) in table.iter() {
+        let kb = key.encode();
+        buf.extend_from_slice(&(kb.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&kb);
+        let rb = bincode::serde::encode_to_vec(record, config)
             .map_err(|e| Error::Persistence(e.to_string()))?;
-        bincode::serde::encode_into_std_write(record, &mut buf, config)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
+        buf.extend_from_slice(&(rb.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&rb);
     }
 
     Ok(buf)
 }
 
-/// Deserialize a `Table<R>` from bytes.
-fn deserialize_table<R: Record>(bytes: &[u8]) -> Result<Table<R>> {
+/// Read `n` bytes at `at`, advancing it. Every length in the payload is
+/// attacker-controlled, so the arithmetic is checked.
+fn take<'a>(bytes: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
+    let end = at.checked_add(n).filter(|e| *e <= bytes.len()).ok_or_else(|| {
+        Error::Persistence(format!(
+            "table payload truncated: need {n} bytes at offset {at}, have {}",
+            bytes.len().saturating_sub(*at)
+        ))
+    })?;
+    let out = &bytes[*at..end];
+    *at = end;
+    Ok(out)
+}
+
+fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32> {
+    Ok(u32::from_be_bytes(take(bytes, at, 4)?.try_into().unwrap()))
+}
+
+fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64> {
+    Ok(u64::from_be_bytes(take(bytes, at, 8)?.try_into().unwrap()))
+}
+
+/// Deserialize a `Table<R, K>` from bytes written by [`serialize_table`].
+fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, K>> {
     let config = bincode::config::standard();
-    let mut offset = 0;
+    let mut at = 0usize;
 
-    let (next_id, read): (u64, _) = bincode::decode_from_slice(&bytes[offset..], config)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    offset += read;
-
-    let (count, read): (u64, _) = bincode::decode_from_slice(&bytes[offset..], config)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    offset += read;
-
-    let mut table = Table::<R>::new();
-    for _ in 0..count {
-        let (id, read): (u64, _) = bincode::decode_from_slice(&bytes[offset..], config)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
-        offset += read;
-
-        let (record, read): (R, _) = bincode::serde::decode_from_slice(&bytes[offset..], config)
-            .map_err(|e| Error::Persistence(e.to_string()))?;
-        offset += read;
-
-        table.insert_with_id(id, record)?;
+    let header = take(bytes, &mut at, 2)?;
+    if header[0] != TABLE_MAGIC_V2 {
+        return Err(Error::Persistence(format!(
+            "unsupported table format version: leading byte 0x{:02x} is not the v{} marker \
+             (this looks like a pre-0.3.0 v1 table, whose row keys were fixed 8-byte ids). \
+             Table data written before 0.3.0 cannot be read: recover with the previous \
+             version, export the data, and re-import it into a 0.3.0+ store — or delete the \
+             checkpoint/WAL directory to start fresh.",
+            header[0], TABLE_FORMAT_V2
+        )));
     }
-    table.set_next_id(next_id);
+    if header[1] != TABLE_FORMAT_V2 {
+        return Err(Error::Persistence(format!(
+            "unsupported table format version {}: this build reads v{}. The data was written \
+             by a newer UltimaDB — upgrade the binary to read it.",
+            header[1], TABLE_FORMAT_V2
+        )));
+    }
 
-    Ok(table)
+    let next_id = match take(bytes, &mut at, 1)?[0] {
+        0 => None,
+        1 => {
+            let len = take_u32(bytes, &mut at)? as usize;
+            Some(K::decode(take(bytes, &mut at, len)?)?)
+        }
+        other => {
+            return Err(Error::Persistence(format!(
+                "invalid has_next_id byte {other} in table payload"
+            )));
+        }
+    };
+
+    let count = take_u64(bytes, &mut at)?;
+    // `count` is attacker-controlled; every row costs at least 8 bytes on the
+    // wire (two length prefixes), so clamp the pre-allocation to what the
+    // payload could actually hold.
+    let cap = (count as usize).min(bytes.len() / 8);
+    let mut rows: Vec<(K, Arc<R>)> = Vec::with_capacity(cap);
+    for _ in 0..count {
+        let klen = take_u32(bytes, &mut at)? as usize;
+        let key = K::decode(take(bytes, &mut at, klen)?)?;
+        let rlen = take_u32(bytes, &mut at)? as usize;
+        let (record, _): (R, _) =
+            bincode::serde::decode_from_slice(take(bytes, &mut at, rlen)?, config)
+                .map_err(|e| Error::Persistence(e.to_string()))?;
+        rows.push((key, Arc::new(record)));
+    }
+
+    // `from_bulk` only debug-asserts ascending order — validate it here, at
+    // the trust boundary, so a malformed payload cannot corrupt the tree in a
+    // release build.
+    for (i, w) in rows.windows(2).enumerate() {
+        if w[0].0 >= w[1].0 {
+            return Err(Error::Persistence(format!(
+                "table payload rows not strictly ascending: key {} at row {i} >= key {} at row {}",
+                hex(&w[0].0),
+                hex(&w[1].0),
+                i + 1
+            )));
+        }
+    }
+
+    Table::from_bulk(rows, next_id, Vec::new())
 }
 
 #[cfg(test)]
@@ -338,7 +497,7 @@ mod tests {
     #[test]
     fn register_and_serialize_record() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
 
         let user = TestUser {
             name: "Alice".into(),
@@ -354,7 +513,7 @@ mod tests {
     #[test]
     fn register_and_serialize_table() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
 
         let mut table = Table::<TestUser>::new();
         table
@@ -394,16 +553,16 @@ mod tests {
     #[test]
     fn register_duplicate_same_type_is_noop() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
-        reg.register::<TestUser>("users").unwrap(); // no error
+        reg.register::<TestUser, u64>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap(); // no error
     }
 
     #[test]
     fn register_duplicate_different_type_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         assert!(matches!(
-            reg.register::<String>("users"),
+            reg.register::<String, u64>("users"),
             Err(Error::TypeMismatch(_))
         ));
     }
@@ -411,14 +570,14 @@ mod tests {
     #[test]
     fn validate_type_matches() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         reg.validate_type::<TestUser>("users").unwrap();
     }
 
     #[test]
     fn validate_type_mismatch() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         assert!(matches!(
             reg.validate_type::<String>("users"),
             Err(Error::TypeMismatch(_))
@@ -435,7 +594,7 @@ mod tests {
     fn contains_registered_table() {
         let mut reg = TableRegistry::default();
         assert!(!reg.contains("users"));
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         assert!(reg.contains("users"));
         assert!(!reg.contains("orders"));
     }
@@ -443,8 +602,8 @@ mod tests {
     #[test]
     fn table_names_returns_all_registered() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
-        reg.register::<String>("logs").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
+        reg.register::<String, u64>("logs").unwrap();
         let mut names = reg.table_names();
         names.sort();
         assert_eq!(names, vec!["logs", "users"]);
@@ -459,7 +618,7 @@ mod tests {
     #[test]
     fn new_empty_table_creates_empty() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
         let table_any = (info.new_empty_table)();
         let table = table_any
@@ -472,7 +631,7 @@ mod tests {
     #[test]
     fn replay_insert_update_delete() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         // Start with an empty table
@@ -484,7 +643,7 @@ mod tests {
             age: 30,
         };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        (info.replay_insert)(table_box.as_any_mut(), 1, &data).unwrap();
+        (info.replay_insert)(table_box.as_any_mut(), &1u64.encode(), &data).unwrap();
 
         let table = table_box
             .as_any()
@@ -499,7 +658,7 @@ mod tests {
             age: 31,
         };
         let data = bincode::serde::encode_to_vec(&updated, bincode::config::standard()).unwrap();
-        (info.replay_update)(table_box.as_any_mut(), 1, &data).unwrap();
+        (info.replay_update)(table_box.as_any_mut(), &1u64.encode(), &data).unwrap();
 
         let table = table_box
             .as_any()
@@ -508,7 +667,7 @@ mod tests {
         assert_eq!(table.get(&1).unwrap().name, "Alice Updated");
 
         // Replay delete
-        (info.replay_delete)(table_box.as_any_mut(), 1).unwrap();
+        (info.replay_delete)(table_box.as_any_mut(), &1u64.encode()).unwrap();
 
         let table = table_box
             .as_any()
@@ -520,7 +679,7 @@ mod tests {
     #[test]
     fn replay_insert_duplicate_id_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
@@ -529,16 +688,16 @@ mod tests {
             age: 30,
         };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        (info.replay_insert)(table_box.as_any_mut(), 1, &data).unwrap();
+        (info.replay_insert)(table_box.as_any_mut(), &1u64.encode(), &data).unwrap();
         // Insert same ID again
-        let result = (info.replay_insert)(table_box.as_mut(), 1, &data);
+        let result = (info.replay_insert)(table_box.as_mut(), &1u64.encode(), &data);
         assert!(result.is_err());
     }
 
     #[test]
     fn replay_update_missing_id_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
@@ -547,25 +706,25 @@ mod tests {
             age: 30,
         };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        let result = (info.replay_update)(table_box.as_mut(), 99, &data);
+        let result = (info.replay_update)(table_box.as_mut(), &99u64.encode(), &data);
         assert!(result.is_err());
     }
 
     #[test]
     fn replay_delete_missing_id_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
-        let result = (info.replay_delete)(table_box.as_mut(), 99);
+        let result = (info.replay_delete)(table_box.as_mut(), &99u64.encode());
         assert!(result.is_err());
     }
 
     #[test]
     fn serialize_record_wrong_type_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
         // Pass a String instead of TestUser
         let wrong: String = "not a user".into();
@@ -576,7 +735,7 @@ mod tests {
     #[test]
     fn serialize_table_wrong_type_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
         // Pass a Table<String> instead of Table<TestUser>
         let wrong_table = Table::<String>::new();
@@ -587,7 +746,7 @@ mod tests {
     #[test]
     fn replay_insert_wrong_table_type_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         let mut wrong_table: Box<dyn Any + Send + Sync> = Box::new(Table::<String>::new());
@@ -596,14 +755,14 @@ mod tests {
             age: 30,
         };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        let result = (info.replay_insert)(wrong_table.as_mut(), 1, &data);
+        let result = (info.replay_insert)(wrong_table.as_mut(), &1u64.encode(), &data);
         assert!(matches!(result, Err(Error::TypeMismatch(_))));
     }
 
     #[test]
     fn replay_update_wrong_table_type_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         let mut wrong_table: Box<dyn Any + Send + Sync> = Box::new(Table::<String>::new());
@@ -612,25 +771,25 @@ mod tests {
             age: 30,
         };
         let data = bincode::serde::encode_to_vec(&user, bincode::config::standard()).unwrap();
-        let result = (info.replay_update)(wrong_table.as_mut(), 1, &data);
+        let result = (info.replay_update)(wrong_table.as_mut(), &1u64.encode(), &data);
         assert!(matches!(result, Err(Error::TypeMismatch(_))));
     }
 
     #[test]
     fn replay_delete_wrong_table_type_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
 
         let mut wrong_table: Box<dyn Any + Send + Sync> = Box::new(Table::<String>::new());
-        let result = (info.replay_delete)(wrong_table.as_mut(), 1);
+        let result = (info.replay_delete)(wrong_table.as_mut(), &1u64.encode());
         assert!(matches!(result, Err(Error::TypeMismatch(_))));
     }
 
     #[test]
     fn serialize_deserialize_empty_table() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
 
         let table = Table::<TestUser>::new();
         let info = reg.get("users").unwrap();
@@ -644,7 +803,7 @@ mod tests {
     #[test]
     fn table_roundtrip_preserves_next_id() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
 
         let mut table = Table::<TestUser>::new();
         table
@@ -675,10 +834,273 @@ mod tests {
         assert!(reg.get("nope").is_none());
     }
 
+    /// The point of format v2: a table whose primary key is not a `u64` at
+    /// all round-trips through the type-erased serializer.
+    #[test]
+    fn roundtrip_string_keyed_table() {
+        let mut reg = TableRegistry::default();
+        reg.register::<String, String>("emails").unwrap();
+
+        let mut t: Table<String, String> = Table::new_keyed();
+        t.put("a@x.com".to_string(), "Alice".to_string()).unwrap();
+        t.put("b@x.com".to_string(), "Bob".to_string()).unwrap();
+
+        let info = reg.get("emails").unwrap();
+        let bytes = (info.serialize_table)(&t as &dyn std::any::Any).unwrap();
+        let restored = (info.deserialize_table)(&bytes).unwrap();
+        let restored = restored
+            .as_any()
+            .downcast_ref::<Table<String, String>>()
+            .unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored.get(&"a@x.com".to_string()),
+            Some(&"Alice".to_string())
+        );
+        assert_eq!(restored.get(&"b@x.com".to_string()), Some(&"Bob".to_string()));
+        // An explicitly-keyed table has no id counter, and the `has_next_id`
+        // byte must carry that across the round-trip.
+        assert_eq!(restored.next_id_opt(), None);
+    }
+
+    #[test]
+    fn roundtrip_u64_keyed_table_preserves_next_id() {
+        let mut reg = TableRegistry::default();
+        reg.register::<String, u64>("rows").unwrap();
+
+        let mut t: Table<String> = Table::new();
+        t.insert("first".to_string()).unwrap();
+        t.insert("second".to_string()).unwrap();
+
+        let info = reg.get("rows").unwrap();
+        let bytes = (info.serialize_table)(&t as &dyn std::any::Any).unwrap();
+        let restored = (info.deserialize_table)(&bytes).unwrap();
+        let restored = restored.as_any().downcast_ref::<Table<String>>().unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.next_id(), 3);
+    }
+
+    #[test]
+    fn deserialize_rejects_v1_format() {
+        // A v1 payload began with the bincode varint of `next_id`, whose
+        // leading byte is never the v2 magic (0xFF is not a legal varint tag).
+        let mut reg = TableRegistry::default();
+        reg.register::<String, u64>("rows").unwrap();
+        let info = reg.get("rows").unwrap();
+
+        let v1_bytes = vec![0u8; 24];
+        let Err(err) = (info.deserialize_table)(&v1_bytes) else {
+            panic!("a v1 payload must be rejected");
+        };
+        assert!(
+            format!("{err}").contains("format version"),
+            "expected a format-version error, got: {err}"
+        );
+    }
+
+    /// The ambiguity a bare `[version: u8 = 2]` header would have had: a real
+    /// v1 payload for a table with exactly one insert starts with the byte
+    /// `0x02` (varint of `next_id = 2`). It must still be rejected.
+    #[test]
+    fn deserialize_rejects_v1_payload_whose_first_byte_is_two() {
+        let config = bincode::config::standard();
+        let mut v1 = Vec::new();
+        bincode::encode_into_std_write(2u64, &mut v1, config).unwrap(); // next_id
+        bincode::encode_into_std_write(1u64, &mut v1, config).unwrap(); // count
+        bincode::encode_into_std_write(1u64, &mut v1, config).unwrap(); // row id
+        bincode::serde::encode_into_std_write(
+            &TestUser {
+                name: "Alice".into(),
+                age: 30,
+            },
+            &mut v1,
+            config,
+        )
+        .unwrap();
+        assert_eq!(v1[0], TABLE_FORMAT_V2, "fixture must exercise the collision");
+
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+        let Err(err) = (info.deserialize_table)(&v1) else {
+            panic!("a v1 payload must be rejected");
+        };
+        assert!(
+            format!("{err}").contains("format version"),
+            "expected a format-version error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_a_newer_format_version() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut bytes = vec![TABLE_MAGIC_V2, TABLE_FORMAT_V2 + 1, 0u8];
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        let Err(err) = (info.deserialize_table)(&bytes) else {
+            panic!("a newer format version must be rejected");
+        };
+        assert!(
+            format!("{err}").contains("format version"),
+            "expected a format-version error, got: {err}"
+        );
+    }
+
+    /// Length fields are attacker-controlled: a truncated payload must error,
+    /// never panic on an out-of-range slice.
+    #[test]
+    fn deserialize_truncated_payload_errors_not_panics() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut table = Table::<TestUser>::new();
+        table
+            .insert(TestUser {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+        let full = (info.serialize_table)(&table).unwrap();
+        for cut in 1..full.len() {
+            assert!(
+                (info.deserialize_table)(&full[..cut]).is_err(),
+                "truncation at {cut} bytes must error"
+            );
+        }
+    }
+
+    /// The wire order guarantee `Table::from_bulk` only debug-asserts.
+    #[test]
+    fn build_from_raw_rows_rejects_unsorted_keys() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let rec = bincode::serde::encode_to_vec(
+            TestUser {
+                name: "A".into(),
+                age: 1,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let rows = vec![
+            (2u64.encode(), rec.clone()),
+            (1u64.encode(), rec.clone()),
+        ];
+        assert!(matches!(
+            (info.build_from_raw_rows)(rows, None),
+            Err(Error::Persistence(_))
+        ));
+    }
+
+    /// An empty install of a `u64` table must still hand back a usable id
+    /// counter — `Table::insert` panics without one.
+    #[test]
+    fn build_from_raw_rows_empty_u64_table_keeps_its_counter() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let built = (info.build_from_raw_rows)(Vec::new(), None).unwrap();
+        let table = built.as_any().downcast_ref::<Table<TestUser>>().unwrap();
+        assert_eq!(table.next_id(), 1);
+    }
+
+    /// ...and an explicitly-keyed table must never grow one.
+    #[test]
+    fn build_from_raw_rows_keyed_table_has_no_counter() {
+        let mut reg = TableRegistry::default();
+        reg.register::<String, String>("emails").unwrap();
+        let info = reg.get("emails").unwrap();
+
+        let config = bincode::config::standard();
+        let rec = bincode::serde::encode_to_vec("Alice".to_string(), config).unwrap();
+        let built =
+            (info.build_from_raw_rows)(vec![("a@x.com".to_string().encode(), rec)], None).unwrap();
+        let table = built
+            .as_any()
+            .downcast_ref::<Table<String, String>>()
+            .unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.next_id_opt(), None);
+    }
+
+    /// `new_empty_table` is the WAL-replay path for a table absent from the
+    /// base snapshot; it obeys the same counter invariant.
+    #[test]
+    fn new_empty_table_counter_follows_the_key_type() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        reg.register::<String, String>("emails").unwrap();
+
+        let auto = (reg.get("users").unwrap().new_empty_table)();
+        assert_eq!(
+            auto.as_any()
+                .downcast_ref::<Table<TestUser>>()
+                .unwrap()
+                .next_id(),
+            1
+        );
+
+        let keyed = (reg.get("emails").unwrap().new_empty_table)();
+        assert_eq!(
+            keyed
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap()
+                .next_id_opt(),
+            None
+        );
+    }
+
+    /// Replay addresses rows by encoded key, so a non-`u64` key type replays
+    /// too.
+    #[test]
+    fn replay_roundtrip_on_a_string_keyed_table() {
+        let mut reg = TableRegistry::default();
+        reg.register::<String, String>("emails").unwrap();
+        let info = reg.get("emails").unwrap();
+
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
+        let key = "a@x.com".to_string().encode();
+        let config = bincode::config::standard();
+        let data = bincode::serde::encode_to_vec("Alice".to_string(), config).unwrap();
+        (info.replay_insert)(table_box.as_any_mut(), &key, &data).unwrap();
+        // Duplicate insert at the same key is still an error.
+        assert!((info.replay_insert)(table_box.as_any_mut(), &key, &data).is_err());
+
+        let updated = bincode::serde::encode_to_vec("Alice 2".to_string(), config).unwrap();
+        (info.replay_update)(table_box.as_any_mut(), &key, &updated).unwrap();
+        {
+            let table = table_box
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap();
+            assert_eq!(table.get(&"a@x.com".to_string()), Some(&"Alice 2".into()));
+            assert_eq!(table.next_id_opt(), None);
+        }
+
+        (info.replay_delete)(table_box.as_any_mut(), &key).unwrap();
+        assert_eq!(
+            table_box
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
     #[test]
     fn deserialize_record_bad_bytes_errors() {
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser>("users").unwrap();
+        reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
         let result = (info.deserialize_record)(&[0xFF, 0xFF, 0xFF]);
         assert!(matches!(result, Err(Error::Persistence(_))));

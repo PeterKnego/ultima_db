@@ -277,7 +277,7 @@ mod tests {
 
     fn make_snapshot_with_users() -> (Snapshot, TableRegistry) {
         let mut reg = TableRegistry::default();
-        reg.register::<User>("users").unwrap();
+        reg.register::<User, u64>("users").unwrap();
 
         let mut table = Table::<User>::new();
         table
@@ -525,7 +525,7 @@ mod tests {
         data.extend_from_slice(&checksum.to_le_bytes());
 
         let mut reg = TableRegistry::default();
-        reg.register::<User>("users").unwrap();
+        reg.register::<User, u64>("users").unwrap();
         let result = deserialize_snapshot(&data, &reg);
         assert!(
             matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("truncated"))
@@ -598,8 +598,8 @@ mod tests {
         }
 
         let mut reg = TableRegistry::default();
-        reg.register::<User>("users").unwrap();
-        reg.register::<Order>("orders").unwrap();
+        reg.register::<User, u64>("users").unwrap();
+        reg.register::<Order, u64>("orders").unwrap();
 
         let mut user_table = Table::<User>::new();
         user_table
@@ -665,7 +665,7 @@ mod tests {
     fn snapshot_with_unregistered_table_skips_it() {
         // Snapshot has "users" and "logs", but only "users" is registered
         let mut reg = TableRegistry::default();
-        reg.register::<User>("users").unwrap();
+        reg.register::<User, u64>("users").unwrap();
 
         let mut user_table = Table::<User>::new();
         user_table

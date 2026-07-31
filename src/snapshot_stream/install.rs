@@ -255,6 +255,16 @@ impl crate::store::Store {
                 }
             }
 
+            // The registry builds rows from order-preserving encoded key
+            // bytes, but the stream format still carries fixed 8-byte
+            // little-endian `u64` keys (the mirror image of the adapter in
+            // `build.rs`). Re-encode here; task 7 makes the format
+            // key-generic and both adapters go away.
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
+                .into_iter()
+                .map(|(key, val)| (crate::primary_key::PrimaryKey::encode(&key), val))
+                .collect();
+
             let table_box = registry
                 .build_table_from_raw(&table_header.name, rows, existing_table)
                 .expect("contains() returned true, so entry must exist")?;

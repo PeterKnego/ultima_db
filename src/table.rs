@@ -308,6 +308,21 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         self.next_id.clone()
     }
 
+    /// An empty table carrying `next_id` as its auto-increment counter.
+    ///
+    /// Spelled without the [`AutoKey`] bound so the type-erased registry
+    /// closures can build one for *any* key type: `None` for an explicitly-
+    /// keyed table, `Some(K::first())` when `K` is the one `AutoKey`. Under an
+    /// `AutoKey` bound, prefer [`Table::new`].
+    #[allow(dead_code)]
+    pub(crate) fn empty_with_counter(next_id: Option<K>) -> Self {
+        Self {
+            data: BTree::new(),
+            next_id,
+            indexes: BTreeMap::new(),
+        }
+    }
+
     /// Insert-or-replace a record at an explicit key. Available for every key
     /// type — this is how explicitly-keyed tables are written.
     ///

@@ -813,8 +813,27 @@ impl Store {
     /// Register a table type for persistence. Must be called before any
     /// transactions that touch this table, and before [`Store::recover`] or
     /// [`Store::checkpoint`].
+    ///
+    /// Registers the `u64`-keyed table `Table<R>` — unchanged from 0.2.x. For
+    /// a table with an explicit primary-key type, use
+    /// [`Store::register_table_keyed`]. (This method cannot itself take the
+    /// key parameter: Rust has no default type parameters on functions, so
+    /// `register_table::<R>(..)` would stop compiling.)
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
+        self.register_table_keyed::<R, u64>(name)
+    }
+
+    /// Register a table type keyed by `K` for persistence.
+    ///
+    /// The key type must match the one the table is opened with: the registry
+    /// closures downcast to `Table<R, K>`, and a mismatch surfaces as
+    /// [`Error::TypeMismatch`] at checkpoint or replay time.
+    #[cfg(feature = "persistence")]
+    pub fn register_table_keyed<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        name: &str,
+    ) -> Result<()> {
         let mut inner = self.inner.write();
         Arc::get_mut(&mut inner.registry)
             .ok_or_else(|| {
@@ -822,7 +841,7 @@ impl Store {
                     "cannot register table: registry is in use (checkpoint in progress?)".into(),
                 )
             })?
-            .register::<R>(name)
+            .register::<R, K>(name)
     }
 
     /// Write a checkpoint of the latest snapshot to disk.
@@ -1016,10 +1035,15 @@ impl Store {
                                         })?
                                         .as_any_mut();
 
+                                    // The registry closures address rows by
+                                    // encoded key bytes; WAL ops still carry
+                                    // `u64` ids, whose encoding is their
+                                    // big-endian form.
+                                    let key = crate::primary_key::PrimaryKey::encode(id);
                                     if matches!(op, crate::wal::WalOp::Insert { .. }) {
-                                        (info.replay_insert)(table_mut, *id, data)?;
+                                        (info.replay_insert)(table_mut, &key, data)?;
                                     } else {
-                                        (info.replay_update)(table_mut, *id, data)?;
+                                        (info.replay_update)(table_mut, &key, data)?;
                                     }
                                 }
                                 crate::wal::WalOp::Delete { table, id } => {
@@ -1033,7 +1057,8 @@ impl Store {
                                                 "table Arc has multiple references during replay".into()
                                             ))?
                                             .as_any_mut();
-                                        (info.replay_delete)(table_mut, *id)?;
+                                        let key = crate::primary_key::PrimaryKey::encode(id);
+                                        (info.replay_delete)(table_mut, &key)?;
                                     }
                                 }
                                 crate::wal::WalOp::CreateTable { .. } => {}
