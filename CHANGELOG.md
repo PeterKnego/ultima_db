@@ -96,8 +96,8 @@ messages state this path in full.
   unaffected.
 - `snapshot_stream::codec::TableHeader` gained public `key_type_id` and
   `key_type` fields. Struct-literal construction of it must be updated.
-- `wal::WalOp::{Insert, Update, Delete}` gained a `key_type` field (only
-  visible with the `bench-internals` feature, which is what exposes `wal`).
+- `wal::WalOp::{Insert, Update, Delete}` gained a `key_type` field. Struct-literal
+  construction must be updated for any code with the `persistence` feature enabled.
 
 ### Added
 
@@ -148,9 +148,10 @@ messages state this path in full.
   when moving a table off `u64` keys.
 - Encoded keys are capped at 64 KiB (`MAX_ENCODED_KEY_LEN`), a bound the WAL,
   the checkpoint and the snapshot wire format share by construction and
-  enforce on **write** as well as on read. An over-long key is refused at the
-  `put`/`update`/`delete` that produced it, so `commit()` never acknowledges a
-  row that could not be read back.
+  enforce on **write** as well as on read. With a WAL sink configured,
+  an over-long key is refused at the `put`/`update`/`delete` that produced it,
+  so `commit()` never acknowledges a row that could not be read back. Without
+  a WAL (under `Persistence::smr`), the check surfaces at `checkpoint()` time.
 - The snapshot stream's key-type check compares `PrimaryKey::KEY_TYPE_ID`, not
   `std::any::type_name`: the id is declared by the key type, so it is stable
   across compiler versions and injective across crate versions in a way the

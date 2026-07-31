@@ -750,11 +750,12 @@ mod tests {
             <(u32, String)>::KEY_TYPE_ID,
             <(String, u32)>::KEY_TYPE_ID
         );
-        // Recomputed by hand from the documented construction, so a change to
-        // the mixing function fails here rather than silently orphaning data.
+        // Pinned literal value computed from the documented FNV-1a mixing
+        // function. A changed derivation would produce a different value here,
+        // failing the test and preventing silently orphaned data.
         assert_eq!(
             <(u32, String)>::KEY_TYPE_ID,
-            tuple_key_type_id(2, 3, 11, 0)
+            0x8B1B9607u32
         );
     }
 
