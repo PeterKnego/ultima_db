@@ -2,6 +2,8 @@
 // Copyright 2026 Peter Knego
 
 use std::any::Any;
+#[cfg(feature = "persistence")]
+use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
@@ -36,6 +38,26 @@ use crate::{Error, Result};
 pub(crate) trait MergeableTable: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// The `TypeId` of this table's primary key, read off the *live* table.
+    ///
+    /// The registry knows a key type too, but the two can disagree: a table
+    /// can be created by `open_table_keyed` without ever being registered,
+    /// and `register_table*` afterwards records whatever the caller asked
+    /// for. Anything making a key-shaped decision about a concrete table —
+    /// the snapshot wire format, which can only carry `u64` — must ask the
+    /// table, not the registry, or it will act on the wrong type and
+    /// reinterpret the rows.
+    ///
+    /// Gated like `index_list` below: every caller (the registration guard
+    /// and both ends of the snapshot wire format) is persistence-only.
+    #[cfg(feature = "persistence")]
+    fn key_type_id(&self) -> TypeId;
+
+    /// `std::any::type_name` of this table's primary key, for error messages
+    /// (`TypeId` has no printable form).
+    #[cfg(feature = "persistence")]
+    fn key_type_name(&self) -> &'static str;
 
     /// O(1)-CoW clone (Arc bumps on the BTree root and index internals).
     fn boxed_clone(&self) -> Box<dyn MergeableTable>;
@@ -83,6 +105,16 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    #[cfg(feature = "persistence")]
+    fn key_type_id(&self) -> TypeId {
+        TypeId::of::<K>()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn key_type_name(&self) -> &'static str {
+        std::any::type_name::<K>()
     }
 
     fn boxed_clone(&self) -> Box<dyn MergeableTable> {

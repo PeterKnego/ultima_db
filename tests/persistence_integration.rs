@@ -1639,3 +1639,72 @@ fn opening_a_fresh_table_under_the_wrong_key_type_errors_at_open() {
     wtx.commit().unwrap();
     store.checkpoint().unwrap();
 }
+
+/// The registry may not disagree with the live data. Registration does not
+/// have to come first, so a table can already exist under one key type when
+/// `register_table*` is called with another; recording that registration left
+/// the registry and the snapshot pointing at different `K`, and everything
+/// downstream that trusts the registry — notably the snapshot wire format —
+/// then acted on the wrong type. Reproduces the emit-side corruption:
+/// `register_table::<Row>` after a `String` create used to return `Ok(())`,
+/// after which `snapshot_stream` happily emitted the eight bytes of the key
+/// `"abcdefgh"` reinterpreted as the u64 `7017280452245743464`.
+#[test]
+fn register_table_after_a_differently_keyed_table_exists_is_refused() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = Store::new(
+        StoreConfig::builder()
+            .persistence(Persistence::smr(dir.path().to_path_buf()))
+            .build(),
+    )
+    .unwrap();
+
+    // A String-keyed table created without ever being registered.
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table_keyed::<String, String>("t").unwrap();
+    t.put("abcdefgh".to_string(), "v".to_string()).unwrap();
+    drop(t);
+    wtx.commit().unwrap();
+
+    // Registering it as u64 must now be refused, not silently accepted.
+    assert!(matches!(
+        store.register_table::<String>("t"),
+        Err(Error::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        store.register_table_keyed::<String, u32>("t"),
+        Err(Error::TypeMismatch(_))
+    ));
+
+    // The matching registration is accepted, and the store checkpoints —
+    // the state the mismatched registration could never have reached.
+    store.register_table_keyed::<String, String>("t").unwrap();
+    store.checkpoint().unwrap();
+}
+
+/// The mirror of the above for a name that does *not* exist yet: registration
+/// before creation is unconstrained, and it is `open_table_keyed` that then
+/// holds the new table to the registration.
+#[test]
+fn registering_before_the_table_exists_still_pins_the_key_type() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = Store::new(
+        StoreConfig::builder()
+            .persistence(Persistence::smr(dir.path().to_path_buf()))
+            .build(),
+    )
+    .unwrap();
+    store.register_table_keyed::<String, String>("t").unwrap();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    assert!(matches!(
+        wtx.open_table::<String>("t"),
+        Err(Error::TypeMismatch(_))
+    ));
+    // Re-registering the same pair stays idempotent once the table exists.
+    let mut t = wtx.open_table_keyed::<String, String>("t").unwrap();
+    t.put("k".to_string(), "v".to_string()).unwrap();
+    drop(t);
+    wtx.commit().unwrap();
+    store.register_table_keyed::<String, String>("t").unwrap();
+}

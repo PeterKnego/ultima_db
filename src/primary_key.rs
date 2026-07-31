@@ -29,6 +29,14 @@ pub trait PrimaryKey: Ord + Clone + Send + Sync + 'static {
     ///
     /// Collisions are permitted: they cause a *spurious* write conflict
     /// (a retry), never a missed one, so the detector stays sound.
+    ///
+    /// **Override this if the type can be hashed without allocating.** The
+    /// default hashes `encode()`, which allocates a `Vec<u8>` per call, and
+    /// this sits on the point-read and per-mutation hot paths. Every key type
+    /// this crate implements overrides it. The only requirements are
+    /// determinism within a process and that equal keys agree — digests are
+    /// never persisted and never compared across key types (a table has one
+    /// `K`), so they need not match `encode()`'s bytes or anything else.
     fn hash64(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.encode().hash(&mut h);
@@ -77,6 +85,21 @@ pub(crate) fn auto_counter_seed<K: PrimaryKey>() -> Option<K> {
     (&first as &dyn std::any::Any).downcast_ref::<K>().cloned()
 }
 
+/// Hash a value directly, with no intermediate encoding.
+///
+/// The [`PrimaryKey::hash64`] default hashes `encode()`, which allocates a
+/// `Vec<u8>` per call. Every key type with a cheap, allocation-free `Hash`
+/// overrides it with this. Digests are process-local — they are only ever
+/// compared against other digests from the same run (write sets, read sets,
+/// the intent table) and never persisted — so the choice of hash is free, as
+/// long as it is deterministic within the process and equal keys agree, which
+/// `Hash`/`Eq` guarantees.
+fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish()
+}
+
 fn truncated(expected: usize, got: usize) -> Error {
     Error::InvalidBulkLoadInput(format!(
         "primary key decode: expected {expected} bytes, got {got}"
@@ -102,6 +125,9 @@ macro_rules! unsigned_key_body {
                 .try_into()
                 .map_err(|_| truncated(N, bytes.len()))?;
             Ok(<$t>::from_be_bytes(arr))
+        }
+        fn hash64(&self) -> u64 {
+            hash_of(self)
         }
     };
 }
@@ -130,6 +156,9 @@ macro_rules! impl_signed_key {
                     .map_err(|_| truncated(N, bytes.len()))?;
                 let biased = <$u>::from_be_bytes(arr);
                 Ok((biased ^ (1 << (<$u>::BITS - 1))) as $t)
+            }
+            fn hash64(&self) -> u64 {
+                hash_of(self)
             }
         }
     )*};
@@ -163,6 +192,9 @@ impl PrimaryKey for String {
         String::from_utf8(bytes.to_vec())
             .map_err(|e| Error::InvalidBulkLoadInput(format!("primary key not UTF-8: {e}")))
     }
+    fn hash64(&self) -> u64 {
+        hash_of(self.as_bytes())
+    }
 }
 
 impl PrimaryKey for Vec<u8> {
@@ -172,6 +204,9 @@ impl PrimaryKey for Vec<u8> {
     }
     fn decode(bytes: &[u8]) -> Result<Self> {
         Ok(bytes.to_vec())
+    }
+    fn hash64(&self) -> u64 {
+        hash_of(self.as_slice())
     }
 }
 
@@ -257,6 +292,13 @@ impl<A: PrimaryKey, B: PrimaryKey> PrimaryKey for (A, B) {
         let b = B::decode(&bytes[at..])?;
         Ok((a, b))
     }
+    /// Compose the elements' digests rather than hashing the composite
+    /// encoding: encoding a tuple allocates once per element plus the output
+    /// buffer, and every element type that can hash without allocating
+    /// already does.
+    fn hash64(&self) -> u64 {
+        hash_of(&(self.0.hash64(), self.1.hash64()))
+    }
 }
 
 impl<A: PrimaryKey, B: PrimaryKey, C: PrimaryKey> PrimaryKey for (A, B, C) {
@@ -304,6 +346,10 @@ impl<A: PrimaryKey, B: PrimaryKey, C: PrimaryKey> PrimaryKey for (A, B, C) {
         };
         let c = C::decode(&bytes[at..])?;
         Ok((a, b, c))
+    }
+    /// See the two-element impl.
+    fn hash64(&self) -> u64 {
+        hash_of(&(self.0.hash64(), self.1.hash64(), self.2.hash64()))
     }
 }
 

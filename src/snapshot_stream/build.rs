@@ -160,20 +160,19 @@ impl SnapshotReader {
                 // table whose keys the format cannot represent, rather than
                 // squeeze them through `u64::decode` (which succeeds for any
                 // 8-byte key encoding and silently mangles the rest).
-                match self.registry.key_type(&name) {
-                    Some((id, _)) if id == std::any::TypeId::of::<u64>() => {}
-                    Some((_, key_type)) => {
-                        return Err(SnapshotStreamError::NonU64Key {
-                            table: name,
-                            key_type,
-                        });
-                    }
-                    None => {
-                        return Err(SnapshotStreamError::UnknownTable {
-                            name,
-                            type_id: 0,
-                        });
-                    }
+                //
+                // Asked of the *live table*, not of the registry. The two can
+                // disagree — `open_table_keyed` can create a table that was
+                // never registered, and `register_table*` afterwards records
+                // whatever the caller asked for — and it is the table's rows
+                // that are about to be encoded, so the table is the authority.
+                // Gating on the registry here let a `String`-keyed table with
+                // a `u64` registration emit a stream of reinterpreted keys.
+                if table_arc.key_type_id() != std::any::TypeId::of::<u64>() {
+                    return Err(SnapshotStreamError::NonU64Key {
+                        table: name,
+                        key_type: table_arc.key_type_name(),
+                    });
                 }
 
                 // widened in task 7: `collect_serialized_rows` now hands back

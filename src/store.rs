@@ -841,13 +841,30 @@ impl Store {
     ///
     /// The key type must match the one the table is opened with: the registry
     /// closures downcast to `Table<R, K>`, and a mismatch surfaces as
-    /// [`Error::TypeMismatch`] at checkpoint or replay time.
+    /// [`Error::TypeMismatch`].
+    ///
+    /// If a table of this name already exists in the latest snapshot, its key
+    /// type wins: registering a conflicting `K` returns
+    /// [`Error::TypeMismatch`] rather than recording a registration that
+    /// disagrees with the live data. Registering *after* creating a table is
+    /// legal and common (nothing forces registration to come first), so
+    /// without this check the registry and the snapshot could drift apart —
+    /// and every consumer that trusts the registry, notably the snapshot wire
+    /// format, would then act on the wrong key type.
     #[cfg(feature = "persistence")]
     pub fn register_table_keyed<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
         &self,
         name: &str,
     ) -> Result<()> {
         let mut inner = self.inner.write();
+        if let Some(live) = inner
+            .snapshots
+            .get(&inner.latest_version)
+            .and_then(|snap| snap.tables.get(name))
+            && live.key_type_id() != std::any::TypeId::of::<K>()
+        {
+            return Err(Error::TypeMismatch(name.to_string()));
+        }
         Arc::get_mut(&mut inner.registry)
             .ok_or_else(|| {
                 Error::Persistence(
@@ -2462,7 +2479,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     /// Look up a record by its key.
     pub fn get(&self, key: impl Borrow<K>) -> Option<&R> {
         let key = key.borrow();
-        record_point_read(self.read_set, &self.table_name, key.hash64());
+        record_point_read(self.read_set, &self.table_name, key);
         self.table_metrics.inc_primary_key_reads(1);
         self.table.get(key)
     }
@@ -2494,7 +2511,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     /// Returns true if the table contains a record with the given key.
     pub fn contains(&self, key: impl Borrow<K>) -> bool {
         let key = key.borrow();
-        record_point_read(self.read_set, &self.table_name, key.hash64());
+        record_point_read(self.read_set, &self.table_name, key);
         self.table_metrics.inc_primary_key_reads(1);
         self.table.contains(key)
     }
@@ -2523,7 +2540,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     /// Look up multiple records by key.
     pub fn get_many(&self, keys: &[K]) -> Vec<Option<&R>> {
         for key in keys {
-            record_point_read(self.read_set, &self.table_name, key.hash64());
+            record_point_read(self.read_set, &self.table_name, key);
         }
         self.table_metrics.inc_primary_key_reads(keys.len() as u64);
         self.table.get_many(keys)
@@ -2619,7 +2636,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     /// Keys that don't exist in the table are silently skipped.
     pub fn resolve(&self, keys: &[K]) -> Vec<(K, &R)> {
         for key in keys {
-            record_point_read(self.read_set, &self.table_name, key.hash64());
+            record_point_read(self.read_set, &self.table_name, key);
         }
         self.table_metrics.inc_primary_key_reads(keys.len() as u64);
         self.table.resolve(keys)
@@ -2820,17 +2837,22 @@ pub struct TableReader<'tx, R: Record, K = u64> {
 /// Record a point-read against `table` for the given `id`. No-op when `rs`
 /// is `None` (SnapshotIsolation or read-only tx).
 #[inline]
-fn record_point_read(
+fn record_point_read<K: PrimaryKey>(
     rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
     table: &str,
-    id: u64,
+    key: &K,
 ) {
+    // The digest is computed *inside* the `Some` arm, never as an argument.
+    // `PrimaryKey::hash64` defaults to hashing `encode()`, which allocates,
+    // and `rs` is `None` for every store that is not MultiWriter+Serializable
+    // — which is the default configuration and the hot read path. Hoisting
+    // the call out to the caller put one `Vec<u8>` on every `get`.
     if let Some(cell) = rs {
         cell.borrow_mut()
             .entry(table.to_string())
             .or_default()
             .keys
-            .insert(id);
+            .insert(key.hash64());
     }
 }
 
