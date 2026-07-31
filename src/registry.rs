@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::persistence::Record;
-use crate::primary_key::{AutoKey, PrimaryKey};
+use crate::primary_key::{PrimaryKey, auto_counter_seed};
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
 
@@ -57,6 +57,22 @@ pub(crate) struct TableTypeInfo {
     /// `TypeId` of the concrete record type `R`, used to validate that
     /// `open_table::<R>` matches the registered type.
     pub type_id: TypeId,
+    /// `TypeId` of the concrete primary-key type `K`.
+    ///
+    /// Every closure below downcasts to `Table<R, K>`, so `R` alone does not
+    /// identify what this entry can operate on: registering `("users", User,
+    /// u64)` and then `("users", User, String)` differ only here. Without the
+    /// key type in the identity check the second registration is a silent
+    /// no-op that only surfaces much later — at checkpoint or replay time — as
+    /// an opaque "table downcast failed". It is also what lets the snapshot
+    /// wire-format install path refuse a `u64`-keyed stream aimed at a
+    /// non-`u64` destination table instead of decoding 8 raw bytes into a
+    /// garbage key.
+    pub key_type_id: TypeId,
+    /// `std::any::type_name::<K>()`, carried purely so a key-type mismatch
+    /// can name the offending type in its error message (`TypeId` has no
+    /// printable form).
+    pub key_type_name: &'static str,
     /// Serialize a single record (`&R` as `&dyn Any`) to bytes.
     pub serialize_record: SerializeAnyFn,
     /// Deserialize bytes to a single record (`Box<dyn Any + Send + Sync>` wrapping `R`).
@@ -91,22 +107,6 @@ pub(crate) struct TableRegistry {
     entries: BTreeMap<String, TableTypeInfo>,
 }
 
-/// The auto-increment counter a fresh table of key type `K` starts with:
-/// `Some(1)` for `u64` — the one [`AutoKey`] — and `None` for every
-/// explicitly-keyed type.
-///
-/// A `PrimaryKey`-only bound cannot spell `AutoKey::first()`, and Rust has no
-/// specialization, so recover it by type identity instead: `K: 'static`, so
-/// this is a plain downcast of a `u64` to `K`, which succeeds exactly when
-/// `K == u64`. Keeping the seed here (rather than pushing an `AutoKey` bound
-/// out to every caller) is what lets the type-erased closures build an empty
-/// table for any key type while preserving the
-/// `next_id_opt() == None` ⟺ explicitly-keyed invariant.
-fn auto_counter_seed<K: PrimaryKey>() -> Option<K> {
-    let first = <u64 as AutoKey>::first();
-    (&first as &dyn Any).downcast_ref::<K>().cloned()
-}
-
 /// Hex-render a key for an error message. `K` carries no `Debug`/`Display`
 /// bound; the order-preserving encoding is the one printable form every key
 /// type has (`Table::insert_with_id` reports duplicates the same way).
@@ -126,15 +126,24 @@ impl TableRegistry {
         use std::collections::btree_map::Entry;
         match self.entries.entry(name.to_string()) {
             Entry::Occupied(e) => {
-                if e.get().type_id != TypeId::of::<R>() {
+                // Both halves of the identity must match: a same-`R`,
+                // different-`K` re-registration is a *conflict*, not an
+                // idempotent repeat (the stored closures downcast to
+                // `Table<R, K>` and would reject every table the caller
+                // subsequently opens).
+                if e.get().type_id != TypeId::of::<R>()
+                    || e.get().key_type_id != TypeId::of::<K>()
+                {
                     return Err(Error::TypeMismatch(name.to_string()));
                 }
-                // Already registered with the same type — no-op.
+                // Already registered with the same record and key type — no-op.
                 Ok(())
             }
             Entry::Vacant(e) => {
                 e.insert(TableTypeInfo {
                     type_id: TypeId::of::<R>(),
+                    key_type_id: TypeId::of::<K>(),
+                    key_type_name: std::any::type_name::<K>(),
                     serialize_record: Box::new(|any| {
                         let record = any
                             .downcast_ref::<R>()
@@ -290,15 +299,37 @@ impl TableRegistry {
         self.entries.contains_key(name)
     }
 
-    /// Validate that a table name is registered with the expected type.
-    pub fn validate_type<R: 'static>(&self, name: &str) -> Result<()> {
+    /// Validate that a table name is registered with the expected record type
+    /// and the expected primary-key type.
+    ///
+    /// Both halves matter: the registry's closures are built for one exact
+    /// `Table<R, K>`, so a table opened as `Table<R, u64>` against an entry
+    /// registered for `Table<R, String>` would serialize and replay through
+    /// closures that reject it.
+    pub fn validate_type_keyed<R: 'static, K: 'static>(&self, name: &str) -> Result<()> {
         if let Some(info) = self.entries.get(name)
-            && info.type_id != TypeId::of::<R>()
+            && (info.type_id != TypeId::of::<R>() || info.key_type_id != TypeId::of::<K>())
         {
             return Err(Error::TypeMismatch(name.to_string()));
         }
         // If not registered, we don't enforce — allows non-persistent tables.
         Ok(())
+    }
+
+    /// [`validate_type_keyed`](Self::validate_type_keyed) for the default
+    /// `u64`-keyed table.
+    pub fn validate_type<R: 'static>(&self, name: &str) -> Result<()> {
+        self.validate_type_keyed::<R, u64>(name)
+    }
+
+    /// The registered primary-key type for `name` as `(TypeId, type_name)`,
+    /// or `None` if the table is not registered. Used by the snapshot-stream
+    /// build/install paths, whose wire format still carries fixed 8-byte
+    /// `u64` keys and must refuse anything else rather than reinterpret it.
+    pub fn key_type(&self, name: &str) -> Option<(TypeId, &'static str)> {
+        self.entries
+            .get(name)
+            .map(|info| (info.key_type_id, info.key_type_name))
     }
 
     /// Returns the names of all registered tables.
@@ -581,6 +612,55 @@ mod tests {
         reg.register::<TestUser, u64>("users").unwrap();
         assert!(matches!(
             reg.register::<String, u64>("users"),
+            Err(Error::TypeMismatch(_))
+        ));
+    }
+
+    /// Same record type, different *key* type is a conflict, not an
+    /// idempotent repeat. Without the `key_type_id` half of the identity
+    /// check the second call would silently no-op, leaving the registry
+    /// holding `Table<TestUser, u64>` closures for a table every caller
+    /// afterwards opens as `Table<TestUser, String>` — a mismatch that only
+    /// surfaces at checkpoint or replay time as "table downcast failed".
+    #[test]
+    fn register_duplicate_same_record_different_key_errors() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        assert!(matches!(
+            reg.register::<TestUser, String>("users"),
+            Err(Error::TypeMismatch(_))
+        ));
+        // The first registration is intact — the failed one changed nothing.
+        assert_eq!(
+            reg.key_type("users").map(|(id, _)| id),
+            Some(TypeId::of::<u64>())
+        );
+        reg.register::<TestUser, u64>("users").unwrap();
+    }
+
+    #[test]
+    fn register_duplicate_same_record_and_key_is_noop() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, String>("users").unwrap();
+        reg.register::<TestUser, String>("users").unwrap(); // no error
+        assert_eq!(
+            reg.key_type("users").map(|(id, _)| id),
+            Some(TypeId::of::<String>())
+        );
+    }
+
+    #[test]
+    fn validate_type_keyed_rejects_wrong_key_type() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, String>("users").unwrap();
+        reg.validate_type_keyed::<TestUser, String>("users").unwrap();
+        assert!(matches!(
+            reg.validate_type_keyed::<TestUser, u64>("users"),
+            Err(Error::TypeMismatch(_))
+        ));
+        // The `u64` convenience wrapper agrees.
+        assert!(matches!(
+            reg.validate_type::<TestUser>("users"),
             Err(Error::TypeMismatch(_))
         ));
     }

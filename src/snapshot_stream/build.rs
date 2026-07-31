@@ -155,6 +155,27 @@ impl SnapshotReader {
                         type_id: 0,
                     })?;
 
+                // Same `u64`-only restriction the install path enforces, at
+                // the other end of the pipe: refuse to *emit* a stream for a
+                // table whose keys the format cannot represent, rather than
+                // squeeze them through `u64::decode` (which succeeds for any
+                // 8-byte key encoding and silently mangles the rest).
+                match self.registry.key_type(&name) {
+                    Some((id, _)) if id == std::any::TypeId::of::<u64>() => {}
+                    Some((_, key_type)) => {
+                        return Err(SnapshotStreamError::NonU64Key {
+                            table: name,
+                            key_type,
+                        });
+                    }
+                    None => {
+                        return Err(SnapshotStreamError::UnknownTable {
+                            name,
+                            type_id: 0,
+                        });
+                    }
+                }
+
                 // widened in task 7: `collect_serialized_rows` now hands back
                 // order-preserving encoded key bytes, but the stream format
                 // still carries fixed 8-byte little-endian `u64` keys, so

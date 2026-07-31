@@ -32,8 +32,17 @@ pub enum Error {
         /// the conflict was a version-level check at `begin_write` rather than
         /// a key-level overlap.
         table: String,
-        /// The overlapping keys that caused the conflict. Empty for version-level
+        /// [`PrimaryKey::hash64`](crate::PrimaryKey::hash64) digests of the
+        /// overlapping keys that caused the conflict. Empty for version-level
         /// and whole-table (deletion / bulk-replace) conflicts.
+        ///
+        /// Digests, not the keys themselves: a table's primary key may be any
+        /// [`PrimaryKey`](crate::PrimaryKey) type, and this variant has to
+        /// name one concrete type. Even on a `u64`-keyed table the value is
+        /// the digest of the id, not the id — treat it as an opaque conflict
+        /// identifier for logging and correlation, not as something to look a
+        /// row up by. To recover the offending rows, re-read them on the
+        /// retry.
         keys: Vec<u64>,
         /// The conflicting writer's version: the winning committed transaction's
         /// version for commit-time key/table conflicts; the current `latest_version`

@@ -61,6 +61,22 @@ pub trait AutoKey: PrimaryKey {
         Self: Sized;
 }
 
+/// The auto-increment counter a fresh table of key type `K` starts with:
+/// `Some(1)` for `u64` — the one [`AutoKey`] — and `None` for every
+/// explicitly-keyed type.
+///
+/// A `PrimaryKey`-only bound cannot spell `AutoKey::first()`, and Rust has no
+/// specialization, so recover it by type identity instead: `K: 'static`, so
+/// this is a plain downcast of a `u64` to `K`, which succeeds exactly when
+/// `K == u64`. Keeping the seed here (rather than pushing an `AutoKey` bound
+/// out to every caller) is what lets the type-erased registry closures and
+/// `WriteTx::open_table_keyed` build an empty table for any key type while
+/// preserving the `next_id_opt() == None` ⟺ explicitly-keyed invariant.
+pub(crate) fn auto_counter_seed<K: PrimaryKey>() -> Option<K> {
+    let first = <u64 as AutoKey>::first();
+    (&first as &dyn std::any::Any).downcast_ref::<K>().cloned()
+}
+
 fn truncated(expected: usize, got: usize) -> Error {
     Error::InvalidBulkLoadInput(format!(
         "primary key decode: expected {expected} bytes, got {got}"

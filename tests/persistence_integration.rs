@@ -6,7 +6,7 @@
 mod common;
 
 use std::path::Path;
-use ultima_db::{Durability, Persistence, Store, StoreConfig, WalWrite};
+use ultima_db::{Durability, Error, Persistence, Store, StoreConfig, WalWrite};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct User {
@@ -1331,23 +1331,17 @@ fn checkpoint_concurrent_with_commits_loses_no_acknowledged_commit() {
 // Arbitrary primary keys: end-to-end WAL recovery of a String-keyed table
 // ---------------------------------------------------------------------------
 
-// TASK 6 removes the `cfg(any())` and the `#[ignore]` below.
-//
-// This test needs `Store::begin_write` -> `WriteTx::open_table_keyed` and
-// `ReadTx::open_table_keyed`, which Task 6 delivers; `Store::register_table_keyed`
-// (Task 4) already exists. `#[ignore]` alone is not enough — an ignored test is
-// still compiled — so the body is additionally gated off with `cfg(any())`
-// (always false, and unlike a made-up feature name it raises no
-// `unexpected_cfgs` warning). Deleting the two attribute lines is all Task 6's
-// Step 5 has to do. The test is deliberately NOT weakened to run today: the
-// WAL-level coverage for variable-length keys lives in
-// `src/wal.rs::variable_length_keys_roundtrip_through_the_wal_file`, and this
-// is the end-to-end counterpart.
-#[cfg(any())]
-#[ignore = "needs open_table_keyed on the tx types (Task 6)"]
+/// The end-to-end counterpart to
+/// `src/wal.rs::variable_length_keys_roundtrip_through_the_wal_file`: a
+/// `String`-keyed table written through the public transaction API, fsynced,
+/// and read back from a fresh store after WAL replay.
 #[test]
 fn string_keyed_table_survives_wal_recovery() {
     let dir = common::test_scratch::scratch_dir();
+    // Bound rather than inlined so the reads below can take `&key` — the
+    // by-reference form a non-`Copy` key wants — without clippy flagging a
+    // borrow of a throwaway temporary.
+    let (alice, bob) = ("alice@x.com".to_string(), "bob@x.com".to_string());
 
     {
         let store = Store::new(
@@ -1366,8 +1360,8 @@ fn string_keyed_table_survives_wal_recovery() {
 
         let mut wtx = store.begin_write(None).unwrap();
         let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
-        t.put("alice@x.com".to_string(), "Alice".to_string()).unwrap();
-        t.put("bob@x.com".to_string(), "Bob".to_string()).unwrap();
+        t.put(alice.clone(), "Alice".to_string()).unwrap();
+        t.put(bob.clone(), "Bob".to_string()).unwrap();
         drop(t);
         wtx.commit().unwrap();
     }
@@ -1389,8 +1383,8 @@ fn string_keyed_table_survives_wal_recovery() {
 
     let rtx = store.begin_read(None).unwrap();
     let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
-    assert_eq!(t.get(&"alice@x.com".to_string()), Some(&"Alice".to_string()));
-    assert_eq!(t.get(&"bob@x.com".to_string()), Some(&"Bob".to_string()));
+    assert_eq!(t.get(&alice), Some(&"Alice".to_string()));
+    assert_eq!(t.get(&bob), Some(&"Bob".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,4 +1576,66 @@ fn the_v1_gate_does_not_reject_a_healthy_or_empty_wal() {
                 .unwrap_or_else(|e| panic!("{wal_write:?}/{label}: commit refused: {e}"));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registration identity includes the key type
+// ---------------------------------------------------------------------------
+
+/// Registering a name twice with the same record type but a different key
+/// type must be refused. Before the registry's identity included the key
+/// type this was a silent no-op: the second call left `Table<R, u64>`
+/// closures in place, every subsequent `open_table_keyed::<R, String>`
+/// succeeded in memory, and the mismatch only surfaced at `checkpoint()` as
+/// an opaque "table downcast failed".
+#[test]
+fn register_table_keyed_rejects_a_second_key_type_for_the_same_name() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = Store::new(
+        StoreConfig::builder()
+            .persistence(Persistence::smr(dir.path().to_path_buf()))
+            .build(),
+    )
+    .unwrap();
+
+    store.register_table_keyed::<String, u64>("t").unwrap();
+    // Idempotent repeat: fine.
+    store.register_table_keyed::<String, u64>("t").unwrap();
+    // Same record type, different key type: refused.
+    assert!(matches!(
+        store.register_table_keyed::<String, String>("t"),
+        Err(Error::TypeMismatch(_))
+    ));
+    // `register_table` is the u64 spelling of the same thing.
+    store.register_table::<String>("t").unwrap();
+}
+
+/// The mismatch is caught at `open_table*` time too, on the one path where
+/// nothing else pins the key type: a table that does not yet exist in the
+/// base snapshot. Without the check a fresh `Table<R, u64>` would be created,
+/// committed, and only rejected later by the registry's serializer.
+#[test]
+fn opening_a_fresh_table_under_the_wrong_key_type_errors_at_open() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = Store::new(
+        StoreConfig::builder()
+            .persistence(Persistence::smr(dir.path().to_path_buf()))
+            .build(),
+    )
+    .unwrap();
+    store
+        .register_table_keyed::<String, String>("emails")
+        .unwrap();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    assert!(
+        matches!(wtx.open_table::<String>("emails"), Err(Error::TypeMismatch(_))),
+        "a u64 open of a String-registered table must fail at open time"
+    );
+    // The correctly-keyed open works, and checkpoints without complaint.
+    let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
+    t.put("a@x.com".to_string(), "A".to_string()).unwrap();
+    drop(t);
+    wtx.commit().unwrap();
+    store.checkpoint().unwrap();
 }

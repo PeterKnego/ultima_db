@@ -1024,4 +1024,97 @@ mod tests {
             "expected Malformed for bad UTF-8, got: {res:?}"
         );
     }
+
+    /// The wire format carries fixed 8-byte little-endian `u64` row keys. A
+    /// destination that registered the table with a different primary-key type
+    /// must be refused outright, because the failure mode is *silent*: the
+    /// eight bytes of `1u64` are also a valid (NUL-padded) `String`, so
+    /// `String::decode` succeeds, the strict-ascent check downstream passes,
+    /// and the table would install full of garbage keys with no error
+    /// anywhere. Also: the destination must be left untouched.
+    #[test]
+    fn install_refuses_a_u64_stream_into_a_non_u64_keyed_table() {
+        use ultima_db::snapshot_stream::install::InstallOptions;
+        use ultima_db::{PrimaryKey, SnapshotStreamError};
+
+        // The hazard, stated as an assertion: re-encoding a u64 stream key
+        // into a String key is not a decode *failure* that would surface on
+        // its own. It silently succeeds.
+        assert_eq!(
+            <String as PrimaryKey>::decode(&1u64.encode()).unwrap().len(),
+            8,
+            "u64 key bytes decode cleanly as a String — hence the explicit guard"
+        );
+
+        // Source: an ordinary u64-keyed table with ids 1..=3.
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table::<Row>("rows").unwrap();
+            for i in 1..=3u64 {
+                t.insert(Row { value: i }).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination: same name, same record type, String primary key.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table_keyed::<Row, String>("rows").unwrap();
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            let mut t = tx.open_table_keyed::<Row, String>("rows").unwrap();
+            t.put("keep-me".to_string(), Row { value: 99 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let before = dst.begin_read(None).unwrap().version();
+
+        let res =
+            dst.install_snapshot_stream(std::io::Cursor::new(&bytes), InstallOptions::default());
+        match res {
+            Err(SnapshotStreamError::NonU64Key { table, .. }) => assert_eq!(table, "rows"),
+            other => panic!("expected NonU64Key, got: {other:?}"),
+        }
+
+        // Untouched: same version, same single pre-existing row.
+        let rtx = dst.begin_read(None).unwrap();
+        assert_eq!(rtx.version(), before);
+        let t = rtx.open_table_keyed::<Row, String>("rows").unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get("keep-me".to_string()), Some(&Row { value: 99 }));
+    }
+
+    /// The same restriction at the other end of the pipe: building a stream
+    /// from a non-`u64`-keyed table must fail loudly rather than squeeze the
+    /// keys through `u64::decode`.
+    #[test]
+    fn snapshot_stream_refuses_to_emit_a_non_u64_keyed_table() {
+        use ultima_db::SnapshotStreamError;
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table_keyed::<Row, String>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table_keyed::<Row, String>("rows").unwrap();
+            t.put("a".to_string(), Row { value: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        let res = src
+            .snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .map_err(SnapshotStreamError::from);
+        let msg = format!("{res:?}");
+        assert!(
+            msg.contains("non-u64 primary key"),
+            "expected a non-u64 key refusal, got: {msg}"
+        );
+    }
 }

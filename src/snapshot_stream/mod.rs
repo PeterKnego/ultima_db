@@ -86,6 +86,27 @@ pub enum SnapshotStreamError {
         /// Name of the custom index.
         index: String,
     },
+    /// The snapshot wire format carries every row key as a fixed 8-byte
+    /// little-endian `u64`, but this table is registered with a different
+    /// primary-key type on the store at this end of the stream.
+    ///
+    /// This is a hard error rather than a best-effort reinterpretation
+    /// because the raw bytes are *decodable* as several key types — the
+    /// 8 bytes of `1u64`, for instance, are also a valid (NUL-filled)
+    /// `String` — so silently re-encoding them would install a table full of
+    /// garbage keys that passes every downstream ordering and CRC check. The
+    /// wire format becomes key-generic in a follow-up; until then, snapshot
+    /// streaming is `u64`-keyed only.
+    #[error(
+        "table '{table}' has a non-u64 primary key ({key_type}); the snapshot \
+         wire format only carries u64 row keys"
+    )]
+    NonU64Key {
+        /// Name of the offending table.
+        table: String,
+        /// The registered primary-key type, as `std::any::type_name`.
+        key_type: &'static str,
+    },
     /// A row's bytes failed to deserialize into the destination table's
     /// record type.
     #[error("invalid wire payload for table '{table}': {reason}")]

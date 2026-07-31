@@ -232,6 +232,27 @@ impl crate::store::Store {
                 }
             }
 
+            // The wire format's row keys are fixed 8-byte little-endian
+            // `u64`s. If the destination registered this table with any other
+            // primary-key type, those bytes must NOT be re-encoded into it:
+            // `String::decode` of `1u64`'s eight bytes succeeds (NUL is valid
+            // UTF-8), the strict-ascent check downstream still passes, and the
+            // table installs full of garbage keys with no error anywhere.
+            // Refuse at the trust boundary instead. (Task 7 makes the format
+            // key-generic and this restriction goes away.)
+            match registry.key_type(&table_header.name) {
+                Some((id, _)) if id == std::any::TypeId::of::<u64>() => {}
+                Some((_, key_type)) => {
+                    return Err(SnapshotStreamError::NonU64Key {
+                        table: table_header.name,
+                        key_type,
+                    });
+                }
+                // `contains()` was true immediately above, so this is
+                // unreachable; treat it the same as "not registered".
+                None => continue,
+            }
+
             // Deserialise raw bytes → Box<dyn MergeableTable> via the registry.
             // Pass the destination's existing table (if any) so its secondary
             // index definitions are cloned and rebuilt over the new rows.

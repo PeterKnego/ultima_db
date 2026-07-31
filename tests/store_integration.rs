@@ -2007,7 +2007,9 @@ fn multi_writer_overlapping_keys_conflict() {
             ..
         } => {
             assert_eq!(table, "t");
-            assert!(keys.contains(&1));
+            // `keys` carries `hash64()` digests, not row ids — the variant has
+            // to name one concrete type and a table's key may be anything.
+            assert!(keys.contains(&ultima_db::PrimaryKey::hash64(&1u64)));
             assert!(wait_for.is_some(), "early-fail should carry a CommitWaiter");
             // Exercise the CommitWaiter Debug impl — it must be opaque
             // (not leak inner state) but still produce something.
@@ -3298,4 +3300,233 @@ fn uncommitted_remove_mut_invisible_to_concurrent_reader() {
     assert_eq!(t.len() as u64, N / 2);
     assert_eq!(t.get(1), None);
     assert_eq!(t.get(N), Some(&base_val(N)));
+}
+
+// ---------------------------------------------------------------------------
+// Arbitrary primary keys — `open_table_keyed`
+// ---------------------------------------------------------------------------
+
+/// A `String`-keyed table opened, written, committed and read back entirely
+/// through the public API. `put`/`get` replace `insert`/`get(id)`: there is no
+/// auto-increment for a key the store cannot generate.
+#[test]
+fn string_keyed_table_end_to_end() {
+    let store = Store::default();
+    let alice = "alice@x.com".to_string();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
+    t.put(alice.clone(), "Alice".to_string()).unwrap();
+    drop(t);
+    let v = wtx.commit().unwrap();
+
+    let rtx = store.begin_read(Some(v)).unwrap();
+    let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+    assert_eq!(t.get(&alice), Some(&"Alice".to_string()));
+}
+
+/// Opening a `String`-keyed table as `u64` (or vice versa) must be a type
+/// error at open time, not a surprise at checkpoint time.
+#[test]
+fn keyed_table_reopened_with_wrong_key_type_errors() {
+    let store = Store::default();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
+    t.put("alice@x.com".to_string(), "Alice".to_string()).unwrap();
+    drop(t);
+    let v = wtx.commit().unwrap();
+
+    // Same record type, wrong key type — through both transaction kinds.
+    let rtx = store.begin_read(Some(v)).unwrap();
+    assert!(matches!(
+        rtx.open_table::<String>("emails"),
+        Err(Error::TypeMismatch(_))
+    ));
+    let mut wtx = store.begin_write(None).unwrap();
+    assert!(matches!(
+        wtx.open_table::<String>("emails"),
+        Err(Error::TypeMismatch(_))
+    ));
+    // ... and re-opening within one transaction under a third key type.
+    assert!(wtx.open_table_keyed::<String, String>("emails").is_ok());
+    assert!(matches!(
+        wtx.open_table_keyed::<String, u32>("emails"),
+        Err(Error::TypeMismatch(_))
+    ));
+}
+
+/// Two MultiWriter transactions writing *different* string keys of the same
+/// table must both commit: OCC compares `hash64()` digests, and distinct keys
+/// hash apart with overwhelming probability.
+#[test]
+fn multiwriter_disjoint_string_keys_both_commit() {
+    use ultima_db::{StoreConfig, WriterMode};
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
+    .unwrap();
+
+    let mut w1 = store.begin_write(None).unwrap();
+    let mut t1 = w1.open_table_keyed::<String, String>("emails").unwrap();
+    t1.put("a@x.com".to_string(), "A".to_string()).unwrap();
+    drop(t1);
+
+    let mut w2 = store.begin_write(None).unwrap();
+    let mut t2 = w2.open_table_keyed::<String, String>("emails").unwrap();
+    t2.put("b@x.com".to_string(), "B".to_string()).unwrap();
+    drop(t2);
+
+    w1.commit().unwrap();
+    let v = w2.commit().expect("disjoint keys must not conflict");
+
+    // The second commit went through the merge slow path (a concurrent
+    // committer touched `emails` since w2's base), so this also proves the
+    // merge replayed w2's *exact* key rather than a digest.
+    let rtx = store.begin_read(Some(v)).unwrap();
+    let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+    let (ka, kb) = ("a@x.com".to_string(), "b@x.com".to_string());
+    assert_eq!(t.get(&ka), Some(&"A".to_string()));
+    assert_eq!(t.get(&kb), Some(&"B".to_string()));
+}
+
+/// The same string key from two MultiWriter transactions must conflict at
+/// commit-time OCC. `w2` is opened first so its base predates `w1`'s commit,
+/// and `w1` is fully committed (releasing its intents) before `w2` writes —
+/// otherwise `put`'s early-fail intent claim would raise the conflict sooner
+/// and this path would never be exercised. See
+/// `multiwriter_same_string_key_conflicts_early_via_intent` for that one.
+#[test]
+fn multiwriter_same_string_key_conflicts() {
+    use ultima_db::{StoreConfig, WriterMode};
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
+    .unwrap();
+
+    let mut seed = store.begin_write(None).unwrap();
+    let mut t = seed.open_table_keyed::<String, String>("emails").unwrap();
+    t.put("a@x.com".to_string(), "seed".to_string()).unwrap();
+    drop(t);
+    seed.commit().unwrap();
+
+    // w2's base is the seed version.
+    let mut w2 = store.begin_write(None).unwrap();
+
+    let mut w1 = store.begin_write(None).unwrap();
+    let mut t1 = w1.open_table_keyed::<String, String>("emails").unwrap();
+    t1.put("a@x.com".to_string(), "one".to_string()).unwrap();
+    drop(t1);
+    w1.commit().unwrap();
+
+    let mut t2 = w2.open_table_keyed::<String, String>("emails").unwrap();
+    t2.put("a@x.com".to_string(), "two".to_string()).unwrap();
+    drop(t2);
+
+    let err = w2.commit().expect_err("same key must conflict");
+    assert!(matches!(err, Error::WriteConflict { .. }), "got {err:?}");
+}
+
+/// The early-fail half: while `w1` is still live and holding the write intent
+/// on a key, a second writer's `put` on that same key fails immediately rather
+/// than doing work it would only lose at commit. The reported `keys` are
+/// `hash64()` digests, not the keys themselves.
+#[test]
+fn multiwriter_same_string_key_conflicts_early_via_intent() {
+    use ultima_db::{PrimaryKey, StoreConfig, WriterMode};
+    let store = Store::new(
+        StoreConfig::builder()
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
+    .unwrap();
+
+    let mut w1 = store.begin_write(None).unwrap();
+    let mut t1 = w1.open_table_keyed::<String, String>("emails").unwrap();
+    t1.put("a@x.com".to_string(), "one".to_string()).unwrap();
+    drop(t1);
+
+    let mut w2 = store.begin_write(None).unwrap();
+    let mut t2 = w2.open_table_keyed::<String, String>("emails").unwrap();
+    let err = t2
+        .put("a@x.com".to_string(), "two".to_string())
+        .expect_err("live intent on the same key must fail fast");
+    match err {
+        Error::WriteConflict { table, keys, .. } => {
+            assert_eq!(table, "emails");
+            assert_eq!(keys, vec!["a@x.com".to_string().hash64()]);
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+/// A tuple-keyed table exercises the multi-element `PrimaryKey` encoding
+/// through the transaction API, and range scans over it must come back in
+/// key order.
+#[test]
+fn tuple_keyed_table_ranges_in_key_order() {
+    let store = Store::default();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx
+        .open_table_keyed::<String, (u32, String)>("cells")
+        .unwrap();
+    for (row, col) in [(2u32, "b"), (1, "b"), (2, "a"), (1, "a")] {
+        t.put((row, col.to_string()), format!("{row}{col}")).unwrap();
+    }
+    drop(t);
+    let v = wtx.commit().unwrap();
+
+    let rtx = store.begin_read(Some(v)).unwrap();
+    let t = rtx
+        .open_table_keyed::<String, (u32, String)>("cells")
+        .unwrap();
+    let all: Vec<(u32, String)> = t.iter().map(|(k, _)| k).collect();
+    assert_eq!(
+        all,
+        vec![
+            (1, "a".to_string()),
+            (1, "b".to_string()),
+            (2, "a".to_string()),
+            (2, "b".to_string()),
+        ]
+    );
+    let row1: Vec<String> = t
+        .range((1u32, String::new())..(2u32, String::new()))
+        .map(|(_, v)| v.clone())
+        .collect();
+    assert_eq!(row1, vec!["1a".to_string(), "1b".to_string()]);
+}
+
+/// `delete` and `update` on a `String`-keyed writer route through the same
+/// exact-key write set the merge replays.
+#[test]
+fn string_keyed_update_and_delete_round_trip() {
+    let store = Store::default();
+    let (ka, kb) = ("a@x.com".to_string(), "b@x.com".to_string());
+
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
+    t.put(ka.clone(), "A".to_string()).unwrap();
+    t.put(kb.clone(), "B".to_string()).unwrap();
+    drop(t);
+    wtx.commit().unwrap();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table_keyed::<String, String>("emails").unwrap();
+    t.update(&ka, "A2".to_string()).unwrap();
+    let gone = t.delete(&kb).unwrap();
+    assert_eq!(*gone, "B".to_string());
+    drop(t);
+    let v = wtx.commit().unwrap();
+
+    let rtx = store.begin_read(Some(v)).unwrap();
+    let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+    assert_eq!(t.get(&ka), Some(&"A2".to_string()));
+    assert_eq!(t.get(&kb), None);
+    assert_eq!(t.len(), 1);
 }
