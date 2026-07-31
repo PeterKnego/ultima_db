@@ -680,7 +680,7 @@ impl Store {
             Some(_) => {
                 return Err(Error::WriteConflict {
                     table: String::new(),
-                    keys: vec![],
+                    key_digests: vec![],
                     version: inner.latest_version,
                     wait_for: None,
                 });
@@ -942,6 +942,35 @@ impl Store {
         Ok(version)
     }
 
+    /// Refuse to replay a WAL op whose key was encoded with a different key
+    /// type than the table is registered with in this build.
+    ///
+    /// The registry closures decode the op's key bytes with *their* `K`, and
+    /// several key types accept each other's encodings: `u64`/`i64` differ
+    /// only in the sign bit, the eight bytes of a `u64` id are a valid
+    /// NUL-filled `String`, `String`/`Vec<u8>` are interchangeable. The
+    /// encoding is order-preserving, so the reinterpreted keys pass the
+    /// ascending-order validation too — without this check the replay
+    /// succeeds and the table comes back full of silently reinterpreted keys.
+    #[cfg(feature = "persistence")]
+    fn check_replay_key_type(
+        table: &str,
+        info: &crate::registry::TableTypeInfo,
+        key_type: u32,
+    ) -> Result<()> {
+        if key_type != info.key_type_code {
+            return Err(Error::WalCorrupted(format!(
+                "table '{table}': {}",
+                crate::primary_key::key_type_mismatch_msg_raw(
+                    info.key_type_code,
+                    info.key_type_name,
+                    key_type
+                )
+            )));
+        }
+        Ok(())
+    }
+
     /// Recover state from disk (checkpoint + WAL replay).
     ///
     /// Call this after creating the store with [`Store::new`] and registering
@@ -1041,12 +1070,23 @@ impl Store {
                         }
                         for op in &entry.ops {
                             match op {
-                                crate::wal::WalOp::Insert { table, key, data }
-                                | crate::wal::WalOp::Update { table, key, data } => {
+                                crate::wal::WalOp::Insert {
+                                    table,
+                                    key_type,
+                                    key,
+                                    data,
+                                }
+                                | crate::wal::WalOp::Update {
+                                    table,
+                                    key_type,
+                                    key,
+                                    data,
+                                } => {
                                     let info = inner
                                         .registry
                                         .get(table)
                                         .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
+                                    Self::check_replay_key_type(table, info, *key_type)?;
 
                                     if !tables.contains_key(table) {
                                         tables.insert(
@@ -1074,11 +1114,16 @@ impl Store {
                                         (info.replay_update)(table_mut, key, data)?;
                                     }
                                 }
-                                crate::wal::WalOp::Delete { table, key } => {
+                                crate::wal::WalOp::Delete {
+                                    table,
+                                    key_type,
+                                    key,
+                                } => {
                                     let info = inner
                                         .registry
                                         .get(table)
                                         .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
+                                    Self::check_replay_key_type(table, info, *key_type)?;
                                     if let Some(table_arc) = tables.get_mut(table) {
                                         let table_mut = Arc::get_mut(table_arc)
                                             .ok_or_else(|| Error::Persistence(
@@ -1688,7 +1733,7 @@ impl Store {
         if inner.next_ticket != inner.promote_gate.current_turn() {
             return Err(Error::WriteConflict {
                 table: pending[0].name.clone(),
-                keys: vec![],
+                key_digests: vec![],
                 version: inner.latest_version,
                 wait_for: None,
             });
@@ -1697,7 +1742,7 @@ impl Store {
         if inner.latest_version != base_version {
             return Err(Error::WriteConflict {
                 table: pending[0].name.clone(),
-                keys: vec![],
+                key_digests: vec![],
                 version: inner.latest_version,
                 wait_for: None,
             });
@@ -2498,7 +2543,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
                 self.metrics.inc_write_conflict();
                 Err(Error::WriteConflict {
                     table: self.table_name.to_string(),
-                    keys: vec![digest],
+                    key_digests: vec![digest],
                     // Early-fail has no "conflicting committed version"; the
                     // holder is still in flight. Use 0 as a sentinel.
                     version: 0,
@@ -2527,6 +2572,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         self.claim_intent(key)?;
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
+            let encoded_key = Self::encoded_key(key)?;
             let data = Self::serialize_record(&record)?;
             self.table.update(key, record)?;
             if let Some(ws) = &mut self.write_set {
@@ -2534,7 +2580,8 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
             }
             w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                 table: w.table_name.clone(),
-                key: key.encode(),
+                key_type: K::KEY_TYPE_ID,
+                key: encoded_key,
                 data,
             });
             self.table_metrics.inc_updates(1);
@@ -2552,6 +2599,13 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     pub fn delete(&mut self, key: impl Borrow<K>) -> Result<Arc<R>> {
         let key = key.borrow();
         self.claim_intent(key)?;
+        // Encoded up front, before the row is removed: a key the WAL cannot
+        // carry has to fail without changing the table.
+        #[cfg(feature = "persistence")]
+        let encoded_key = match &self.wal_ops {
+            Some(_) => Some(Self::encoded_key(key)?),
+            None => None,
+        };
         let old = self.table.delete(key)?;
         if let Some(ws) = &mut self.write_set {
             ws.record(key);
@@ -2560,7 +2614,8 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         if let Some(w) = &mut self.wal_ops {
             w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                 table: w.table_name.clone(),
-                key: key.encode(),
+                key_type: K::KEY_TYPE_ID,
+                key: encoded_key.expect("encoded when wal_ops is Some"),
             });
         }
         self.table_metrics.inc_deletes(1);
@@ -2577,9 +2632,9 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     pub fn update_batch(&mut self, updates: Vec<(K, R)>) -> Result<()> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            let ops_data: Vec<(K, Vec<u8>)> = updates
+            let ops_data: Vec<(Vec<u8>, Vec<u8>)> = updates
                 .iter()
-                .map(|(key, r)| Self::serialize_record(r).map(|d| (key.clone(), d)))
+                .map(|(key, r)| Ok((Self::encoded_key(key)?, Self::serialize_record(r)?)))
                 .collect::<Result<_>>()?;
             let keys: Vec<K> = updates.iter().map(|(key, _)| key.clone()).collect();
             self.table.update_batch(updates)?;
@@ -2589,7 +2644,8 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
             for (key, data) in ops_data {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
-                    key: key.encode(),
+                    key_type: K::KEY_TYPE_ID,
+                    key,
                     data,
                 });
             }
@@ -2608,16 +2664,24 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     /// Delete multiple records atomically. See `update_batch` for why
     /// batch ops skip early-fail intent claiming.
     pub fn delete_batch(&mut self, keys: &[K]) -> Result<()> {
+        // Encoded before the batch runs, for the same reason `delete` does it:
+        // an over-long key must not take the rows with it.
+        #[cfg(feature = "persistence")]
+        let encoded_keys: Option<Vec<Vec<u8>>> = match &self.wal_ops {
+            Some(_) => Some(keys.iter().map(Self::encoded_key).collect::<Result<_>>()?),
+            None => None,
+        };
         self.table.delete_batch(keys)?;
         if let Some(ws) = &mut self.write_set {
             ws.record_all(keys.iter());
         }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            for key in keys {
+            for key in encoded_keys.expect("encoded when wal_ops is Some") {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                     table: w.table_name.clone(),
-                    key: key.encode(),
+                    key_type: K::KEY_TYPE_ID,
+                    key,
                 });
             }
         }
@@ -2629,6 +2693,22 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     fn serialize_record(record: &R) -> Result<Vec<u8>> {
         bincode::serde::encode_to_vec(record, bincode::config::standard())
             .map_err(|e| Error::Persistence(e.to_string()))
+    }
+
+    /// Encode a key for a WAL op, refusing one over the shared 64 KiB cap
+    /// ([`MAX_ENCODED_KEY_LEN`](crate::primary_key::MAX_ENCODED_KEY_LEN)).
+    ///
+    /// `serialize_entry` enforces the same bound — that is the choke point no
+    /// sink can bypass — but it runs at commit, after the mutation has already
+    /// been applied to the in-memory table and reported successful. Refusing
+    /// here means the caller learns at the offending `put`/`update`/`delete`,
+    /// with the table untouched, instead of losing an entire transaction's
+    /// worth of otherwise-valid rows at commit.
+    #[cfg(feature = "persistence")]
+    fn encoded_key(key: &K) -> Result<Vec<u8>> {
+        let encoded = key.encode();
+        crate::primary_key::check_encoded_key_len(encoded.len(), "WAL entry")?;
+        Ok(encoded)
     }
 
     // --- Read methods (pass-through) ---
@@ -2814,7 +2894,7 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         };
         #[cfg(feature = "persistence")]
         let encoded_key = if self.wal_ops.is_some() {
-            Some(key.encode())
+            Some(Self::encoded_key(&key)?)
         } else {
             None
         };
@@ -2833,12 +2913,14 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
             let op = if had_prior {
                 crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
+                    key_type: K::KEY_TYPE_ID,
                     key,
                     data,
                 }
             } else {
                 crate::wal::WalOp::Insert {
                     table: w.table_name.clone(),
+                    key_type: K::KEY_TYPE_ID,
                     key,
                     data,
                 }
@@ -2870,6 +2952,7 @@ impl<'tx, R: Record, K: AutoKey> TableWriter<'tx, R, K> {
             }
             w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
                 table: w.table_name.clone(),
+                key_type: K::KEY_TYPE_ID,
                 key: id.encode(),
                 data,
             });
@@ -2899,6 +2982,7 @@ impl<'tx, R: Record, K: AutoKey> TableWriter<'tx, R, K> {
             for (id, data) in ids.iter().zip(data_list) {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
                     table: w.table_name.clone(),
+                    key_type: K::KEY_TYPE_ID,
                     key: id.encode(),
                     data,
                 });
@@ -4200,7 +4284,7 @@ impl WriteTx {
                 {
                     return Some(Error::WriteConflict {
                         table: deleted.clone(),
-                        keys: vec![],
+                        key_digests: vec![],
                         version: cws.version,
                         wait_for: None,
                     });
@@ -4211,7 +4295,7 @@ impl WriteTx {
                 if cws.tables.contains_key(deleted) {
                     return Some(Error::WriteConflict {
                         table: deleted.clone(),
-                        keys: vec![],
+                        key_digests: vec![],
                         version: cws.version,
                         wait_for: None,
                     });
@@ -4235,7 +4319,7 @@ impl WriteTx {
                     let conflicting: Vec<u64> = my_keys.intersection(their_keys).copied().collect();
                     return Some(Error::WriteConflict {
                         table: table_name.clone(),
-                        keys: conflicting,
+                        key_digests: conflicting,
                         version: cws.version,
                         wait_for: None,
                     });

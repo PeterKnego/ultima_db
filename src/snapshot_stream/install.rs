@@ -286,13 +286,19 @@ impl crate::store::Store {
             // erroring, and the install lands a table of one key type on top
             // of another — flipping the key type and destroying every
             // pre-existing row without a word.
-            let live = existing_table.map(|t| (t.key_type_id(), t.key_type_name()));
+            // The comparison is on `PrimaryKey::KEY_TYPE_ID`, the discriminant
+            // the key type declares about itself, not on `type_name`:
+            // `type_name` is neither promised stable across compiler versions
+            // (a false refusal) nor injective across crate versions of a
+            // third-party key type (a false *accept*, the direction that
+            // matters). The stream's name is kept for the error message only.
+            let live = existing_table.map(|t| (t.key_type_id(), t.key_type_name(), t.key_type_code()));
             let registered = registry.key_type(&table_header.name);
             let mismatch = [live, registered]
                 .into_iter()
                 .flatten()
-                .find(|(_, name)| *name != table_header.key_type);
-            if let Some((_, destination)) = mismatch {
+                .find(|(_, _, code)| *code != table_header.key_type_id);
+            if let Some((_, destination, _)) = mismatch {
                 return Err(SnapshotStreamError::KeyTypeMismatch {
                     table: table_header.name,
                     stream: table_header.key_type,
@@ -300,14 +306,13 @@ impl crate::store::Store {
                 });
             }
 
-            // The name comparison above is only as good as `type_name` being
-            // injective, and it is not: two crate *versions* of the same key
-            // type print identically. `TypeId` is exact within a process, so
-            // comparing the two ends we hold in memory — registry and live
-            // table — closes the local half of that collision for free. (It
-            // cannot close the remote half; the stream carries no `TypeId`,
-            // and `TypeId` is not stable across builds anyway.)
-            if let (Some((live_id, _)), Some((registered_id, _))) = (live, registered)
+            // Two key types may legitimately share an id only by a
+            // third-party author's mistake, but the destination's *own* two
+            // records of the key type must never disagree. `TypeId` is exact
+            // within a process, so comparing the two ends held in memory —
+            // registry and live table — costs nothing and catches a
+            // registration that does not match the table it will replace.
+            if let (Some((live_id, ..)), Some((registered_id, ..))) = (live, registered)
                 && live_id != registered_id
             {
                 return Err(crate::Error::TypeMismatch(table_header.name).into());

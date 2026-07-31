@@ -1388,6 +1388,254 @@ fn string_keyed_table_survives_wal_recovery() {
 }
 
 // ---------------------------------------------------------------------------
+// Key-type identity: a directory reopened under a different `K` is refused
+// ---------------------------------------------------------------------------
+
+/// Write three rows into `dir` through a `u64`-keyed table, checkpointing (or
+/// not) at the end. `checkpointed` selects which of the two on-disk formats
+/// carries the data on the way back in: the checkpoint, or the WAL alone.
+fn seed_u64_table(dir: &Path, checkpointed: bool) {
+    let store = open_store(standalone_config(dir, Durability::Consistent));
+    for name in ["Alice", "Bob", "Carol"] {
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users")
+            .unwrap()
+            .insert(User {
+                name: name.into(),
+                age: 30,
+            })
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+    if checkpointed {
+        store.checkpoint().unwrap();
+    }
+}
+
+/// Reopen `dir` with `users` registered under `K` and return recovery's error.
+fn recover_users_as<K: ultima_db::PrimaryKey>(dir: &Path) -> Error {
+    let store = Store::new(standalone_config(dir, Durability::Consistent)).unwrap();
+    store.register_table_keyed::<User, K>("users").unwrap();
+    match store.recover() {
+        Ok(()) => panic!(
+            "recovery accepted a table written under a different key type \
+             (reopened as {})",
+            std::any::type_name::<K>()
+        ),
+        Err(e) => e,
+    }
+}
+
+fn assert_key_type_error(err: &Error, expected: &str, found: &str) {
+    let msg = err.to_string();
+    assert!(
+        msg.contains("primary key type mismatch"),
+        "expected a key-type error, got: {msg}"
+    );
+    assert!(msg.contains(expected), "message must name {expected}: {msg}");
+    assert!(msg.contains(found), "message must name {found}: {msg}");
+}
+
+/// A `u64`-keyed directory reopened as `String`-keyed must be refused, through
+/// both on-disk formats.
+///
+/// Before the key-type tag this recovered `Ok` with `len == 3` and the key
+/// `"\0\0\0\0\0\0\0\u{1}"` — the eight bytes of `1u64`, which are valid UTF-8.
+#[test]
+fn a_u64_table_reopened_as_string_keyed_is_refused() {
+    for checkpointed in [false, true] {
+        let dir = common::test_scratch::scratch_dir();
+        seed_u64_table(dir.path(), checkpointed);
+        let err = recover_users_as::<String>(dir.path());
+        assert_key_type_error(&err, "String", "u64");
+    }
+}
+
+/// The equal-width case, which is the one nothing else can catch: `i64::decode`
+/// accepts any eight bytes, and since both encodings are order-preserving the
+/// reinterpreted keys pass the ascending-order validation too. Before the tag
+/// this recovered `Ok` with keys `[-9223372036854775807, ...]`.
+#[test]
+fn a_u64_table_reopened_as_i64_keyed_is_refused() {
+    for checkpointed in [false, true] {
+        let dir = common::test_scratch::scratch_dir();
+        seed_u64_table(dir.path(), checkpointed);
+        let err = recover_users_as::<i64>(dir.path());
+        assert_key_type_error(&err, "i64", "u64");
+    }
+}
+
+/// `String` and `Vec<u8>` encode *identically* — the tag is the only thing
+/// that distinguishes them anywhere in either format.
+#[test]
+fn a_string_table_reopened_as_vec_u8_keyed_is_refused() {
+    for checkpointed in [false, true] {
+        let dir = common::test_scratch::scratch_dir();
+        {
+            let store = Store::new(standalone_config(dir.path(), Durability::Consistent)).unwrap();
+            store
+                .register_table_keyed::<User, String>("emails")
+                .unwrap();
+            store.recover().unwrap();
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<User, String>("emails").unwrap();
+            t.put(
+                "a@x.com".to_string(),
+                User {
+                    name: "Alice".into(),
+                    age: 30,
+                },
+            )
+            .unwrap();
+            drop(t);
+            wtx.commit().unwrap();
+            if checkpointed {
+                store.checkpoint().unwrap();
+            }
+        }
+
+        let store = Store::new(standalone_config(dir.path(), Durability::Consistent)).unwrap();
+        store
+            .register_table_keyed::<User, Vec<u8>>("emails")
+            .unwrap();
+        let Err(err) = store.recover() else {
+            panic!("a String-keyed table must not recover as Vec<u8>-keyed");
+        };
+        assert_key_type_error(&err, "Vec<u8>", "String");
+
+        // The matching key type still recovers, so the refusal is about the
+        // type and not about the data.
+        let store = Store::new(standalone_config(dir.path(), Durability::Consistent)).unwrap();
+        store
+            .register_table_keyed::<User, String>("emails")
+            .unwrap();
+        store.recover().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<User, String>("emails").unwrap();
+        assert_eq!(t.len(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key length cap: refused at the mutation, never acknowledged by commit
+// ---------------------------------------------------------------------------
+
+/// An over-long key must be refused *before* `commit()` acknowledges it.
+///
+/// The cap used to be enforced only on read, so `commit()` returned `Ok(v2)`
+/// for a key no reader would accept: under `PerEntry` recovery then failed
+/// permanently, and under `CoalescedPrealloc` — the mode
+/// `Persistence::standalone_fast` selects — the tail-tolerant scan stopped at
+/// the bad record and silently dropped the whole transaction, taking the
+/// ordinary rows committed alongside it.
+#[test]
+fn an_over_long_key_is_refused_at_the_mutation_in_every_wal_write_mode() {
+    for wal_write in [
+        WalWrite::PerEntry,
+        WalWrite::Coalesced,
+        WalWrite::CoalescedPrealloc,
+    ] {
+        let dir = common::test_scratch::scratch_dir();
+        let config = StoreConfig::builder()
+            .persistence(Persistence::standalone(
+                dir.path().to_path_buf(),
+                Durability::Consistent,
+                wal_write,
+            ))
+            .build();
+        let over_long = "k".repeat(70 * 1024);
+
+        {
+            let store = Store::new(config.clone()).unwrap();
+            store.register_table_keyed::<User, String>("t").unwrap();
+            store.recover().unwrap();
+
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<User, String>("t").unwrap();
+            t.put(
+                "a".to_string(),
+                User {
+                    name: "Alice".into(),
+                    age: 30,
+                },
+            )
+            .unwrap();
+            let err = t
+                .put(
+                    over_long.clone(),
+                    User {
+                        name: "Huge".into(),
+                        age: 1,
+                    },
+                )
+                .expect_err("an over-long key must be refused at the mutation");
+            assert!(
+                matches!(err, Error::KeyTooLong { len, max, .. } if len == 70 * 1024 && max == 64 * 1024),
+                "expected KeyTooLong, got: {err} ({wal_write:?})"
+            );
+            // The failed write left the table alone, and the transaction is
+            // still usable — the co-committed rows are not collateral damage.
+            assert!(t.get(&over_long).is_none());
+            t.put(
+                "b".to_string(),
+                User {
+                    name: "Bob".into(),
+                    age: 40,
+                },
+            )
+            .unwrap();
+            drop(t);
+            wtx.commit().unwrap();
+        }
+
+        let store = Store::new(config).unwrap();
+        store.register_table_keyed::<User, String>("t").unwrap();
+        store.recover().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<User, String>("t").unwrap();
+        assert_eq!(
+            t.len(),
+            2,
+            "both ordinary rows must survive recovery ({wal_write:?})"
+        );
+    }
+}
+
+/// `Persistence::smr` writes checkpoints and no WAL, so it is the path where a
+/// checkpoint-only cap would have gone missing. Both persistence modes refuse
+/// the same key.
+#[test]
+fn the_key_cap_is_the_same_for_smr_and_standalone() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = Store::new(smr_config(dir.path())).unwrap();
+    store.register_table_keyed::<User, String>("t").unwrap();
+    store.recover().unwrap();
+
+    let mut wtx = store.begin_write(None).unwrap();
+    let mut t = wtx.open_table_keyed::<User, String>("t").unwrap();
+    t.put(
+        "k".repeat(70 * 1024),
+        User {
+            name: "Huge".into(),
+            age: 1,
+        },
+    )
+    .unwrap();
+    drop(t);
+    wtx.commit().unwrap();
+
+    // No WAL to refuse it at commit, so the checkpoint is the boundary — and
+    // it refuses rather than writing a file `standalone` could never have.
+    let err = store
+        .checkpoint()
+        .expect_err("an over-long key must not reach a checkpoint");
+    assert!(
+        matches!(err, Error::KeyTooLong { .. }),
+        "expected KeyTooLong, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Pre-0.3.0 (v1) WAL rejection
 // ---------------------------------------------------------------------------
 

@@ -35,19 +35,23 @@ pub(crate) fn bulk_next_counter<K: PrimaryKey>(
     seed: Option<K>,
     last_key: Option<&K>,
 ) -> Result<Option<K>> {
-    let had_counter = seed.is_some();
     let mut counter = seed;
     if let Some(k) = last_key {
         k.advance_auto_counter(&mut counter);
-    }
-    // Cleared only when the highest key has no successor (`u64::MAX`).
-    // Dropping the `Some` invariant would turn a later `insert` into a panic
-    // — fail loudly here instead.
-    if had_counter && counter.is_none() {
-        return Err(Error::InvalidBulkLoadInput(
-            "highest bulk-load key is the maximum id; the auto-increment counter would overflow"
-                .into(),
-        ));
+        // The counter stalls at or below the highest key only when that key
+        // has no successor (`u64::MAX`). `advance_auto_counter` leaves it in
+        // place there rather than clearing it — clearing would flip the
+        // table to "explicitly keyed" — so the stall is read off the
+        // counter's position. Silently loading a table whose counter sits
+        // under an occupied id would make a later `insert` overwrite that
+        // row; fail loudly instead.
+        if crate::primary_key::counter_exhausted(&counter, k) {
+            return Err(Error::InvalidBulkLoadInput(
+                "highest bulk-load key is the maximum id; the auto-increment counter would \
+                 overflow"
+                    .into(),
+            ));
+        }
     }
     Ok(counter)
 }

@@ -788,6 +788,7 @@ mod tests {
             &TableHeader {
                 name: "rows".to_string(),
                 record_type_id: 0,
+                key_type_id: <u64 as ultima_db::PrimaryKey>::KEY_TYPE_ID,
                 key_type: std::any::type_name::<u64>().to_string(),
                 row_count: u64::MAX,
                 indexes: Vec::new(),
@@ -1173,6 +1174,61 @@ mod tests {
         assert_eq!(t.get("keep-me".to_string()), Some(&Row { value: 99 }));
     }
 
+    /// The check is decided by `key_type_id`, not by the type *name*.
+    ///
+    /// The name is only a diagnostic: `std::any::type_name` is not injective
+    /// across crate versions of a third-party key type, so two incompatible
+    /// key types can print identically. Here the stream keeps a name the
+    /// destination agrees with and carries a different `key_type_id`; the
+    /// install must still refuse it.
+    #[test]
+    fn install_decides_the_key_type_check_on_the_id_not_the_name() {
+        use ultima_db::snapshot_stream::install::InstallOptions;
+        use ultima_db::SnapshotStreamError;
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<Row>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            tx.open_table::<Row>("rows")
+                .unwrap()
+                .insert(Row { value: 1 })
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Patch the header's `key_type_id` and nothing else. Layout: file
+        // header (22) | name_len (2) | name | record_type_id (8) |
+        // key_type_id (4) | ...
+        let at = 22 + 2 + "rows".len() + 8;
+        let original = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            original,
+            <u64 as ultima_db::PrimaryKey>::KEY_TYPE_ID,
+            "the patch offset must land on the key type id"
+        );
+        bytes[at..at + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        // The name field still says `u64`, and the destination *is* `u64`.
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        match dst.install_snapshot_stream(std::io::Cursor::new(&bytes), InstallOptions::default()) {
+            Err(SnapshotStreamError::KeyTypeMismatch { stream, .. }) => {
+                assert_eq!(
+                    stream,
+                    std::any::type_name::<u64>(),
+                    "the name is reported as the stream sent it"
+                );
+            }
+            other => panic!("expected KeyTypeMismatch, got: {other:?}"),
+        }
+    }
+
     /// A `String`-keyed table is emittable now — the restriction the old
     /// `NonU64Key` guard imposed at this end of the pipe is gone. What must
     /// still hold is that the emitted header names `String`, so the receiver
@@ -1283,6 +1339,7 @@ mod tests {
             &TableHeader {
                 name: "rows".to_string(),
                 record_type_id: 0,
+                key_type_id: <u64 as ultima_db::PrimaryKey>::KEY_TYPE_ID,
                 key_type: std::any::type_name::<u64>().to_string(),
                 row_count: 1,
                 indexes: Vec::new(),

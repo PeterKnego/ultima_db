@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::persistence::Record;
-use crate::primary_key::{PrimaryKey, auto_counter_seed};
+use crate::primary_key::{
+    PrimaryKey, auto_counter_seed, check_encoded_key_len, key_type_mismatch_msg,
+};
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
 
@@ -73,6 +75,11 @@ pub(crate) struct TableTypeInfo {
     /// can name the offending type in its error message (`TypeId` has no
     /// printable form).
     pub key_type_name: &'static str,
+    /// [`PrimaryKey::KEY_TYPE_ID`] of `K` — the *persisted* key-type identity,
+    /// as opposed to `key_type_id` (process-local) and `key_type_name` (not
+    /// stable across toolchains). This is what the WAL entries carry and what
+    /// recovery compares them against.
+    pub key_type_code: u32,
     /// Serialize a single record (`&R` as `&dyn Any`) to bytes.
     pub serialize_record: SerializeAnyFn,
     /// Deserialize bytes to a single record (`Box<dyn Any + Send + Sync>` wrapping `R`).
@@ -144,6 +151,7 @@ impl TableRegistry {
                     type_id: TypeId::of::<R>(),
                     key_type_id: TypeId::of::<K>(),
                     key_type_name: std::any::type_name::<K>(),
+                    key_type_code: K::KEY_TYPE_ID,
                     serialize_record: Box::new(|any| {
                         let record = any
                             .downcast_ref::<R>()
@@ -239,18 +247,21 @@ impl TableRegistry {
                         // explicitly-keyed type, so those tables land on `None`
                         // — the invariant the v2 `has_next_id` byte encodes.
                         let mut next_id = auto_counter_seed::<K>();
-                        let has_counter = next_id.is_some();
                         if let Some((last, _)) = sorted.last() {
                             last.advance_auto_counter(&mut next_id);
-                        }
-                        // The counter is cleared only when the highest key has
-                        // no successor (`u64::MAX`). Dropping the `Some`
-                        // invariant would turn a later `insert` into a panic —
-                        // fail loudly here instead.
-                        if has_counter && next_id.is_none() {
-                            return Err(Error::Persistence(
-                                "last row id is u64::MAX; next_id would overflow".into(),
-                            ));
+                            // The counter stalls at or below the highest key
+                            // only when that key has no successor
+                            // (`u64::MAX`); `advance_auto_counter` leaves it
+                            // in place there rather than clearing it, since a
+                            // cleared counter would flip the table to
+                            // "explicitly keyed" and turn a later `insert`
+                            // into a panic. Installing a counter that points
+                            // at an occupied id is just as bad — fail loudly.
+                            if crate::primary_key::counter_exhausted(&next_id, last) {
+                                return Err(Error::Persistence(
+                                    "last row id is u64::MAX; next_id would overflow".into(),
+                                ));
+                            }
                         }
                         // Preserve secondary indexes by cloning the destination's
                         // existing index definitions. Empty for a fresh receiver.
@@ -322,15 +333,18 @@ impl TableRegistry {
         self.validate_type_keyed::<R, u64>(name)
     }
 
-    /// The registered primary-key type for `name` as `(TypeId, type_name)`,
-    /// or `None` if the table is not registered. Used by the snapshot-stream
-    /// install path to check the incoming stream's declared key type against
-    /// this store's, since the row keys are opaque bytes that several key
-    /// types would decode without complaint.
-    pub fn key_type(&self, name: &str) -> Option<(TypeId, &'static str)> {
+    /// The registered primary-key type for `name` as
+    /// `(TypeId, type_name, KEY_TYPE_ID)`, or `None` if the table is not
+    /// registered. Used by the snapshot-stream install path to check the
+    /// incoming stream's declared key type against this store's, since the row
+    /// keys are opaque bytes that several key types would decode without
+    /// complaint. Three forms because each answers a different question: the
+    /// `TypeId` is exact but process-local, the id is what crosses the wire,
+    /// and the name is what an error message can print.
+    pub fn key_type(&self, name: &str) -> Option<(TypeId, &'static str, u32)> {
         self.entries
             .get(name)
-            .map(|info| (info.key_type_id, info.key_type_name))
+            .map(|info| (info.key_type_id, info.key_type_name, info.key_type_code))
     }
 
     /// Returns the names of all registered tables.
@@ -377,7 +391,7 @@ const TABLE_FORMAT_V2: u8 = 2;
 /// Serialize a `Table<R, K>` to bytes.
 ///
 /// Format v2:
-/// `[magic: u8 = 0xFF][version: u8 = 2][has_next_id: u8]`
+/// `[magic: u8 = 0xFF][version: u8 = 2][key_type: u32-be][has_next_id: u8]`
 /// `[next_id_len: u32-be, next_id_bytes]?`
 /// `[num_entries: u64-be]`
 /// `[key_len: u32-be, key_bytes, rec_len: u32-be, rec_bytes]*`
@@ -388,6 +402,13 @@ const TABLE_FORMAT_V2: u8 = 2;
 /// explicitly-keyed table (`next_id_opt() == None`) and `1` for an
 /// auto-increment one.
 ///
+/// `key_type` is [`PrimaryKey::KEY_TYPE_ID`]. Without it, a checkpoint written
+/// under one `K` and read under another recovers `Ok` with every key silently
+/// reinterpreted: the encodings of same-width types decode into each other
+/// (`u64`/`i64`, `String`/`Vec<u8>`), and because the encoding is
+/// order-preserving the reinterpreted keys still pass the strict-ascent
+/// validation below.
+///
 /// v1 (`[next_id: u64][count: u64][id: u64, rec]*`, all bincode-varint) is
 /// rejected on read — see [`TABLE_MAGIC_V2`].
 fn serialize_table<R: Record, K: PrimaryKey>(table: &Table<R, K>) -> Result<Vec<u8>> {
@@ -396,6 +417,7 @@ fn serialize_table<R: Record, K: PrimaryKey>(table: &Table<R, K>) -> Result<Vec<
 
     buf.push(TABLE_MAGIC_V2);
     buf.push(TABLE_FORMAT_V2);
+    buf.extend_from_slice(&K::KEY_TYPE_ID.to_be_bytes());
 
     match table.next_id_opt() {
         Some(id) => {
@@ -413,6 +435,11 @@ fn serialize_table<R: Record, K: PrimaryKey>(table: &Table<R, K>) -> Result<Vec<
     // `from_bulk` needs on the way back in.
     for (key, record) in table.iter() {
         let kb = key.encode();
+        // The same 64 KiB cap the WAL and the snapshot stream enforce, applied
+        // here on the way *out*. The two persistence formats have to agree:
+        // a key the checkpoint accepts and the WAL refuses is a row that
+        // survives one durability path and destroys the other (task56).
+        check_encoded_key_len(kb.len(), "checkpoint table payload")?;
         buf.extend_from_slice(&(kb.len() as u32).to_be_bytes());
         buf.extend_from_slice(&kb);
         let rb = bincode::serde::encode_to_vec(record, config)
@@ -459,10 +486,10 @@ fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, 
              Table data written before 0.3.0 cannot be read by this build. To migrate: with \
              the previous UltimaDB version, `Store::recover()` the old directory, read the \
              rows out through a `ReadTx`, and load them into a 0.3.0+ store with \
-             `Store::bulk_load` / `Store::bulk_load_batch` (or move them over the wire with \
-             `Store::open_checkpoint_reader` + `Store::install_snapshot_stream`). To discard \
-             the old data instead, delete the checkpoint and WAL files in the persistence \
-             directory.",
+             `Store::bulk_load` / `Store::bulk_load_batch` — into a *fresh* persistence \
+             directory, so no stale higher-versioned checkpoint outranks the migrated one. \
+             To discard the old data instead, delete the checkpoint and WAL files in the \
+             persistence directory.",
             header[0], TABLE_FORMAT_V2
         )));
     }
@@ -472,6 +499,15 @@ fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, 
              by a newer UltimaDB — upgrade the binary to read it.",
             header[1], TABLE_FORMAT_V2
         )));
+    }
+
+    // The key type the rows were written with. Checked before a single key is
+    // decoded: encoded keys are opaque bytes, several key types decode each
+    // other's encodings without complaint, and the order-preserving encoding
+    // means the reinterpreted keys pass every later validation too.
+    let key_type = take_u32(bytes, &mut at)?;
+    if key_type != K::KEY_TYPE_ID {
+        return Err(Error::Persistence(key_type_mismatch_msg::<K>(key_type)));
     }
 
     let next_id = match take(bytes, &mut at, 1)?[0] {
@@ -495,6 +531,10 @@ fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, 
     let mut rows: Vec<(K, Arc<R>)> = Vec::with_capacity(cap);
     for _ in 0..count {
         let klen = take_u32(bytes, &mut at)? as usize;
+        // Bound the length before it is used to slice, matching the writer's
+        // cap and the WAL's. `take` would refuse a length past the end of the
+        // payload anyway, but "as long as the file is" is not a bound.
+        check_encoded_key_len(klen, "checkpoint table payload")?;
         let key = K::decode(take(bytes, &mut at, klen)?)?;
         let rlen = take_u32(bytes, &mut at)? as usize;
         let (record, _): (R, _) =
@@ -633,7 +673,7 @@ mod tests {
         ));
         // The first registration is intact — the failed one changed nothing.
         assert_eq!(
-            reg.key_type("users").map(|(id, _)| id),
+            reg.key_type("users").map(|(id, ..)| id),
             Some(TypeId::of::<u64>())
         );
         reg.register::<TestUser, u64>("users").unwrap();
@@ -645,7 +685,7 @@ mod tests {
         reg.register::<TestUser, String>("users").unwrap();
         reg.register::<TestUser, String>("users").unwrap(); // no error
         assert_eq!(
-            reg.key_type("users").map(|(id, _)| id),
+            reg.key_type("users").map(|(id, ..)| id),
             Some(TypeId::of::<String>())
         );
     }
@@ -1086,18 +1126,23 @@ mod tests {
                 .unwrap();
         }
         let bytes = (info.serialize_table)(&table).unwrap();
-        // [magic][version][has_next_id][next_id_len: u32-be][next_id: 8][count: u64-be]
+        // [magic][version][key_type: u32-be][has_next_id][next_id_len: u32-be]
+        // [next_id: 8][count: u64-be]
         assert_eq!(bytes[0], TABLE_MAGIC_V2);
         assert_eq!(bytes[1], TABLE_FORMAT_V2);
-        assert_eq!(bytes[2], 1, "a u64 table carries a counter");
-        assert_eq!(u32::from_be_bytes(bytes[3..7].try_into().unwrap()), 8);
-        assert_eq!(u64::from_be_bytes(bytes[7..15].try_into().unwrap()), 3);
+        assert_eq!(
+            u32::from_be_bytes(bytes[2..6].try_into().unwrap()),
+            <u64 as PrimaryKey>::KEY_TYPE_ID
+        );
+        assert_eq!(bytes[6], 1, "a u64 table carries a counter");
+        assert_eq!(u32::from_be_bytes(bytes[7..11].try_into().unwrap()), 8);
+        assert_eq!(u64::from_be_bytes(bytes[11..19].try_into().unwrap()), 3);
         assert_eq!(u64::from_be_bytes(bytes[COUNT_AT..COUNT_AT + 8].try_into().unwrap()), 2);
         bytes
     }
 
     /// Offset of the `num_entries` field for a `u64`-keyed payload.
-    const COUNT_AT: usize = 15;
+    const COUNT_AT: usize = 19;
 
     /// Corrupted-but-*not*-truncated input: understating `count` must not be
     /// read as a smaller table. Before the trailing-byte check this returned
@@ -1155,6 +1200,105 @@ mod tests {
         for expected in ["format version", "Store::recover", "bulk_load", "delete"] {
             assert!(msg.contains(expected), "message missing {expected:?}: {msg}");
         }
+    }
+
+    /// A checkpoint written under one key type must be refused under another.
+    ///
+    /// Without the `key_type` field this returned `Ok` with every key silently
+    /// reinterpreted: `u64` and `i64` encodings differ only in the sign bit,
+    /// `String` and `Vec<u8>` are byte-identical, and the eight bytes of a
+    /// `u64` id are valid UTF-8. Because the encoding is order-preserving, the
+    /// reinterpreted keys pass the strict-ascent check below too, so nothing
+    /// downstream noticed.
+    #[test]
+    fn a_table_written_under_one_key_type_is_refused_under_another() {
+        let mut u64_table = Table::<TestUser>::new();
+        for (name, age) in [("Alice", 30u32), ("Bob", 25)] {
+            u64_table
+                .insert(TestUser {
+                    name: name.into(),
+                    age,
+                })
+                .unwrap();
+        }
+        let u64_bytes = serialize_table(&u64_table).unwrap();
+
+        // The same-width case, which is the silent one.
+        let Err(err) = deserialize_table::<TestUser, i64>(&u64_bytes) else {
+            panic!("an i64 read of a u64 table must be refused");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("i64"), "message was: {msg}");
+        assert!(msg.contains("u64"), "message was: {msg}");
+        // And the different-width one.
+        assert!(deserialize_table::<TestUser, String>(&u64_bytes).is_err());
+        assert!(deserialize_table::<TestUser, u32>(&u64_bytes).is_err());
+        // The matching read still works.
+        assert_eq!(
+            deserialize_table::<TestUser, u64>(&u64_bytes).unwrap().len(),
+            2
+        );
+
+        // String -> Vec<u8>: byte-identical encodings, so nothing but the tag
+        // can tell them apart.
+        let mut str_table = Table::<TestUser, String>::new_keyed();
+        str_table
+            .put(
+                "a@x.com".to_string(),
+                TestUser {
+                    name: "Alice".into(),
+                    age: 30,
+                },
+            )
+            .unwrap();
+        let str_bytes = serialize_table(&str_table).unwrap();
+        let Err(err) = deserialize_table::<TestUser, Vec<u8>>(&str_bytes) else {
+            panic!("a Vec<u8> read of a String table must be refused");
+        };
+        assert!(err.to_string().contains("String"), "message was: {err}");
+        assert_eq!(
+            deserialize_table::<TestUser, String>(&str_bytes)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The checkpoint enforces the same 64 KiB key cap as the WAL, at both
+    /// ends. The two formats have to agree: a key one accepts and the other
+    /// refuses is a row that survives `Persistence::smr` and destroys
+    /// `Persistence::standalone`.
+    #[test]
+    fn the_checkpoint_enforces_the_shared_key_cap_at_both_ends() {
+        let mut table = Table::<TestUser, String>::new_keyed();
+        let over_long = "k".repeat(crate::primary_key::MAX_ENCODED_KEY_LEN + 1);
+        table
+            .put(
+                over_long,
+                TestUser {
+                    name: "Alice".into(),
+                    age: 30,
+                },
+            )
+            .unwrap();
+        let err = serialize_table(&table).unwrap_err();
+        assert!(err.to_string().contains("maximum"), "message was: {err}");
+
+        // Read side: a hand-built payload that claims an over-long key is
+        // refused before the length is used to slice.
+        let mut bytes = Vec::new();
+        bytes.push(TABLE_MAGIC_V2);
+        bytes.push(TABLE_FORMAT_V2);
+        bytes.extend_from_slice(&<String as PrimaryKey>::KEY_TYPE_ID.to_be_bytes());
+        bytes.push(0u8); // no counter
+        bytes.extend_from_slice(&1u64.to_be_bytes()); // one row
+        bytes.extend_from_slice(
+            &((crate::primary_key::MAX_ENCODED_KEY_LEN + 1) as u32).to_be_bytes(),
+        );
+        let Err(err) = deserialize_table::<TestUser, String>(&bytes) else {
+            panic!("an over-long key length must be refused");
+        };
+        assert!(err.to_string().contains("maximum"), "message was: {err}");
     }
 
     /// The wire order guarantee `Table::from_bulk` only debug-asserts.

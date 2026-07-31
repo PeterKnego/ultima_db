@@ -184,6 +184,9 @@ impl SnapshotReader {
                 // `register_table*` afterwards records whatever the caller
                 // asked for — and it is this table's rows that were just
                 // encoded, so the table is the authority on what decodes them.
+                // The id is what the receiver checks; the name rides along so
+                // it can name what it refused.
+                let key_type_id = table_arc.key_type_code();
                 let key_type = table_arc.key_type_name().to_string();
 
                 // Build index definitions for the table header.
@@ -199,6 +202,7 @@ impl SnapshotReader {
                 let table_header = TableHeader {
                     name: name.clone(),
                     record_type_id,
+                    key_type_id,
                     key_type,
                     row_count,
                     indexes,

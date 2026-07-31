@@ -55,10 +55,21 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     fn key_type_id(&self) -> TypeId;
 
     /// `std::any::type_name` of this table's primary key. Used for error
-    /// messages (`TypeId` has no printable form) and as the key-type
-    /// identity the snapshot wire format carries between stores.
+    /// messages (`TypeId` has no printable form) and carried on the snapshot
+    /// wire format so the receiving end can *name* a mismatch it detects.
     #[cfg(feature = "persistence")]
     fn key_type_name(&self) -> &'static str;
+
+    /// [`PrimaryKey::KEY_TYPE_ID`](crate::primary_key::PrimaryKey::KEY_TYPE_ID)
+    /// of this table's primary key: the persisted key-type identity, and the
+    /// one the wire format's mismatch check is *decided* on.
+    ///
+    /// `key_type_name` is neither stable across compiler versions nor
+    /// injective across crate versions of a third-party key type; the id is
+    /// declared by the key type itself and is neither. Read off the live
+    /// table for the same reason the name is — see `key_type_id`.
+    #[cfg(feature = "persistence")]
+    fn key_type_code(&self) -> u32;
 
     /// O(1)-CoW clone (Arc bumps on the BTree root and index internals).
     fn boxed_clone(&self) -> Box<dyn MergeableTable>;
@@ -116,6 +127,11 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
     #[cfg(feature = "persistence")]
     fn key_type_name(&self) -> &'static str {
         std::any::type_name::<K>()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn key_type_code(&self) -> u32 {
+        K::KEY_TYPE_ID
     }
 
     fn boxed_clone(&self) -> Box<dyn MergeableTable> {

@@ -26,7 +26,10 @@ pub enum Error {
     /// should retry against a fresh base. If `wait_for` is `Some`, blocking on it
     /// may allow retry to succeed; if `None`, the conflicting writer has finished
     /// and retry must acquire a fresh snapshot.
-    #[error("write conflict on table '{table}', keys {keys:?} (conflicting version {version})")]
+    #[error(
+        "write conflict on table '{table}', key digests {key_digests:?} \
+         (conflicting version {version})"
+    )]
     WriteConflict {
         /// Name of the table on which the conflict was detected. Empty when
         /// the conflict was a version-level check at `begin_write` rather than
@@ -43,7 +46,12 @@ pub enum Error {
         /// identifier for logging and correlation, not as something to look a
         /// row up by. To recover the offending rows, re-read them on the
         /// retry.
-        keys: Vec<u64>,
+        ///
+        /// Called `keys` before 0.3.0, when it really did carry row ids. The
+        /// rename is the point: same name, different meaning is the one kind
+        /// of break that produces neither a compile error nor a runtime one,
+        /// so the field was renamed to make every use site fail to compile.
+        key_digests: Vec<u64>,
         /// The conflicting writer's version: the winning committed transaction's
         /// version for commit-time key/table conflicts; the current `latest_version`
         /// for the begin_write version check; or `0` (sentinel—no committed
@@ -142,6 +150,24 @@ pub enum Error {
     /// across delta buckets, AutoId used in Delta, etc.).
     #[error("invalid bulk-load input: {0}")]
     InvalidBulkLoadInput(String),
+    /// An encoded primary key exceeded the maximum every persistence format
+    /// shares (`MAX_ENCODED_KEY_LEN`, 64 KiB).
+    ///
+    /// Returned by the mutation that produced the key (`put`, `update`,
+    /// `delete`, and their batch forms) when the store is persisted, and by
+    /// the WAL and checkpoint writers as the choke point behind them. The
+    /// refusal is on the *write* side deliberately: a key the formats cannot
+    /// carry must not be acknowledged by `commit()` and then be undiscoverable
+    /// until recovery.
+    #[error("{context}: encoded primary key is {len} bytes, over the {max}-byte maximum")]
+    KeyTooLong {
+        /// Length of the offending encoded key.
+        len: usize,
+        /// The shared cap (`MAX_ENCODED_KEY_LEN`).
+        max: usize,
+        /// Which format or operation refused it.
+        context: String,
+    },
     /// A multi-table opener (`open_tables2`/`open_tables3`) was given the same
     /// table name twice. Two writers to one table would alias; use a single
     /// writer for that table instead.
@@ -166,13 +192,13 @@ mod tests {
     fn error_write_conflict_displays() {
         let e = Error::WriteConflict {
             table: "users".to_string(),
-            keys: vec![1, 2],
+            key_digests: vec![1, 2],
             version: 3,
             wait_for: None,
         };
         assert_eq!(
             e.to_string(),
-            "write conflict on table 'users', keys [1, 2] (conflicting version 3)"
+            "write conflict on table 'users', key digests [1, 2] (conflicting version 3)"
         );
     }
 

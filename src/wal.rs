@@ -23,6 +23,7 @@ use std::thread;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::primary_key::check_encoded_key_len;
 use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,9 @@ pub enum WalOp {
     Insert {
         /// Name of the table the row was inserted into.
         table: String,
+        /// [`PrimaryKey::KEY_TYPE_ID`](crate::PrimaryKey::KEY_TYPE_ID) of the
+        /// key type `key` was encoded with. See [`WalOp::key_type`].
+        key_type: u32,
         /// Encoded primary key of the inserted row
         /// ([`PrimaryKey::encode`](crate::PrimaryKey::encode)).
         key: Vec<u8>,
@@ -96,6 +100,9 @@ pub enum WalOp {
     Update {
         /// Name of the table the row belongs to.
         table: String,
+        /// [`PrimaryKey::KEY_TYPE_ID`](crate::PrimaryKey::KEY_TYPE_ID) of the
+        /// key type `key` was encoded with. See [`WalOp::key_type`].
+        key_type: u32,
         /// Encoded primary key of the updated row
         /// ([`PrimaryKey::encode`](crate::PrimaryKey::encode)).
         key: Vec<u8>,
@@ -106,6 +113,9 @@ pub enum WalOp {
     Delete {
         /// Name of the table the row was removed from.
         table: String,
+        /// [`PrimaryKey::KEY_TYPE_ID`](crate::PrimaryKey::KEY_TYPE_ID) of the
+        /// key type `key` was encoded with. See [`WalOp::key_type`].
+        key_type: u32,
         /// Encoded primary key of the deleted row
         /// ([`PrimaryKey::encode`](crate::PrimaryKey::encode)).
         key: Vec<u8>,
@@ -130,6 +140,31 @@ pub enum WalOp {
         /// Names of the tables the bulk load replaced.
         tables: Vec<String>,
     },
+}
+
+impl WalOp {
+    /// The key type this op's encoded key was written with
+    /// ([`PrimaryKey::KEY_TYPE_ID`](crate::PrimaryKey::KEY_TYPE_ID)), or
+    /// `None` for the ops that carry no key.
+    ///
+    /// Recorded per op, not per entry: one transaction can write to tables
+    /// with different key types. Recovery compares it against the key type
+    /// the table is registered with in *this* build and refuses to replay on
+    /// a mismatch, because an encoded key is opaque bytes that a different
+    /// key type will decode without complaint — the eight bytes of `1u64`
+    /// are a valid NUL-filled `String`, and an `i64` reading of a `u64` key
+    /// differs only in the sign bit. The encoding is order-preserving, so the
+    /// reinterpreted keys go on to pass every downstream check; without this
+    /// tag nothing in the pipeline notices.
+    #[must_use]
+    pub fn key_type(&self) -> Option<u32> {
+        match self {
+            WalOp::Insert { key_type, .. }
+            | WalOp::Update { key_type, .. }
+            | WalOp::Delete { key_type, .. } => Some(*key_type),
+            WalOp::CreateTable { .. } | WalOp::DeleteTable { .. } | WalOp::BulkLoad { .. } => None,
+        }
+    }
 }
 
 /// A complete WAL entry for one committed transaction.
@@ -168,7 +203,8 @@ const WAL_ENTRY_MAGIC: u8 = 0xFF;
 /// On-disk WAL entry format version.
 ///
 /// v1 (pre-0.3.0, implicit — it carried no marker) addressed rows by `u64`
-/// id. v2 carries [`PrimaryKey::encode`](crate::PrimaryKey::encode) bytes.
+/// id. v2 carries a [`PrimaryKey::KEY_TYPE_ID`](crate::PrimaryKey::KEY_TYPE_ID)
+/// tag plus [`PrimaryKey::encode`](crate::PrimaryKey::encode) bytes.
 /// There is no compatibility branch: a v1 WAL is rejected by
 /// [`check_entry_header`].
 const WAL_FORMAT_VERSION: u8 = 2;
@@ -230,8 +266,10 @@ fn check_entry_header(data: &[u8]) -> Result<usize> {
 /// not be allowed to drift apart.
 const MAX_KEY_LEN: usize = crate::primary_key::MAX_ENCODED_KEY_LEN;
 
-/// Read a length-prefixed encoded primary key at `data[offset..]`, returning
-/// the key and the number of bytes consumed.
+/// Read a key-type tag and length-prefixed encoded primary key at
+/// `data[offset..]`, returning the tag, the key, and the number of bytes
+/// consumed. The tag is a bincode varint, so it costs one byte for every
+/// built-in key type.
 ///
 /// Deliberately does *not* go through `bincode::decode_from_slice::<Vec<u8>>`:
 /// that reads the length and allocates in one step, leaving no place to reject
@@ -241,8 +279,11 @@ const MAX_KEY_LEN: usize = crate::primary_key::MAX_ENCODED_KEY_LEN;
 /// ("usize is being encoded as a u64", `bincode-2.0.1/src/varint/
 /// encode_unsigned.rs:109`), so decoding it as `u64` is byte-exact on every
 /// platform — pinned by `key_length_prefix_matches_bincode_across_widths`.
-fn decode_key(data: &[u8], offset: usize) -> Result<(Vec<u8>, usize)> {
+fn decode_key(data: &[u8], offset: usize) -> Result<(u32, Vec<u8>, usize)> {
     let config = bincode::config::standard();
+    let (key_type, type_read): (u32, usize) = bincode::decode_from_slice(&data[offset..], config)
+        .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+    let offset = offset + type_read;
     let (len, read): (u64, usize) = bincode::decode_from_slice(&data[offset..], config)
         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
     if len > MAX_KEY_LEN as u64 {
@@ -260,7 +301,7 @@ fn decode_key(data: &[u8], offset: usize) -> Result<(Vec<u8>, usize)> {
             "encoded primary key of {len} bytes extends past the end of the entry"
         )));
     }
-    Ok((data[start..end].to_vec(), read + len))
+    Ok((key_type, data[start..end].to_vec(), type_read + read + len))
 }
 
 /// Tag bytes for WalOp variants.
@@ -270,6 +311,26 @@ const TAG_DELETE: u8 = 3;
 const TAG_CREATE_TABLE: u8 = 4;
 const TAG_DELETE_TABLE: u8 = 5;
 const TAG_BULK_LOAD: u8 = 6;
+
+/// Write one key-carrying op's `[key_type][len][key bytes]` prefix.
+///
+/// The cap is enforced **here, on the way out**, and not only in
+/// [`decode_key`]. Checking it on read alone meant `commit()` returned `Ok` —
+/// telling the caller the transaction was durable — for a key `recover()`
+/// could never read back: under `PerEntry` the log became permanently
+/// unrecoverable, and under `CoalescedPrealloc` the tail-tolerant scan stopped
+/// at the bad record and silently dropped the whole transaction, ordinary
+/// co-committed rows included. Refusing at serialization covers all three
+/// write modes and every sink at once.
+fn serialize_key(buf: &mut Vec<u8>, key_type: u32, key: &[u8]) -> Result<()> {
+    let config = bincode::config::standard();
+    check_encoded_key_len(key.len(), "WAL entry")?;
+    bincode::encode_into_std_write(key_type, buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(key, buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    Ok(())
+}
 
 fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
@@ -284,30 +345,41 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
 
     for op in &entry.ops {
         match op {
-            WalOp::Insert { table, key, data } => {
+            WalOp::Insert {
+                table,
+                key_type,
+                key,
+                data,
+            } => {
                 buf.push(TAG_INSERT);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                bincode::encode_into_std_write(key.as_slice(), &mut buf, config)
-                    .map_err(|e| Error::Persistence(e.to_string()))?;
+                serialize_key(&mut buf, *key_type, key)?;
                 bincode::encode_into_std_write(data.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
-            WalOp::Update { table, key, data } => {
+            WalOp::Update {
+                table,
+                key_type,
+                key,
+                data,
+            } => {
                 buf.push(TAG_UPDATE);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                bincode::encode_into_std_write(key.as_slice(), &mut buf, config)
-                    .map_err(|e| Error::Persistence(e.to_string()))?;
+                serialize_key(&mut buf, *key_type, key)?;
                 bincode::encode_into_std_write(data.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
-            WalOp::Delete { table, key } => {
+            WalOp::Delete {
+                table,
+                key_type,
+                key,
+            } => {
                 buf.push(TAG_DELETE);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                bincode::encode_into_std_write(key.as_slice(), &mut buf, config)
-                    .map_err(|e| Error::Persistence(e.to_string()))?;
+                serialize_key(&mut buf, *key_type, key)?;
             }
             WalOp::CreateTable { name } => {
                 buf.push(TAG_CREATE_TABLE);
@@ -359,7 +431,7 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     bincode::decode_from_slice(&data[offset..], config)
                         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (key, read) = decode_key(data, offset)?;
+                let (key_type, key, read) = decode_key(data, offset)?;
                 offset += read;
                 let (blob, read): (Vec<u8>, _) =
                     bincode::decode_from_slice(&data[offset..], config)
@@ -368,12 +440,14 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                 if tag == TAG_INSERT {
                     ops.push(WalOp::Insert {
                         table,
+                        key_type,
                         key,
                         data: blob,
                     });
                 } else {
                     ops.push(WalOp::Update {
                         table,
+                        key_type,
                         key,
                         data: blob,
                     });
@@ -384,9 +458,13 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     bincode::decode_from_slice(&data[offset..], config)
                         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (key, read) = decode_key(data, offset)?;
+                let (key_type, key, read) = decode_key(data, offset)?;
                 offset += read;
-                ops.push(WalOp::Delete { table, key });
+                ops.push(WalOp::Delete {
+                    table,
+                    key_type,
+                    key,
+                });
             }
             TAG_CREATE_TABLE => {
                 let (name, read): (String, _) = bincode::decode_from_slice(&data[offset..], config)
@@ -1944,6 +2022,17 @@ mod tests {
         id.encode()
     }
 
+    /// The key-type tag every `u64`-keyed fixture carries, spelled once.
+    const KT: u32 = <u64 as PrimaryKey>::KEY_TYPE_ID;
+
+    /// Frame a `u64` key the way [`serialize_key`] does, for the `decode_key`
+    /// tests that assemble a key field by hand.
+    fn framed_key(key: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        serialize_key(&mut buf, KT, key).unwrap();
+        buf
+    }
+
     // -----------------------------------------------------------------------
     // Bounded key reads
     // -----------------------------------------------------------------------
@@ -1957,16 +2046,29 @@ mod tests {
         let config = bincode::config::standard();
         for len in [0usize, 1, 8, 250, 251, 252, 1000, 65_535, MAX_KEY_LEN] {
             let key: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-            let enc = bincode::encode_to_vec(key.as_slice(), config).unwrap();
-            let (got, read) = decode_key(&enc, 0)
-                .unwrap_or_else(|e| panic!("len {len} rejected: {e}"));
+            let enc = framed_key(&key);
+            // The length prefix bincode would write, for the width assertion.
+            let bincode_len = bincode::encode_to_vec(key.as_slice(), config).unwrap().len();
+            let tag_len = bincode::encode_to_vec(KT, config).unwrap().len();
+            let (got_type, got, read) =
+                decode_key(&enc, 0).unwrap_or_else(|e| panic!("len {len} rejected: {e}"));
+            assert_eq!(got_type, KT, "len {len}: key type tag differs");
             assert_eq!(got, key, "len {len}: bytes differ");
             assert_eq!(read, enc.len(), "len {len}: consumed the wrong span");
+            assert_eq!(
+                read,
+                tag_len + bincode_len,
+                "len {len}: the field is [key type tag][bincode-framed key]"
+            );
             // And the same read offset by a prefix, as it is used in practice.
             let mut framed = vec![0xAAu8; 3];
             framed.extend_from_slice(&enc);
-            let (got2, read2) = decode_key(&framed, 3).unwrap();
-            assert_eq!((got2, read2), (key, read), "len {len}: offset read differs");
+            let (got_type2, got2, read2) = decode_key(&framed, 3).unwrap();
+            assert_eq!(
+                (got_type2, got2, read2),
+                (KT, key, read),
+                "len {len}: offset read differs"
+            );
         }
     }
 
@@ -1974,7 +2076,8 @@ mod tests {
     /// The claim here is 3 GB inside an 11-byte buffer.
     #[test]
     fn an_over_long_key_length_is_rejected() {
-        let mut evil = vec![253u8]; // bincode U64_BYTE discriminant
+        let mut evil = vec![KT as u8]; // key type tag (a one-byte varint)
+        evil.push(253u8); // bincode U64_BYTE discriminant
         evil.extend_from_slice(&3_000_000_000u64.to_le_bytes());
         evil.extend_from_slice(&[7, 7]);
         let err = decode_key(&evil, 0).unwrap_err();
@@ -1987,9 +2090,8 @@ mod tests {
     /// truncation, and is reported as one rather than panicking on the slice.
     #[test]
     fn a_key_running_past_the_end_of_the_entry_is_rejected() {
-        let mut short = bincode::encode_to_vec([0u8; 100].as_slice(), bincode::config::standard())
-            .unwrap();
-        short.truncate(4); // 1 length byte + 3 of the 100 key bytes
+        let mut short = framed_key(&[0u8; 100]);
+        short.truncate(5); // tag + 1 length byte + 3 of the 100 key bytes
         let err = decode_key(&short, 0).unwrap_err();
         assert!(
             err.to_string().contains("past the end"),
@@ -1998,7 +2100,15 @@ mod tests {
     }
 
     /// A key at the cap survives a full entry round trip; one byte over is
-    /// refused by the entry decoder, not just by `decode_key` in isolation.
+    /// refused **by the writer**.
+    ///
+    /// The writer is where it has to be caught. Enforcing the cap only on read
+    /// meant `serialize_entry` produced a record no reader would ever accept:
+    /// `commit()` returned `Ok` — an acknowledged, supposedly durable
+    /// transaction — and then `recover()` either failed permanently
+    /// (`PerEntry`) or, under the tail-tolerant `CoalescedPrealloc` scan the
+    /// `standalone_fast` preset uses, stopped at the bad record and silently
+    /// dropped the whole transaction, ordinary co-committed rows included.
     #[test]
     fn a_key_at_the_cap_roundtrips_and_one_over_is_refused() {
         let at_cap = vec![0x5Au8; MAX_KEY_LEN];
@@ -2006,6 +2116,7 @@ mod tests {
             version: 1,
             ops: vec![WalOp::Insert {
                 table: "t".into(),
+                key_type: KT,
                 key: at_cap.clone(),
                 data: vec![1],
             }],
@@ -2014,20 +2125,80 @@ mod tests {
         let back = deserialize_entry(&bytes).unwrap();
         assert!(matches!(&back.ops[0], WalOp::Insert { key, .. } if *key == at_cap));
 
-        let over = WalEntry {
-            version: 1,
-            ops: vec![WalOp::Insert {
+        // One byte over, in each of the three key-carrying variants: the
+        // choke point covers all of them, and all sinks with them.
+        let too_long = vec![0x5Au8; MAX_KEY_LEN + 1];
+        let over = [
+            WalOp::Insert {
                 table: "t".into(),
-                key: vec![0x5Au8; MAX_KEY_LEN + 1],
+                key_type: KT,
+                key: too_long.clone(),
                 data: vec![1],
-            }],
+            },
+            WalOp::Update {
+                table: "t".into(),
+                key_type: KT,
+                key: too_long.clone(),
+                data: vec![1],
+            },
+            WalOp::Delete {
+                table: "t".into(),
+                key_type: KT,
+                key: too_long.clone(),
+            },
+        ];
+        for op in over {
+            let entry = WalEntry {
+                version: 1,
+                ops: vec![op],
+            };
+            let err = serialize_entry(&entry).unwrap_err();
+            assert!(err.to_string().contains("maximum"), "message was: {err}");
+        }
+    }
+
+    /// The key-type tag rides along in every key-carrying op and survives the
+    /// round trip. Without it a table reopened under a different `K` recovers
+    /// `Ok` with silently reinterpreted keys — see `Store::recover`, which
+    /// compares this tag against the registry's.
+    #[test]
+    fn the_key_type_tag_round_trips_on_every_key_carrying_op() {
+        let entry = WalEntry {
+            version: 7,
+            ops: vec![
+                WalOp::Insert {
+                    table: "t".into(),
+                    key_type: <String as PrimaryKey>::KEY_TYPE_ID,
+                    key: b"alice".to_vec(),
+                    data: vec![1],
+                },
+                WalOp::Update {
+                    table: "t".into(),
+                    key_type: <String as PrimaryKey>::KEY_TYPE_ID,
+                    key: b"alice".to_vec(),
+                    data: vec![2],
+                },
+                WalOp::Delete {
+                    table: "t".into(),
+                    key_type: <String as PrimaryKey>::KEY_TYPE_ID,
+                    key: b"alice".to_vec(),
+                },
+                WalOp::Insert {
+                    table: "u".into(),
+                    key_type: KT,
+                    key: k(1),
+                    data: vec![3],
+                },
+                // Key-free ops carry no tag.
+                WalOp::DeleteTable { name: "v".into() },
+            ],
         };
-        let bytes = serialize_entry(&over).unwrap();
-        let err = deserialize_entry(&bytes).unwrap_err();
-        assert!(
-            err.to_string().contains("maximum"),
-            "message was: {err}"
-        );
+        let back = deserialize_entry(&serialize_entry(&entry).unwrap()).unwrap();
+        let tags: Vec<Option<u32>> = back.ops.iter().map(WalOp::key_type).collect();
+        let s = Some(<String as PrimaryKey>::KEY_TYPE_ID);
+        assert_eq!(tags, vec![s, s, s, Some(KT), None]);
+        // The two tags must actually differ, or the test proves nothing.
+        assert_ne!(<String as PrimaryKey>::KEY_TYPE_ID, KT);
     }
 
     // -----------------------------------------------------------------------
@@ -2276,8 +2447,8 @@ mod tests {
     fn frame_entry_concatenation_reads_back_via_read_wal() {
         let dir = crate::test_scratch::scratch_dir();
         let path = dir.path().join(WAL_FILENAME);
-        let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), key: k(1), data: vec![1, 2, 3] }] };
-        let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), key: k(1) }] };
+        let e1 = WalEntry { version: 1, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(1), data: vec![1, 2, 3] }] };
+        let e2 = WalEntry { version: 2, ops: vec![WalOp::Delete { table: "t".into(), key_type: KT, key: k(1) }] };
 
         let mut bytes = frame_entry(&e1).unwrap();
         bytes.extend_from_slice(&frame_entry(&e2).unwrap());
@@ -2340,7 +2511,7 @@ mod tests {
         assert!(matches!(&wtx.wal_ops.borrow()[0], WalOp::Insert { table, key, .. } if table == "users" && *key == k(1)));
         assert!(matches!(&wtx.wal_ops.borrow()[1], WalOp::Insert { table, key, .. } if table == "users" && *key == k(2)));
         assert!(matches!(&wtx.wal_ops.borrow()[2], WalOp::Update { table, key, .. } if table == "users" && *key == k(1)));
-        assert!(matches!(&wtx.wal_ops.borrow()[3], WalOp::Delete { table, key } if table == "users" && *key == k(2)));
+        assert!(matches!(&wtx.wal_ops.borrow()[3], WalOp::Delete { table, key, .. } if table == "users" && *key == k(2)));
     }
 
     #[test]
@@ -2392,16 +2563,19 @@ mod tests {
             ops: vec![
                 WalOp::Insert {
                     table: "users".into(),
+                    key_type: KT,
                     key: k(1),
                     data: vec![1, 2, 3],
                 },
                 WalOp::Update {
                     table: "users".into(),
+                    key_type: KT,
                     key: k(1),
                     data: vec![4, 5, 6],
                 },
                 WalOp::Delete {
                     table: "users".into(),
+                    key_type: KT,
                     key: k(1),
                 },
                 WalOp::CreateTable {
@@ -2440,6 +2614,7 @@ mod tests {
                 .iter()
                 .map(|key| WalOp::Insert {
                     table: "emails".into(),
+                    key_type: KT,
                     key: key.clone(),
                     data: vec![7],
                 })
@@ -2472,6 +2647,7 @@ mod tests {
                 version: 1,
                 ops: vec![WalOp::Insert {
                     table: "t".into(),
+                    key_type: KT,
                     key: k(1),
                     data: vec![10],
                 }],
@@ -2480,6 +2656,7 @@ mod tests {
                 version: 2,
                 ops: vec![WalOp::Delete {
                     table: "t".into(),
+                    key_type: KT,
                     key: k(1),
                 }],
             };
@@ -2573,6 +2750,7 @@ mod tests {
                 version: 1,
                 ops: vec![WalOp::Insert {
                     table: "t".into(),
+                    key_type: KT,
                     key: k(1),
                     data: vec![10],
                 }],
@@ -3198,7 +3376,7 @@ mod tests {
         {
             let mut sink = BufferedFileSink::open(dir.path(), true).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -3213,7 +3391,7 @@ mod tests {
         {
             let mut sink = BufferedFileSink::open(dir.path(), false).unwrap(); // sync_all
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -3243,7 +3421,7 @@ mod tests {
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap();
             }
             sink.sync().unwrap();
         } // Drop truncates to logical length + syncs
@@ -3261,7 +3439,7 @@ mod tests {
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=n {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key: k(v), data: vec![0u8; 16 * 1024] }] }).unwrap();
+                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![0u8; 16 * 1024] }] }).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -3281,6 +3459,7 @@ mod tests {
                     version: v,
                     ops: vec![WalOp::Insert {
                         table: "t".into(),
+                        key_type: KT,
                         key: k(v),
                         data: vec![v as u8; 32],
                     }],

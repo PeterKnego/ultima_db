@@ -21,8 +21,9 @@ pub const FILE_MAGIC: &[u8; 8] = b"ULTSNAP\0";
 ///   whose lexicographic order equals key order — so the receiver's
 ///   strict-ascent check over decoded keys is equivalent to one over the
 ///   raw bytes, which is what keeps `BTree::from_sorted` correct.
-/// - [`TableHeader`] carries `key_type`, the source table's primary-key type
-///   name. See that field for why it is checked rather than ignored.
+/// - [`TableHeader`] carries `key_type_id` and `key_type`, the source table's
+///   primary-key identity. See those fields for why they are checked rather
+///   than ignored.
 pub const FILE_FORMAT_V: u16 = 2;
 
 /// Decoded file-level header: format version, source snapshot version, and
@@ -51,35 +52,31 @@ pub struct TableHeader {
     /// mismatch hint only — not stable across Rust builds — since install
     /// dispatches by table `name`, not by this id.
     pub record_type_id: u64,
-    /// `std::any::type_name` of the source table's primary key, taken from
-    /// the *live* table the rows were read out of.
+    /// [`PrimaryKey::KEY_TYPE_ID`](crate::PrimaryKey::KEY_TYPE_ID) of the
+    /// source table's primary key, taken from the *live* table the rows were
+    /// read out of.
     ///
     /// Unlike `record_type_id` this is *enforced* on install: the row keys
     /// are opaque bytes, and several key types accept the same bytes (the
     /// eight bytes of `1u64` are also a valid NUL-padded `String`), so a
     /// stream aimed at a destination with a different `K` would decode
     /// cleanly, pass the strict-ascent check, and install a table full of
-    /// garbage keys with no error anywhere. Comparing the type names catches
-    /// that at the trust boundary — see
+    /// garbage keys with no error anywhere. Comparing this id at the trust
+    /// boundary catches it — see
     /// [`SnapshotStreamError::KeyTypeMismatch`](crate::SnapshotStreamError::KeyTypeMismatch).
     ///
-    /// Two limits, both accepted deliberately:
-    ///
-    /// - `type_name` is not **stable**: Rust does not guarantee the string
-    ///   across compiler versions, so a cross-toolchain stream can be refused
-    ///   when it would in fact have decoded. That direction is safe — a loud
-    ///   refusal, never a silent mis-decode.
-    /// - `type_name` is not **injective**: two binaries linking different
-    ///   *versions* of the crate that defines a key type produce the identical
-    ///   string, so a stream whose `encode` changed between those versions is
-    ///   accepted and mis-decoded silently. This check does not catch that
-    ///   case, and nothing on the wire can — closing it needs a discriminant
-    ///   the key type declares rather than one derived from Rust internals.
-    ///   The install path does compare `TypeId`s between the destination's
-    ///   registry and its live table, which closes the *local* half.
-    ///
-    /// In the deployment this format exists for (SMR replicas of one binary)
-    /// both ends agree by construction and neither limit applies.
+    /// It is the id and not `key_type` below that decides, because the id is
+    /// declared by the key type itself: `std::any::type_name` is neither
+    /// promised stable across compiler versions (which would refuse a stream
+    /// that would have decoded — safe, but noise) nor injective across crate
+    /// versions of a third-party key type (which would *accept* a stream that
+    /// must not be). The same id is what the WAL and checkpoint formats
+    /// carry, so all three agree on what "same key type" means.
+    pub key_type_id: u32,
+    /// `std::any::type_name` of the source table's primary key, carried for
+    /// diagnostics: a mismatch is decided by `key_type_id`, but an id alone
+    /// is a poor error message, and the emitting end is the only place the
+    /// name is known. Never compared.
     pub key_type: String,
     /// Number of rows in this table's row stream.
     pub row_count: u64,
@@ -140,12 +137,13 @@ pub fn decode_file_header(b: &[u8]) -> Result<(FileHeader, usize), SnapshotStrea
 }
 
 /// Appends `h` to `buf` in the wire format's little-endian table-header
-/// layout (name length + utf-8 name, `record_type_id`, `key_type` length +
-/// utf-8 name, `row_count`, and each index's kind + name).
+/// layout (name length + utf-8 name, `record_type_id`, `key_type_id`,
+/// `key_type` length + utf-8 name, `row_count`, and each index's kind + name).
 pub fn encode_table_header(h: &TableHeader, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&(h.name.len() as u16).to_le_bytes());
     buf.extend_from_slice(h.name.as_bytes());
     buf.extend_from_slice(&h.record_type_id.to_le_bytes());
+    buf.extend_from_slice(&h.key_type_id.to_le_bytes());
     buf.extend_from_slice(&(h.key_type.len() as u16).to_le_bytes());
     buf.extend_from_slice(h.key_type.as_bytes());
     buf.extend_from_slice(&h.row_count.to_le_bytes());
@@ -175,11 +173,13 @@ pub fn decode_table_header(b: &[u8]) -> Result<(TableHeader, usize), SnapshotStr
         .map_err(|_| SnapshotStreamError::Malformed("invalid UTF-8 in table name"))?
         .to_string();
     p += name_len;
-    if b.len() < p + 8 + 2 {
+    if b.len() < p + 8 + 4 + 2 {
         return Err(SnapshotStreamError::Truncated);
     }
     let record_type_id = u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
     p += 8;
+    let key_type_id = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+    p += 4;
     let key_type_len = u16::from_le_bytes(b[p..p + 2].try_into().unwrap()) as usize;
     p += 2;
     if b.len() < p + key_type_len {
@@ -218,6 +218,7 @@ pub fn decode_table_header(b: &[u8]) -> Result<(TableHeader, usize), SnapshotStr
         TableHeader {
             name,
             record_type_id,
+            key_type_id,
             key_type,
             row_count,
             indexes,
@@ -249,6 +250,7 @@ mod tests {
         let h = TableHeader {
             name: "users".to_string(),
             record_type_id: 0xDEADBEEF,
+            key_type_id: <String as crate::PrimaryKey>::KEY_TYPE_ID,
             key_type: "alloc::string::String".to_string(),
             row_count: 1_000_000,
             indexes: vec![
@@ -270,14 +272,15 @@ mod tests {
     }
 
     /// Every prefix of a table header must be rejected as `Truncated` rather
-    /// than panicking on an out-of-range slice. The `key_type` field added in
-    /// v2 sits between two other length-prefixed fields, so its bounds check
-    /// is easy to get subtly wrong.
+    /// than panicking on an out-of-range slice. The `key_type_id`/`key_type`
+    /// pair added in v2 sits between two other length-prefixed fields, so its
+    /// bounds check is easy to get subtly wrong.
     #[test]
     fn truncated_table_header_never_panics() {
         let h = TableHeader {
             name: "users".to_string(),
             record_type_id: 7,
+            key_type_id: <String as crate::PrimaryKey>::KEY_TYPE_ID,
             key_type: "alloc::string::String".to_string(),
             row_count: 3,
             indexes: vec![IndexDef {

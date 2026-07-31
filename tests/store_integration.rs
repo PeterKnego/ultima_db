@@ -2002,14 +2002,16 @@ fn multi_writer_overlapping_keys_conflict() {
     match err {
         Error::WriteConflict {
             table,
-            keys,
+            key_digests,
             wait_for,
             ..
         } => {
             assert_eq!(table, "t");
-            // `keys` carries `hash64()` digests, not row ids — the variant has
-            // to name one concrete type and a table's key may be anything.
-            assert!(keys.contains(&ultima_db::PrimaryKey::hash64(&1u64)));
+            // `key_digests` carries `hash64()` digests, not row ids — the
+            // variant has to name one concrete type and a table's key may be
+            // anything. The field name says so, so a caller that logged the
+            // old `keys` as ids gets a compile error rather than new numbers.
+            assert!(key_digests.contains(&ultima_db::PrimaryKey::hash64(&1u64)));
             assert!(wait_for.is_some(), "early-fail should carry a CommitWaiter");
             // Exercise the CommitWaiter Debug impl — it must be opaque
             // (not leak inner state) but still produce something.
@@ -2169,7 +2171,7 @@ fn multi_writer_insert_batch_tracks_keys() {
     wtx_a.commit().unwrap();
     let err = wtx_b.commit().unwrap_err();
     assert!(
-        matches!(err, Error::WriteConflict { table, keys, .. } if table == "t" && !keys.is_empty())
+        matches!(err, Error::WriteConflict { table, key_digests, .. } if table == "t" && !key_digests.is_empty())
     );
 }
 
@@ -3456,9 +3458,11 @@ fn multiwriter_same_string_key_conflicts_early_via_intent() {
         .put("a@x.com".to_string(), "two".to_string())
         .expect_err("live intent on the same key must fail fast");
     match err {
-        Error::WriteConflict { table, keys, .. } => {
+        Error::WriteConflict {
+            table, key_digests, ..
+        } => {
             assert_eq!(table, "emails");
-            assert_eq!(keys, vec!["a@x.com".to_string().hash64()]);
+            assert_eq!(key_digests, vec!["a@x.com".to_string().hash64()]);
         }
         other => panic!("got {other:?}"),
     }
