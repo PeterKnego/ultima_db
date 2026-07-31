@@ -1,5 +1,125 @@
 # Changelog
 
+## 0.3.0 — 2026-07-31
+
+Arbitrary primary keys: a table can now be keyed by `String`, `Vec<u8>`, any
+integer width, or a tuple, instead of only an auto-incrementing `u64`. This is
+the on-disk format break announced in 0.2.0 — **read the migration note below
+before upgrading a store that has data on disk.**
+
+### Migration from 0.2.x — required if you use `persistence`
+
+There is no in-place upgrade, and **checkpointing on 0.2.x does not help**:
+0.3.0 rejects pre-0.3.0 checkpoints as well as pre-0.3.0 WALs. The path is:
+
+1. With the **0.2.x** binary, `Store::recover()` the existing persistence
+   directory.
+2. Read the rows out through a `ReadTx`.
+3. Load them into a **0.3.0** store with `Store::bulk_load` /
+   `Store::bulk_load_batch` — existing `u64`-keyed tables need no key change —
+   and then `checkpoint()`.
+
+(There is no `export` API; the steps above are the export.) Both rejection
+messages state this path in full.
+
+### Breaking — on-disk and wire formats
+
+- **WAL entry format v2.** Each entry payload now opens with
+  `[magic 0xFF][format 2]` and carries an encoded primary key instead of a
+  `u64` id. A pre-0.3.0 WAL is refused **when the store is opened**, in all
+  three `WalWrite` modes (`PerEntry`, `Coalesced`, `CoalescedPrealloc`) — not
+  merely at `recover()`. This is deliberate: appending to a v1 WAL would let
+  `commit()` acknowledge writes as durable that `recover()` could never read
+  back, and the only remedy the later error could offer would destroy exactly
+  those acknowledged commits.
+- **Checkpoint table format v2.** The per-table payload header is two bytes,
+  `[magic 0xFF][version 2]`, followed by explicit big-endian lengths for the
+  auto-increment counter, each key and each record. Rejected at `recover()`
+  with an error naming the table. (Two bytes rather than one because
+  `bincode`'s standard config is a varint encoding: a v1 payload for a table
+  that had taken exactly one insert begins with the literal byte `0x02`, so a
+  bare version byte would have *silently misread* it as v2. `0xFF` is not a
+  legal varint tag.)
+- **Snapshot stream `FILE_FORMAT_V` 1 → 2.** Rows are
+  `key_len(u32) | key | val_len(u32) | val`, and each table header carries the
+  source table's primary-key type. This is a **live-replication** break as
+  well as an on-disk one: a 0.2.0 SMR follower cannot install a 0.3.0 leader's
+  snapshot, and a 0.3.0 follower cannot install a 0.2.0 leader's. Both
+  directions reject cleanly rather than mis-parsing.
+
+### Breaking — API
+
+- `SnapshotStreamError::NonU64Key` is **removed**; `KeyTypeMismatch { table,
+  stream, destination }` and `KeyTooLong { table, len, max }` are added. The
+  key-type check is enforced on install because row keys are opaque bytes that
+  several key types decode without complaint (the eight bytes of `1u64` are
+  also a valid NUL-filled `String`), so a mismatched stream would otherwise
+  install garbage keys silently.
+- `SnapshotStreamError` is now `#[non_exhaustive]`. Downstream `match`
+  expressions over it must include a wildcard arm. Done in the release that
+  already breaks exhaustive matches over it, so it costs nothing extra now and
+  makes future variants non-breaking.
+- **`Error::WriteConflict.keys` now carries `PrimaryKey::hash64` digests, not
+  row ids — including on `u64`-keyed tables.** This one is *silent*: code that
+  logged or correlated those numbers still compiles and now emits different
+  values. Treat the entries as opaque conflict identifiers; to recover the
+  offending rows, re-read them on the retry. (Renaming the field to
+  `key_digests`, which would turn this into a compile error, was considered
+  and deferred — say so if you would prefer it before 1.0.)
+- **Direct `Table` users**: `get`, `update`, `delete` and `contains` now take
+  `&K` where they took a `u64` by value; `get_many`, `delete_batch` and
+  `resolve` take `&[K]`; and `iter`, `range`, `first`, `last` yield
+  `(&K, &R)` instead of `(u64, &R)`. The transaction handle layer
+  (`TableReader`/`TableWriter`) masks this — it takes `impl Borrow<K>` and its
+  `iter`/`range` still yield `(K, &R)` — so code going through `open_table` is
+  unaffected.
+- `snapshot_stream::codec::TableHeader` gained a public `key_type` field.
+  Struct-literal construction of it must be updated.
+
+### Added
+
+- `Table<R, K = u64>`, generic over the primary key. The type parameter is
+  defaulted, so every existing `Table<R>` mention keeps compiling.
+- `PrimaryKey` trait (order-preserving `encode`/`decode`, a `hash64` conflict
+  digest, and `ENCODED_LEN` for tuple framing), implemented for `u8`–`u128`,
+  `i8`–`i128`, `String`, `Vec<u8>`, and 2- and 3-tuples. `AutoKey`, which
+  gates auto-increment, is implemented only for `u64`.
+- `WriteTx::open_table_keyed::<R, K>`, `ReadTx::open_table_keyed::<R, K>`,
+  `Store::register_table_keyed::<R, K>`, `Store::bulk_load_keyed::<R, K>`.
+  These are **additive**: `open_table`, `register_table`, `open_tables2` and
+  `open_tables3` keep their exact signatures and stay `u64`-only, because Rust
+  has no default type parameters on *functions* — widening them would make
+  every existing `open_table::<R>(..)` turbofish an `E0107`. Keyed
+  `open_tables2`/`open_tables3` are deferred until a caller needs them.
+- Secondary indexes over any primary key: `ManagedIndex` storage is generic
+  over the row key independently of the index key, and `CustomIndex<R, K =
+  u64>` and the built-in BM25 `FullTextIndex` are widened the same way. This
+  is additive — existing `CustomIndex` impls are unchanged.
+- `BTree::range_prefix` — an O(log n + k) prefix scan on a `BTree<(A, B), V>`,
+  which a `RangeBounds` cannot express without inventing minimum and maximum
+  values for `B`.
+- `examples/string_keyed_table.rs`.
+
+### Notes
+
+- A `String`-keyed table's `get` does **not** accept a `&str`: the standard
+  library provides `String: Borrow<str>`, not `str: Borrow<String>`, so
+  `t.get("alice@example.com")` does not compile — pass a `&String`. This is
+  the inverse of `HashMap<String, _>::get` and is the most common surprise
+  when moving a table off `u64` keys.
+- Encoded keys are capped at 64 KiB (`MAX_ENCODED_KEY_LEN`), a bound the WAL
+  and the snapshot wire format share by construction.
+- The snapshot stream's key-type check compares `std::any::type_name`, which
+  Rust does not promise stable across compiler versions. Same-binary SMR is
+  unaffected; a cross-toolchain stream fails loudly rather than silently.
+- Full design notes: `docs/tasks/task56_arbitrary_primary_keys.md`.
+
+### ultima-vector
+
+- Version-only release. No source changes; republished so that its dependency
+  requirement admits `ultima-db` 0.3.0 (for `0.x` crates `^0.2.0` excludes
+  `0.3.0`, so without this the vector crate would pin consumers to 0.2.x).
+
 ## 0.2.0 — 2026-07-30
 
 **Heads-up: an on-disk format break is coming in 0.3.0.** Arbitrary primary

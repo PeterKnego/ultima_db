@@ -1,6 +1,6 @@
 [package]
 name = "ultima-vector"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "HNSW vector search built on UltimaDB"
@@ -20,7 +20,7 @@ default = []
 persistence = ["ultima-db/persistence"]
 
 [dependencies]
-ultima-db = { path = "..", version = "0.2.0" }
+ultima-db = { path = "..", version = "0.3.0" }
 smallvec = "1"
 roaring = "0.11"
 rand = "0.10"

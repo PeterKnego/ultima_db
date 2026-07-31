@@ -136,6 +136,18 @@ storage layer needs nothing.
 >    bullet below). This also means `src/registry.rs`, the type-erasure
 >    boundary, is the real center of gravity for this change rather than
 >    `src/table.rs`.
+>
+> **Further corrections found during implementation** (2026-07-31; the
+> canonical record is now `docs/tasks/task56_arbitrary_primary_keys.md`, which
+> supersedes both this spec and the plan on these two points):
+>
+> 3. **Length-prefixed tuple encoding is not order-preserving** — a shorter
+>    first element always sorts first regardless of its value. Replaced by
+>    `ENCODED_LEN` + escape-and-terminate framing.
+> 4. **The checkpoint table header is two bytes, `[magic 0xFF][version 2]`,
+>    not one.** `bincode`'s varint encoding makes a bare version byte of `2`
+>    collide with a v1 payload whose `next_id` is `2`, which would have been a
+>    silent misread rather than a rejection.
 
 The work is in the layers that assumed `u64`:
 

@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "ultima-db"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "ultima-vector"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "pulp",

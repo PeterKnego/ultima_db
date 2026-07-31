@@ -68,6 +68,8 @@ Read these before Task 1; several tasks depend on them and they are not re-deriv
 - `String` / `Vec<u8>`: raw bytes. (UTF-8 byte order equals code-point order, so this is correct for `String`.)
 - Tuples: concatenation of each element's encoding, where every element **except the last** is length-prefixed with a 4-byte big-endian length. Fixed-width integer elements need no prefix but get one anyway for decode uniformity — keep it simple and uniform.
 
+> **Superseded during implementation — this tuple rule is NOT order-preserving.** A length prefix puts the length ahead of the content in the comparison, so `("b", 0)` sorts before `("aa", 0)` bytewise while the opposite holds under `Ord`. Replaced by `ENCODED_LEN: Option<usize>` plus escape-and-terminate framing (`0x00 → 0x00,0xFF`; terminator `0x00,0x01`) for variable-length non-final elements, with fixed-width elements left unframed. See `docs/tasks/task56_arbitrary_primary_keys.md`.
+
 - [ ] **Step 1: Write the failing tests**
 
 Create `src/primary_key.rs` with only the tests plus a `use` line that will not yet resolve:
@@ -1252,6 +1254,13 @@ In `src/registry.rs`:
 1. Change the six closure aliases as listed in **Interfaces** above.
 2. `pub fn register<R: Record, K: PrimaryKey>(&mut self, name: &str) -> Result<()>` — every closure body it builds now works with `Table<R, K>` and encodes/decodes keys via `K::encode` / `K::decode`.
 3. Replace `serialize_table` / `deserialize_table` with the v2 format:
+
+> **Superseded during implementation.** The one-byte header below is wrong and
+> was corrected to a two-byte `[magic 0xFF][version 2]`: `bincode`'s standard
+> config is a varint encoding, so a v1 payload for a table with `next_id == 2`
+> begins with the literal byte `0x02` and a bare version byte would have
+> silently misread it as v2. `0xFF` is not a legal varint tag. The real layout
+> is in `docs/tasks/task56_arbitrary_primary_keys.md`.
 
 ```rust
 /// Format v2: `[version: u8 = 2][has_next_id: u8][next_id_len: u32,

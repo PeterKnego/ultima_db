@@ -2096,6 +2096,15 @@ impl ReadTx {
     /// on functions, so giving `open_table` a second parameter would break
     /// every `open_table::<R>(..)` turbofish in existence.
     ///
+    /// # Passing keys by reference
+    ///
+    /// Reads take `impl Borrow<K>`, so on a `String`-keyed table a `&str` is
+    /// **not** accepted: the standard library provides `String: Borrow<str>`,
+    /// not `str: Borrow<String>`. `t.get("alice")` does not compile; pass
+    /// `t.get(&alice)` (a `&String`) or an owned `String`. This is the inverse
+    /// of `HashMap<String, _>::get`, which looks up by `&str`, and it is the
+    /// most common surprise when moving a table off `u64` keys.
+    ///
     /// Returns [`Error::TableNotFound`] if the table does not exist in this
     /// snapshot, or [`Error::TypeMismatch`] if it was created with a different
     /// record *or* key type.
@@ -3167,6 +3176,16 @@ impl WriteTx {
     /// [`open_table`](Self::open_table): Rust has no default type parameters
     /// on functions, so giving `open_table` a second parameter would break
     /// every `open_table::<R>(..)` turbofish in existence.
+    ///
+    /// # Passing keys by reference
+    ///
+    /// [`TableWriter::put`] takes the key by value, but every read and
+    /// `delete` takes `impl Borrow<K>`, so on a `String`-keyed table a `&str`
+    /// is **not** accepted: the standard library provides `String:
+    /// Borrow<str>`, not `str: Borrow<String>`. `t.get("alice")` does not
+    /// compile; pass `t.get(&alice)` (a `&String`) or an owned `String`. This
+    /// is the inverse of `HashMap<String, _>::get`, which looks up by `&str`,
+    /// and it is the most common surprise when moving a table off `u64` keys.
     ///
     /// Creates an empty `K`-keyed table if `name` does not exist in the base
     /// snapshot; returns [`Error::TypeMismatch`] if it exists with a different

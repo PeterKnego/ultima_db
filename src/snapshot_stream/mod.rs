@@ -22,7 +22,14 @@ use thiserror::Error;
 /// untrusted input and validates magic bytes, per-table and whole-file CRCs,
 /// and row counts before touching destination state; all install-path
 /// failures leave the destination `Store` untouched.
+///
+/// `#[non_exhaustive]`: match arms over this enum must include a wildcard.
+/// Added in 0.3.0, the release that already removes `NonU64Key` and adds
+/// `KeyTypeMismatch`/`KeyTooLong` — so downstream exhaustive matches break
+/// this cycle regardless, and this is the last free moment to make future
+/// variants non-breaking.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SnapshotStreamError {
     /// Underlying I/O failure while reading or writing the wire stream.
     #[error("io: {0}")]

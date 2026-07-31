@@ -37,9 +37,15 @@ that premise or specialising around it.
 
 - Eliminate the per-value `Arc` for small or `Copy` records (inline storage
   instead of `Arc<V>`).
-- A dense-integer-key fast path. **This gets easier after `Table<R, K = u64>`
-  lands** (adoption program §2a) — a generic key type finally gives something
-  to specialise on.
+- A dense-integer-key fast path. **`Table<R, K = u64>` has landed** (0.3.0,
+  `docs/tasks/task56_arbitrary_primary_keys.md`), so the specialisation hook
+  now exists: `K` is a real type parameter carrying `PrimaryKey`
+  (`ENCODED_LEN`, `encode`, `hash64`) plus the `AutoKey` sub-trait that only
+  `u64` implements. `AutoKey` is already the gate for `insert` and the
+  bulk-append path, so it is the natural bound for a dense-slot layout — an
+  `impl<R> Table<R, u64>` block, or a new `DenseKey: AutoKey` marker, can
+  carry a slot-addressed representation without touching the generic path.
+  Still a performance change, and still unmeasured.
 - Deeper batch amortisation beyond the current `insert_batch` bulk-append path.
 
 **Measurement.** Same-host A/B on the `hi-perf-cmp` fleet harness; the sandbox
