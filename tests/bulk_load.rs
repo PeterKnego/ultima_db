@@ -1124,3 +1124,202 @@ mod bulk_load_custom_index {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Store::bulk_load_keyed — bulk load over an arbitrary primary key
+// ---------------------------------------------------------------------------
+
+mod bulk_load_keyed {
+    use ultima_db::{Error, IndexKind, Store};
+
+    #[test]
+    fn bulk_load_string_keyed_table() {
+        let store = Store::default();
+
+        let rows = vec![
+            ("a@x.com".to_string(), "Alice".to_string()),
+            ("b@x.com".to_string(), "Bob".to_string()),
+            ("c@x.com".to_string(), "Carol".to_string()),
+        ];
+
+        store
+            .bulk_load_keyed::<String, String>("emails", rows, None)
+            .unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get("b@x.com".to_string()), Some(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn bulk_load_rejects_unsorted_keys() {
+        let store = Store::default();
+        let rows = vec![
+            ("b@x.com".to_string(), "Bob".to_string()),
+            ("a@x.com".to_string(), "Alice".to_string()),
+        ];
+        let err = store
+            .bulk_load_keyed::<String, String>("emails", rows, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidBulkLoadInput(_)),
+            "expected InvalidBulkLoadInput, got {err:?}"
+        );
+        // Rejected before anything was built: no table exists.
+        let rtx = store.begin_read(None).unwrap();
+        assert!(rtx.open_table_keyed::<String, String>("emails").is_err());
+    }
+
+    #[test]
+    fn bulk_load_rejects_duplicate_keys() {
+        let store = Store::default();
+        let rows = vec![
+            ("dup".to_string(), "first".to_string()),
+            ("dup".to_string(), "second".to_string()),
+        ];
+        let err = store
+            .bulk_load_keyed::<String, String>("t", rows, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidBulkLoadInput(_)),
+            "expected InvalidBulkLoadInput, got {err:?}"
+        );
+    }
+
+    /// Byte order and `Ord` order agree for `String`, so a run of keys that
+    /// is ascending by `Ord` is also ascending by encoding — the equivalence
+    /// `BTree::from_sorted` relies on. Prefix pairs ("b" < "bb") are the
+    /// interesting case: a fixed-width or length-prefixed encoding would get
+    /// them wrong.
+    #[test]
+    fn variable_length_keys_load_and_range_in_key_order() {
+        let store = Store::default();
+        let keys = ["", "a", "ab", "b", "bb", "c", "zzzzzzzzzzzz"];
+        let rows: Vec<(String, u64)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.to_string(), i as u64))
+            .collect();
+
+        store.bulk_load_keyed::<u64, String>("t", rows, None).unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<u64, String>("t").unwrap();
+        assert_eq!(t.len(), keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(t.get(k.to_string()), Some(&(i as u64)), "key {k:?}");
+        }
+        let scanned: Vec<String> = t.range(..).map(|(k, _)| k.clone()).collect();
+        let expected: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        assert_eq!(scanned, expected, "rows must come back in key order");
+    }
+
+    /// Replace semantics: previous contents go away, index *definitions* stay
+    /// and are rebuilt over the loaded rows.
+    #[test]
+    fn preserves_index_definitions_and_replaces_contents() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<u64, String>("t").unwrap();
+            t.define_index("by_value", IndexKind::Unique, |r: &u64| *r)
+                .unwrap();
+            t.put("old".to_string(), 900).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let rows: Vec<(String, u64)> = vec![
+            ("k1".to_string(), 10),
+            ("k2".to_string(), 20),
+            ("k3".to_string(), 30),
+        ];
+        store.bulk_load_keyed::<u64, String>("t", rows, None).unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<u64, String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get("old".to_string()), None, "replace must drop old rows");
+        assert_eq!(
+            t.get_unique("by_value", &20u64).unwrap(),
+            Some(("k2".to_string(), &20))
+        );
+        assert_eq!(
+            t.get_unique("by_value", &900u64).unwrap(),
+            None,
+            "the replaced row must be gone from the index too"
+        );
+    }
+
+    /// `create_if_missing: false` on a table that does not exist.
+    #[test]
+    fn honours_create_if_missing_false() {
+        use ultima_db::BulkLoadOptions;
+
+        let store = Store::default();
+        let opts = BulkLoadOptions {
+            create_if_missing: false,
+            checkpoint_after: false,
+        };
+        let err = store
+            .bulk_load_keyed::<String, String>("nope", vec![], Some(opts))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::TableNotFound(_)),
+            "expected TableNotFound, got {err:?}"
+        );
+    }
+
+    /// A `u64`-keyed table loaded through the keyed entry point keeps its
+    /// auto-increment counter: a subsequent `insert` must not reissue an id
+    /// the load already used.
+    #[test]
+    fn u64_keys_advance_the_auto_increment_counter() {
+        let store = Store::default();
+        let rows: Vec<(u64, String)> = (1u64..=5).map(|i| (i, format!("v{i}"))).collect();
+        store.bulk_load_keyed::<String, u64>("t", rows, None).unwrap();
+
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        let id = t.insert("next".to_string()).unwrap();
+        assert_eq!(id, 6, "counter must resume past the highest loaded id");
+        wtx.commit().unwrap();
+    }
+
+    /// An explicitly-keyed table has no auto-increment counter, and a bulk
+    /// load must not invent one — the `next_id_opt() == None` ⟺
+    /// explicitly-keyed invariant that table serialization encodes.
+    #[test]
+    fn string_keys_do_not_gain_a_counter() {
+        let store = Store::default();
+        let rows = vec![("k".to_string(), "v".to_string())];
+        store
+            .bulk_load_keyed::<String, String>("t", rows, None)
+            .unwrap();
+
+        // Round-tripping the table through a write tx and back is the
+        // observable proxy: a spurious counter would make `put` advance it and
+        // the table would stop behaving like an explicitly-keyed one.
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table_keyed::<String, String>("t").unwrap();
+            t.put("k2".to_string(), "v2".to_string()).unwrap();
+        }
+        wtx.commit().unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, String>("t").unwrap();
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn empty_rows_creates_an_empty_table() {
+        let store = Store::default();
+        store
+            .bulk_load_keyed::<String, String>("t", vec![], None)
+            .unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, String>("t").unwrap();
+        assert_eq!(t.len(), 0);
+    }
+}

@@ -64,10 +64,10 @@ pub(crate) struct TableTypeInfo {
     /// u64)` and then `("users", User, String)` differ only here. Without the
     /// key type in the identity check the second registration is a silent
     /// no-op that only surfaces much later — at checkpoint or replay time — as
-    /// an opaque "table downcast failed". It is also what lets the snapshot
-    /// wire-format install path refuse a `u64`-keyed stream aimed at a
-    /// non-`u64` destination table instead of decoding 8 raw bytes into a
-    /// garbage key.
+    /// an opaque "table downcast failed". It is also half of what lets the
+    /// snapshot wire-format install path refuse a stream whose keys were
+    /// encoded with a different type instead of decoding raw bytes into
+    /// garbage keys (the live table is the other half).
     pub key_type_id: TypeId,
     /// `std::any::type_name::<K>()`, carried purely so a key-type mismatch
     /// can name the offending type in its error message (`TypeId` has no
@@ -324,8 +324,9 @@ impl TableRegistry {
 
     /// The registered primary-key type for `name` as `(TypeId, type_name)`,
     /// or `None` if the table is not registered. Used by the snapshot-stream
-    /// build/install paths, whose wire format still carries fixed 8-byte
-    /// `u64` keys and must refuse anything else rather than reinterpret it.
+    /// install path to check the incoming stream's declared key type against
+    /// this store's, since the row keys are opaque bytes that several key
+    /// types would decode without complaint.
     pub fn key_type(&self, name: &str) -> Option<(TypeId, &'static str)> {
         self.entries
             .get(name)

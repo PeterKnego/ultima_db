@@ -10,7 +10,20 @@ pub const FILE_MAGIC: &[u8; 8] = b"ULTSNAP\0";
 /// The wire format version this build writes and accepts. Bumped only on a
 /// breaking wire-format change; `decode_file_header` rejects any other value
 /// as `SnapshotStreamError::BadFormatVersion`.
-pub const FILE_FORMAT_V: u16 = 1;
+///
+/// v2 (this build) made the format primary-key generic. Two changes, both
+/// breaking:
+///
+/// - Each row is `key_len(u32-le) | key_bytes | val_len(u32-le) | val_bytes`.
+///   v1 wrote a fixed 8-byte little-endian `u64` in place of the first two
+///   fields, which could not carry a `String`, `Vec<u8>`, or tuple key. The
+///   key bytes are [`PrimaryKey::encode`](crate::PrimaryKey::encode) output,
+///   whose lexicographic order equals key order — so the receiver's
+///   strict-ascent check over decoded keys is equivalent to one over the
+///   raw bytes, which is what keeps `BTree::from_sorted` correct.
+/// - [`TableHeader`] carries `key_type`, the source table's primary-key type
+///   name. See that field for why it is checked rather than ignored.
+pub const FILE_FORMAT_V: u16 = 2;
 
 /// Decoded file-level header: format version, source snapshot version, and
 /// declared table count. See `docs/tasks/task27_snapshot_stream.md` for the
@@ -38,6 +51,24 @@ pub struct TableHeader {
     /// mismatch hint only — not stable across Rust builds — since install
     /// dispatches by table `name`, not by this id.
     pub record_type_id: u64,
+    /// `std::any::type_name` of the source table's primary key, taken from
+    /// the *live* table the rows were read out of.
+    ///
+    /// Unlike `record_type_id` this is *enforced* on install: the row keys
+    /// are opaque bytes, and several key types accept the same bytes (the
+    /// eight bytes of `1u64` are also a valid NUL-padded `String`), so a
+    /// stream aimed at a destination with a different `K` would decode
+    /// cleanly, pass the strict-ascent check, and install a table full of
+    /// garbage keys with no error anywhere. Comparing the type names catches
+    /// that at the trust boundary — see
+    /// [`SnapshotStreamError::KeyTypeMismatch`](crate::SnapshotStreamError::KeyTypeMismatch).
+    ///
+    /// The check is only as good as `type_name`'s stability, which Rust does
+    /// not guarantee across compiler versions. In the deployment this format
+    /// exists for (SMR replicas of one binary) both ends agree by
+    /// construction; a cross-toolchain mismatch would surface as a loud
+    /// refusal, never as a silent mis-decode.
+    pub key_type: String,
     /// Number of rows in this table's row stream.
     pub row_count: u64,
     /// Secondary index definitions (name + kind) declared on the source
@@ -97,12 +128,14 @@ pub fn decode_file_header(b: &[u8]) -> Result<(FileHeader, usize), SnapshotStrea
 }
 
 /// Appends `h` to `buf` in the wire format's little-endian table-header
-/// layout (name length + utf-8 name, `record_type_id`, `row_count`, and each
-/// index's kind + name).
+/// layout (name length + utf-8 name, `record_type_id`, `key_type` length +
+/// utf-8 name, `row_count`, and each index's kind + name).
 pub fn encode_table_header(h: &TableHeader, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&(h.name.len() as u16).to_le_bytes());
     buf.extend_from_slice(h.name.as_bytes());
     buf.extend_from_slice(&h.record_type_id.to_le_bytes());
+    buf.extend_from_slice(&(h.key_type.len() as u16).to_le_bytes());
+    buf.extend_from_slice(h.key_type.as_bytes());
     buf.extend_from_slice(&h.row_count.to_le_bytes());
     buf.extend_from_slice(&(h.indexes.len() as u16).to_le_bytes());
     for idx in &h.indexes {
@@ -130,11 +163,23 @@ pub fn decode_table_header(b: &[u8]) -> Result<(TableHeader, usize), SnapshotStr
         .map_err(|_| SnapshotStreamError::Malformed("invalid UTF-8 in table name"))?
         .to_string();
     p += name_len;
-    if b.len() < p + 8 + 8 + 2 {
+    if b.len() < p + 8 + 2 {
         return Err(SnapshotStreamError::Truncated);
     }
     let record_type_id = u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
     p += 8;
+    let key_type_len = u16::from_le_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+    p += 2;
+    if b.len() < p + key_type_len {
+        return Err(SnapshotStreamError::Truncated);
+    }
+    let key_type = std::str::from_utf8(&b[p..p + key_type_len])
+        .map_err(|_| SnapshotStreamError::Malformed("invalid UTF-8 in key type name"))?
+        .to_string();
+    p += key_type_len;
+    if b.len() < p + 8 + 2 {
+        return Err(SnapshotStreamError::Truncated);
+    }
     let row_count = u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
     p += 8;
     let idx_count = u16::from_le_bytes(b[p..p + 2].try_into().unwrap()) as usize;
@@ -161,6 +206,7 @@ pub fn decode_table_header(b: &[u8]) -> Result<(TableHeader, usize), SnapshotStr
         TableHeader {
             name,
             record_type_id,
+            key_type,
             row_count,
             indexes,
         },
@@ -175,7 +221,7 @@ mod tests {
     #[test]
     fn file_header_roundtrip() {
         let h = FileHeader {
-            format_ver: 1,
+            format_ver: FILE_FORMAT_V,
             store_ver: 42,
             table_count: 3,
         };
@@ -191,6 +237,7 @@ mod tests {
         let h = TableHeader {
             name: "users".to_string(),
             record_type_id: 0xDEADBEEF,
+            key_type: "alloc::string::String".to_string(),
             row_count: 1_000_000,
             indexes: vec![
                 IndexDef {
@@ -208,5 +255,54 @@ mod tests {
         let (decoded, n) = decode_table_header(&buf).unwrap();
         assert_eq!(decoded, h);
         assert_eq!(n, buf.len());
+    }
+
+    /// Every prefix of a table header must be rejected as `Truncated` rather
+    /// than panicking on an out-of-range slice. The `key_type` field added in
+    /// v2 sits between two other length-prefixed fields, so its bounds check
+    /// is easy to get subtly wrong.
+    #[test]
+    fn truncated_table_header_never_panics() {
+        let h = TableHeader {
+            name: "users".to_string(),
+            record_type_id: 7,
+            key_type: "alloc::string::String".to_string(),
+            row_count: 3,
+            indexes: vec![IndexDef {
+                kind: 0,
+                name: "by_email".to_string(),
+            }],
+        };
+        let mut buf = Vec::new();
+        encode_table_header(&h, &mut buf);
+        for cut in 0..buf.len() {
+            assert!(
+                matches!(
+                    decode_table_header(&buf[..cut]),
+                    Err(SnapshotStreamError::Truncated)
+                ),
+                "prefix of length {cut} should decode as Truncated"
+            );
+        }
+    }
+
+    /// A v1 payload (or anything else) must be refused by version, not
+    /// misparsed: v1 rows carried a fixed 8-byte key where v2 carries a
+    /// length prefix, so there is no safe way to read one as the other.
+    #[test]
+    fn v1_format_version_is_rejected() {
+        let mut buf = Vec::new();
+        encode_file_header(
+            &FileHeader {
+                format_ver: 1,
+                store_ver: 9,
+                table_count: 1,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            decode_file_header(&buf),
+            Err(SnapshotStreamError::BadFormatVersion(1))
+        ));
     }
 }

@@ -14,9 +14,43 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::persistence::Record;
+use crate::primary_key::PrimaryKey;
 use crate::store::Store;
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
+
+/// The auto-increment counter a bulk-built table should carry.
+///
+/// `seed` is the counter the table starts from — `Some(K::first())` for a
+/// fresh auto-increment table, the existing counter when replacing one in
+/// place, and `None` for every explicitly-keyed type. `last_key` is the
+/// highest key in the rows about to be loaded; advancing past it is what
+/// stops a later `insert` from handing out an id the load already used.
+///
+/// Written without an [`AutoKey`](crate::primary_key::AutoKey) bound so the
+/// key-generic entry points can call it: `advance_auto_counter` is a no-op
+/// for every explicitly-keyed type, so those tables stay on `None` — the
+/// invariant `next_id_opt() == None` ⟺ explicitly-keyed.
+pub(crate) fn bulk_next_counter<K: PrimaryKey>(
+    seed: Option<K>,
+    last_key: Option<&K>,
+) -> Result<Option<K>> {
+    let had_counter = seed.is_some();
+    let mut counter = seed;
+    if let Some(k) = last_key {
+        k.advance_auto_counter(&mut counter);
+    }
+    // Cleared only when the highest key has no successor (`u64::MAX`).
+    // Dropping the `Some` invariant would turn a later `insert` into a panic
+    // — fail loudly here instead.
+    if had_counter && counter.is_none() {
+        return Err(Error::InvalidBulkLoadInput(
+            "highest bulk-load key is the maximum id; the auto-increment counter would overflow"
+                .into(),
+        ));
+    }
+    Ok(counter)
+}
 
 /// Top-level shape of a bulk load: replace the table or apply a delta.
 pub enum BulkLoadInput<R> {

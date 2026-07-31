@@ -17,7 +17,6 @@ use super::codec::{
     FILE_FORMAT_V, FILE_MAGIC, FileHeader, IndexDef, TableHeader, encode_file_header,
     encode_table_header,
 };
-use crate::primary_key::PrimaryKey;
 use crate::registry::TableRegistry;
 use crate::store::Snapshot;
 
@@ -65,8 +64,10 @@ enum State {
 }
 
 struct TableIterState {
-    /// Pre-serialized rows for the current table, in primary-key order.
-    rows: Vec<(u64, Vec<u8>)>,
+    /// Pre-serialized `(encoded key, record)` rows for the current table, in
+    /// primary-key order — which, by the `PrimaryKey` encoding contract, is
+    /// also ascending order of the raw key bytes.
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
     /// Index of the next row to emit from `rows`.
     row_idx: usize,
     /// CRC32 over the row stream of this table only.
@@ -155,36 +156,18 @@ impl SnapshotReader {
                         type_id: 0,
                     })?;
 
-                // Same `u64`-only restriction the install path enforces, at
-                // the other end of the pipe: refuse to *emit* a stream for a
-                // table whose keys the format cannot represent, rather than
-                // squeeze them through `u64::decode` (which succeeds for any
-                // 8-byte key encoding and silently mangles the rest).
-                //
-                // Asked of the *live table*, not of the registry. The two can
-                // disagree — `open_table_keyed` can create a table that was
-                // never registered, and `register_table*` afterwards records
-                // whatever the caller asked for — and it is the table's rows
-                // that are about to be encoded, so the table is the authority.
-                // Gating on the registry here let a `String`-keyed table with
-                // a `u64` registration emit a stream of reinterpreted keys.
-                if table_arc.key_type_id() != std::any::TypeId::of::<u64>() {
-                    return Err(SnapshotStreamError::NonU64Key {
-                        table: name,
-                        key_type: table_arc.key_type_name(),
-                    });
-                }
+                // Rows carry `PrimaryKey::encode` bytes verbatim — no key type
+                // is privileged and nothing is reinterpreted on the way out.
+                let serialized_rows: Vec<(Vec<u8>, Vec<u8>)> =
+                    table_arc.collect_serialized_rows(serialize_fn)?;
 
-                // widened in task 7: `collect_serialized_rows` now hands back
-                // order-preserving encoded key bytes, but the stream format
-                // still carries fixed 8-byte little-endian `u64` keys, so
-                // decode back to `u64` here. Task 7 makes the format
-                // key-generic and this adapter goes away.
-                let serialized_rows: Vec<(u64, Vec<u8>)> = table_arc
-                    .collect_serialized_rows(serialize_fn)?
-                    .into_iter()
-                    .map(|(key_bytes, val)| u64::decode(&key_bytes).map(|k| (k, val)))
-                    .collect::<crate::Result<Vec<_>>>()?;
+                // The key type is asked of the *live table*, not of the
+                // registry. The two can disagree — `open_table_keyed` can
+                // create a table that was never registered, and
+                // `register_table*` afterwards records whatever the caller
+                // asked for — and it is this table's rows that were just
+                // encoded, so the table is the authority on what decodes them.
+                let key_type = table_arc.key_type_name().to_string();
 
                 // Build index definitions for the table header.
                 let index_list = table_arc.index_list();
@@ -199,6 +182,7 @@ impl SnapshotReader {
                 let table_header = TableHeader {
                     name: name.clone(),
                     record_type_id,
+                    key_type,
                     row_count,
                     indexes,
                 };
@@ -217,17 +201,20 @@ impl SnapshotReader {
                 let ts = self.current_table.as_mut().unwrap();
 
                 if ts.row_idx < ts.rows.len() {
-                    // Emit one row: key (u64 LE) + val_len (u32 LE) + val bytes.
+                    // Emit one row:
+                    // key_len (u32 LE) + key bytes + val_len (u32 LE) + val bytes.
                     let (key, val) = &ts.rows[ts.row_idx];
                     ts.row_idx += 1;
                     self.total_rows += 1;
 
+                    let key_len = key.len() as u32;
                     let val_len = val.len() as u32;
                     // Accumulate into a temporary chunk so we can CRC it in one pass.
-                    let chunk_len = 8 + 4 + val.len();
+                    let chunk_len = 4 + key.len() + 4 + val.len();
                     self.buffer.reserve(chunk_len);
                     let start = self.buffer.len();
-                    self.buffer.extend_from_slice(&key.to_le_bytes());
+                    self.buffer.extend_from_slice(&key_len.to_le_bytes());
+                    self.buffer.extend_from_slice(key);
                     self.buffer.extend_from_slice(&val_len.to_le_bytes());
                     self.buffer.extend_from_slice(val);
                     let chunk = &self.buffer[start..];

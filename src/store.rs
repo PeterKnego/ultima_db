@@ -1349,18 +1349,17 @@ impl Store {
 
                 // 2. Validate + materialize off-lock.
                 let mat = materialize_delta(delta, base_typed.data_ref())?;
-                let next_id = mat
-                    .max_id
-                    .map(|m| m + 1)
-                    .unwrap_or(base_typed.next_id())
-                    .max(base_typed.next_id());
+                // Keep the table's existing counter and push it past the
+                // highest key the delta leaves behind, so an id the delta
+                // used can never be handed out again.
+                let next_id = crate::bulk_load::bulk_next_counter(
+                    base_typed.next_id_opt(),
+                    mat.rows.last().map(|(id, _)| id),
+                )?;
 
                 let index_defs = base_typed.empty_index_defs()?;
-                // widened in task 7: bulk-load is still `u64`-keyed, so the
-                // `Option<K>` id counter `from_bulk` now takes is always
-                // `Some` here.
                 let new_table: crate::table::Table<R> =
-                    crate::table::Table::from_bulk(mat.rows, Some(next_id), index_defs)?;
+                    crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
 
                 // 3. Conflict check + install. If `latest_version` advanced
                 //    since `base_version`, abort with WriteConflict.
@@ -1373,6 +1372,84 @@ impl Store {
                 Ok(new_version)
             }
         }
+    }
+
+    /// Bulk-load a table addressed by explicit primary keys of any
+    /// [`PrimaryKey`](crate::PrimaryKey) type — the key-generic counterpart of
+    /// [`Store::bulk_load`], which stays `u64`-only because its
+    /// [`BulkSource`](crate::BulkSource) shapes (`AutoId`, `Unsorted`) are
+    /// auto-increment concepts.
+    ///
+    /// Replace semantics: the table's previous contents are discarded and its
+    /// index *definitions* are preserved and rebuilt over the new rows. The
+    /// table is created if it does not exist.
+    ///
+    /// `rows` must be in **strictly ascending key order** with no duplicates;
+    /// anything else is rejected with [`Error::InvalidBulkLoadInput`] before
+    /// any tree is built, so the store is untouched. This is not a
+    /// convenience check — [`BTree::from_sorted`](crate::BTree::from_sorted)
+    /// assumes ascending input and only debug-asserts it, so unsorted rows
+    /// would silently corrupt the tree in a release build.
+    ///
+    /// `opts` defaults to [`BulkLoadOptions::default`](crate::BulkLoadOptions)
+    /// when `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::Store;
+    ///
+    /// let store = Store::default();
+    /// let rows = vec![
+    ///     ("a@example.com".to_string(), "Alice".to_string()),
+    ///     ("b@example.com".to_string(), "Bob".to_string()),
+    /// ];
+    /// store
+    ///     .bulk_load_keyed::<String, String>("emails", rows, None)
+    ///     .unwrap();
+    ///
+    /// let rtx = store.begin_read(None).unwrap();
+    /// let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+    /// assert_eq!(t.len(), 2);
+    /// ```
+    pub fn bulk_load_keyed<R: Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        table_name: &str,
+        rows: Vec<(K, R)>,
+        opts: Option<crate::bulk_load::BulkLoadOptions>,
+    ) -> Result<u64> {
+        let opts = opts.unwrap_or_default();
+
+        // Validate ordering *before* building anything. Comparing `K` values
+        // directly is equivalent to comparing their encodings — the
+        // `PrimaryKey` contract requires the encoding to be order-preserving
+        // — so this is the same check the wire-format install path makes over
+        // raw key bytes.
+        for w in rows.windows(2) {
+            if w[0].0 >= w[1].0 {
+                return Err(Error::InvalidBulkLoadInput(
+                    "bulk load rows must be in ascending primary-key order".into(),
+                ));
+            }
+        }
+
+        let sorted: Vec<(K, Arc<R>)> = rows.into_iter().map(|(k, r)| (k, Arc::new(r))).collect();
+        let new_table =
+            self.build_table_from_sorted::<R, K>(table_name, sorted, opts.create_if_missing)?;
+
+        let base_version = self.latest_version();
+        let new_version = self.install_batch(
+            vec![crate::bulk_load::PendingTable {
+                name: table_name.to_string(),
+                table: Arc::new(new_table) as Arc<dyn MergeableTable>,
+            }],
+            base_version,
+            None,
+        )?;
+        if opts.checkpoint_after {
+            self.checkpoint_and_prune_after_bulk(new_version)?;
+        }
+        Ok(new_version)
     }
 
     /// Install a freshly-built table as a new snapshot, refusing the install
@@ -1452,19 +1529,36 @@ impl Store {
 
         // 1. Materialize sorted rows off-lock.
         let mat = materialize_source::<R>(source)?;
-        let next_id = mat.max_id.map(|m| m + 1).unwrap_or(1);
 
-        // 2. Snapshot to read existing index defs (if any).
+        // 2. Build off-lock, reusing the key-generic builder. `BulkSource` is
+        //    `u64`-keyed by construction (the auto-increment source shapes
+        //    only make sense for an `AutoKey`); explicit keys of any type go
+        //    through `Store::bulk_load_keyed` instead.
+        self.build_table_from_sorted::<R, u64>(name, mat.rows, create_if_missing)
+    }
+
+    /// Build a table from strictly-ascending `(key, record)` rows, cloning
+    /// the index *definitions* of the table that name currently holds (if
+    /// any) so secondary indexes survive the load. Does not install.
+    ///
+    /// Shared by the `u64` `BulkSource` path and by
+    /// [`Store::bulk_load_keyed`]; nothing here is `u64`-specific.
+    pub(crate) fn build_table_from_sorted<R: Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        name: &str,
+        sorted: Vec<(K, Arc<R>)>,
+        create_if_missing: bool,
+    ) -> Result<crate::table::Table<R, K>> {
         let base_snapshot = {
             let inner = self.inner.read();
             inner.snapshots[&inner.latest_version].clone()
         };
 
-        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R, u64>>> =
+        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R, K>>> =
             if let Some(existing) = base_snapshot.tables.get(name) {
                 let typed = existing
                     .as_any()
-                    .downcast_ref::<crate::table::Table<R>>()
+                    .downcast_ref::<crate::table::Table<R, K>>()
                     .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
                 typed.empty_index_defs()?
             } else if create_if_missing {
@@ -1473,11 +1567,15 @@ impl Store {
                 return Err(Error::TableNotFound(name.to_string()));
             };
 
-        // 3. Build off-lock.
-        // widened in task 7: see `bulk_load`'s note on the `Option<K>` counter.
-        let new_table: crate::table::Table<R> =
-            crate::table::Table::from_bulk(mat.rows, Some(next_id), index_defs)?;
-        Ok(new_table)
+        // A replacement starts the counter over from the key type's first id
+        // (`None` for an explicitly-keyed table) and advances past the highest
+        // loaded key — the rows being replaced are gone, so their ids are not
+        // reserved.
+        let next_id = crate::bulk_load::bulk_next_counter(
+            crate::primary_key::auto_counter_seed::<K>(),
+            sorted.last().map(|(k, _)| k),
+        )?;
+        crate::table::Table::from_bulk(sorted, next_id, index_defs)
     }
 
     /// Install N pre-built tables atomically as one snapshot. Mirrors

@@ -45,17 +45,18 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// can be created by `open_table_keyed` without ever being registered,
     /// and `register_table*` afterwards records whatever the caller asked
     /// for. Anything making a key-shaped decision about a concrete table —
-    /// the snapshot wire format, which can only carry `u64` — must ask the
-    /// table, not the registry, or it will act on the wrong type and
-    /// reinterpret the rows.
+    /// `register_table_keyed`'s guard, and the key type the snapshot wire
+    /// format stamps on each table header — must ask the table, not the
+    /// registry, or it will act on the wrong type and reinterpret the rows.
     ///
     /// Gated like `index_list` below: every caller (the registration guard
     /// and both ends of the snapshot wire format) is persistence-only.
     #[cfg(feature = "persistence")]
     fn key_type_id(&self) -> TypeId;
 
-    /// `std::any::type_name` of this table's primary key, for error messages
-    /// (`TypeId` has no printable form).
+    /// `std::any::type_name` of this table's primary key. Used for error
+    /// messages (`TypeId` has no printable form) and as the key-type
+    /// identity the snapshot wire format carries between stores.
     #[cfg(feature = "persistence")]
     fn key_type_name(&self) -> &'static str;
 

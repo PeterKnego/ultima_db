@@ -15,7 +15,9 @@ mod tests {
     use std::io::Read;
 
     use serde::{Deserialize, Serialize};
-    use ultima_db::snapshot_stream::codec::{FILE_FORMAT_V, FILE_MAGIC};
+    use ultima_db::snapshot_stream::codec::{
+        FILE_FORMAT_V, FILE_MAGIC, decode_file_header, decode_table_header,
+    };
     use ultima_db::{Store, StoreConfig};
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -129,17 +131,9 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).unwrap();
 
-        // File header is 22 bytes, then table header starts.
-        // Table header layout: name_len(2) + name_bytes + type_id(8) + row_count(8) + ...
-        let p = 22usize; // after file header
-        let name_len = u16::from_le_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
-        let row_count_offset = p + 2 + name_len + 8; // skip name_len + name + type_id
-        let row_count = u64::from_le_bytes(
-            buf[row_count_offset..row_count_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
-        assert_eq!(row_count, 42, "table header row_count mismatch");
+        let (_, n) = decode_file_header(&buf).unwrap();
+        let (header, _) = decode_table_header(&buf[n..]).unwrap();
+        assert_eq!(header.row_count, 42, "table header row_count mismatch");
     }
 
     // ── Task 4 tests: install_snapshot_stream ────────────────────────────────
@@ -358,9 +352,18 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
 
-        // Flip a byte roughly in the middle of the row data.
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
+        // Flip a byte inside the first row's *value* payload. Aiming at the
+        // middle of the buffer would land on a length field as often as not,
+        // and a corrupt length is caught as `Truncated` before the CRC is
+        // ever recomputed — a different (also correct) rejection, but not the
+        // one under test here.
+        let (_, file_n) = decode_file_header(&bytes).unwrap();
+        let (_, table_n) = decode_table_header(&bytes[file_n..]).unwrap();
+        let row_start = file_n + table_n;
+        let key_len =
+            u32::from_le_bytes(bytes[row_start..row_start + 4].try_into().unwrap()) as usize;
+        let value_start = row_start + 4 + key_len + 4;
+        bytes[value_start] ^= 0xFF;
 
         let dst = Store::new(StoreConfig::default()).unwrap();
         dst.register_table::<Row>("rows").unwrap();
@@ -474,15 +477,9 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).unwrap();
 
-        let p = 22usize;
-        let name_len = u16::from_le_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
-        let row_count_offset = p + 2 + name_len + 8;
-        let row_count = u64::from_le_bytes(
-            buf[row_count_offset..row_count_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
-        assert_eq!(row_count, 5, "streaming v1 should have 5 rows");
+        let (_, n) = decode_file_header(&buf).unwrap();
+        let (header, _) = decode_table_header(&buf[n..]).unwrap();
+        assert_eq!(header.row_count, 5, "streaming v1 should have 5 rows");
     }
 
     // ── Task 5 tests: list_checkpoints + open_checkpoint_reader ─────────────
@@ -791,6 +788,7 @@ mod tests {
             &TableHeader {
                 name: "rows".to_string(),
                 record_type_id: 0,
+                key_type: std::any::type_name::<u64>().to_string(),
                 row_count: u64::MAX,
                 indexes: Vec::new(),
             },
@@ -1025,21 +1023,99 @@ mod tests {
         );
     }
 
-    /// The wire format carries fixed 8-byte little-endian `u64` row keys. A
-    /// destination that registered the table with a different primary-key type
-    /// must be refused outright, because the failure mode is *silent*: the
-    /// eight bytes of `1u64` are also a valid (NUL-padded) `String`, so
-    /// `String::decode` succeeds, the strict-ascent check downstream passes,
-    /// and the table would install full of garbage keys with no error
-    /// anywhere. Also: the destination must be left untouched.
+    /// A `String`-keyed table must survive a full stream → install round
+    /// trip. This is the case that proves the format is genuinely key-generic
+    /// rather than "u64 with wider framing": `String` keys are
+    /// variable-length, so the row framing does real work, and they are
+    /// ordered by their bytes, so the receiver's strict-ascent check is
+    /// exercised against an encoding that is not a fixed-width integer.
     #[test]
-    fn install_refuses_a_u64_stream_into_a_non_u64_keyed_table() {
+    fn round_trips_a_string_keyed_table() {
+        // Deliberately spans encoded lengths 1..=9 and includes a pair that
+        // shares a prefix ("b", "bb") — the case a fixed-width key format
+        // cannot represent and a non-order-preserving encoding gets wrong.
+        let keys = ["", "a", "ab", "b", "bb", "zzzzzzzzz"];
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table_keyed::<Row, String>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table_keyed::<Row, String>("rows").unwrap();
+            // Inserted out of order on purpose: the table stores them in key
+            // order, and that is the order the stream must emit.
+            for (i, k) in [3usize, 0, 5, 1, 4, 2].into_iter().enumerate() {
+                t.put(keys[k].to_string(), Row { value: i as u64 })
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // The invariant the type-erased install path rests on: the wire's
+        // keys are ascending as *raw bytes*, which is only equivalent to
+        // ascending as `K` because `PrimaryKey::encode` is order-preserving.
+        // Assert it on the bytes themselves, where the receiver sees them.
+        let (_, file_n) = decode_file_header(&bytes).unwrap();
+        let (header, table_n) = decode_table_header(&bytes[file_n..]).unwrap();
+        let mut p = file_n + table_n;
+        let mut wire_keys: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..header.row_count {
+            let key_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            wire_keys.push(bytes[p..p + key_len].to_vec());
+            p += key_len;
+            let val_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + val_len;
+        }
+        assert!(
+            wire_keys.windows(2).all(|w| w[0] < w[1]),
+            "encoded keys must be strictly ascending on the wire: {wire_keys:?}"
+        );
+        let expected_bytes: Vec<Vec<u8>> = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+        assert_eq!(
+            wire_keys, expected_bytes,
+            "byte order must agree with key order"
+        );
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table_keyed::<Row, String>("rows").unwrap();
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+
+        let rtx = dst.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<Row, String>("rows").unwrap();
+        assert_eq!(t.len(), keys.len());
+        let src_rtx = src.begin_read(None).unwrap();
+        let src_t = src_rtx.open_table_keyed::<Row, String>("rows").unwrap();
+        for k in keys {
+            assert_eq!(
+                t.get(k.to_string()),
+                src_t.get(k.to_string()),
+                "row {k:?} did not survive the round trip"
+            );
+        }
+    }
+
+    /// The keys the wire carries are opaque bytes, and several key types
+    /// accept the same bytes — the eight bytes of `1u64` are also a valid
+    /// (NUL-padded) `String`, so `String::decode` succeeds, the strict-ascent
+    /// check downstream passes, and the table would install full of garbage
+    /// keys with no error anywhere. The table header therefore names the key
+    /// type the source encoded with, and a destination that disagrees refuses
+    /// the install. Also: the destination must be left untouched.
+    #[test]
+    fn install_refuses_a_stream_encoded_with_a_different_key_type() {
         use ultima_db::snapshot_stream::install::InstallOptions;
         use ultima_db::{PrimaryKey, SnapshotStreamError};
 
-        // The hazard, stated as an assertion: re-encoding a u64 stream key
-        // into a String key is not a decode *failure* that would surface on
-        // its own. It silently succeeds.
+        // The hazard, stated as an assertion: decoding a u64 stream key as a
+        // String is not a decode *failure* that would surface on its own. It
+        // silently succeeds.
         assert_eq!(
             <String as PrimaryKey>::decode(&1u64.encode()).unwrap().len(),
             8,
@@ -1077,8 +1153,16 @@ mod tests {
         let res =
             dst.install_snapshot_stream(std::io::Cursor::new(&bytes), InstallOptions::default());
         match res {
-            Err(SnapshotStreamError::NonU64Key { table, .. }) => assert_eq!(table, "rows"),
-            other => panic!("expected NonU64Key, got: {other:?}"),
+            Err(SnapshotStreamError::KeyTypeMismatch {
+                table,
+                stream,
+                destination,
+            }) => {
+                assert_eq!(table, "rows");
+                assert_eq!(stream, std::any::type_name::<u64>());
+                assert_eq!(destination, std::any::type_name::<String>());
+            }
+            other => panic!("expected KeyTypeMismatch, got: {other:?}"),
         }
 
         // Untouched: same version, same single pre-existing row.
@@ -1089,12 +1173,13 @@ mod tests {
         assert_eq!(t.get("keep-me".to_string()), Some(&Row { value: 99 }));
     }
 
-    /// The same restriction at the other end of the pipe: building a stream
-    /// from a non-`u64`-keyed table must fail loudly rather than squeeze the
-    /// keys through `u64::decode`.
+    /// A `String`-keyed table is emittable now — the restriction the old
+    /// `NonU64Key` guard imposed at this end of the pipe is gone. What must
+    /// still hold is that the emitted header names `String`, so the receiver
+    /// can tell.
     #[test]
-    fn snapshot_stream_refuses_to_emit_a_non_u64_keyed_table() {
-        use ultima_db::SnapshotStreamError;
+    fn snapshot_stream_emits_a_non_u64_keyed_table() {
+        use ultima_db::snapshot_stream::codec::{decode_file_header, decode_table_header};
 
         let src = Store::new(StoreConfig::default()).unwrap();
         src.register_table_keyed::<Row, String>("rows").unwrap();
@@ -1106,15 +1191,15 @@ mod tests {
         }
 
         let mut bytes = Vec::new();
-        let res = src
-            .snapshot_stream(None)
+        src.snapshot_stream(None)
             .unwrap()
             .read_to_end(&mut bytes)
-            .map_err(SnapshotStreamError::from);
-        let msg = format!("{res:?}");
-        assert!(
-            msg.contains("non-u64 primary key"),
-            "expected a non-u64 key refusal, got: {msg}"
-        );
+            .expect("emitting a String-keyed table must succeed");
+
+        let (_, n) = decode_file_header(&bytes).unwrap();
+        let (header, _) = decode_table_header(&bytes[n..]).unwrap();
+        assert_eq!(header.name, "rows");
+        assert_eq!(header.key_type, std::any::type_name::<String>());
+        assert_eq!(header.row_count, 1);
     }
 }
