@@ -1458,8 +1458,8 @@ fn recovery_rejects_a_pre_0_3_0_wal() {
             ))
             .build();
 
-        // The prealloc sink scans at open time, so the refusal can surface from
-        // either `Store::new` or `recover()`; both are acceptable, silence is not.
+        // Every sink now refuses at open; recovery is the belt to that
+        // suspenders. Either surface is acceptable, silence is not.
         let err = match Store::new(config) {
             Err(e) => e,
             Ok(store) => {
@@ -1471,12 +1471,115 @@ fn recovery_rejects_a_pre_0_3_0_wal() {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("format version 1"),
+            msg.contains("no v2 format marker"),
             "{wal_write:?}: message was: {msg}"
         );
         assert!(
             msg.contains("Store::bulk_load"),
             "{wal_write:?}: message was: {msg}"
         );
+    }
+}
+
+/// Opening a store on a pre-0.3.0 directory must fail at `Store::new`, in
+/// **every** write mode — not just the preallocating one.
+///
+/// The append-mode sinks (`PerEntry`, `Coalesced`) do not read the file they
+/// open. Before this check they let the store construct, accepted a
+/// `Durability::Consistent` commit, and returned `Ok` — telling the caller the
+/// write was durable — while appending v2 records behind the v1 prefix. The
+/// next `recover()` then failed permanently, and the only remedy the error
+/// could offer was deleting the WAL: destroying exactly the commit that had
+/// just been acknowledged. `CoalescedPrealloc` happened to be safe only
+/// because it scans to rebuild its write head.
+///
+/// The assertions that matter are (1) the store never opens, so no commit can
+/// be acknowledged, and (2) the v1 file is left byte-identical, so it is still
+/// readable by the 0.2.x build the migration path tells the operator to use.
+#[test]
+fn opening_a_store_on_a_pre_0_3_0_wal_is_refused_in_every_write_mode() {
+    let modes = [
+        (Durability::Consistent, WalWrite::PerEntry),
+        (Durability::Consistent, WalWrite::Coalesced),
+        (Durability::Consistent, WalWrite::CoalescedPrealloc),
+        (Durability::Eventual, WalWrite::PerEntry),
+        // The inline-fsync path builds its sink through the same `open`
+        // functions, so it must refuse too.
+        (Durability::ConsistentInline, WalWrite::PerEntry),
+        (Durability::ConsistentInline, WalWrite::CoalescedPrealloc),
+    ];
+
+    for (durability, wal_write) in modes {
+        let dir = common::test_scratch::scratch_dir();
+        let wal_path = dir.path().join("wal.bin");
+        std::fs::write(&wal_path, v1_wal_bytes()).unwrap();
+        let before = std::fs::read(&wal_path).unwrap();
+
+        let config = StoreConfig::builder()
+            .persistence(Persistence::standalone(
+                dir.path().to_path_buf(),
+                durability,
+                wal_write,
+            ))
+            .build();
+
+        let err = Store::new(config).err().unwrap_or_else(|| {
+            panic!("{durability:?}/{wal_write:?}: opened a store on a pre-0.3.0 WAL")
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no v2 format marker"),
+            "{durability:?}/{wal_write:?}: message was: {msg}"
+        );
+
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            before,
+            "{durability:?}/{wal_write:?}: the pre-0.3.0 WAL was modified; \
+             an operator following the migration path would find it damaged"
+        );
+    }
+}
+
+/// The gate must not fire on the files a healthy store legitimately produces:
+/// a directory with no WAL at all, an empty WAL, and — for the preallocating
+/// sink — a WAL that is nothing but zeros. All three must open and commit.
+#[test]
+fn the_v1_gate_does_not_reject_a_healthy_or_empty_wal() {
+    for wal_write in [
+        WalWrite::PerEntry,
+        WalWrite::Coalesced,
+        WalWrite::CoalescedPrealloc,
+    ] {
+        for (label, seed) in [
+            ("absent", None),
+            ("empty", Some(Vec::new())),
+            ("preallocated zeros", Some(vec![0u8; 8192])),
+        ] {
+            let dir = common::test_scratch::scratch_dir();
+            if let Some(bytes) = seed {
+                std::fs::write(dir.path().join("wal.bin"), bytes).unwrap();
+            }
+            let config = StoreConfig::builder()
+                .persistence(Persistence::standalone(
+                    dir.path().to_path_buf(),
+                    Durability::Consistent,
+                    wal_write,
+                ))
+                .build();
+
+            let store = Store::new(config)
+                .unwrap_or_else(|e| panic!("{wal_write:?}/{label}: {e}"));
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<User>("users")
+                .unwrap()
+                .insert(User {
+                    name: "Alice".into(),
+                    age: 30,
+                })
+                .unwrap();
+            wtx.commit()
+                .unwrap_or_else(|e| panic!("{wal_write:?}/{label}: commit refused: {e}"));
+        }
     }
 }

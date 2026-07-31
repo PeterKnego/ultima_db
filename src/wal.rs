@@ -188,14 +188,16 @@ fn check_entry_header(data: &[u8]) -> Result<usize> {
     }
     if data[0] != WAL_ENTRY_MAGIC {
         return Err(Error::WalCorrupted(format!(
-            "WAL format version 1 (pre-0.3.0: no version marker, leading byte 0x{:02X}) is not \
-             supported by this build (expected {WAL_FORMAT_VERSION}). 0.3.0 changed the on-disk \
-             row-key encoding from fixed u64 ids to encoded primary keys, and pre-0.3.0 \
-             checkpoints are rejected too — so checkpointing with the old build does not migrate \
-             the data. To migrate: with the previous UltimaDB version, `Store::recover()` the old \
-             directory, read the rows out through a `ReadTx`, and load them into a 0.3.0+ store \
-             with `Store::bulk_load` / `Store::bulk_load_batch`. To discard the old data instead, \
-             delete the WAL and checkpoint files in the persistence directory.",
+            "WAL entry carries no v{WAL_FORMAT_VERSION} format marker (leading byte 0x{:02X}, \
+             expected 0x{WAL_ENTRY_MAGIC:02X}). This is either a pre-0.3.0 WAL or a corrupted \
+             one — pre-0.3.0 entries carried no marker at all, so this byte alone cannot tell \
+             them apart. If the file predates 0.3.0: 0.3.0 changed the on-disk row-key encoding \
+             from fixed u64 ids to encoded primary keys, and pre-0.3.0 checkpoints are rejected \
+             too, so checkpointing with the old build does not migrate the data — instead, with \
+             the previous UltimaDB version, `Store::recover()` the old directory, read the rows \
+             out through a `ReadTx`, and load them into a 0.3.0+ store with `Store::bulk_load` / \
+             `Store::bulk_load_batch`. If the file is corrupt: restore from a checkpoint, or \
+             delete the WAL and checkpoint files in the persistence directory to start fresh.",
             data[0]
         )));
     }
@@ -208,6 +210,53 @@ fn check_entry_header(data: &[u8]) -> Result<usize> {
         )));
     }
     Ok(2)
+}
+
+/// Upper bound on one encoded primary key in a WAL entry.
+///
+/// The key used to be a `u64` varint — inherently bounded at 9 bytes. It is now
+/// a length-prefixed byte string whose length comes straight off disk, so it
+/// needs an explicit cap, the same way `op_count` does below. 64 KiB is orders
+/// of magnitude above any sane key (a `u64` encodes to 8 bytes; the largest
+/// plausible tuple-of-strings key is a few hundred) while keeping a corrupt
+/// length from driving a large allocation.
+///
+/// This mirrors the bounds-checked `take` helpers the registry reader grew for
+/// the same reason (task 4 follow-up), so both trust boundaries now validate
+/// lengths before acting on them.
+const MAX_KEY_LEN: usize = 64 * 1024;
+
+/// Read a length-prefixed encoded primary key at `data[offset..]`, returning
+/// the key and the number of bytes consumed.
+///
+/// Deliberately does *not* go through `bincode::decode_from_slice::<Vec<u8>>`:
+/// that reads the length and allocates in one step, leaving no place to reject
+/// an implausible length first. Reading the length separately keeps the
+/// validation ahead of the allocation. The length prefix is bincode's own
+/// `usize` varint, which bincode documents and implements as a `u64` varint
+/// ("usize is being encoded as a u64", `bincode-2.0.1/src/varint/
+/// encode_unsigned.rs:109`), so decoding it as `u64` is byte-exact on every
+/// platform — pinned by `key_length_prefix_matches_bincode_across_widths`.
+fn decode_key(data: &[u8], offset: usize) -> Result<(Vec<u8>, usize)> {
+    let config = bincode::config::standard();
+    let (len, read): (u64, usize) = bincode::decode_from_slice(&data[offset..], config)
+        .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+    if len > MAX_KEY_LEN as u64 {
+        return Err(Error::WalCorrupted(format!(
+            "encoded primary key claims {len} bytes, over the {MAX_KEY_LEN}-byte maximum"
+        )));
+    }
+    let len = len as usize;
+    let start = offset + read;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| Error::WalCorrupted("encoded primary key length overflows".into()))?;
+    if end > data.len() {
+        return Err(Error::WalCorrupted(format!(
+            "encoded primary key of {len} bytes extends past the end of the entry"
+        )));
+    }
+    Ok((data[start..end].to_vec(), read + len))
 }
 
 /// Tag bytes for WalOp variants.
@@ -306,8 +355,7 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     bincode::decode_from_slice(&data[offset..], config)
                         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (key, read): (Vec<u8>, _) = bincode::decode_from_slice(&data[offset..], config)
-                    .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+                let (key, read) = decode_key(data, offset)?;
                 offset += read;
                 let (blob, read): (Vec<u8>, _) =
                     bincode::decode_from_slice(&data[offset..], config)
@@ -332,8 +380,7 @@ fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
                     bincode::decode_from_slice(&data[offset..], config)
                         .map_err(|e| Error::WalCorrupted(e.to_string()))?;
                 offset += read;
-                let (key, read): (Vec<u8>, _) = bincode::decode_from_slice(&data[offset..], config)
-                    .map_err(|e| Error::WalCorrupted(e.to_string()))?;
+                let (key, read) = decode_key(data, offset)?;
                 offset += read;
                 ops.push(WalOp::Delete { table, key });
             }
@@ -714,6 +761,7 @@ impl FileSink {
     fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
+        reject_unreadable_wal(&wal_path)?;
         let file = open_wal_append(&wal_path)?;
         sync_dir(dir)?;
         Ok(FileSink {
@@ -730,6 +778,49 @@ fn open_wal_append(path: &Path) -> Result<File> {
         .append(true)
         .open(path)
         .map_err(|e| Error::Persistence(e.to_string()))
+}
+
+/// Refuse to *open* a WAL whose first record this build cannot read.
+///
+/// The append-mode sinks ([`FileSink`], [`BufferedFileSink`]) never read the
+/// file they open. Without this check, a store pointed at a pre-0.3.0
+/// directory constructs cleanly, accepts commits, and returns `Ok` from a
+/// `Durability::Consistent` `commit()` — telling the caller the data is
+/// durable — while appending v2 records behind a v1 prefix. The next
+/// `recover()` then fails permanently, and the only remedy the error can offer
+/// is deleting the WAL, which destroys exactly the commits that were
+/// acknowledged. Failing at open is the honest behavior: the operator finds out
+/// before they think they have written data.
+///
+/// [`PreallocFileSink::open_with_chunk`] already refuses, because it scans the
+/// file to reconstruct its write head; this closes the same gap for the two
+/// sinks that do not scan.
+///
+/// Only the first record's header is inspected — a full scan on every store
+/// construction would cost O(WAL), and one record is enough: a WAL file is
+/// written by a single build, so its records are homogeneous. A missing,
+/// empty, or sub-record-sized file is accepted (there is nothing to misread);
+/// a first record that is present but damaged is reported by the same
+/// "pre-0.3.0 or corrupt" message, which is accurate either way — and these
+/// sinks recover strictly, so such a file could not have recovered regardless.
+fn reject_unreadable_wal(path: &Path) -> Result<()> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::Persistence(e.to_string())),
+    };
+    // 4-byte frame length + the 2-byte payload header.
+    let mut head = [0u8; 6];
+    match file.read_exact(&mut head) {
+        Ok(()) => {}
+        // Shorter than one header: an empty or freshly created WAL.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(Error::Persistence(e.to_string())),
+    }
+    if u32::from_le_bytes(head[0..4].try_into().unwrap()) == 0 {
+        return Ok(()); // zero len-prefix: empty / preallocated log
+    }
+    check_entry_header(&head[4..]).map(|_| ())
 }
 
 impl WalSink for FileSink {
@@ -768,6 +859,7 @@ impl BufferedFileSink {
     fn open(dir: &Path, datasync: bool) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
         let wal_path = dir.join(WAL_FILENAME);
+        reject_unreadable_wal(&wal_path)?;
         let file = open_wal_append(&wal_path)?;
         sync_dir(dir)?;
         Ok(BufferedFileSink {
@@ -1849,6 +1941,92 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Bounded key reads
+    // -----------------------------------------------------------------------
+
+    /// `decode_key` reads the length prefix itself rather than letting bincode
+    /// read-and-allocate in one step, so it must agree with bincode's writer at
+    /// every varint width — including the boundaries where the encoding changes
+    /// shape (250 -> literal byte, 251 -> `U16_BYTE` + 2, 65536 -> `U32_BYTE` + 4).
+    #[test]
+    fn key_length_prefix_matches_bincode_across_widths() {
+        let config = bincode::config::standard();
+        for len in [0usize, 1, 8, 250, 251, 252, 1000, 65_535, MAX_KEY_LEN] {
+            let key: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let enc = bincode::encode_to_vec(key.as_slice(), config).unwrap();
+            let (got, read) = decode_key(&enc, 0)
+                .unwrap_or_else(|e| panic!("len {len} rejected: {e}"));
+            assert_eq!(got, key, "len {len}: bytes differ");
+            assert_eq!(read, enc.len(), "len {len}: consumed the wrong span");
+            // And the same read offset by a prefix, as it is used in practice.
+            let mut framed = vec![0xAAu8; 3];
+            framed.extend_from_slice(&enc);
+            let (got2, read2) = decode_key(&framed, 3).unwrap();
+            assert_eq!((got2, read2), (key, read), "len {len}: offset read differs");
+        }
+    }
+
+    /// A corrupt length must be refused *before* it can drive an allocation.
+    /// The claim here is 3 GB inside an 11-byte buffer.
+    #[test]
+    fn an_over_long_key_length_is_rejected() {
+        let mut evil = vec![253u8]; // bincode U64_BYTE discriminant
+        evil.extend_from_slice(&3_000_000_000u64.to_le_bytes());
+        evil.extend_from_slice(&[7, 7]);
+        let err = decode_key(&evil, 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("3000000000"), "message was: {msg}");
+        assert!(msg.contains(&MAX_KEY_LEN.to_string()), "message was: {msg}");
+    }
+
+    /// A length that is plausible but runs past the end of the entry is a
+    /// truncation, and is reported as one rather than panicking on the slice.
+    #[test]
+    fn a_key_running_past_the_end_of_the_entry_is_rejected() {
+        let mut short = bincode::encode_to_vec([0u8; 100].as_slice(), bincode::config::standard())
+            .unwrap();
+        short.truncate(4); // 1 length byte + 3 of the 100 key bytes
+        let err = decode_key(&short, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("past the end"),
+            "message was: {err}"
+        );
+    }
+
+    /// A key at the cap survives a full entry round trip; one byte over is
+    /// refused by the entry decoder, not just by `decode_key` in isolation.
+    #[test]
+    fn a_key_at_the_cap_roundtrips_and_one_over_is_refused() {
+        let at_cap = vec![0x5Au8; MAX_KEY_LEN];
+        let entry = WalEntry {
+            version: 1,
+            ops: vec![WalOp::Insert {
+                table: "t".into(),
+                key: at_cap.clone(),
+                data: vec![1],
+            }],
+        };
+        let bytes = serialize_entry(&entry).unwrap();
+        let back = deserialize_entry(&bytes).unwrap();
+        assert!(matches!(&back.ops[0], WalOp::Insert { key, .. } if *key == at_cap));
+
+        let over = WalEntry {
+            version: 1,
+            ops: vec![WalOp::Insert {
+                table: "t".into(),
+                key: vec![0x5Au8; MAX_KEY_LEN + 1],
+                data: vec![1],
+            }],
+        };
+        let bytes = serialize_entry(&over).unwrap();
+        let err = deserialize_entry(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum"),
+            "message was: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // v1 (pre-0.3.0) format rejection
     // -----------------------------------------------------------------------
 
@@ -1935,7 +2113,12 @@ mod tests {
 
         let err = read_wal(&path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("format version 1"), "message was: {msg}");
+        assert!(msg.contains("no v2 format marker"), "message was: {msg}");
+        // The leading byte alone cannot distinguish a v1 WAL from a corrupt
+        // one, so the message must offer both readings and a remedy for each
+        // — not present the pre-0.3.0 migration as established fact.
+        assert!(msg.contains("pre-0.3.0"), "message was: {msg}");
+        assert!(msg.contains("corrupt"), "message was: {msg}");
         assert!(msg.contains("Store::bulk_load"), "message was: {msg}");
     }
 
@@ -1954,7 +2137,7 @@ mod tests {
 
         let err = scan_wal(&path, true).unwrap_err();
         assert!(
-            err.to_string().contains("format version 1"),
+            err.to_string().contains("no v2 format marker"),
             "message was: {err}"
         );
         assert!(PreallocFileSink::open_with_chunk(dir.path(), 4096).is_err());
@@ -1979,7 +2162,7 @@ mod tests {
         );
         let err = deserialize_entry(&payload).unwrap_err();
         assert!(
-            err.to_string().contains("format version 1"),
+            err.to_string().contains("no v2 format marker"),
             "message was: {err}"
         );
     }
@@ -1996,7 +2179,7 @@ mod tests {
         );
         let err = check_entry_header(&payload).unwrap_err();
         assert!(
-            err.to_string().contains("format version 1"),
+            err.to_string().contains("no v2 format marker"),
             "message was: {err}"
         );
     }
