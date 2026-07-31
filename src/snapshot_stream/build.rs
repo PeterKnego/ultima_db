@@ -17,6 +17,7 @@ use super::codec::{
     FILE_FORMAT_V, FILE_MAGIC, FileHeader, IndexDef, TableHeader, encode_file_header,
     encode_table_header,
 };
+use crate::primary_key::MAX_ENCODED_KEY_LEN;
 use crate::registry::TableRegistry;
 use crate::store::Snapshot;
 
@@ -64,8 +65,10 @@ enum State {
 }
 
 struct TableIterState {
-    /// Pre-serialized rows for the current table, in primary-key order.
-    rows: Vec<(u64, Vec<u8>)>,
+    /// Pre-serialized `(encoded key, record)` rows for the current table, in
+    /// primary-key order — which, by the `PrimaryKey` encoding contract, is
+    /// also ascending order of the raw key bytes.
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
     /// Index of the next row to emit from `rows`.
     row_idx: usize,
     /// CRC32 over the row stream of this table only.
@@ -154,7 +157,37 @@ impl SnapshotReader {
                         type_id: 0,
                     })?;
 
-                let serialized_rows = table_arc.collect_serialized_rows(serialize_fn)?;
+                // Rows carry `PrimaryKey::encode` bytes verbatim — no key type
+                // is privileged and nothing is reinterpreted on the way out.
+                let serialized_rows: Vec<(Vec<u8>, Vec<u8>)> =
+                    table_arc.collect_serialized_rows(serialize_fn)?;
+
+                // Same 64 KiB cap the WAL enforces. Checked before the table
+                // header goes out, and checked here rather than at emit time
+                // because the row's length prefix is a `u32`: an over-long key
+                // would silently truncate its own length into a stream that
+                // still passes every CRC on the other side.
+                if let Some((key, _)) = serialized_rows
+                    .iter()
+                    .find(|(k, _)| k.len() > MAX_ENCODED_KEY_LEN)
+                {
+                    return Err(SnapshotStreamError::KeyTooLong {
+                        table: name,
+                        len: key.len(),
+                        max: MAX_ENCODED_KEY_LEN,
+                    });
+                }
+
+                // The key type is asked of the *live table*, not of the
+                // registry. The two can disagree — `open_table_keyed` can
+                // create a table that was never registered, and
+                // `register_table*` afterwards records whatever the caller
+                // asked for — and it is this table's rows that were just
+                // encoded, so the table is the authority on what decodes them.
+                // The id is what the receiver checks; the name rides along so
+                // it can name what it refused.
+                let key_type_id = table_arc.key_type_code();
+                let key_type = table_arc.key_type_name().to_string();
 
                 // Build index definitions for the table header.
                 let index_list = table_arc.index_list();
@@ -169,6 +202,8 @@ impl SnapshotReader {
                 let table_header = TableHeader {
                     name: name.clone(),
                     record_type_id,
+                    key_type_id,
+                    key_type,
                     row_count,
                     indexes,
                 };
@@ -187,17 +222,20 @@ impl SnapshotReader {
                 let ts = self.current_table.as_mut().unwrap();
 
                 if ts.row_idx < ts.rows.len() {
-                    // Emit one row: key (u64 LE) + val_len (u32 LE) + val bytes.
+                    // Emit one row:
+                    // key_len (u32 LE) + key bytes + val_len (u32 LE) + val bytes.
                     let (key, val) = &ts.rows[ts.row_idx];
                     ts.row_idx += 1;
                     self.total_rows += 1;
 
+                    let key_len = key.len() as u32;
                     let val_len = val.len() as u32;
                     // Accumulate into a temporary chunk so we can CRC it in one pass.
-                    let chunk_len = 8 + 4 + val.len();
+                    let chunk_len = 4 + key.len() + 4 + val.len();
                     self.buffer.reserve(chunk_len);
                     let start = self.buffer.len();
-                    self.buffer.extend_from_slice(&key.to_le_bytes());
+                    self.buffer.extend_from_slice(&key_len.to_le_bytes());
+                    self.buffer.extend_from_slice(key);
                     self.buffer.extend_from_slice(&val_len.to_le_bytes());
                     self.buffer.extend_from_slice(val);
                     let chunk = &self.buffer[start..];

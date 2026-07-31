@@ -1124,3 +1124,367 @@ mod bulk_load_custom_index {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Store::bulk_load_keyed — bulk load over an arbitrary primary key
+// ---------------------------------------------------------------------------
+
+mod bulk_load_keyed {
+    use ultima_db::{Error, IndexKind, Store};
+
+    #[test]
+    fn bulk_load_string_keyed_table() {
+        let store = Store::default();
+
+        let rows = vec![
+            ("a@x.com".to_string(), "Alice".to_string()),
+            ("b@x.com".to_string(), "Bob".to_string()),
+            ("c@x.com".to_string(), "Carol".to_string()),
+        ];
+
+        store
+            .bulk_load_keyed::<String, String>("emails", rows, None)
+            .unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get("b@x.com".to_string()), Some(&"Bob".to_string()));
+    }
+
+    #[test]
+    fn bulk_load_rejects_unsorted_keys() {
+        let store = Store::default();
+        let rows = vec![
+            ("b@x.com".to_string(), "Bob".to_string()),
+            ("a@x.com".to_string(), "Alice".to_string()),
+        ];
+        let err = store
+            .bulk_load_keyed::<String, String>("emails", rows, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidBulkLoadInput(_)),
+            "expected InvalidBulkLoadInput, got {err:?}"
+        );
+        // Rejected before anything was built: no table exists.
+        let rtx = store.begin_read(None).unwrap();
+        assert!(rtx.open_table_keyed::<String, String>("emails").is_err());
+    }
+
+    #[test]
+    fn bulk_load_rejects_duplicate_keys() {
+        let store = Store::default();
+        let rows = vec![
+            ("dup".to_string(), "first".to_string()),
+            ("dup".to_string(), "second".to_string()),
+        ];
+        let err = store
+            .bulk_load_keyed::<String, String>("t", rows, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidBulkLoadInput(_)),
+            "expected InvalidBulkLoadInput, got {err:?}"
+        );
+    }
+
+    /// Variable-length keys, including a prefix pair ("b" < "bb"), load and
+    /// scan back in `K`'s `Ord` order.
+    ///
+    /// Note what this does *not* test: the bulk-load path never calls
+    /// `PrimaryKey::encode` — `from_bulk` → `BTree::from_sorted` is keyed on
+    /// `K` throughout — so this passes with an arbitrarily broken `encode`.
+    /// The encode-order ⟺ key-order equivalence is only load-bearing where
+    /// keys become bytes, and it is asserted there, on the wire, in
+    /// `tests/snapshot_stream.rs::round_trips_a_string_keyed_table`.
+    #[test]
+    fn variable_length_keys_load_and_range_in_key_order() {
+        let store = Store::default();
+        let keys = ["", "a", "ab", "b", "bb", "c", "zzzzzzzzzzzz"];
+        let rows: Vec<(String, u64)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.to_string(), i as u64))
+            .collect();
+
+        store.bulk_load_keyed::<u64, String>("t", rows, None).unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<u64, String>("t").unwrap();
+        assert_eq!(t.len(), keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(t.get(k.to_string()), Some(&(i as u64)), "key {k:?}");
+        }
+        let scanned: Vec<String> = t.range(..).map(|(k, _)| k.clone()).collect();
+        let expected: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        assert_eq!(scanned, expected, "rows must come back in key order");
+    }
+
+    /// Replace semantics: previous contents go away, index *definitions* stay
+    /// and are rebuilt over the loaded rows.
+    #[test]
+    fn preserves_index_definitions_and_replaces_contents() {
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<u64, String>("t").unwrap();
+            t.define_index("by_value", IndexKind::Unique, |r: &u64| *r)
+                .unwrap();
+            t.put("old".to_string(), 900).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let rows: Vec<(String, u64)> = vec![
+            ("k1".to_string(), 10),
+            ("k2".to_string(), 20),
+            ("k3".to_string(), 30),
+        ];
+        store.bulk_load_keyed::<u64, String>("t", rows, None).unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<u64, String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get("old".to_string()), None, "replace must drop old rows");
+        assert_eq!(
+            t.get_unique("by_value", &20u64).unwrap(),
+            Some(("k2".to_string(), &20))
+        );
+        assert_eq!(
+            t.get_unique("by_value", &900u64).unwrap(),
+            None,
+            "the replaced row must be gone from the index too"
+        );
+    }
+
+    /// `create_if_missing: false` on a table that does not exist.
+    #[test]
+    fn honours_create_if_missing_false() {
+        use ultima_db::BulkLoadOptions;
+
+        let store = Store::default();
+        let opts = BulkLoadOptions {
+            create_if_missing: false,
+            checkpoint_after: false,
+        };
+        let err = store
+            .bulk_load_keyed::<String, String>("nope", vec![], Some(opts))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::TableNotFound(_)),
+            "expected TableNotFound, got {err:?}"
+        );
+    }
+
+    /// A `u64`-keyed table loaded through the keyed entry point keeps its
+    /// auto-increment counter: a subsequent `insert` must not reissue an id
+    /// the load already used.
+    #[test]
+    fn u64_keys_advance_the_auto_increment_counter() {
+        let store = Store::default();
+        let rows: Vec<(u64, String)> = (1u64..=5).map(|i| (i, format!("v{i}"))).collect();
+        store.bulk_load_keyed::<String, u64>("t", rows, None).unwrap();
+
+        let mut wtx = store.begin_write(None).unwrap();
+        let mut t = wtx.open_table::<String>("t").unwrap();
+        let id = t.insert("next".to_string()).unwrap();
+        assert_eq!(id, 6, "counter must resume past the highest loaded id");
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn empty_rows_creates_an_empty_table() {
+        let store = Store::default();
+        store
+            .bulk_load_keyed::<String, String>("t", vec![], None)
+            .unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, String>("t").unwrap();
+        assert_eq!(t.len(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bulk_load_keyed vs a commit landing during the build (OCC)
+// ---------------------------------------------------------------------------
+
+mod bulk_load_keyed_occ {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ultima_db::{Error, IndexKind, Store, StoreConfig, WriterMode};
+
+    /// `bulk_load_keyed` must capture its base version *before* building the
+    /// table, not after. The build is unbounded off-lock work — the index
+    /// rebuild calls the extractor once per row — so a commit can land in the
+    /// middle of it. Reading `latest_version()` afterwards compares a
+    /// post-commit version against itself, and the install then overwrites the
+    /// concurrent commit with no error.
+    ///
+    /// The extractor is the hook that makes the interleaving deterministic:
+    /// it is caller code, invoked at a point strictly between the base-version
+    /// capture and the install, with no store lock held.
+    #[test]
+    fn conflicts_with_a_commit_that_lands_during_the_build() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+
+        // 0 = disarmed (seeding), 1 = armed, 2 = already fired.
+        let state = Arc::new(AtomicUsize::new(0));
+        let hook_state = state.clone();
+        let hook_store = store.clone();
+
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<u64, String>("t").unwrap();
+            t.define_index("by_value", IndexKind::NonUnique, move |r: &u64| {
+                if hook_state
+                    .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    // A concurrent committer advances latest_version while
+                    // the bulk load is mid-build.
+                    let mut w = hook_store.begin_write(None).unwrap();
+                    w.open_table_keyed::<u64, String>("other")
+                        .unwrap()
+                        .put("x".to_string(), 7)
+                        .unwrap();
+                    w.commit().unwrap();
+                }
+                *r
+            })
+            .unwrap();
+            t.put("seed".to_string(), 0).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        state.store(1, Ordering::SeqCst);
+        let rows: Vec<(String, u64)> = (0..8u64).map(|i| (format!("k{i}"), i)).collect();
+        let res = store.bulk_load_keyed::<u64, String>("t", rows, None);
+
+        assert_eq!(state.load(Ordering::SeqCst), 2, "the hook must have fired");
+        assert!(
+            matches!(res, Err(Error::WriteConflict { .. })),
+            "a commit during the build must be refused, got {res:?}"
+        );
+
+        // The concurrent commit survived intact — the failure mode this
+        // guards is the install silently erasing it.
+        let rtx = store.begin_read(None).unwrap();
+        let other = rtx.open_table_keyed::<u64, String>("other").unwrap();
+        assert_eq!(other.get("x".to_string()), Some(&7));
+        // And the load did not land: "t" still holds only the seed row.
+        let t = rtx.open_table_keyed::<u64, String>("t").unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get("seed".to_string()), Some(&0));
+    }
+
+    /// The uncontended path must still succeed — the fix must not turn every
+    /// load with an index into a conflict.
+    #[test]
+    fn succeeds_when_no_commit_lands_during_the_build() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<u64, String>("t").unwrap();
+            t.define_index("by_value", IndexKind::NonUnique, |r: &u64| *r)
+                .unwrap();
+            t.put("seed".to_string(), 0).unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let rows: Vec<(String, u64)> = (0..8u64).map(|i| (format!("k{i}"), i)).collect();
+        store.bulk_load_keyed::<u64, String>("t", rows, None).unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<u64, String>("t").unwrap();
+        assert_eq!(t.len(), 8);
+        // The index definition survived and was rebuilt over the new rows.
+        assert_eq!(t.get_by_index("by_value", &3u64).unwrap().len(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bulk_load_keyed must not create a table that contradicts its registration
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "persistence")]
+mod bulk_load_keyed_registration {
+    use serde::{Deserialize, Serialize};
+    use ultima_db::{Error, Store, StoreConfig};
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+    struct Row {
+        v: u64,
+    }
+
+    /// Creating a table from nothing is the only moment nothing else fixes its
+    /// key type, so it must be held to any registration the store already has.
+    /// Without the check the load returns `Ok`, the store then holds a
+    /// `Table<Row, String>` under a `u64` registration, and every subsequent
+    /// `checkpoint()` fails permanently with an opaque downcast error.
+    ///
+    /// `open_table_keyed` has always refused this; `bulk_load_keyed` must
+    /// agree, or it is a public route back into the disagreement that the
+    /// snapshot-stream guards exist to catch.
+    #[test]
+    fn refuses_a_key_type_that_contradicts_the_registration() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        store.register_table::<Row>("t").unwrap(); // u64-keyed
+
+        let rows = vec![("k".to_string(), Row { v: 1 })];
+        let err = store
+            .bulk_load_keyed::<Row, String>("t", rows, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::TypeMismatch(ref n) if n == "t"),
+            "expected TypeMismatch, got {err:?}"
+        );
+
+        // The same refusal `open_table_keyed` gives, and the store is clean:
+        // a checkpoint still works.
+        let mut wtx = store.begin_write(None).unwrap();
+        assert!(matches!(
+            wtx.open_table_keyed::<Row, String>("t"),
+            Err(Error::TypeMismatch(_))
+        ));
+        drop(wtx);
+    }
+
+    /// An unregistered name is still free to take any key type — the check
+    /// constrains, it does not require registration.
+    #[test]
+    fn allows_any_key_type_for_an_unregistered_table() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        let rows = vec![("k".to_string(), Row { v: 1 })];
+        store
+            .bulk_load_keyed::<Row, String>("unregistered", rows, None)
+            .unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<Row, String>("unregistered").unwrap();
+        assert_eq!(t.get("k".to_string()), Some(&Row { v: 1 }));
+    }
+
+    /// A matching registration is of course fine.
+    #[test]
+    fn allows_the_registered_key_type() {
+        let store = Store::new(StoreConfig::default()).unwrap();
+        store.register_table_keyed::<Row, String>("t").unwrap();
+        let rows = vec![("k".to_string(), Row { v: 1 })];
+        store.bulk_load_keyed::<Row, String>("t", rows, None).unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        assert_eq!(
+            rtx.open_table_keyed::<Row, String>("t").unwrap().len(),
+            1
+        );
+    }
+}

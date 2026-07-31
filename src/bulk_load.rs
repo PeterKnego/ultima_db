@@ -14,9 +14,47 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::persistence::Record;
+use crate::primary_key::PrimaryKey;
 use crate::store::Store;
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
+
+/// The auto-increment counter a bulk-built table should carry.
+///
+/// `seed` is the counter the table starts from — `Some(K::first())` for a
+/// fresh auto-increment table, the existing counter when replacing one in
+/// place, and `None` for every explicitly-keyed type. `last_key` is the
+/// highest key in the rows about to be loaded; advancing past it is what
+/// stops a later `insert` from handing out an id the load already used.
+///
+/// Written without an [`AutoKey`](crate::primary_key::AutoKey) bound so the
+/// key-generic entry points can call it: `advance_auto_counter` is a no-op
+/// for every explicitly-keyed type, so those tables stay on `None` — the
+/// invariant `next_id_opt() == None` ⟺ explicitly-keyed.
+pub(crate) fn bulk_next_counter<K: PrimaryKey>(
+    seed: Option<K>,
+    last_key: Option<&K>,
+) -> Result<Option<K>> {
+    let mut counter = seed;
+    if let Some(k) = last_key {
+        k.advance_auto_counter(&mut counter);
+        // The counter stalls at or below the highest key only when that key
+        // has no successor (`u64::MAX`). `advance_auto_counter` leaves it in
+        // place there rather than clearing it — clearing would flip the
+        // table to "explicitly keyed" — so the stall is read off the
+        // counter's position. Silently loading a table whose counter sits
+        // under an occupied id would make a later `insert` overwrite that
+        // row; fail loudly instead.
+        if crate::primary_key::counter_exhausted(&counter, k) {
+            return Err(Error::InvalidBulkLoadInput(
+                "highest bulk-load key is the maximum id; the auto-increment counter would \
+                 overflow"
+                    .into(),
+            ));
+        }
+    }
+    Ok(counter)
+}
 
 /// Top-level shape of a bulk load: replace the table or apply a delta.
 pub enum BulkLoadInput<R> {
@@ -567,5 +605,89 @@ mod stream_tests {
             .collect();
         let res = store.bulk_load_stream::<Row, _>("rows", rows.into_iter().map(Ok), 10);
         assert!(matches!(res, Err(Error::InvalidBulkLoadInput(_))));
+    }
+}
+
+/// `bulk_next_counter` and the counter a bulk-built table ends up carrying.
+///
+/// These live in-crate because the observable is `Table::next_id_opt()`, which
+/// is `pub(crate)`. The public surface has no way to distinguish `None` from
+/// `Some(_)` on an explicitly-keyed table — `put` behaves identically either
+/// way — so an integration test asserting round-trip behaviour would pass with
+/// the invariant broken. The byte that *does* bite is `has_next_id` in table
+/// serialization format v2, and it reads `next_id_opt()` directly.
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+    use crate::Store;
+    use crate::table::Table;
+
+    /// Read the counter off the named table in the store's latest snapshot.
+    fn next_id_of<R: Record, K: crate::primary_key::PrimaryKey>(
+        store: &Store,
+        name: &str,
+    ) -> Option<K> {
+        let inner = store.inner.read();
+        inner.snapshots[&inner.latest_version].tables[name]
+            .as_any()
+            .downcast_ref::<Table<R, K>>()
+            .expect("table present with the expected types")
+            .next_id_opt()
+    }
+
+    /// An explicitly-keyed table must never gain a counter: the
+    /// `next_id_opt() == None` ⟺ explicitly-keyed invariant is what the v2
+    /// `has_next_id` byte encodes, and inventing a `Some` here would make the
+    /// table serialize as an auto-increment one.
+    #[test]
+    fn string_keyed_bulk_load_leaves_the_counter_none() {
+        let store = Store::default();
+        store
+            .bulk_load_keyed::<String, String>("t", vec![("k".to_string(), "v".to_string())], None)
+            .unwrap();
+        assert_eq!(next_id_of::<String, String>(&store, "t"), None);
+    }
+
+    /// The `AutoKey` case: the counter lands one past the highest loaded key.
+    #[test]
+    fn u64_keyed_bulk_load_advances_the_counter_past_the_last_key() {
+        let store = Store::default();
+        let rows: Vec<(u64, String)> = (1u64..=5).map(|i| (i, format!("v{i}"))).collect();
+        store.bulk_load_keyed::<String, u64>("t", rows, None).unwrap();
+        assert_eq!(next_id_of::<String, u64>(&store, "t"), Some(6));
+    }
+
+    /// An empty load on an `AutoKey` table still seeds the counter — it must
+    /// not collapse to `None` and flip the table's kind.
+    #[test]
+    fn empty_u64_bulk_load_keeps_the_seed_counter() {
+        let store = Store::default();
+        store
+            .bulk_load_keyed::<String, u64>("t", vec![], None)
+            .unwrap();
+        assert_eq!(next_id_of::<String, u64>(&store, "t"), Some(1));
+    }
+
+    #[test]
+    fn explicit_key_type_never_gains_a_counter() {
+        // Directly, at the helper: the seed is what decides, and
+        // `advance_auto_counter` is a no-op for every non-`AutoKey` type.
+        let last = "zzz".to_string();
+        assert_eq!(
+            bulk_next_counter::<String>(None, Some(&last)).unwrap(),
+            None
+        );
+    }
+
+    /// A `Some` counter that the highest key would push past `u64::MAX` must
+    /// fail loudly rather than silently clear to `None` — a cleared counter
+    /// turns a later `insert` into a panic.
+    #[test]
+    fn counter_overflow_is_an_error_not_a_silent_none() {
+        let res = bulk_next_counter::<u64>(Some(1), Some(&u64::MAX));
+        assert!(
+            matches!(res, Err(Error::InvalidBulkLoadInput(_))),
+            "expected InvalidBulkLoadInput, got {res:?}"
+        );
     }
 }

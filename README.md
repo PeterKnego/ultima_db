@@ -34,6 +34,11 @@ tiers, all four engines, ms and ops/sec, methodology):
   indexes (unique, non-unique, and user-defined `CustomIndex`
   implementations such as the built-in BM25 full-text index), and atomic
   batch operations.
+- **Arbitrary primary keys** — `Table<R, K = u64>`: key a table by
+  `String`, `Vec<u8>`, any integer width, or a tuple, via
+  `open_table_keyed::<R, K>`, instead of stashing the natural key in a
+  unique index beside a surrogate id. Key encoding is order-preserving, so
+  range scans, bulk loads and WAL replay all see the same order.
 - **Concurrent writers** — opt-in `MultiWriter` mode with key-level
   optimistic concurrency control: writers conflict only when they touch the
   same rows of the same table. Serializable snapshot isolation (write-skew
@@ -68,10 +73,18 @@ let v1 = wtx.commit().unwrap();
 let rtx = store.begin_read(Some(v1)).unwrap();
 assert_eq!(rtx.open_table::<String>("users").unwrap().get(id),
            Some(&"alice".to_string()));
+
+// Or key the table yourself. `put` replaces `insert`, since there is no
+// counter for a key the store cannot generate.
+let mut wtx = store.begin_write(None).unwrap();
+let mut emails = wtx.open_table_keyed::<String, String>("by_email").unwrap();
+emails.put("alice@example.com".to_string(), "alice".to_string()).unwrap();
+drop(emails);
+wtx.commit().unwrap();
 ```
 
 More in [`examples/`](examples/): basic usage, multiple stores, concurrent
-writers with conflict retry, and bulk restore.
+writers with conflict retry, bulk restore, and a `String`-keyed table.
 
 ## Installation
 

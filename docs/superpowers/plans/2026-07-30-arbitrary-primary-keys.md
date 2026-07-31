@@ -37,6 +37,8 @@ Read these before Task 1; several tasks depend on them and they are not re-deriv
 |---|---|---|
 | `src/primary_key.rs` (new) | The `PrimaryKey` trait, `AutoKey` marker, order-preserving encode/decode, blanket impls | 1 |
 | `src/index.rs` | Secondary index storage generic over the *row* key type | 2 |
+| `src/btree.rs` | `range_prefix` primitive so a prefix scan needs no min/max key values | 2b |
+| `src/fulltext.rs` | `CustomIndex` + `FullTextIndex` widened over the row key | 3b |
 | `src/table.rs` | `Table<R, K>`; `MergeableTable` reworked for type erasure | 3 |
 | `src/registry.rs` | Type-erased closures carry encoded key bytes; table serialization format v2 | 4 |
 | `src/wal.rs` | `WalOp` carries key bytes; format version bump; recovery rejects v1 | 5 |
@@ -65,6 +67,8 @@ Read these before Task 1; several tasks depend on them and they are not re-deriv
 - Signed integers: big-endian with the sign bit flipped (`(v as uN) ^ (1 << (BITS-1))`), so negatives sort before positives.
 - `String` / `Vec<u8>`: raw bytes. (UTF-8 byte order equals code-point order, so this is correct for `String`.)
 - Tuples: concatenation of each element's encoding, where every element **except the last** is length-prefixed with a 4-byte big-endian length. Fixed-width integer elements need no prefix but get one anyway for decode uniformity — keep it simple and uniform.
+
+> **Superseded during implementation — this tuple rule is NOT order-preserving.** A length prefix puts the length ahead of the content in the comparison, so `("b", 0)` sorts before `("aa", 0)` bytewise while the opposite holds under `Ord`. Replaced by `ENCODED_LEN: Option<usize>` plus escape-and-terminate framing (`0x00 → 0x00,0xFF`; terminator `0x00,0x01`) for variable-length non-final elements, with fixed-width elements left unframed. See `docs/tasks/task56_arbitrary_primary_keys.md`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -495,6 +499,280 @@ is unchanged."
 
 ---
 
+### Task 2b: `BTree` prefix range, and removing the `RowBound` sentinel
+
+**Inserted 2026-07-30, after Task 2's review.** Task 2 could not express "every
+entry whose first tuple component equals `IK`" as a `RangeBounds<(IK, K)>`,
+because that needs concrete endpoint values and `PrimaryKey` guarantees only
+`Ord` — `String` has no maximum. It worked around this with a private
+`RowBound<K> = NegInf | Row(K) | PosInf` sentinel. That is correct (the review
+verified range semantics exhaustively) but it **measurably regresses the
+default path**: `size_of::<(u32, u64)>()` is 16 bytes, `size_of::<(u32,
+RowBound<u64>)>()` is 24 — +50% per non-unique index entry, ~+33% per B-tree
+node, on every existing `u64` user. The cost is specific to niche-less scalar
+keys; for `String` row keys the enum packs into the pointer niche and is free.
+
+Peter's ruling: add the primitive and remove the sentinel.
+
+**Files:**
+- Modify: `src/btree.rs` (the `range` method at `:536` and the `BTreeRange`
+  iterator's bound handling / `descend_left_from` / `descend_right_from`)
+- Modify: `src/index.rs` (delete `RowBound`, restore `BTree<(IK, K), ()>`)
+- Test: `src/btree.rs` and `src/index.rs` in-file tests
+
+**Interfaces:**
+- Consumes: Task 2's generic index storage.
+- Produces:
+  - `BTree::<(A, B), V>::range_prefix<'a>(&'a self, prefix: &'a A) -> impl Iterator<Item = (&'a (A, B), &'a V)> + 'a` — every entry whose first component equals `prefix`, ascending, in O(log n + k).
+  - `NonUniqueStorage<IK, K> { tree: BTree<(IK, K), ()> }` — the bare composite, as the original plan specified. `RowBound` is gone.
+
+**Approach.** Do not add a second iterator type. `BTreeRange` currently stores
+`start: Bound<K>` / `end: Bound<K>` and `descend_left_from` / `descend_right_from`
+consume them. Generalize that to a *monotone locator* — a `Fn(&K) -> Ordering`
+reporting whether a key is before (`Less`), inside (`Equal`), or after
+(`Greater`) the range — and have the existing `range()` construct a locator
+from its bounds so its behavior is bit-for-bit unchanged. `range_prefix` then
+supplies a locator that compares only the tuple's first component. The locator
+must be monotone with respect to key order; document that as the safety
+contract, since a non-monotone one would silently truncate the scan.
+
+**`src/btree.rs` is the crate's most performance-sensitive file and the one the
+Lean model covers.** The formal model covers node invariants (ordering,
+fill factor), not range iteration, so this change does not invalidate it — but
+keep the edit surgical and do not restructure anything the descent path does
+not require.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `#[cfg(test)] mod tests` in `src/btree.rs`:
+
+```rust
+    #[test]
+    fn range_prefix_returns_exactly_the_matching_group() {
+        let mut t: BTree<(u32, String), ()> = BTree::new();
+        for (a, b) in [
+            (1u32, "x"),
+            (2, "a"),
+            (2, "b"),
+            (2, "c"),
+            (3, "y"),
+        ] {
+            t = t.insert((a, b.to_string()), ());
+        }
+
+        let got: Vec<(u32, String)> = t.range_prefix(&2).map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, "a".to_string()),
+                (2, "b".to_string()),
+                (2, "c".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn range_prefix_handles_first_last_absent_and_empty() {
+        let mut t: BTree<(u32, String), ()> = BTree::new();
+        for (a, b) in [(1u32, "p"), (1, "q"), (5, "r")] {
+            t = t.insert((a, b.to_string()), ());
+        }
+
+        // First group.
+        assert_eq!(t.range_prefix(&1).count(), 2);
+        // Last group.
+        assert_eq!(t.range_prefix(&5).count(), 1);
+        // Absent prefix between two present ones.
+        assert_eq!(t.range_prefix(&3).count(), 0);
+        // Absent prefix below and above everything.
+        assert_eq!(t.range_prefix(&0).count(), 0);
+        assert_eq!(t.range_prefix(&9).count(), 0);
+        // Empty tree.
+        let empty: BTree<(u32, String), ()> = BTree::new();
+        assert_eq!(empty.range_prefix(&1).count(), 0);
+    }
+
+    /// The scan must not degrade to O(n): a prefix group of 3 in a tree of
+    /// 10_000 must not visit the whole tree. Asserted via correctness at
+    /// scale plus the group boundary, which a full scan would still pass —
+    /// so this test guards correctness, and the O(log n + k) claim rests on
+    /// the descent being bound-driven rather than filtered.
+    #[test]
+    fn range_prefix_is_correct_at_scale() {
+        let mut t: BTree<(u32, u32), ()> = BTree::new();
+        for i in 0..10_000u32 {
+            t = t.insert((i % 1000, i), ());
+        }
+        let got: Vec<u32> = t.range_prefix(&500).map(|(k, _)| k.1).collect();
+        assert_eq!(got, vec![500, 1500, 2500, 3500, 4500, 5500, 6500, 7500, 8500, 9500]);
+    }
+
+    /// `range()` must be unchanged by the locator refactor.
+    #[test]
+    fn range_still_honors_every_bound_combination() {
+        use std::ops::Bound;
+        let mut t: BTree<u32, ()> = BTree::new();
+        for i in [10u32, 20, 30, 40] {
+            t = t.insert(i, ());
+        }
+        let cases: Vec<((Bound<u32>, Bound<u32>), Vec<u32>)> = vec![
+            ((Bound::Unbounded, Bound::Unbounded), vec![10, 20, 30, 40]),
+            ((Bound::Included(20), Bound::Included(30)), vec![20, 30]),
+            ((Bound::Excluded(20), Bound::Included(40)), vec![30, 40]),
+            ((Bound::Included(20), Bound::Excluded(40)), vec![20, 30]),
+            ((Bound::Excluded(10), Bound::Excluded(40)), vec![20, 30]),
+            ((Bound::Included(25), Bound::Unbounded), vec![30, 40]),
+            ((Bound::Unbounded, Bound::Excluded(10)), vec![]),
+        ];
+        for ((s, e), want) in cases {
+            let got: Vec<u32> = t.range((s, e)).map(|(k, _)| *k).collect();
+            assert_eq!(got, want, "bounds ({s:?}, {e:?})");
+        }
+    }
+```
+
+And add to `#[cfg(test)] mod tests` in `src/index.rs`, closing the review's
+Issue 4 (nothing currently guards `range_ids` at a non-`u64` row key):
+
+```rust
+    #[test]
+    fn non_unique_range_ids_over_string_primary_key() {
+        use std::ops::Bound;
+        let mut storage: NonUniqueStorage<u32, String> = NonUniqueStorage::new();
+        storage.insert(10u32, "a@x.com".to_string(), "by_age").unwrap();
+        storage.insert(20u32, "b@x.com".to_string(), "by_age").unwrap();
+        storage.insert(20u32, "c@x.com".to_string(), "by_age").unwrap();
+        storage.insert(30u32, "d@x.com".to_string(), "by_age").unwrap();
+
+        let mut got: Vec<String> = storage
+            .range_ids((Bound::Included(20u32), Bound::Included(30u32)))
+            .map(|(_, k)| k)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["b@x.com".to_string(), "c@x.com".to_string(), "d@x.com".to_string()]
+        );
+
+        // Excluding the lower bound must drop that whole group, not part of it.
+        let mut got: Vec<String> = storage
+            .range_ids((Bound::Excluded(20u32), Bound::Unbounded))
+            .map(|(_, k)| k)
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["d@x.com".to_string()]);
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test --lib btree::tests::range_prefix_returns_exactly_the_matching_group`
+Expected: FAIL — `range_prefix` does not exist.
+
+- [ ] **Step 3: Generalize `BTreeRange` to a monotone locator and add `range_prefix`**
+
+Read `src/btree.rs`'s `range`, `BTreeRange`, `descend_left_from`, and
+`descend_right_from` first. Replace the stored `start`/`end` `Bound<K>` pair
+with the locator described in **Approach** above, and introduce one private
+constructor both public entry points share:
+
+```rust
+    /// Iterate over every entry the monotone `locate` predicate reports as
+    /// `Ordering::Equal`, ascending.
+    ///
+    /// `locate` must be monotone with respect to key order — `Less` for keys
+    /// before the range, `Equal` inside, `Greater` after. A non-monotone
+    /// predicate silently truncates the scan.
+    fn range_by<'a>(
+        &'a self,
+        locate: impl Fn(&K) -> std::cmp::Ordering + 'a,
+    ) -> BTreeRange<'a, K, V>
+```
+
+Rebuild the existing `pub fn range` on top of `range_by` by deriving a locator
+from its `RangeBounds`, so its observable behavior is identical (the
+`range_still_honors_every_bound_combination` test is what holds you to that).
+Then add:
+
+```rust
+impl<A: Ord + Clone, B: Ord + Clone, V> BTree<(A, B), V> {
+    /// Iterate over every entry whose first key component equals `prefix`,
+    /// in ascending order, in O(log n + k).
+    ///
+    /// This exists because a prefix scan cannot be written as a
+    /// `RangeBounds<(A, B)>` without inventing minimum and maximum values
+    /// for `B`, which do not exist for types like `String`.
+    pub fn range_prefix<'a>(
+        &'a self,
+        prefix: &'a A,
+    ) -> impl Iterator<Item = (&'a (A, B), &'a V)> + 'a {
+        // locator: compare only the first component
+        self.range_by(move |k: &(A, B)| k.0.cmp(prefix))
+    }
+}
+```
+
+- [ ] **Step 4: Delete `RowBound` and restore the bare composite**
+
+In `src/index.rs`: remove the `RowBound` enum and every use of it.
+`NonUniqueStorage<IK, K>` goes back to `tree: BTree<(IK, K), ()>`, `get_ids`
+becomes a `range_prefix` call, and `range_ids` maps its `IK` bounds onto the
+locator path. Remove the now-dead `filter_map` that skipped sentinels.
+
+- [ ] **Step 5: Pin the six drifted tests back to `u64`**
+
+Task 2's review found that after the widening, six tests silently infer
+`K = i32` instead of `u64`, removing `u64` coverage from the unique-index
+lifecycle. Pin each by making one `on_insert` id argument an explicit `u64`
+literal (the same one-token fix already applied to
+`clone_box_produces_independent_copy`):
+
+`src/index.rs` tests `unique_index_insert_and_lookup`,
+`unique_index_rejects_duplicate`, `unique_index_update_changes_key`,
+`unique_index_update_rejects_conflict`, `unique_index_delete`, and
+`unique_compound_index`.
+
+- [ ] **Step 6: Confirm the sentinel is gone and sizes are restored**
+
+```bash
+grep -rn "RowBound" src/ && echo "FAIL: sentinel still present" || echo "sentinel removed"
+```
+
+Expected: "sentinel removed".
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test --lib btree` and `cargo test --lib index`
+Expected: PASS, including all five new tests.
+
+- [ ] **Step 8: Verify the full gate**
+
+```bash
+cargo test
+cargo test --features persistence
+cargo test -p ultima-vector
+cargo check --lib --no-default-features
+cargo clippy --all-targets --features persistence -- -D warnings
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/btree.rs src/index.rs
+git commit -m "perf(btree): range_prefix primitive; drop the RowBound sentinel
+
+Task 2 wrapped non-unique index row keys in a NegInf|Row|PosInf sentinel
+because a prefix scan could not be expressed as RangeBounds without min/max
+values that PrimaryKey does not provide. That cost +50% per non-unique index
+entry on the default u64 path. BTreeRange now takes a monotone locator
+instead of a Bound pair; range() is rebuilt on it unchanged, and
+range_prefix uses it to scan a tuple's first component directly, restoring
+the bare (IK, K) composite. Also pins six index tests that had silently
+drifted from u64 to i32 after the Task 2 widening."
+```
+
+---
+
 ### Task 3: `Table<R, K = u64>` and the reworked `MergeableTable`
 
 **Files:**
@@ -723,6 +1001,164 @@ heterogeneous key types."
 
 ---
 
+### Task 3b: Widen `CustomIndex` and `FullTextIndex` over the row key
+
+**Inserted 2026-07-31, after Task 3's review.** `CustomIndex` hard-codes
+`id: u64` (`src/index.rs:396-402`), so Task 3 had to pin `define_custom_index`
+and `custom_index` to `Table<R, u64>`. The consequence is that a non-`u64`-keyed
+table can define **zero** custom indexes — including the built-in BM25
+`FullTextIndex`. You could key a table by email but not full-text-search it.
+Peter's ruling: widen it, so the feature ships without an asterisk.
+
+**Files:**
+- Modify: `src/index.rs` (`CustomIndex` trait at `:394-418`, `CustomIndexAdapter`)
+- Modify: `src/fulltext.rs` (`SearchResult`, `FullTextIndex` fields and methods)
+- Modify: `src/table.rs` (unpin `define_custom_index`/`custom_index` from the `Table<R, u64>` block)
+- Test: `src/fulltext.rs` in-file tests, `tests/fulltext_integration.rs`, `tests/custom_index_api.rs`
+
+**Interfaces:**
+- Consumes: `PrimaryKey` (Task 1), `BTree::range_prefix` (Task 2b), `Table<R, K>` (Task 3).
+- Produces:
+  - `pub trait CustomIndex<R: Record, K: PrimaryKey = u64>: Send + Sync + Clone + 'static` with `on_insert(&mut self, key: K, record: &R)`, `on_update(&mut self, key: K, old: &R, new: &R)`, `on_delete(&mut self, key: K, record: &R)`, and `rebuild<'a>(&mut self, data: impl Iterator<Item = (K, &'a R)>)`.
+  - `pub struct SearchResult<K = u64> { pub id: K, pub score: f64 }`
+  - `pub struct FullTextIndex<R, K = u64>` with `postings: BTree<(String, K), u32>` and `doc_lengths: BTree<K, u32>`.
+  - `Table<R, K>::define_custom_index` / `custom_index` available for **all** `K`.
+
+**The defaulted parameter is what makes this non-breaking:** every existing
+downstream `impl CustomIndex<R> for MyIndex` keeps compiling, because `K`
+defaults to `u64` in the trait's own parameter list exactly as it does on
+`Table`. Verify that claim with the existing `tests/custom_index_api.rs`, which
+implements the trait from outside the crate's own modules — it should need no
+edits at all. If it does, say so; that would mean the widening is breaking and
+the plan owner needs to know.
+
+**Two specifics that are not mechanical:**
+
+1. **`src/fulltext.rs:126` currently reads**
+   `postings.range((token.clone(), 0u64)..=(token.clone(), u64::MAX))`.
+   That construction has no generic equivalent — it is precisely the
+   min/max-value assumption that Task 2b removed from the index layer. Replace
+   it with `self.postings.range_prefix(token)`, the primitive Task 2b added.
+   This also drops two `String` clones per token from the BM25 scan.
+2. **`scores: HashMap<u64, f64>` at `src/fulltext.rs:117` cannot stay a
+   `HashMap`** — `PrimaryKey` requires `Ord`, not `Hash`. Use
+   `BTreeMap<K, f64>`. Do not add a `Hash` bound to `PrimaryKey` to preserve the
+   `HashMap`; that would constrain every key type for one call site's
+   convenience.
+
+`total_docs` and `total_doc_length` stay `u64` — they are counts, not keys.
+Do not widen them.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `#[cfg(test)] mod tests` in `src/fulltext.rs`:
+
+```rust
+    #[test]
+    fn full_text_search_over_a_string_keyed_table() {
+        #[derive(Clone, Debug)]
+        struct Doc {
+            body: String,
+        }
+
+        let mut idx: FullTextIndex<Doc, String> =
+            FullTextIndex::new(|d: &Doc| d.body.clone());
+
+        idx.on_insert("doc-a".to_string(), &Doc { body: "the quick brown fox".into() })
+            .unwrap();
+        idx.on_insert("doc-b".to_string(), &Doc { body: "the lazy brown dog".into() })
+            .unwrap();
+        idx.on_insert("doc-c".to_string(), &Doc { body: "unrelated content".into() })
+            .unwrap();
+
+        let hits = idx.search("brown", 10);
+        let mut ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["doc-a".to_string(), "doc-b".to_string()]);
+
+        // "fox" is unique to doc-a.
+        let hits = idx.search("fox", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "doc-a".to_string());
+
+        // Deleting removes the document from future results.
+        idx.on_delete("doc-a".to_string(), &Doc { body: "the quick brown fox".into() });
+        assert!(idx.search("fox", 10).is_empty());
+        assert_eq!(idx.search("brown", 10).len(), 1);
+    }
+```
+
+Adjust `FullTextIndex::new`'s constructor call to match its real signature —
+read it first; the extractor shape above is illustrative of intent, not
+necessarily its exact form.
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test --features fulltext --lib fulltext::tests::full_text_search_over_a_string_keyed_table`
+Expected: FAIL — `FullTextIndex` takes one type parameter.
+
+- [ ] **Step 3: Widen the `CustomIndex` trait and its adapter**
+
+In `src/index.rs`, add the defaulted `K: PrimaryKey = u64` parameter to
+`CustomIndex` and change the four `id: u64` occurrences (three methods plus
+`rebuild`'s iterator item) to `key: K`. Widen `CustomIndexAdapter` so it
+implements `IndexMaintainer<R, K>` rather than `IndexMaintainer<R, u64>`.
+
+- [ ] **Step 4: Widen `FullTextIndex`**
+
+In `src/fulltext.rs`: add `K = u64` to `SearchResult` and `FullTextIndex`,
+change `postings` to `BTree<(String, K), u32>` and `doc_lengths` to
+`BTree<K, u32>`, switch `scores` to `BTreeMap<K, f64>`, and replace the
+`(token, 0u64)..=(token, u64::MAX)` range with `range_prefix` per the note
+above. Leave `total_docs` and `total_doc_length` as `u64`.
+
+- [ ] **Step 5: Unpin `define_custom_index` / `custom_index`**
+
+In `src/table.rs`, move these two methods out of the `Table<R, u64>`-pinned
+block back into the general `impl<R: Record, K: PrimaryKey> Table<R, K>` block.
+Remove the pinned block if it becomes empty.
+
+- [ ] **Step 6: Confirm the widening is source-compatible for downstream implementors**
+
+Run: `cargo test --features fulltext --test custom_index_api`
+Expected: PASS **with no edits to that file.** If it required edits, stop and
+report exactly what changed — that would make the widening a breaking change
+rather than an additive one, which the plan owner must know before release.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test --features fulltext` and `cargo test --features persistence,fulltext`
+Expected: PASS, including the new String-keyed test.
+
+- [ ] **Step 8: Verify the full gate**
+
+```bash
+cargo test
+cargo test --features persistence
+cargo test --features fulltext
+cargo test -p ultima-vector
+cargo check --lib --no-default-features
+cargo clippy --all-targets --features persistence,fulltext -- -D warnings
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/index.rs src/fulltext.rs src/table.rs tests/
+git commit -m "feat(index): widen CustomIndex and FullTextIndex over the row key
+
+CustomIndex hard-coded id: u64, so Task 3 had to pin define_custom_index to
+u64-keyed tables — meaning a String-keyed table could define no custom index
+and no full-text search. Both now carry a defaulted K = u64, so every
+existing downstream impl stays source-compatible.
+
+FullTextIndex's posting scan used (token, 0u64)..=(token, u64::MAX), which
+has no generic equivalent; it now uses the range_prefix primitive added in
+task 2b, dropping two String clones per token as a side effect."
+```
+
+---
+
 ### Task 4: Registry — type-erased closures over encoded keys, table format v2
 
 **Files:**
@@ -818,6 +1254,13 @@ In `src/registry.rs`:
 1. Change the six closure aliases as listed in **Interfaces** above.
 2. `pub fn register<R: Record, K: PrimaryKey>(&mut self, name: &str) -> Result<()>` — every closure body it builds now works with `Table<R, K>` and encodes/decodes keys via `K::encode` / `K::decode`.
 3. Replace `serialize_table` / `deserialize_table` with the v2 format:
+
+> **Superseded during implementation.** The one-byte header below is wrong and
+> was corrected to a two-byte `[magic 0xFF][version 2]`: `bincode`'s standard
+> config is a varint encoding, so a v1 payload for a table with `next_id == 2`
+> begins with the literal byte `0x02` and a bare version byte would have
+> silently misread it as v2. `0xFF` is not a legal varint tag. The real layout
+> is in `docs/tasks/task56_arbitrary_primary_keys.md`.
 
 ```rust
 /// Format v2: `[version: u8 = 2][has_next_id: u8][next_id_len: u32,

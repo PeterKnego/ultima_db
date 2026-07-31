@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
+use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -534,20 +535,67 @@ impl<K: Ord + Clone, V> BTree<K, V> {
 
     /// Iterate over `(&K, &V)` pairs in ascending key order within `range`.
     pub fn range<'a>(&'a self, range: impl RangeBounds<K> + 'a) -> BTreeRange<'a, K, V> {
-        let start = range.start_bound().cloned();
-        let end = range.end_bound().cloned();
+        self.range_with(Locator::Bounds(
+            range.start_bound().cloned(),
+            range.end_bound().cloned(),
+        ))
+    }
+
+    /// Iterate over every entry the monotone `locate` predicate reports as
+    /// [`Ordering::Equal`], in ascending key order.
+    ///
+    /// # Contract
+    ///
+    /// `locate` **must be monotone with respect to key order**: `Less` for
+    /// every key before the range, `Equal` for every key inside it, `Greater`
+    /// for every key after it (formally, `a <= b` implies
+    /// `locate(a) <= locate(b)`). The descent uses `partition_point` on that
+    /// predicate, so a non-monotone `locate` *silently truncates* the scan
+    /// instead of failing — it is not memory-unsafe, but it is a correctness
+    /// bug in the caller that no assertion will catch.
+    ///
+    /// This exists because some scans cannot be expressed as a
+    /// `RangeBounds<K>`: a prefix scan of a composite key `(A, B)` would need
+    /// invented minimum and maximum values for `B`, which types like `String`
+    /// do not have.
+    pub(crate) fn range_by<'a>(
+        &'a self,
+        locate: impl Fn(&K) -> Ordering + Send + Sync + 'a,
+    ) -> BTreeRange<'a, K, V> {
+        self.range_with(Locator::Pred(Box::new(locate)))
+    }
+
+    /// Shared constructor for both range entry points: seed the forward and
+    /// backward stacks by descending with `locate`.
+    fn range_with<'a>(&'a self, locate: Locator<'a, K>) -> BTreeRange<'a, K, V> {
         let mut iter = BTreeRange {
             stack: vec![],
             back_stack: vec![],
-            start: start.clone(),
-            end: end.clone(),
+            locate,
             done: false,
             last_forward: None,
             last_backward: None,
         };
-        iter.descend_left_from(&self.root, &start);
-        iter.descend_right_from(&self.root, &end);
+        iter.descend_left_from(&self.root);
+        iter.descend_right_from(&self.root);
         iter
+    }
+}
+
+impl<A: Ord + Clone + Sync, B: Ord + Clone, V> BTree<(A, B), V> {
+    /// Iterate over every entry whose first key component equals `prefix`,
+    /// in ascending order, in O(log n + k).
+    ///
+    /// This exists because a prefix scan cannot be written as a
+    /// `RangeBounds<(A, B)>` without inventing minimum and maximum values
+    /// for `B`, which do not exist for types like `String`.
+    pub fn range_prefix<'a>(
+        &'a self,
+        prefix: &'a A,
+    ) -> impl Iterator<Item = (&'a (A, B), &'a V)> + 'a {
+        // Monotone by construction: `(a, _)` sorts by `a` first, so comparing
+        // only the first component is consistent with the full key order.
+        self.range_by(move |k: &(A, B)| k.0.cmp(prefix))
     }
 }
 
@@ -571,6 +619,90 @@ impl<K: Ord + Clone, V> Default for BTree<K, V> {
 // Range iterator
 // ---------------------------------------------------------------------------
 
+/// Describes where a key sits relative to the range being scanned: before it,
+/// inside it, or after it. Monotone with respect to key order (see
+/// [`BTree::range_by`]).
+///
+/// Queried through two *directional* predicates rather than one merged
+/// three-way classification, because the descent and the per-item checks each
+/// only ever care about one side. Merging them would cost a second key
+/// comparison per yielded item, and would turn an `Unbounded` side from zero
+/// comparisons into one.
+///
+/// The `RangeBounds` case is a concrete variant rather than just another
+/// boxed closure so that [`BTree::range`] — every index lookup and table scan
+/// in the crate — stays allocation-free and statically dispatched.
+enum Locator<'a, K> {
+    /// Start and end bound, as supplied to [`BTree::range`].
+    Bounds(Bound<K>, Bound<K>),
+    /// An arbitrary monotone predicate, as supplied to [`BTree::range_by`].
+    Pred(Box<dyn Fn(&K) -> Ordering + Send + Sync + 'a>),
+}
+
+/// Is `x` before the range's start bound? One key comparison, or none when
+/// the bound is `Unbounded`.
+#[inline]
+fn before_start<T: Ord>(start: &Bound<T>, x: &T) -> bool {
+    match start {
+        Bound::Unbounded => false,
+        Bound::Included(s) => x < s,
+        Bound::Excluded(s) => x <= s,
+    }
+}
+
+/// Is `x` past the range's end bound? One key comparison, or none when the
+/// bound is `Unbounded`.
+#[inline]
+fn after_end<T: Ord>(end: &Bound<T>, x: &T) -> bool {
+    match end {
+        Bound::Unbounded => false,
+        Bound::Included(e) => x > e,
+        Bound::Excluded(e) => x >= e,
+    }
+}
+
+/// Classify `x` against a `Bound` pair: `Less` before the range, `Equal`
+/// inside, `Greater` after. Monotone in `x` by construction, so it is a valid
+/// [`BTree::range_by`] locator — see `NonUniqueStorage::range_ids`, which
+/// applies it to one half of a composite key.
+///
+/// Callers that only need one side must use [`before_start`] / [`after_end`]
+/// directly: this evaluates *both* bounds, and the iteration path is walked
+/// once per yielded item.
+#[inline]
+pub(crate) fn classify<T: Ord>(start: &Bound<T>, end: &Bound<T>, x: &T) -> Ordering {
+    if before_start(start, x) {
+        Ordering::Less
+    } else if after_end(end, x) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+impl<K: Ord> Locator<'_, K> {
+    /// Is `key` before the range? For `Bounds` this consults the *start* bound
+    /// only — the whole point of keeping the two directions separate, since
+    /// merging them would cost a second key comparison on every yielded item
+    /// (and turn an `Unbounded` side from zero comparisons into one).
+    #[inline]
+    fn is_before_start(&self, key: &K) -> bool {
+        match self {
+            Locator::Bounds(start, _) => before_start(start, key),
+            Locator::Pred(f) => f(key) == Ordering::Less,
+        }
+    }
+
+    /// Is `key` past the range? For `Bounds` this consults the *end* bound only.
+    #[inline]
+    fn is_after_end(&self, key: &K) -> bool {
+        match self {
+            Locator::Bounds(_, end) => after_end(end, key),
+            Locator::Pred(f) => f(key) == Ordering::Greater,
+        }
+    }
+}
+
 /// Iterator over key-value pairs in a `BTree<K, V>` within a key range.
 ///
 /// Supports both forward (`Iterator`) and backward (`DoubleEndedIterator`) traversal,
@@ -580,10 +712,9 @@ pub struct BTreeRange<'a, K, V> {
     stack: Vec<(&'a BTreeNode<K, V>, usize)>,
     /// Stack of (node, one-past-last-entry-index) frames for backward traversal.
     back_stack: Vec<(&'a BTreeNode<K, V>, usize)>,
-    /// Start bound (needed for backward bound checking).
-    start: Bound<K>,
-    /// End bound (needed for forward bound checking).
-    end: Bound<K>,
+    /// Where a key sits relative to the range — replaces the start/end bound
+    /// pair, so both bounded and prefix scans share one descent path.
+    locate: Locator<'a, K>,
     /// Set to true when the forward and backward iterators have met, or a bound
     /// is violated — no further items should be yielded.
     done: bool,
@@ -594,17 +725,17 @@ pub struct BTreeRange<'a, K, V> {
 }
 
 impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
-    /// Push stack frames for the leftmost path that is >= `start`.
-    fn descend_left_from(&mut self, node: &'a Arc<BTreeNode<K, V>>, start: &Bound<K>) {
+    /// Push stack frames for the leftmost path that is not before the range.
+    fn descend_left_from(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
         let n = node.as_ref();
-        let entry_start = match start {
-            Bound::Unbounded => 0,
-            Bound::Included(k) => n.entries.partition_point(|(ek, _)| ek < k),
-            Bound::Excluded(k) => n.entries.partition_point(|(ek, _)| ek <= k),
+        let entry_start = {
+            let locate = &self.locate;
+            n.entries
+                .partition_point(|(ek, _)| locate.is_before_start(ek))
         };
         self.stack.push((n, entry_start));
         if !n.children.is_empty() && entry_start < n.children.len() {
-            self.descend_left_from(&n.children[entry_start], start);
+            self.descend_left_from(&n.children[entry_start]);
         }
     }
 
@@ -618,25 +749,21 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     fn in_end_bound(&self, key: &K) -> bool {
-        match &self.end {
-            Bound::Unbounded => true,
-            Bound::Included(k) => key <= k,
-            Bound::Excluded(k) => key < k,
-        }
+        !self.locate.is_after_end(key)
     }
 
-    /// Push back_stack frames for the rightmost path that is <= `end`.
-    fn descend_right_from(&mut self, node: &'a Arc<BTreeNode<K, V>>, end: &Bound<K>) {
+    /// Push back_stack frames for the rightmost path that is not past the range.
+    fn descend_right_from(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
         let n = node.as_ref();
         // `entry_end` = one past the last valid index for backward iteration.
-        let entry_end = match end {
-            Bound::Unbounded => n.entries.len(),
-            Bound::Included(k) => n.entries.partition_point(|(ek, _)| ek <= k),
-            Bound::Excluded(k) => n.entries.partition_point(|(ek, _)| ek < k),
+        let entry_end = {
+            let locate = &self.locate;
+            n.entries
+                .partition_point(|(ek, _)| !locate.is_after_end(ek))
         };
         self.back_stack.push((n, entry_end));
         if !n.children.is_empty() && entry_end < n.children.len() {
-            self.descend_right_from(&n.children[entry_end], end);
+            self.descend_right_from(&n.children[entry_end]);
         }
     }
 
@@ -650,11 +777,7 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     fn in_start_bound(&self, key: &K) -> bool {
-        match &self.start {
-            Bound::Unbounded => true,
-            Bound::Included(k) => key >= k,
-            Bound::Excluded(k) => key > k,
-        }
+        !self.locate.is_before_start(key)
     }
 }
 
@@ -1946,6 +2069,90 @@ mod tests {
             .map(|(k, _)| *k)
             .collect();
         assert_eq!(results, vec![6, 7]);
+    }
+
+    #[test]
+    fn range_prefix_returns_exactly_the_matching_group() {
+        let mut t: BTree<(u32, String), ()> = BTree::new();
+        for (a, b) in [
+            (1u32, "x"),
+            (2, "a"),
+            (2, "b"),
+            (2, "c"),
+            (3, "y"),
+        ] {
+            t = t.insert((a, b.to_string()), ());
+        }
+
+        let got: Vec<(u32, String)> = t.range_prefix(&2).map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, "a".to_string()),
+                (2, "b".to_string()),
+                (2, "c".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn range_prefix_handles_first_last_absent_and_empty() {
+        let mut t: BTree<(u32, String), ()> = BTree::new();
+        for (a, b) in [(1u32, "p"), (1, "q"), (5, "r")] {
+            t = t.insert((a, b.to_string()), ());
+        }
+
+        // First group.
+        assert_eq!(t.range_prefix(&1).count(), 2);
+        // Last group.
+        assert_eq!(t.range_prefix(&5).count(), 1);
+        // Absent prefix between two present ones.
+        assert_eq!(t.range_prefix(&3).count(), 0);
+        // Absent prefix below and above everything.
+        assert_eq!(t.range_prefix(&0).count(), 0);
+        assert_eq!(t.range_prefix(&9).count(), 0);
+        // Empty tree.
+        let empty: BTree<(u32, String), ()> = BTree::new();
+        assert_eq!(empty.range_prefix(&1).count(), 0);
+    }
+
+    /// The scan must not degrade to O(n): a prefix group of 3 in a tree of
+    /// 10_000 must not visit the whole tree. Asserted via correctness at
+    /// scale plus the group boundary, which a full scan would still pass —
+    /// so this test guards correctness, and the O(log n + k) claim rests on
+    /// the descent being bound-driven rather than filtered.
+    #[test]
+    fn range_prefix_is_correct_at_scale() {
+        let mut t: BTree<(u32, u32), ()> = BTree::new();
+        for i in 0..10_000u32 {
+            t = t.insert((i % 1000, i), ());
+        }
+        let got: Vec<u32> = t.range_prefix(&500).map(|(k, _)| k.1).collect();
+        assert_eq!(got, vec![500, 1500, 2500, 3500, 4500, 5500, 6500, 7500, 8500, 9500]);
+    }
+
+    /// `range()` must be unchanged by the locator refactor.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn range_still_honors_every_bound_combination() {
+        use std::ops::Bound;
+        let mut t: BTree<u32, ()> = BTree::new();
+        for i in [10u32, 20, 30, 40] {
+            t = t.insert(i, ());
+        }
+        let cases: Vec<((Bound<u32>, Bound<u32>), Vec<u32>)> = vec![
+            ((Bound::Unbounded, Bound::Unbounded), vec![10, 20, 30, 40]),
+            ((Bound::Included(20), Bound::Included(30)), vec![20, 30]),
+            ((Bound::Excluded(20), Bound::Included(40)), vec![30, 40]),
+            ((Bound::Included(20), Bound::Excluded(40)), vec![20, 30]),
+            ((Bound::Excluded(10), Bound::Excluded(40)), vec![20, 30]),
+            ((Bound::Included(25), Bound::Unbounded), vec![30, 40]),
+            ((Bound::Unbounded, Bound::Excluded(10)), vec![]),
+        ];
+        for ((s, e), want) in cases {
+            let got: Vec<u32> = t.range((s, e)).map(|(k, _)| *k).collect();
+            assert_eq!(got, want, "bounds ({s:?}, {e:?})");
+        }
     }
 
     #[test]

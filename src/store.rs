@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use crate::index::IndexKind;
 use crate::intents::{CommitWaiter, IntentMap, IntentWaiter};
 use crate::metrics::StoreMetrics;
 use crate::persistence::Record;
+use crate::primary_key::{AutoKey, PrimaryKey, auto_counter_seed};
 use crate::table::{MergeableTable, Table, TableOpener};
 use crate::{Error, Result};
 
@@ -249,7 +251,14 @@ impl StoreConfigBuilder {
 struct CommittedWriteSet {
     /// The snapshot version this transaction committed as.
     version: u64,
-    /// Table name → set of modified row IDs.
+    /// Table name → [`PrimaryKey::hash64`] digests of the modified row keys.
+    ///
+    /// Digests rather than keys: this map is compared against other writers'
+    /// sets, and two writers on one table need not agree on the key type
+    /// (nor could a single `BTreeSet` hold two of them). A collision costs a
+    /// spurious conflict — a retry — and can never hide a real one, so the
+    /// detector stays sound. The commit *merge* uses exact keys instead; see
+    /// [`DirtyEntry::modified_keys`].
     tables: BTreeMap<String, BTreeSet<u64>>,
     /// Tables that were deleted during this transaction.
     /// Used to detect cross-table conflicts (e.g., writer A deletes a table
@@ -263,7 +272,11 @@ struct CommittedWriteSet {
 
 /// The reads a `Serializable` WriteTx has issued against one table.
 ///
-/// `keys` records primary-key point reads (precise). `table_scan` is set to
+/// `keys` records primary-key point reads as [`PrimaryKey::hash64`] digests
+/// (precise up to a hash collision, which can only over-approximate the read
+/// set — the same soundness argument as [`CommittedWriteSet::tables`], which
+/// it is validated against and therefore must be digested the same way).
+/// `table_scan` is set to
 /// `true` whenever a non-key read is issued — `iter`, `range`, `len`,
 /// `is_empty`, `first`, `last`, `get_unique`, `get_by_index`, `get_by_key`,
 /// `index_range`, `custom_index`, `resolve`. v1 conservatively treats any
@@ -667,7 +680,7 @@ impl Store {
             Some(_) => {
                 return Err(Error::WriteConflict {
                     table: String::new(),
-                    keys: vec![],
+                    key_digests: vec![],
                     version: inner.latest_version,
                     wait_for: None,
                 });
@@ -813,16 +826,52 @@ impl Store {
     /// Register a table type for persistence. Must be called before any
     /// transactions that touch this table, and before [`Store::recover`] or
     /// [`Store::checkpoint`].
+    ///
+    /// Registers the `u64`-keyed table `Table<R>` — unchanged from 0.2.x. For
+    /// a table with an explicit primary-key type, use
+    /// [`Store::register_table_keyed`]. (This method cannot itself take the
+    /// key parameter: Rust has no default type parameters on functions, so
+    /// `register_table::<R>(..)` would stop compiling.)
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
+        self.register_table_keyed::<R, u64>(name)
+    }
+
+    /// Register a table type keyed by `K` for persistence.
+    ///
+    /// The key type must match the one the table is opened with: the registry
+    /// closures downcast to `Table<R, K>`, and a mismatch surfaces as
+    /// [`Error::TypeMismatch`].
+    ///
+    /// If a table of this name already exists in the latest snapshot, its key
+    /// type wins: registering a conflicting `K` returns
+    /// [`Error::TypeMismatch`] rather than recording a registration that
+    /// disagrees with the live data. Registering *after* creating a table is
+    /// legal and common (nothing forces registration to come first), so
+    /// without this check the registry and the snapshot could drift apart —
+    /// and every consumer that trusts the registry, notably the snapshot wire
+    /// format, would then act on the wrong key type.
+    #[cfg(feature = "persistence")]
+    pub fn register_table_keyed<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        name: &str,
+    ) -> Result<()> {
         let mut inner = self.inner.write();
+        if let Some(live) = inner
+            .snapshots
+            .get(&inner.latest_version)
+            .and_then(|snap| snap.tables.get(name))
+            && live.key_type_id() != std::any::TypeId::of::<K>()
+        {
+            return Err(Error::TypeMismatch(name.to_string()));
+        }
         Arc::get_mut(&mut inner.registry)
             .ok_or_else(|| {
                 Error::Persistence(
                     "cannot register table: registry is in use (checkpoint in progress?)".into(),
                 )
             })?
-            .register::<R>(name)
+            .register::<R, K>(name)
     }
 
     /// Write a checkpoint of the latest snapshot to disk.
@@ -891,6 +940,35 @@ impl Store {
         crate::checkpoint::cleanup_old_checkpoints(&dir, version)?;
 
         Ok(version)
+    }
+
+    /// Refuse to replay a WAL op whose key was encoded with a different key
+    /// type than the table is registered with in this build.
+    ///
+    /// The registry closures decode the op's key bytes with *their* `K`, and
+    /// several key types accept each other's encodings: `u64`/`i64` differ
+    /// only in the sign bit, the eight bytes of a `u64` id are a valid
+    /// NUL-filled `String`, `String`/`Vec<u8>` are interchangeable. The
+    /// encoding is order-preserving, so the reinterpreted keys pass the
+    /// ascending-order validation too — without this check the replay
+    /// succeeds and the table comes back full of silently reinterpreted keys.
+    #[cfg(feature = "persistence")]
+    fn check_replay_key_type(
+        table: &str,
+        info: &crate::registry::TableTypeInfo,
+        key_type: u32,
+    ) -> Result<()> {
+        if key_type != info.key_type_code {
+            return Err(Error::WalCorrupted(format!(
+                "table '{table}': {}",
+                crate::primary_key::key_type_mismatch_msg_raw(
+                    info.key_type_code,
+                    info.key_type_name,
+                    key_type
+                )
+            )));
+        }
+        Ok(())
     }
 
     /// Recover state from disk (checkpoint + WAL replay).
@@ -992,12 +1070,23 @@ impl Store {
                         }
                         for op in &entry.ops {
                             match op {
-                                crate::wal::WalOp::Insert { table, id, data }
-                                | crate::wal::WalOp::Update { table, id, data } => {
+                                crate::wal::WalOp::Insert {
+                                    table,
+                                    key_type,
+                                    key,
+                                    data,
+                                }
+                                | crate::wal::WalOp::Update {
+                                    table,
+                                    key_type,
+                                    key,
+                                    data,
+                                } => {
                                     let info = inner
                                         .registry
                                         .get(table)
                                         .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
+                                    Self::check_replay_key_type(table, info, *key_type)?;
 
                                     if !tables.contains_key(table) {
                                         tables.insert(
@@ -1016,24 +1105,32 @@ impl Store {
                                         })?
                                         .as_any_mut();
 
+                                    // The WAL and the registry closures speak
+                                    // the same language since 0.3.0: encoded
+                                    // primary-key bytes, straight through.
                                     if matches!(op, crate::wal::WalOp::Insert { .. }) {
-                                        (info.replay_insert)(table_mut, *id, data)?;
+                                        (info.replay_insert)(table_mut, key, data)?;
                                     } else {
-                                        (info.replay_update)(table_mut, *id, data)?;
+                                        (info.replay_update)(table_mut, key, data)?;
                                     }
                                 }
-                                crate::wal::WalOp::Delete { table, id } => {
+                                crate::wal::WalOp::Delete {
+                                    table,
+                                    key_type,
+                                    key,
+                                } => {
                                     let info = inner
                                         .registry
                                         .get(table)
                                         .ok_or_else(|| Error::TableNotRegistered(table.clone()))?;
+                                    Self::check_replay_key_type(table, info, *key_type)?;
                                     if let Some(table_arc) = tables.get_mut(table) {
                                         let table_mut = Arc::get_mut(table_arc)
                                             .ok_or_else(|| Error::Persistence(
                                                 "table Arc has multiple references during replay".into()
                                             ))?
                                             .as_any_mut();
-                                        (info.replay_delete)(table_mut, *id)?;
+                                        (info.replay_delete)(table_mut, key)?;
                                     }
                                 }
                                 crate::wal::WalOp::CreateTable { .. } => {}
@@ -1297,11 +1394,13 @@ impl Store {
 
                 // 2. Validate + materialize off-lock.
                 let mat = materialize_delta(delta, base_typed.data_ref())?;
-                let next_id = mat
-                    .max_id
-                    .map(|m| m + 1)
-                    .unwrap_or(base_typed.next_id())
-                    .max(base_typed.next_id());
+                // Keep the table's existing counter and push it past the
+                // highest key the delta leaves behind, so an id the delta
+                // used can never be handed out again.
+                let next_id = crate::bulk_load::bulk_next_counter(
+                    base_typed.next_id_opt(),
+                    mat.rows.last().map(|(id, _)| id),
+                )?;
 
                 let index_defs = base_typed.empty_index_defs()?;
                 let new_table: crate::table::Table<R> =
@@ -1318,6 +1417,99 @@ impl Store {
                 Ok(new_version)
             }
         }
+    }
+
+    /// Bulk-load a table addressed by explicit primary keys of any
+    /// [`PrimaryKey`](crate::PrimaryKey) type — the key-generic counterpart of
+    /// [`Store::bulk_load`], which stays `u64`-only because its
+    /// [`BulkSource`](crate::BulkSource) shapes (`AutoId`, `Unsorted`) are
+    /// auto-increment concepts.
+    ///
+    /// Replace semantics: the table's previous contents are discarded and its
+    /// index *definitions* are preserved and rebuilt over the new rows. The
+    /// table is created if it does not exist.
+    ///
+    /// `rows` must be in **strictly ascending key order** with no duplicates;
+    /// anything else is rejected with [`Error::InvalidBulkLoadInput`] before
+    /// any tree is built, so the store is untouched. This is not a
+    /// convenience check — [`BTree::from_sorted`](crate::BTree::from_sorted)
+    /// assumes ascending input and only debug-asserts it, so unsorted rows
+    /// would silently corrupt the tree in a release build.
+    ///
+    /// `opts` defaults to [`BulkLoadOptions::default`](crate::BulkLoadOptions)
+    /// when `None`.
+    ///
+    /// # Concurrency
+    ///
+    /// Same contract as [`Store::bulk_load`]. The base version is captured
+    /// before the table is built, so a commit that lands at any point during
+    /// the build — including inside a secondary index's extractor, which the
+    /// rebuild calls once per row — is refused with [`Error::WriteConflict`]
+    /// rather than silently overwritten. Retry against the new state. In
+    /// `WriterMode::SingleWriter` an open writer instead yields
+    /// [`Error::WriterBusy`], since that mode has no commit-time OCC to catch
+    /// the install.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ultima_db::Store;
+    ///
+    /// let store = Store::default();
+    /// let rows = vec![
+    ///     ("a@example.com".to_string(), "Alice".to_string()),
+    ///     ("b@example.com".to_string(), "Bob".to_string()),
+    /// ];
+    /// store
+    ///     .bulk_load_keyed::<String, String>("emails", rows, None)
+    ///     .unwrap();
+    ///
+    /// let rtx = store.begin_read(None).unwrap();
+    /// let t = rtx.open_table_keyed::<String, String>("emails").unwrap();
+    /// assert_eq!(t.len(), 2);
+    /// ```
+    pub fn bulk_load_keyed<R: Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        table_name: &str,
+        rows: Vec<(K, R)>,
+        opts: Option<crate::bulk_load::BulkLoadOptions>,
+    ) -> Result<u64> {
+        let opts = opts.unwrap_or_default();
+
+        // Validate ordering *before* building anything. Comparing `K` values
+        // directly is equivalent to comparing their encodings — the
+        // `PrimaryKey` contract requires the encoding to be order-preserving
+        // — so this is the same check the wire-format install path makes over
+        // raw key bytes.
+        for w in rows.windows(2) {
+            if w[0].0 >= w[1].0 {
+                return Err(Error::InvalidBulkLoadInput(
+                    "bulk load rows must be in ascending primary-key order".into(),
+                ));
+            }
+        }
+
+        let sorted: Vec<(K, Arc<R>)> = rows.into_iter().map(|(k, r)| (k, Arc::new(r))).collect();
+        // `base_version` comes back from the builder, captured under the same
+        // read lock as the snapshot it read index definitions from. Reading
+        // `latest_version()` here instead would compare a post-commit version
+        // against itself and silently overwrite any commit that landed during
+        // the build.
+        let (new_table, base_version) =
+            self.build_table_from_sorted::<R, K>(table_name, sorted, opts.create_if_missing)?;
+
+        let new_version = self.install_batch(
+            vec![crate::bulk_load::PendingTable {
+                name: table_name.to_string(),
+                table: Arc::new(new_table) as Arc<dyn MergeableTable>,
+            }],
+            base_version,
+            None,
+        )?;
+        if opts.checkpoint_after {
+            self.checkpoint_and_prune_after_bulk(new_version)?;
+        }
+        Ok(new_version)
     }
 
     /// Install a freshly-built table as a new snapshot, refusing the install
@@ -1397,31 +1589,88 @@ impl Store {
 
         // 1. Materialize sorted rows off-lock.
         let mat = materialize_source::<R>(source)?;
-        let next_id = mat.max_id.map(|m| m + 1).unwrap_or(1);
 
-        // 2. Snapshot to read existing index defs (if any).
-        let base_snapshot = {
+        // 2. Build off-lock, reusing the key-generic builder. `BulkSource` is
+        //    `u64`-keyed by construction (the auto-increment source shapes
+        //    only make sense for an `AutoKey`); explicit keys of any type go
+        //    through `Store::bulk_load_keyed` instead.
+        //
+        //    The builder's captured version is discarded here: both callers of
+        //    this helper (`bulk_load`'s Replace arm and `BulkLoadBatch::add`)
+        //    install against the version their *batch* was opened at, which is
+        //    captured earlier still — so their OCC check is at least as strict
+        //    as the builder's.
+        let (table, _base_version) =
+            self.build_table_from_sorted::<R, u64>(name, mat.rows, create_if_missing)?;
+        Ok(table)
+    }
+
+    /// Build a table from strictly-ascending `(key, record)` rows, cloning
+    /// the index *definitions* of the table that name currently holds (if
+    /// any) so secondary indexes survive the load. Does not install.
+    ///
+    /// Returns the built table together with the `latest_version` observed
+    /// **under the same read lock** as the snapshot it read index definitions
+    /// from. Callers must use that value as the `base_version` they hand to
+    /// `install_batch`, not a fresh `latest_version()` read afterwards: this
+    /// function's index rebuild runs off-lock and can take a long time on a
+    /// large load, and any commit landing in that window must be visible to
+    /// the install's OCC check. Reading the version after the build compares
+    /// a post-commit version against itself and silently overwrites the
+    /// concurrent commit.
+    ///
+    /// Shared by the `u64` `BulkSource` path and by
+    /// [`Store::bulk_load_keyed`]; nothing here is `u64`-specific.
+    pub(crate) fn build_table_from_sorted<R: Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        name: &str,
+        sorted: Vec<(K, Arc<R>)>,
+        create_if_missing: bool,
+    ) -> Result<(crate::table::Table<R, K>, u64)> {
+        // Snapshot and version together, under one lock — capturing them
+        // separately races a committer that lands between the two reads.
+        // Mirrors `install_snapshot_stream`'s capture.
+        let (base_snapshot, base_version) = {
             let inner = self.inner.read();
-            inner.snapshots[&inner.latest_version].clone()
+            let v = inner.latest_version;
+            (inner.snapshots[&v].clone(), v)
         };
 
-        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R>>> =
+        let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R, K>>> =
             if let Some(existing) = base_snapshot.tables.get(name) {
                 let typed = existing
                     .as_any()
-                    .downcast_ref::<crate::table::Table<R>>()
+                    .downcast_ref::<crate::table::Table<R, K>>()
                     .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
                 typed.empty_index_defs()?
             } else if create_if_missing {
+                // Creating the table from nothing means nothing else fixes
+                // its key type, so hold it to any registration the store
+                // already has — otherwise a `Table<R, K>` built here is later
+                // handed to registry closures built for a different `K` and
+                // fails at checkpoint time with an opaque "table downcast
+                // failed", permanently. Same check, same arm, as
+                // `WriteTx::ensure_dirty_entry`.
+                #[cfg(feature = "persistence")]
+                self.inner.read().registry.validate_type_keyed::<R, K>(name)?;
                 Vec::new()
             } else {
                 return Err(Error::TableNotFound(name.to_string()));
             };
 
-        // 3. Build off-lock.
-        let new_table: crate::table::Table<R> =
-            crate::table::Table::from_bulk(mat.rows, next_id, index_defs)?;
-        Ok(new_table)
+        // A replacement starts the counter over from the key type's first id
+        // (`None` for an explicitly-keyed table) and advances past the highest
+        // loaded key — the rows being replaced are gone, so their ids are not
+        // reserved.
+        let next_id = crate::bulk_load::bulk_next_counter(
+            crate::primary_key::auto_counter_seed::<K>(),
+            sorted.last().map(|(k, _)| k),
+        )?;
+        // The index rebuild inside `from_bulk` calls a caller-supplied
+        // extractor once per row, so this is unbounded off-lock work — which
+        // is exactly why `base_version` was captured above rather than after.
+        let table = crate::table::Table::from_bulk(sorted, next_id, index_defs)?;
+        Ok((table, base_version))
     }
 
     /// Install N pre-built tables atomically as one snapshot. Mirrors
@@ -1484,7 +1733,7 @@ impl Store {
         if inner.next_ticket != inner.promote_gate.current_turn() {
             return Err(Error::WriteConflict {
                 table: pending[0].name.clone(),
-                keys: vec![],
+                key_digests: vec![],
                 version: inner.latest_version,
                 wait_for: None,
             });
@@ -1493,7 +1742,7 @@ impl Store {
         if inner.latest_version != base_version {
             return Err(Error::WriteConflict {
                 table: pending[0].name.clone(),
-                keys: vec![],
+                key_digests: vec![],
                 version: inner.latest_version,
                 wait_for: None,
             });
@@ -1881,6 +2130,40 @@ impl ReadTx {
     /// snapshot, or [`Error::TypeMismatch`] if it was created with a different
     /// record type.
     pub fn open_table<R: Record>(&self, opener: impl TableOpener<R>) -> Result<TableReader<'_, R>> {
+        self.open_table_inner::<R, u64>(opener)
+    }
+
+    /// Borrow a table whose primary key is `K` rather than an auto-increment
+    /// `u64`. Rows are addressed with [`TableReader::get`] taking a `&K`.
+    ///
+    /// This is additive rather than a widening of
+    /// [`open_table`](Self::open_table): Rust has no default type parameters
+    /// on functions, so giving `open_table` a second parameter would break
+    /// every `open_table::<R>(..)` turbofish in existence.
+    ///
+    /// # Passing keys by reference
+    ///
+    /// Reads take `impl Borrow<K>`, so on a `String`-keyed table a `&str` is
+    /// **not** accepted: the standard library provides `String: Borrow<str>`,
+    /// not `str: Borrow<String>`. `t.get("alice")` does not compile; pass
+    /// `t.get(&alice)` (a `&String`) or an owned `String`. This is the inverse
+    /// of `HashMap<String, _>::get`, which looks up by `&str`, and it is the
+    /// most common surprise when moving a table off `u64` keys.
+    ///
+    /// Returns [`Error::TableNotFound`] if the table does not exist in this
+    /// snapshot, or [`Error::TypeMismatch`] if it was created with a different
+    /// record *or* key type.
+    pub fn open_table_keyed<R: Record, K: PrimaryKey>(
+        &self,
+        opener: impl TableOpener<R>,
+    ) -> Result<TableReader<'_, R, K>> {
+        self.open_table_inner::<R, K>(opener)
+    }
+
+    fn open_table_inner<R: Record, K: PrimaryKey>(
+        &self,
+        opener: impl TableOpener<R>,
+    ) -> Result<TableReader<'_, R, K>> {
         let name = opener.table_name();
         let table = self
             .snapshot
@@ -1888,7 +2171,7 @@ impl ReadTx {
             .get(name)
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?
             .as_any()
-            .downcast_ref::<Table<R>>()
+            .downcast_ref::<Table<R, K>>()
             .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
         let table_metrics = self.metrics.register_table(name);
         Ok(TableReader {
@@ -1935,6 +2218,22 @@ struct DirtyEntry {
     /// The table name as a shared handle, so each `open_table` hands out a
     /// refcount bump rather than a fresh allocation.
     name: Arc<str>,
+    /// This writer's modified keys for *this* table, as a `BTreeSet<K>`
+    /// erased to `dyn Any` — a transaction's dirty map holds entries whose
+    /// `K` differ, so the concrete type cannot appear in `DirtyEntry`.
+    ///
+    /// This is the *merge* side of the two-structure split. Its sibling,
+    /// [`WriteTx::write_set`], holds [`PrimaryKey::hash64`] digests of the
+    /// same keys and drives conflict detection, which must compare key sets
+    /// across writers that need not agree on `K`. A digest collision costs a
+    /// spurious conflict (a retry) and never hides a real one, so the
+    /// detector stays sound — but the merge has to *replay* the writes, and
+    /// for that only the exact keys will do.
+    ///
+    /// Populated only in [`WriterMode::MultiWriter`], the only mode whose
+    /// commit can reach the merge slow path; SingleWriter installs its dirty
+    /// tables wholesale and never pays for the bookkeeping.
+    modified_keys: Box<dyn std::any::Any + Send + Sync>,
 }
 
 /// A write transaction.  Tables are lazily copied from the base snapshot on
@@ -1985,7 +2284,11 @@ pub struct WriteTx {
     store_inner: Arc<RwLock<StoreInner>>,
     /// Tables explicitly deleted in this transaction (cleared on re-open).
     deleted_tables: BTreeSet<String>,
-    /// Keys modified during this transaction, per table (MultiWriter only).
+    /// [`PrimaryKey::hash64`] digests of the keys modified during this
+    /// transaction, per table (MultiWriter only). Digests rather than keys
+    /// because OCC compares this set against other writers' sets, and two
+    /// writers on the same table need not agree on the key type; see
+    /// [`DirtyEntry::modified_keys`] for the exact-key half of the split.
     write_set: BTreeMap<String, BTreeSet<u64>>,
     /// Tables that had index DDL (`define_index` / `define_custom_index`)
     /// in this transaction. The merge slow path cannot carry a new index
@@ -2052,9 +2355,9 @@ pub struct WriteTx {
 ///
 /// In [`WriterMode::SingleWriter`] mode, write-set tracking is skipped
 /// and the only overhead is an `Option` check per write call.
-pub struct TableWriter<'tx, R: Record> {
-    table: &'tx mut Table<R>,
-    write_set: Option<&'tx mut BTreeSet<u64>>,
+pub struct TableWriter<'tx, R: Record, K = u64> {
+    table: &'tx mut Table<R, K>,
+    write_set: Option<WriteSetTracker<'tx, K>>,
     metrics: Arc<StoreMetrics>,
     /// Cached per-table counter handle (see `TableReader::table_metrics`).
     table_metrics: Arc<crate::metrics::TableMetrics>,
@@ -2078,6 +2381,40 @@ pub struct TableWriter<'tx, R: Record> {
     ddl_tables: Option<&'tx std::cell::RefCell<BTreeSet<String>>>,
 }
 
+/// The two write-set structures a MultiWriter [`TableWriter`] updates on every
+/// mutation, bundled so a mutation pays one `Option` check instead of two and
+/// so neither half can be updated without the other.
+///
+/// `digests` is [`WriteTx::write_set`]'s entry for this table — 64-bit
+/// [`PrimaryKey::hash64`] values, compared across writers during OCC
+/// validation. `keys` is [`DirtyEntry::modified_keys`] downcast back to its
+/// concrete `BTreeSet<K>`, replayed verbatim by the commit merge. See
+/// `DirtyEntry::modified_keys` for why the split exists.
+struct WriteSetTracker<'tx, K> {
+    digests: &'tx mut BTreeSet<u64>,
+    keys: &'tx mut BTreeSet<K>,
+}
+
+impl<K: PrimaryKey> WriteSetTracker<'_, K> {
+    /// Record one modified key in both structures.
+    #[inline]
+    fn record(&mut self, key: &K) {
+        self.digests.insert(key.hash64());
+        self.keys.insert(key.clone());
+    }
+
+    /// Record a batch of modified keys in both structures.
+    #[inline]
+    fn record_all<'k>(&mut self, keys: impl IntoIterator<Item = &'k K>)
+    where
+        K: 'k,
+    {
+        for key in keys {
+            self.record(key);
+        }
+    }
+}
+
 /// Shared intent-table context held by `TableWriter` in MultiWriter mode.
 /// Borrowed from the parent `WriteTx` for the lifetime of the writer.
 struct IntentCtx<'tx> {
@@ -2093,25 +2430,42 @@ struct WalOpsWriter<'tx> {
     ops: &'tx std::cell::RefCell<Vec<crate::wal::WalOp>>,
 }
 
-/// Downcast a dirty entry to `Table<R>` and read its cached handles. Shared
+/// Downcast a dirty entry to `Table<R, K>` and read its cached handles. Shared
 /// between `open_table` and the tuple openers so the type check and handle
 /// extraction live in one place.
-fn entry_writer_parts<'tx, R: Record>(
+///
+/// The exact-key set comes back alongside the table: both are fields of the
+/// same `DirtyEntry`, so one `&mut` borrow of the entry yields disjoint `&mut`s
+/// to each. A failed key-set downcast is an internal bug (the entry was built
+/// with the same `K` the table was), hence `expect`.
+struct WriterParts<'tx, R, K> {
+    name: Arc<str>,
+    table: &'tx mut Table<R, K>,
+    table_metrics: Arc<crate::metrics::TableMetrics>,
+    modified_keys: &'tx mut BTreeSet<K>,
+}
+
+fn entry_writer_parts<'tx, R: Record, K: PrimaryKey>(
     name: &str,
     entry: &'tx mut DirtyEntry,
-) -> Result<(
-    Arc<str>,
-    &'tx mut Table<R>,
-    Arc<crate::metrics::TableMetrics>,
-)> {
+) -> Result<WriterParts<'tx, R, K>> {
     let table_name = Arc::clone(&entry.name);
     let table_metrics = Arc::clone(&entry.table_metrics);
     let table = entry
         .table
         .as_any_mut()
-        .downcast_mut::<Table<R>>()
+        .downcast_mut::<Table<R, K>>()
         .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
-    Ok((table_name, table, table_metrics))
+    let modified_keys = entry
+        .modified_keys
+        .downcast_mut::<BTreeSet<K>>()
+        .expect("modified_keys is built with the same K as the table");
+    Ok(WriterParts {
+        name: table_name,
+        table,
+        table_metrics,
+        modified_keys,
+    })
 }
 
 /// Build a [`TableWriter`] from already-borrowed transaction pieces. Taking the
@@ -2119,10 +2473,10 @@ fn entry_writer_parts<'tx, R: Record>(
 /// construct several writers at once: each field is borrowed from a *distinct*
 /// field of the transaction, so none alias the `dirty`/`write_set` `&mut`s.
 #[allow(clippy::too_many_arguments)]
-fn assemble_writer<'tx, R: Record>(
+fn assemble_writer<'tx, R: Record, K: PrimaryKey>(
     table_name: Arc<str>,
-    table: &'tx mut Table<R>,
-    write_set: Option<&'tx mut BTreeSet<u64>>,
+    table: &'tx mut Table<R, K>,
+    write_set: Option<WriteSetTracker<'tx, K>>,
     metrics: Arc<StoreMetrics>,
     table_metrics: Arc<crate::metrics::TableMetrics>,
     intents: Option<&'tx IntentMap>,
@@ -2132,7 +2486,7 @@ fn assemble_writer<'tx, R: Record>(
     ddl_tables: Option<&'tx std::cell::RefCell<BTreeSet<String>>>,
     #[cfg(feature = "persistence")] wal_enabled: bool,
     #[cfg(feature = "persistence")] wal_ops_cell: &'tx std::cell::RefCell<Vec<crate::wal::WalOp>>,
-) -> TableWriter<'tx, R> {
+) -> TableWriter<'tx, R, K> {
     let intent_ctx = match (intents, waiter) {
         (Some(intents), Some(waiter)) => Some(IntentCtx {
             intents,
@@ -2163,29 +2517,33 @@ fn assemble_writer<'tx, R: Record>(
         ddl_tables,
     }
 }
-
-impl<'tx, R: Record> TableWriter<'tx, R> {
-    /// Claim a write intent on `(table, id)` for this writer. Returns
+impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
+    /// Claim a write intent on `(table, key)` for this writer. Returns
     /// `Err(WriteConflict { wait_for: Some(..) })` immediately if another
     /// active writer already holds the intent — the caller's retry loop
     /// can block on that waiter until the holder commits or aborts.
     ///
     /// Only runs in `MultiWriter` mode; in `SingleWriter` there can be no
     /// conflicting writer by construction.
-    fn claim_intent(&self, id: u64) -> Result<()> {
+    ///
+    /// The intent table is keyed by [`PrimaryKey::hash64`] for the same
+    /// reason the write set is: writers on one table need not agree on `K`,
+    /// and a digest collision costs a spurious wait, never a missed one.
+    fn claim_intent(&self, key: &K) -> Result<()> {
         let Some(ctx) = self.intent_ctx.as_ref() else {
             return Ok(());
         };
+        let digest = key.hash64();
         match ctx
             .intents
-            .try_acquire(&self.table_name, id, ctx.writer_id, ctx.waiter)
+            .try_acquire(&self.table_name, digest, ctx.writer_id, ctx.waiter)
         {
             Ok(()) => Ok(()),
             Err(holder_waiter) => {
                 self.metrics.inc_write_conflict();
                 Err(Error::WriteConflict {
                     table: self.table_name.to_string(),
-                    keys: vec![id],
+                    key_digests: vec![digest],
                     // Early-fail has no "conflicting committed version"; the
                     // holder is still in flight. Use 0 as a sentinel.
                     version: 0,
@@ -2197,103 +2555,71 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 
     // --- Write methods (tracked) ---
 
-    /// Insert a record. Returns the auto-assigned ID.
-    pub fn insert(&mut self, record: R) -> Result<u64> {
-        #[cfg(feature = "persistence")]
-        if let Some(w) = &mut self.wal_ops {
-            let data = Self::serialize_record(&record)?;
-            let id = self.table.insert(record)?;
-            if let Some(ws) = &mut self.write_set {
-                ws.insert(id);
-            }
-            w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
-                table: w.table_name.clone(),
-                id,
-                data,
-            });
-            self.table_metrics.inc_inserts(1);
-            return Ok(id);
-        }
-        let id = self.table.insert(record)?;
-        if let Some(ws) = &mut self.write_set {
-            ws.insert(id);
-        }
-        self.table_metrics.inc_inserts(1);
-        Ok(id)
+    /// Insert-or-replace a record at an explicit primary key.
+    ///
+    /// This is how explicitly-keyed tables (opened with
+    /// [`WriteTx::open_table_keyed`]) are written: there is no auto-increment
+    /// for a key the store cannot generate. On a `u64` table `put` also works,
+    /// and advances the id counter past `key` so a later
+    /// [`insert`](Self::insert) cannot reissue it.
+    pub fn put(&mut self, key: K, record: R) -> Result<()> {
+        self.upsert(key, record)
     }
 
-    /// Update a record by its ID.
-    pub fn update(&mut self, id: u64, record: R) -> Result<()> {
-        self.claim_intent(id)?;
+    /// Update a record by its key.
+    pub fn update(&mut self, key: impl Borrow<K>, record: R) -> Result<()> {
+        let key = key.borrow();
+        self.claim_intent(key)?;
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
+            let encoded_key = Self::encoded_key(key)?;
             let data = Self::serialize_record(&record)?;
-            self.table.update(id, record)?;
+            self.table.update(key, record)?;
             if let Some(ws) = &mut self.write_set {
-                ws.insert(id);
+                ws.record(key);
             }
             w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                 table: w.table_name.clone(),
-                id,
+                key_type: K::KEY_TYPE_ID,
+                key: encoded_key,
                 data,
             });
             self.table_metrics.inc_updates(1);
             return Ok(());
         }
-        self.table.update(id, record)?;
+        self.table.update(key, record)?;
         if let Some(ws) = &mut self.write_set {
-            ws.insert(id);
+            ws.record(key);
         }
         self.table_metrics.inc_updates(1);
         Ok(())
     }
 
-    /// Delete a record by its ID. Returns the deleted record.
-    pub fn delete(&mut self, id: u64) -> Result<Arc<R>> {
-        self.claim_intent(id)?;
-        let old = self.table.delete(id)?;
+    /// Delete a record by its key. Returns the deleted record.
+    pub fn delete(&mut self, key: impl Borrow<K>) -> Result<Arc<R>> {
+        let key = key.borrow();
+        self.claim_intent(key)?;
+        // Encoded up front, before the row is removed: a key the WAL cannot
+        // carry has to fail without changing the table.
+        #[cfg(feature = "persistence")]
+        let encoded_key = match &self.wal_ops {
+            Some(_) => Some(Self::encoded_key(key)?),
+            None => None,
+        };
+        let old = self.table.delete(key)?;
         if let Some(ws) = &mut self.write_set {
-            ws.insert(id);
+            ws.record(key);
         }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                 table: w.table_name.clone(),
-                id,
+                key_type: K::KEY_TYPE_ID,
+                key: encoded_key.expect("encoded when wal_ops is Some"),
             });
         }
         self.table_metrics.inc_deletes(1);
         Ok(old)
-    }
-
-    /// Insert multiple records atomically.
-    pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<u64>> {
-        #[cfg(feature = "persistence")]
-        if let Some(w) = &mut self.wal_ops {
-            let data_list: Vec<Vec<u8>> = records
-                .iter()
-                .map(|r| Self::serialize_record(r))
-                .collect::<Result<_>>()?;
-            let ids = self.table.insert_batch(records)?;
-            if let Some(ws) = &mut self.write_set {
-                ws.extend(ids.iter().copied());
-            }
-            for (id, data) in ids.iter().zip(data_list) {
-                w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
-                    table: w.table_name.clone(),
-                    id: *id,
-                    data,
-                });
-            }
-            self.table_metrics.inc_inserts(ids.len() as u64);
-            return Ok(ids);
-        }
-        let ids = self.table.insert_batch(records)?;
-        if let Some(ws) = &mut self.write_set {
-            ws.extend(ids.iter().copied());
-        }
-        self.table_metrics.inc_inserts(ids.len() as u64);
-        Ok(ids)
     }
 
     /// Update multiple records atomically.
@@ -2302,55 +2628,64 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     /// the underlying `Table::update_batch` uses snapshot-and-restore for
     /// atomic rollback, and pre-claiming intents would leave dangling
     /// claims on failure (breaking the poison-free guarantee of the
-    /// write set). Conflict on any id still surfaces — just at commit.
-    pub fn update_batch(&mut self, updates: Vec<(u64, R)>) -> Result<()> {
+    /// write set). Conflict on any key still surfaces — just at commit.
+    pub fn update_batch(&mut self, updates: Vec<(K, R)>) -> Result<()> {
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            let ops_data: Vec<(u64, Vec<u8>)> = updates
+            let ops_data: Vec<(Vec<u8>, Vec<u8>)> = updates
                 .iter()
-                .map(|(id, r)| Self::serialize_record(r).map(|d| (*id, d)))
+                .map(|(key, r)| Ok((Self::encoded_key(key)?, Self::serialize_record(r)?)))
                 .collect::<Result<_>>()?;
-            let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
+            let keys: Vec<K> = updates.iter().map(|(key, _)| key.clone()).collect();
             self.table.update_batch(updates)?;
             if let Some(ws) = &mut self.write_set {
-                ws.extend(ids.iter());
+                ws.record_all(keys.iter());
             }
-            for (id, data) in ops_data {
+            for (key, data) in ops_data {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
-                    id,
+                    key_type: K::KEY_TYPE_ID,
+                    key,
                     data,
                 });
             }
-            self.table_metrics.inc_updates(ids.len() as u64);
+            self.table_metrics.inc_updates(keys.len() as u64);
             return Ok(());
         }
-        let ids: Vec<u64> = updates.iter().map(|(id, _)| *id).collect();
+        let keys: Vec<K> = updates.iter().map(|(key, _)| key.clone()).collect();
         self.table.update_batch(updates)?;
         if let Some(ws) = &mut self.write_set {
-            ws.extend(ids.iter());
+            ws.record_all(keys.iter());
         }
-        self.table_metrics.inc_updates(ids.len() as u64);
+        self.table_metrics.inc_updates(keys.len() as u64);
         Ok(())
     }
 
     /// Delete multiple records atomically. See `update_batch` for why
     /// batch ops skip early-fail intent claiming.
-    pub fn delete_batch(&mut self, ids: &[u64]) -> Result<()> {
-        self.table.delete_batch(ids)?;
+    pub fn delete_batch(&mut self, keys: &[K]) -> Result<()> {
+        // Encoded before the batch runs, for the same reason `delete` does it:
+        // an over-long key must not take the rows with it.
+        #[cfg(feature = "persistence")]
+        let encoded_keys: Option<Vec<Vec<u8>>> = match &self.wal_ops {
+            Some(_) => Some(keys.iter().map(Self::encoded_key).collect::<Result<_>>()?),
+            None => None,
+        };
+        self.table.delete_batch(keys)?;
         if let Some(ws) = &mut self.write_set {
-            ws.extend(ids.iter().copied());
+            ws.record_all(keys.iter());
         }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
-            for &id in ids {
+            for key in encoded_keys.expect("encoded when wal_ops is Some") {
                 w.ops.borrow_mut().push(crate::wal::WalOp::Delete {
                     table: w.table_name.clone(),
-                    id,
+                    key_type: K::KEY_TYPE_ID,
+                    key,
                 });
             }
         }
-        self.table_metrics.inc_deletes(ids.len() as u64);
+        self.table_metrics.inc_deletes(keys.len() as u64);
         Ok(())
     }
 
@@ -2360,23 +2695,40 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
             .map_err(|e| Error::Persistence(e.to_string()))
     }
 
-    // --- Read methods (pass-through) ---
-
-    /// Look up a record by its ID.
-    pub fn get(&self, id: u64) -> Option<&R> {
-        record_point_read(self.read_set, &self.table_name, id);
-        self.table_metrics.inc_primary_key_reads(1);
-        self.table.get(id)
+    /// Encode a key for a WAL op, refusing one over the shared 64 KiB cap
+    /// ([`MAX_ENCODED_KEY_LEN`](crate::primary_key::MAX_ENCODED_KEY_LEN)).
+    ///
+    /// `serialize_entry` enforces the same bound — that is the choke point no
+    /// sink can bypass — but it runs at commit, after the mutation has already
+    /// been applied to the in-memory table and reported successful. Refusing
+    /// here means the caller learns at the offending `put`/`update`/`delete`,
+    /// with the table untouched, instead of losing an entire transaction's
+    /// worth of otherwise-valid rows at commit.
+    #[cfg(feature = "persistence")]
+    fn encoded_key(key: &K) -> Result<Vec<u8>> {
+        let encoded = key.encode();
+        crate::primary_key::check_encoded_key_len(encoded.len(), "WAL entry")?;
+        Ok(encoded)
     }
 
-    /// Returns an iterator over records within the specified ID range.
+    // --- Read methods (pass-through) ---
+
+    /// Look up a record by its key.
+    pub fn get(&self, key: impl Borrow<K>) -> Option<&R> {
+        let key = key.borrow();
+        record_point_read(self.read_set, &self.table_name, key);
+        self.table_metrics.inc_primary_key_reads(1);
+        self.table.get(key)
+    }
+
+    /// Returns an iterator over records within the specified key range.
     pub fn range<'a>(
         &'a self,
-        range: impl std::ops::RangeBounds<u64> + 'a,
-    ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+        range: impl std::ops::RangeBounds<K> + 'a,
+    ) -> impl Iterator<Item = (K, &'a R)> + 'a {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_scans();
-        self.table.range(range)
+        self.table.range(range).map(|(k, v)| (k.clone(), v))
     }
 
     /// Returns the number of records in the table.
@@ -2393,51 +2745,53 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         self.table.is_empty()
     }
 
-    /// Returns true if the table contains a record with the given ID.
-    pub fn contains(&self, id: u64) -> bool {
-        record_point_read(self.read_set, &self.table_name, id);
+    /// Returns true if the table contains a record with the given key.
+    pub fn contains(&self, key: impl Borrow<K>) -> bool {
+        let key = key.borrow();
+        record_point_read(self.read_set, &self.table_name, key);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.contains(id)
+        self.table.contains(key)
     }
 
-    /// Returns the first (lowest ID) record, or `None` if empty.
-    pub fn first(&self) -> Option<(u64, &R)> {
+    /// Returns the first (lowest key) record, or `None` if empty.
+    pub fn first(&self) -> Option<(K, &R)> {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.first()
+        self.table.first().map(|(k, v)| (k.clone(), v))
     }
 
-    /// Returns the last (highest ID) record, or `None` if empty.
-    pub fn last(&self) -> Option<(u64, &R)> {
+    /// Returns the last (highest key) record, or `None` if empty.
+    pub fn last(&self) -> Option<(K, &R)> {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.last()
+        self.table.last().map(|(k, v)| (k.clone(), v))
     }
 
-    /// Iterate over all records in ID order.
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+    /// Iterate over all records in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (K, &R)> + '_ {
         record_table_scan(self.read_set, &self.table_name);
         self.table_metrics.inc_primary_key_scans();
-        self.table.iter()
+        self.table.iter().map(|(k, v)| (k.clone(), v))
     }
 
-    /// Look up multiple records by ID.
-    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
-        for id in ids {
-            record_point_read(self.read_set, &self.table_name, *id);
+    /// Look up multiple records by key.
+    pub fn get_many(&self, keys: &[K]) -> Vec<Option<&R>> {
+        for key in keys {
+            record_point_read(self.read_set, &self.table_name, key);
         }
-        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
-        self.table.get_many(ids)
+        self.table_metrics.inc_primary_key_reads(keys.len() as u64);
+        self.table.get_many(keys)
     }
 
     // --- Index methods (pass-through) ---
 
-    /// Define a secondary index.
-    pub fn define_index<K: Ord + Clone + Send + Sync + 'static>(
+    /// Define a secondary index. `IK` is the *index* key; the table's primary
+    /// key stays `K`.
+    pub fn define_index<IK: Ord + Clone + Send + Sync + 'static>(
         &mut self,
         name: &str,
         kind: IndexKind,
-        extractor: impl Fn(&R) -> K + Send + Sync + 'static,
+        extractor: impl Fn(&R) -> IK + Send + Sync + 'static,
     ) -> Result<()> {
         self.metrics.register_index(&self.table_name, name);
         self.table.define_index(name, kind, extractor)?;
@@ -2450,44 +2804,44 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     }
 
     /// Look up a single record by a unique index.
-    pub fn get_unique<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn get_unique<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        key: &K,
-    ) -> Result<Option<(u64, &R)>> {
+        key: &IK,
+    ) -> Result<Option<(K, &R)>> {
         record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_unique(index_name, key)
     }
 
     /// Look up records by a non-unique index key.
-    pub fn get_by_index<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn get_by_index<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        key: &K,
-    ) -> Result<Vec<(u64, &R)>> {
+        key: &IK,
+    ) -> Result<Vec<(K, &R)>> {
         record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_index(index_name, key)
     }
 
     /// Look up records by index key (works for both unique and non-unique).
-    pub fn get_by_key<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn get_by_key<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        key: &K,
-    ) -> Result<Vec<(u64, &R)>> {
+        key: &IK,
+    ) -> Result<Vec<(K, &R)>> {
         record_table_scan(self.read_set, &self.table_name);
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_key(index_name, key)
     }
 
     /// Range scan on an index (works for both unique and non-unique).
-    pub fn index_range<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn index_range<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        range: impl std::ops::RangeBounds<K>,
-    ) -> Result<Vec<(u64, &R)>> {
+        range: impl std::ops::RangeBounds<IK>,
+    ) -> Result<Vec<(K, &R)>> {
         record_table_scan(self.read_set, &self.table_name);
         self.metrics
             .inc_index_range_scans(&self.table_name, index_name);
@@ -2495,7 +2849,7 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     }
 
     /// Define a custom index on the underlying table.
-    pub fn define_custom_index<I: crate::CustomIndex<R>>(
+    pub fn define_custom_index<I: crate::CustomIndex<R, K>>(
         &mut self,
         name: &str,
         index: I,
@@ -2510,51 +2864,64 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
     }
 
     /// Retrieve a reference to a custom index by name, downcast to the concrete type.
-    pub fn custom_index<I: crate::CustomIndex<R>>(&self, name: &str) -> Result<&I> {
+    pub fn custom_index<I: crate::CustomIndex<R, K>>(&self, name: &str) -> Result<&I> {
         record_table_scan(self.read_set, &self.table_name);
         self.table.custom_index(name)
     }
 
-    /// Resolve a slice of record IDs to `(id, &record)` pairs.
-    /// IDs that don't exist in the table are silently skipped.
-    pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
-        for id in ids {
-            record_point_read(self.read_set, &self.table_name, *id);
+    /// Resolve a slice of primary keys to `(key, &record)` pairs.
+    /// Keys that don't exist in the table are silently skipped.
+    pub fn resolve(&self, keys: &[K]) -> Vec<(K, &R)> {
+        for key in keys {
+            record_point_read(self.read_set, &self.table_name, key);
         }
-        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
-        self.table.resolve(ids)
+        self.table_metrics.inc_primary_key_reads(keys.len() as u64);
+        self.table.resolve(keys)
     }
 
-    /// Insert-or-replace a record at an explicit ID. Maintains secondary
+    /// Insert-or-replace a record at an explicit key. Maintains secondary
     /// indexes, tracks the key in the write set, and emits the appropriate
-    /// WAL op (Insert if no prior, Update if replacing). Used internally
-    /// by [`Self::bulk_load`] to ingest rows with caller-supplied IDs.
-    fn upsert(&mut self, id: u64, record: R) -> Result<()> {
-        self.claim_intent(id)?;
-        let had_prior = self.table.contains(id);
+    /// WAL op (Insert if no prior, Update if replacing). The engine behind
+    /// [`Self::put`] and [`Self::bulk_load`].
+    fn upsert(&mut self, key: K, record: R) -> Result<()> {
+        self.claim_intent(&key)?;
+        let had_prior = self.table.contains(&key);
         #[cfg(feature = "persistence")]
         let data = if self.wal_ops.is_some() {
             Some(Self::serialize_record(&record)?)
         } else {
             None
         };
-        self.table.upsert_arc(id, Arc::new(record))?;
+        #[cfg(feature = "persistence")]
+        let encoded_key = if self.wal_ops.is_some() {
+            Some(Self::encoded_key(&key)?)
+        } else {
+            None
+        };
+        // `upsert_arc` consumes the key, so keep a copy to record *after* it
+        // succeeds — a failed write must not leave the key in the write set
+        // (that would make a later commit conflict on a row it never wrote).
+        let recorded = self.write_set.is_some().then(|| key.clone());
+        self.table.upsert_arc(key, Arc::new(record))?;
         if let Some(ws) = &mut self.write_set {
-            ws.insert(id);
+            ws.record(recorded.as_ref().expect("cloned when write_set is Some"));
         }
         #[cfg(feature = "persistence")]
         if let Some(w) = &mut self.wal_ops {
             let data = data.expect("serialized when wal_ops is Some");
+            let key = encoded_key.expect("encoded when wal_ops is Some");
             let op = if had_prior {
                 crate::wal::WalOp::Update {
                     table: w.table_name.clone(),
-                    id,
+                    key_type: K::KEY_TYPE_ID,
+                    key,
                     data,
                 }
             } else {
                 crate::wal::WalOp::Insert {
                     table: w.table_name.clone(),
-                    id,
+                    key_type: K::KEY_TYPE_ID,
+                    key,
                     data,
                 }
             };
@@ -2567,7 +2934,72 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
         }
         Ok(())
     }
+}
 
+// ---------------------------------------------------------------------------
+// TableWriter — auto-increment API, only for keys the store can assign (`u64`)
+// ---------------------------------------------------------------------------
+
+impl<'tx, R: Record, K: AutoKey> TableWriter<'tx, R, K> {
+    /// Insert a record. Returns the auto-assigned ID.
+    pub fn insert(&mut self, record: R) -> Result<K> {
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            let data = Self::serialize_record(&record)?;
+            let id = self.table.insert(record)?;
+            if let Some(ws) = &mut self.write_set {
+                ws.record(&id);
+            }
+            w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
+                table: w.table_name.clone(),
+                key_type: K::KEY_TYPE_ID,
+                key: id.encode(),
+                data,
+            });
+            self.table_metrics.inc_inserts(1);
+            return Ok(id);
+        }
+        let id = self.table.insert(record)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.record(&id);
+        }
+        self.table_metrics.inc_inserts(1);
+        Ok(id)
+    }
+
+    /// Insert multiple records atomically.
+    pub fn insert_batch(&mut self, records: Vec<R>) -> Result<Vec<K>> {
+        #[cfg(feature = "persistence")]
+        if let Some(w) = &mut self.wal_ops {
+            let data_list: Vec<Vec<u8>> = records
+                .iter()
+                .map(|r| Self::serialize_record(r))
+                .collect::<Result<_>>()?;
+            let ids = self.table.insert_batch(records)?;
+            if let Some(ws) = &mut self.write_set {
+                ws.record_all(ids.iter());
+            }
+            for (id, data) in ids.iter().zip(data_list) {
+                w.ops.borrow_mut().push(crate::wal::WalOp::Insert {
+                    table: w.table_name.clone(),
+                    key_type: K::KEY_TYPE_ID,
+                    key: id.encode(),
+                    data,
+                });
+            }
+            self.table_metrics.inc_inserts(ids.len() as u64);
+            return Ok(ids);
+        }
+        let ids = self.table.insert_batch(records)?;
+        if let Some(ws) = &mut self.write_set {
+            ws.record_all(ids.iter());
+        }
+        self.table_metrics.inc_inserts(ids.len() as u64);
+        Ok(ids)
+    }
+}
+
+impl<R: Record> TableWriter<'_, R, u64> {
     /// Apply a [`BulkLoadInput`] within this `WriteTx`.
     ///
     /// This is a convenience wrapper around the existing `*_batch` methods —
@@ -2633,8 +3065,8 @@ impl<'tx, R: Record> TableWriter<'tx, R> {
 ///
 /// Returned by [`ReadTx::open_table`]. Provides the same read methods as
 /// [`TableWriter`] while tracking read metrics.
-pub struct TableReader<'tx, R: Record> {
-    table: &'tx Table<R>,
+pub struct TableReader<'tx, R: Record, K = u64> {
+    table: &'tx Table<R, K>,
     metrics: &'tx StoreMetrics,
     /// Cached per-table counter handle: read methods are hot (HNSW issues
     /// thousands of `get`s per query) and must not take the metrics map's
@@ -2646,17 +3078,22 @@ pub struct TableReader<'tx, R: Record> {
 /// Record a point-read against `table` for the given `id`. No-op when `rs`
 /// is `None` (SnapshotIsolation or read-only tx).
 #[inline]
-fn record_point_read(
+fn record_point_read<K: PrimaryKey>(
     rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntry>>>,
     table: &str,
-    id: u64,
+    key: &K,
 ) {
+    // The digest is computed *inside* the `Some` arm, never as an argument.
+    // `PrimaryKey::hash64` defaults to hashing `encode()`, which allocates,
+    // and `rs` is `None` for every store that is not MultiWriter+Serializable
+    // — which is the default configuration and the hot read path. Hoisting
+    // the call out to the caller put one `Vec<u8>` on every `get`.
     if let Some(cell) = rs {
         cell.borrow_mut()
             .entry(table.to_string())
             .or_default()
             .keys
-            .insert(id);
+            .insert(key.hash64());
     }
 }
 
@@ -2671,20 +3108,20 @@ fn record_table_scan(rs: Option<&std::cell::RefCell<BTreeMap<String, ReadSetEntr
     }
 }
 
-impl<'tx, R: Record> TableReader<'tx, R> {
-    /// Look up a record by its ID.
-    pub fn get(&self, id: u64) -> Option<&R> {
+impl<'tx, R: Record, K: PrimaryKey> TableReader<'tx, R, K> {
+    /// Look up a record by its key.
+    pub fn get(&self, key: impl Borrow<K>) -> Option<&R> {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.get(id)
+        self.table.get(key.borrow())
     }
 
-    /// Returns an iterator over records within the specified ID range.
+    /// Returns an iterator over records within the specified key range.
     pub fn range<'a>(
         &'a self,
-        range: impl std::ops::RangeBounds<u64> + 'a,
-    ) -> impl Iterator<Item = (u64, &'a R)> + 'a {
+        range: impl std::ops::RangeBounds<K> + 'a,
+    ) -> impl Iterator<Item = (K, &'a R)> + 'a {
         self.table_metrics.inc_primary_key_scans();
-        self.table.range(range)
+        self.table.range(range).map(|(k, v)| (k.clone(), v))
     }
 
     /// Returns the number of records in the table.
@@ -2699,87 +3136,88 @@ impl<'tx, R: Record> TableReader<'tx, R> {
         self.table.is_empty()
     }
 
-    /// Returns true if the table contains a record with the given ID.
-    pub fn contains(&self, id: u64) -> bool {
+    /// Returns true if the table contains a record with the given key.
+    pub fn contains(&self, key: impl Borrow<K>) -> bool {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.contains(id)
+        self.table.contains(key.borrow())
     }
 
-    /// Returns the first (lowest ID) record, or `None` if empty.
-    pub fn first(&self) -> Option<(u64, &R)> {
+    /// Returns the first (lowest key) record, or `None` if empty.
+    pub fn first(&self) -> Option<(K, &R)> {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.first()
+        self.table.first().map(|(k, v)| (k.clone(), v))
     }
 
-    /// Returns the last (highest ID) record, or `None` if empty.
-    pub fn last(&self) -> Option<(u64, &R)> {
+    /// Returns the last (highest key) record, or `None` if empty.
+    pub fn last(&self) -> Option<(K, &R)> {
         self.table_metrics.inc_primary_key_reads(1);
-        self.table.last()
+        self.table.last().map(|(k, v)| (k.clone(), v))
     }
 
-    /// Iterate over all records in ID order.
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &R)> + '_ {
+    /// Iterate over all records in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (K, &R)> + '_ {
         self.table_metrics.inc_primary_key_scans();
-        self.table.iter()
+        self.table.iter().map(|(k, v)| (k.clone(), v))
     }
 
-    /// Look up multiple records by ID.
-    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<&R>> {
-        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
-        self.table.get_many(ids)
+    /// Look up multiple records by key.
+    pub fn get_many(&self, keys: &[K]) -> Vec<Option<&R>> {
+        self.table_metrics.inc_primary_key_reads(keys.len() as u64);
+        self.table.get_many(keys)
     }
 
-    /// Look up a single record by a unique index.
-    pub fn get_unique<K: Ord + Clone + Send + Sync + 'static>(
+    /// Look up a single record by a unique index. `IK` is the *index* key;
+    /// the table's primary key stays `K`.
+    pub fn get_unique<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        key: &K,
-    ) -> Result<Option<(u64, &R)>> {
+        key: &IK,
+    ) -> Result<Option<(K, &R)>> {
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_unique(index_name, key)
     }
 
     /// Look up records by a non-unique index key.
-    pub fn get_by_index<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn get_by_index<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        key: &K,
-    ) -> Result<Vec<(u64, &R)>> {
+        key: &IK,
+    ) -> Result<Vec<(K, &R)>> {
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_index(index_name, key)
     }
 
     /// Look up records by index key (works for both unique and non-unique).
-    pub fn get_by_key<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn get_by_key<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        key: &K,
-    ) -> Result<Vec<(u64, &R)>> {
+        key: &IK,
+    ) -> Result<Vec<(K, &R)>> {
         self.metrics.inc_index_reads(&self.table_name, index_name);
         self.table.get_by_key(index_name, key)
     }
 
     /// Range scan on an index (works for both unique and non-unique).
-    pub fn index_range<K: Ord + Clone + Send + Sync + 'static>(
+    pub fn index_range<IK: Ord + Clone + Send + Sync + 'static>(
         &self,
         index_name: &str,
-        range: impl std::ops::RangeBounds<K>,
-    ) -> Result<Vec<(u64, &R)>> {
+        range: impl std::ops::RangeBounds<IK>,
+    ) -> Result<Vec<(K, &R)>> {
         self.metrics
             .inc_index_range_scans(&self.table_name, index_name);
         self.table.index_range(index_name, range)
     }
 
     /// Retrieve a reference to a custom index by name, downcast to the concrete type.
-    pub fn custom_index<I: crate::CustomIndex<R>>(&self, name: &str) -> Result<&I> {
+    pub fn custom_index<I: crate::CustomIndex<R, K>>(&self, name: &str) -> Result<&I> {
         self.table.custom_index(name)
     }
 
-    /// Resolve a slice of record IDs to `(id, &record)` pairs.
-    /// IDs that don't exist in the table are silently skipped.
-    pub fn resolve(&self, ids: &[u64]) -> Vec<(u64, &R)> {
-        self.table_metrics.inc_primary_key_reads(ids.len() as u64);
-        self.table.resolve(ids)
+    /// Resolve a slice of primary keys to `(key, &record)` pairs.
+    /// Keys that don't exist in the table are silently skipped.
+    pub fn resolve(&self, keys: &[K]) -> Vec<(K, &R)> {
+        self.table_metrics.inc_primary_key_reads(keys.len() as u64);
+        self.table.resolve(keys)
     }
 }
 
@@ -2807,8 +3245,48 @@ impl WriteTx {
         &mut self,
         opener: impl TableOpener<R>,
     ) -> Result<TableWriter<'_, R>> {
+        self.open_table_inner::<R, u64>(opener)
+    }
+
+    /// Open a table whose primary key is `K` rather than an auto-increment
+    /// `u64`.
+    ///
+    /// Rows are addressed with [`TableWriter::put`] / [`TableWriter::get`] /
+    /// [`TableWriter::delete`]; there is no auto-increment for a key the store
+    /// cannot generate, so [`TableWriter::insert`] is not available on the
+    /// returned writer.
+    ///
+    /// This is additive rather than a widening of
+    /// [`open_table`](Self::open_table): Rust has no default type parameters
+    /// on functions, so giving `open_table` a second parameter would break
+    /// every `open_table::<R>(..)` turbofish in existence.
+    ///
+    /// # Passing keys by reference
+    ///
+    /// [`TableWriter::put`] takes the key by value, but every read and
+    /// `delete` takes `impl Borrow<K>`, so on a `String`-keyed table a `&str`
+    /// is **not** accepted: the standard library provides `String:
+    /// Borrow<str>`, not `str: Borrow<String>`. `t.get("alice")` does not
+    /// compile; pass `t.get(&alice)` (a `&String`) or an owned `String`. This
+    /// is the inverse of `HashMap<String, _>::get`, which looks up by `&str`,
+    /// and it is the most common surprise when moving a table off `u64` keys.
+    ///
+    /// Creates an empty `K`-keyed table if `name` does not exist in the base
+    /// snapshot; returns [`Error::TypeMismatch`] if it exists with a different
+    /// record *or* key type.
+    pub fn open_table_keyed<R: Record, K: PrimaryKey>(
+        &mut self,
+        opener: impl TableOpener<R>,
+    ) -> Result<TableWriter<'_, R, K>> {
+        self.open_table_inner::<R, K>(opener)
+    }
+
+    fn open_table_inner<R: Record, K: PrimaryKey>(
+        &mut self,
+        opener: impl TableOpener<R>,
+    ) -> Result<TableWriter<'_, R, K>> {
         let name = opener.table_name();
-        self.ensure_dirty_entry::<R>(name)?;
+        self.ensure_dirty_entry::<R, K>(name)?;
         let mw = matches!(self.writer_mode, WriterMode::MultiWriter);
         if mw {
             self.ensure_write_set(name);
@@ -2830,15 +3308,17 @@ impl WriteTx {
         // Single `get_mut` on each map — no aliasing, so no `unsafe` here (the
         // tuple openers below need it because they take several entries at once).
         let entry = self.dirty.get_mut(name).expect("ensured above");
-        let table_metrics = Arc::clone(&entry.table_metrics);
-        let table_name = Arc::clone(&entry.name);
-        let table = entry
-            .table
-            .as_any_mut()
-            .downcast_mut::<Table<R>>()
-            .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
+        let WriterParts {
+            name: table_name,
+            table,
+            table_metrics,
+            modified_keys,
+        } = entry_writer_parts::<R, K>(name, entry)?;
         let write_set = if mw {
-            Some(self.write_set.get_mut(name).expect("ensured above"))
+            Some(WriteSetTracker {
+                digests: self.write_set.get_mut(name).expect("ensured above"),
+                keys: modified_keys,
+            })
         } else {
             None
         };
@@ -2878,8 +3358,8 @@ impl WriteTx {
         if na == nb {
             return Err(Error::DuplicateTableOpen(na.to_string()));
         }
-        self.ensure_dirty_entry::<A>(na)?;
-        self.ensure_dirty_entry::<B>(nb)?;
+        self.ensure_dirty_entry::<A, u64>(na)?;
+        self.ensure_dirty_entry::<B, u64>(nb)?;
         let mw = matches!(self.writer_mode, WriterMode::MultiWriter);
         if mw {
             self.ensure_write_set(na);
@@ -2923,8 +3403,20 @@ impl WriteTx {
         } else {
             (None, None)
         };
-        let (na_h, ta, tma) = entry_writer_parts::<A>(na, ea)?;
-        let (nb_h, tb, tmb) = entry_writer_parts::<B>(nb, eb)?;
+        let pa = entry_writer_parts::<A, u64>(na, ea)?;
+        let pb = entry_writer_parts::<B, u64>(nb, eb)?;
+        let (na_h, ta, tma) = (pa.name, pa.table, pa.table_metrics);
+        let (nb_h, tb, tmb) = (pb.name, pb.table, pb.table_metrics);
+        let (wsa, wsb) = (
+            wsa.map(|digests| WriteSetTracker {
+                digests,
+                keys: pa.modified_keys,
+            }),
+            wsb.map(|digests| WriteSetTracker {
+                digests,
+                keys: pb.modified_keys,
+            }),
+        );
         Ok((
             assemble_writer(
                 na_h,
@@ -2979,9 +3471,9 @@ impl WriteTx {
         if nb == nc {
             return Err(Error::DuplicateTableOpen(nb.to_string()));
         }
-        self.ensure_dirty_entry::<A>(na)?;
-        self.ensure_dirty_entry::<B>(nb)?;
-        self.ensure_dirty_entry::<C>(nc)?;
+        self.ensure_dirty_entry::<A, u64>(na)?;
+        self.ensure_dirty_entry::<B, u64>(nb)?;
+        self.ensure_dirty_entry::<C, u64>(nc)?;
         let mw = matches!(self.writer_mode, WriterMode::MultiWriter);
         if mw {
             self.ensure_write_set(na);
@@ -3035,9 +3527,26 @@ impl WriteTx {
         } else {
             (None, None, None)
         };
-        let (na_h, ta, tma) = entry_writer_parts::<A>(na, ea)?;
-        let (nb_h, tb, tmb) = entry_writer_parts::<B>(nb, eb)?;
-        let (nc_h, tc, tmc) = entry_writer_parts::<C>(nc, ec)?;
+        let pa = entry_writer_parts::<A, u64>(na, ea)?;
+        let pb = entry_writer_parts::<B, u64>(nb, eb)?;
+        let pc = entry_writer_parts::<C, u64>(nc, ec)?;
+        let (na_h, ta, tma) = (pa.name, pa.table, pa.table_metrics);
+        let (nb_h, tb, tmb) = (pb.name, pb.table, pb.table_metrics);
+        let (nc_h, tc, tmc) = (pc.name, pc.table, pc.table_metrics);
+        let (wsa, wsb, wsc) = (
+            wsa.map(|digests| WriteSetTracker {
+                digests,
+                keys: pa.modified_keys,
+            }),
+            wsb.map(|digests| WriteSetTracker {
+                digests,
+                keys: pb.modified_keys,
+            }),
+            wsc.map(|digests| WriteSetTracker {
+                digests,
+                keys: pc.modified_keys,
+            }),
+        );
         Ok((
             assemble_writer(
                 na_h,
@@ -3094,18 +3603,39 @@ impl WriteTx {
     /// snapshot on first open) and type-check it. Idempotent after the first
     /// call in a transaction. This is where the per-table allocation and
     /// metrics-registry hit happen, once per table per transaction.
-    fn ensure_dirty_entry<R: Record>(&mut self, name: &str) -> Result<()> {
+    fn ensure_dirty_entry<R: Record, K: PrimaryKey>(&mut self, name: &str) -> Result<()> {
         if !self.dirty.contains_key(name) {
-            let table: Table<R> = if self.deleted_tables.contains(name) {
-                Table::new()
+            let existing = if self.deleted_tables.contains(name) {
+                None
             } else {
-                match self.base.tables.get(name) {
-                    Some(arc_mt) => arc_mt
-                        .as_any()
-                        .downcast_ref::<Table<R>>()
-                        .ok_or_else(|| Error::TypeMismatch(name.to_string()))?
-                        .clone(), // O(1) BTree root Arc clone
-                    None => Table::new(),
+                self.base.tables.get(name)
+            };
+            let table: Table<R, K> = match existing {
+                Some(arc_mt) => arc_mt
+                    .as_any()
+                    .downcast_ref::<Table<R, K>>()
+                    .ok_or_else(|| Error::TypeMismatch(name.to_string()))?
+                    .clone(), // O(1) BTree root Arc clone
+                None => {
+                    // Building the table from nothing is the one open path
+                    // where neither a snapshot entry nor a prior dirty entry
+                    // pins the (record, key) pair — every other path type-checks
+                    // by downcast. If the store has a registration for this
+                    // name, hold the new table to it: otherwise a
+                    // `Table<R, u64>` created here would later be handed to
+                    // registry closures built for `Table<R, String>` and fail
+                    // at checkpoint time with an opaque "table downcast
+                    // failed".
+                    //
+                    // Deliberately inside this arm: it is the only one that
+                    // needs the check, so re-opening an existing table never
+                    // takes the store lock.
+                    #[cfg(feature = "persistence")]
+                    self.store_inner
+                        .read()
+                        .registry
+                        .validate_type_keyed::<R, K>(name)?;
+                    Table::<R, K>::empty_with_counter(auto_counter_seed::<K>())
                 }
             };
             self.deleted_tables.remove(name);
@@ -3113,6 +3643,7 @@ impl WriteTx {
                 table: Box::new(table),
                 table_metrics: self.metrics.register_table(name),
                 name: Arc::from(name),
+                modified_keys: Box::new(BTreeSet::<K>::new()),
             };
             self.dirty.insert(name.to_string(), entry);
         } else {
@@ -3123,10 +3654,34 @@ impl WriteTx {
                 .expect("present")
                 .table
                 .as_any()
-                .downcast_ref::<Table<R>>()
+                .downcast_ref::<Table<R, K>>()
                 .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
         }
         Ok(())
+    }
+
+    /// The conflict-detection write set for `name`: [`PrimaryKey::hash64`]
+    /// digests, not keys.
+    ///
+    /// Test-only rather than public API — the digest/exact-key split is an
+    /// implementation detail of OCC, and publishing it would freeze the choice
+    /// of digest into the API surface. Tests that need it live in this
+    /// module's `mod tests` for the same reason.
+    #[cfg(test)]
+    pub(crate) fn write_set_digests(&self, name: &str) -> BTreeSet<u64> {
+        self.write_set.get(name).cloned().unwrap_or_default()
+    }
+
+    /// The merge-side exact key set for `name`, downcast back to `BTreeSet<K>`.
+    /// `None` if the table was never opened or `K` does not match. Test-only,
+    /// same rationale as [`Self::write_set_digests`].
+    #[cfg(test)]
+    pub(crate) fn modified_keys_of<K: PrimaryKey>(&self, name: &str) -> Option<BTreeSet<K>> {
+        self.dirty
+            .get(name)?
+            .modified_keys
+            .downcast_ref::<BTreeSet<K>>()
+            .cloned()
     }
 
     /// Ensure the MultiWriter write-set slot for `name` exists. Idempotent.
@@ -3370,9 +3925,13 @@ impl WriteTx {
         let dirty = std::mem::take(&mut self.dirty);
         let mut merged_tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
         for (name, my_dirty) in dirty {
-            // Only the table itself matters from here on; the cached per-table
-            // handles die with the transaction.
-            let my_dirty = my_dirty.table;
+            // The table and its exact modified-key set are what matter from
+            // here on; the cached per-table handles die with the transaction.
+            let DirtyEntry {
+                table: my_dirty,
+                modified_keys,
+                ..
+            } = my_dirty;
             let has_concurrent = concurrent_flags.get(&name).copied().unwrap_or(false);
 
             if !has_concurrent {
@@ -3382,14 +3941,22 @@ impl WriteTx {
                 continue;
             }
 
-            let keys = self.write_set.get(&name);
-            match (latest_tables_ref.get(&name), keys) {
-                (Some(latest_arc), Some(keys)) if !keys.is_empty() => {
+            // Emptiness is read off the digest set, which is maintained in
+            // lockstep with `modified_keys` (and, unlike the erased key set,
+            // can be inspected without naming `K`). The two are empty
+            // together: every recorded key contributes a digest.
+            let digests = self.write_set.get(&name);
+            match (latest_tables_ref.get(&name), digests) {
+                (Some(latest_arc), Some(digests)) if !digests.is_empty() => {
                     let mut merged = latest_arc.boxed_clone();
                     // Drop handles active-writer cleanup on error
                     // (needs_cleanup still true). Table locks drop at
                     // end of scope.
-                    merged.merge_keys_from(&*my_dirty, keys)?;
+                    //
+                    // The merge replays *exact* keys, not digests: conflict
+                    // detection may over-approximate (a hash collision costs a
+                    // retry), but replaying a wrong key would corrupt a row.
+                    merged.merge_keys_from(&*my_dirty, modified_keys.as_ref())?;
                     merged_tables.insert(name, Arc::from(merged));
                 }
                 (Some(_), _) => {
@@ -3717,7 +4284,7 @@ impl WriteTx {
                 {
                     return Some(Error::WriteConflict {
                         table: deleted.clone(),
-                        keys: vec![],
+                        key_digests: vec![],
                         version: cws.version,
                         wait_for: None,
                     });
@@ -3728,7 +4295,7 @@ impl WriteTx {
                 if cws.tables.contains_key(deleted) {
                     return Some(Error::WriteConflict {
                         table: deleted.clone(),
-                        keys: vec![],
+                        key_digests: vec![],
                         version: cws.version,
                         wait_for: None,
                     });
@@ -3752,7 +4319,7 @@ impl WriteTx {
                     let conflicting: Vec<u64> = my_keys.intersection(their_keys).copied().collect();
                     return Some(Error::WriteConflict {
                         table: table_name.clone(),
-                        keys: conflicting,
+                        key_digests: conflicting,
                         version: cws.version,
                         wait_for: None,
                     });
@@ -4046,6 +4613,31 @@ mod tests {
 
     // --- WriteTx tests ---
 
+    /// `TableWriter::upsert` (reachable from safe code through the in-tx
+    /// `bulk_load`) writes caller-supplied ids. The id counter must move past
+    /// them, or a following `insert` in the same transaction silently
+    /// overwrites an upserted row. (Task 3 review, Important 2.)
+    #[test]
+    fn write_tx_upsert_advances_the_id_counter() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            let rows: Vec<(u64, String)> = vec![(1, "one".to_string()), (2, "two".to_string())];
+            t.bulk_load(crate::bulk_load::BulkLoadInput::Replace(
+                crate::bulk_load::BulkSource::sorted_vec(rows),
+            ))
+            .unwrap();
+
+            let id = t.insert("next".to_string()).unwrap();
+            assert_eq!(id, 3, "insert must not reissue an upserted id");
+            assert_eq!(t.len(), 3);
+            assert_eq!(t.get(1), Some(&"one".to_string()));
+            assert_eq!(t.get(3), Some(&"next".to_string()));
+        }
+        wtx.commit().unwrap();
+    }
+
     #[test]
     fn write_tx_open_new_table_creates_empty() {
         let store = Store::default();
@@ -4167,7 +4759,13 @@ mod tests {
             let _ = t.get(1);
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
-        assert!(rs.get("t").map(|e| e.keys.contains(&1)).unwrap_or(false));
+        // The read set stores `hash64()` digests, matching the write set it
+        // is validated against — see `WriteTx::write_set`.
+        assert!(
+            rs.get("t")
+                .map(|e| e.keys.contains(&1u64.hash64()))
+                .unwrap_or(false)
+        );
         assert!(!rs.get("t").map(|e| e.table_scan).unwrap_or(true));
     }
 
@@ -4565,9 +5163,9 @@ mod tests {
         }
         let rs = wtx.read_set.as_ref().unwrap().borrow();
         let entry = rs.get("t").expect("table 't' must be in read_set");
-        assert!(entry.keys.contains(&1));
-        assert!(entry.keys.contains(&2));
-        assert!(entry.keys.contains(&3));
+        assert!(entry.keys.contains(&1u64.hash64()));
+        assert!(entry.keys.contains(&2u64.hash64()));
+        assert!(entry.keys.contains(&3u64.hash64()));
         assert!(
             !entry.table_scan,
             "get_many is point-precise, should not promote to scan"
@@ -4598,7 +5196,7 @@ mod tests {
         let rs = wtx.read_set.as_ref().unwrap().borrow();
         let entry = rs.get("t").expect("table 't' must be in read_set");
         assert!(
-            entry.keys.contains(&999),
+            entry.keys.contains(&999u64.hash64()),
             "missing-key reads must still record (phantom-write-skew defense)"
         );
     }
@@ -4628,7 +5226,7 @@ mod tests {
         let rs = wtx.read_set.as_ref().unwrap().borrow();
         let entry = rs.get("t").expect("table 't' must be in read_set");
         assert!(
-            entry.keys.contains(&1),
+            entry.keys.contains(&1u64.hash64()),
             "point read of id=1 must be retained"
         );
         assert!(
@@ -6559,7 +7157,7 @@ mod tests {
         use crate::table::Table;
         let store = Store::default();
         let v0 = store.latest_version();
-        let new_table: Table<String> = Table::from_bulk(vec![], 1, vec![]).unwrap();
+        let new_table: Table<String> = Table::from_bulk(vec![], Some(1), vec![]).unwrap();
 
         // Manually bump latest_version under the write lock to simulate a
         // concurrent commit that landed between Phase-3 build and install.
@@ -6763,4 +7361,100 @@ mod tests {
         ));
     }
 
+
+    // -----------------------------------------------------------------------
+    // Arbitrary primary keys — the two-structure write set
+    // -----------------------------------------------------------------------
+
+    /// The conflict-detection write set holds `hash64()` digests, while the
+    /// dirty entry holds the exact keys the commit merge replays. This is the
+    /// invariant that makes the detector sound over heterogeneous key types:
+    /// a digest collision can only *add* a conflict (a retry), and the merge
+    /// never sees a digest at all.
+    #[test]
+    fn write_set_records_digests_while_dirty_entry_records_exact_keys() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        let mut w = store.begin_write(None).unwrap();
+        let mut t = w.open_table_keyed::<String, String>("emails").unwrap();
+        t.put("k".to_string(), "v".to_string()).unwrap();
+        t.put("k2".to_string(), "v2".to_string()).unwrap();
+        drop(t);
+
+        // The write set records the digest of each key, not the string.
+        let digests = w.write_set_digests("emails");
+        assert!(digests.contains(&"k".to_string().hash64()));
+        assert!(digests.contains(&"k2".to_string().hash64()));
+        assert_eq!(digests.len(), 2);
+
+        // The dirty entry records the keys themselves, in key order.
+        let keys = w
+            .modified_keys_of::<String>("emails")
+            .expect("table opened as String-keyed");
+        assert_eq!(
+            keys.into_iter().collect::<Vec<_>>(),
+            vec!["k".to_string(), "k2".to_string()]
+        );
+        // ...and only as that type: the erased set is not reinterpretable.
+        assert!(w.modified_keys_of::<u64>("emails").is_none());
+    }
+
+    /// The same split on the default `u64` path: digests, not raw ids, so a
+    /// `u64` writer and a `String` writer on one table compare like for like.
+    #[test]
+    fn u64_write_set_also_records_digests() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        let mut w = store.begin_write(None).unwrap();
+        let mut t = w.open_table::<String>("notes").unwrap();
+        let id = t.insert("hello".to_string()).unwrap();
+        drop(t);
+
+        assert_eq!(
+            w.write_set_digests("notes").into_iter().collect::<Vec<_>>(),
+            vec![id.hash64()]
+        );
+        assert_eq!(
+            w.modified_keys_of::<u64>("notes")
+                .expect("u64-keyed")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+    }
+
+    /// A write that fails must not leave its key in either structure —
+    /// a poisoned write set would make a later commit conflict on a row the
+    /// transaction never wrote.
+    #[test]
+    fn failed_update_does_not_poison_the_write_set() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        let mut w = store.begin_write(None).unwrap();
+        let mut t = w.open_table_keyed::<String, String>("emails").unwrap();
+        let absent = "absent".to_string();
+        assert!(matches!(
+            t.update(&absent, "x".to_string()),
+            Err(Error::KeyNotFound)
+        ));
+        drop(t);
+        assert!(w.write_set_digests("emails").is_empty());
+        assert!(
+            w.modified_keys_of::<String>("emails")
+                .expect("table opened")
+                .is_empty()
+        );
+    }
 }

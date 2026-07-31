@@ -160,12 +160,12 @@ impl crate::store::Store {
         let mut declared_rows_total: u64 = 0;
 
         // Cap pre-allocation against untrusted `row_count`. Each row on the
-        // wire is at minimum 12 bytes (u64 key + u32 val_len + 0-byte value),
-        // so any legitimate `row_count` cannot exceed `remaining_bytes / 12`.
-        // Without this, a malicious or corrupted `row_count = u64::MAX` would
-        // request a many-GB allocation and abort the process before the CRC
-        // check runs.
-        const MIN_ROW_BYTES: usize = 12;
+        // wire is at minimum 8 bytes (u32 key_len + 0-byte key + u32 val_len +
+        // 0-byte value), so any legitimate `row_count` cannot exceed
+        // `remaining_bytes / 8`. Without this, a malicious or corrupted
+        // `row_count = u64::MAX` would request a many-GB allocation and abort
+        // the process before the CRC check runs.
+        const MIN_ROW_BYTES: usize = 8;
 
         for _ in 0..file_header.table_count {
             // 3a. Table header.
@@ -175,28 +175,54 @@ impl crate::store::Store {
             stream_table_names.insert(table_header.name.clone());
             declared_rows_total = declared_rows_total.saturating_add(table_header.row_count);
 
-            // 3b. Rows: key(u64 LE) | val_len(u32 LE) | val(bytes).
+            // 3b. Rows: key_len(u32 LE) | key(bytes) | val_len(u32 LE) | val(bytes).
+            //
+            // The keys stay opaque here: the registry closure for this table
+            // decodes them with the right `K`. Ordering is validated there
+            // too, and encoded order equals key order by the `PrimaryKey`
+            // contract, so nothing is lost by not understanding them.
             let mut table_crc = crc32fast::Hasher::new();
             let remaining = bytes.len().saturating_sub(p);
             let cap_hint =
                 std::cmp::min(table_header.row_count as usize, remaining / MIN_ROW_BYTES);
-            let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(cap_hint);
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(cap_hint);
 
             for _ in 0..table_header.row_count {
-                if bytes.len() < p + 12 {
+                let row_start = p;
+                if bytes.len() < p + 4 {
                     return Err(SnapshotStreamError::Truncated);
                 }
-                let key = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
-                let val_len = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as usize;
-                if bytes.len() < p + 12 + val_len {
+                let key_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                // Same 64 KiB cap the WAL enforces, checked before the key is
+                // allocated rather than after — this length came off untrusted
+                // bytes.
+                if key_len > crate::primary_key::MAX_ENCODED_KEY_LEN {
+                    return Err(SnapshotStreamError::KeyTooLong {
+                        table: table_header.name,
+                        len: key_len,
+                        max: crate::primary_key::MAX_ENCODED_KEY_LEN,
+                    });
+                }
+                // Saturating: a corrupt `key_len`/`val_len` is caller-supplied
+                // and near `u32::MAX`, which can wrap `p + len` on a 32-bit
+                // usize and turn a bounds check into an out-of-range slice.
+                if bytes.len() < p.saturating_add(key_len).saturating_add(4) {
                     return Err(SnapshotStreamError::Truncated);
                 }
-                let val = bytes[p + 12..p + 12 + val_len].to_vec();
-                let chunk = &bytes[p..p + 12 + val_len];
+                let key = bytes[p..p + key_len].to_vec();
+                p += key_len;
+                let val_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                if bytes.len() < p.saturating_add(val_len) {
+                    return Err(SnapshotStreamError::Truncated);
+                }
+                let val = bytes[p..p + val_len].to_vec();
+                p += val_len;
+                let chunk = &bytes[row_start..p];
                 table_crc.update(chunk);
                 total_crc.update(chunk);
                 rows.push((key, val));
-                p += 12 + val_len;
             }
 
             // 3c. Table trailer: table_crc32 (u32 LE).
@@ -239,6 +265,58 @@ impl crate::store::Store {
                 .as_ref()
                 .and_then(|snap| snap.tables.get(&table_header.name))
                 .map(|t| t.as_ref() as &dyn MergeableTable);
+
+            // The row keys are opaque `PrimaryKey::encode` bytes, and several
+            // key types accept the same bytes — `String::decode` of `1u64`'s
+            // eight bytes succeeds (NUL is valid UTF-8), the strict-ascent
+            // check downstream still passes, and the table installs full of
+            // garbage keys with no error anywhere. So the *type* the bytes
+            // were encoded with, which the source recorded in the table
+            // header, has to match this end's before they are decoded.
+            //
+            // Both the destination's registration and its live table are
+            // checked, because they can disagree and each guards a different
+            // failure. The registry's `K` decides what the rebuilt table will
+            // be, so a mismatched registration mis-decodes the incoming
+            // bytes. The live table's `K` is what the install would silently
+            // *replace*: `build_from_raw_rows` looks the existing table up
+            // through an `Option` chain (`registry.rs`'s
+            // `.and_then(..downcast_ref::<Table<R, K>>())`), so a mistyped
+            // destination degrades to "no index definitions" rather than
+            // erroring, and the install lands a table of one key type on top
+            // of another — flipping the key type and destroying every
+            // pre-existing row without a word.
+            // The comparison is on `PrimaryKey::KEY_TYPE_ID`, the discriminant
+            // the key type declares about itself, not on `type_name`:
+            // `type_name` is neither promised stable across compiler versions
+            // (a false refusal) nor injective across crate versions of a
+            // third-party key type (a false *accept*, the direction that
+            // matters). The stream's name is kept for the error message only.
+            let live = existing_table.map(|t| (t.key_type_id(), t.key_type_name(), t.key_type_code()));
+            let registered = registry.key_type(&table_header.name);
+            let mismatch = [live, registered]
+                .into_iter()
+                .flatten()
+                .find(|(_, _, code)| *code != table_header.key_type_id);
+            if let Some((_, destination, _)) = mismatch {
+                return Err(SnapshotStreamError::KeyTypeMismatch {
+                    table: table_header.name,
+                    stream: table_header.key_type,
+                    destination,
+                });
+            }
+
+            // Two key types may legitimately share an id only by a
+            // third-party author's mistake, but the destination's *own* two
+            // records of the key type must never disagree. `TypeId` is exact
+            // within a process, so comparing the two ends held in memory —
+            // registry and live table — costs nothing and catches a
+            // registration that does not match the table it will replace.
+            if let (Some((live_id, ..)), Some((registered_id, ..))) = (live, registered)
+                && live_id != registered_id
+            {
+                return Err(crate::Error::TypeMismatch(table_header.name).into());
+            }
 
             // Reject any custom secondary index up-front: the index-rebuild
             // path inside `Table::from_bulk` panics for `IndexKind::Custom`
@@ -337,5 +415,145 @@ impl crate::store::Store {
         };
 
         Ok(new_version)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live-table key-type guards
+// ---------------------------------------------------------------------------
+//
+// These live inside the crate because they need to construct a store whose
+// registry and whose *live table* disagree about the primary key type. Every
+// public route into that state is closed — `open_table_keyed` and
+// `Store::bulk_load_keyed` both validate against the registry when they create
+// a table from nothing, and `register_table_keyed` validates against the
+// latest snapshot — so the disagreement is forced here directly. That is the
+// point: it proves the wire
+// format's key-type identity is taken from (and checked against) the live
+// table, rather than passing only because something upstream happened to keep
+// the two in step.
+
+#[cfg(all(test, feature = "persistence"))]
+mod live_key_type_tests {
+    use std::io::{Cursor, Read};
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{InstallOptions, SnapshotStreamError};
+    use crate::store::Store;
+    use crate::table::{MergeableTable, Table};
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+    struct Row {
+        v: u64,
+    }
+
+    /// Overwrite `name`'s entry in the latest snapshot, bypassing every public
+    /// guard. Used only to manufacture the registry/live-table disagreement
+    /// the guards under test exist to catch.
+    fn force_live_table(store: &Store, name: &str, table: Box<dyn MergeableTable>) {
+        let mut inner = store.inner.write();
+        let v = inner.latest_version;
+        let mut snap = (*inner.snapshots[&v]).clone();
+        snap.tables.insert(name.to_string(), Arc::from(table));
+        inner.snapshots.insert(v, Arc::new(snap));
+    }
+
+    fn string_table(key: &str, v: u64) -> Box<dyn MergeableTable> {
+        let mut t = Table::<Row, String>::new_keyed();
+        t.put(key.to_string(), Row { v }).unwrap();
+        Box::new(t)
+    }
+
+    /// Emit side. Registry says `u64`, the live table is `String`-keyed.
+    /// The stream's declared key type must come from the table whose rows
+    /// were actually encoded, not from the registry — otherwise the stream
+    /// advertises `u64` over `String` key bytes and a `u64` destination
+    /// accepts it without complaint.
+    #[test]
+    fn emitted_key_type_comes_from_the_live_table_not_the_registry() {
+        let store = Store::default();
+        store.register_table::<Row>("t").unwrap();
+        {
+            let mut tx = store.begin_write(None).unwrap();
+            tx.open_table::<Row>("t").unwrap().insert(Row { v: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        // Exactly 8 bytes, so `u64::decode` would happily accept it.
+        force_live_table(&store, "t", string_table("abcdefgh", 7));
+
+        let mut buf = Vec::new();
+        store
+            .snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .expect("a String-keyed table is emittable now");
+        let (_, n) = super::super::codec::decode_file_header(&buf).unwrap();
+        let (header, _) = super::super::codec::decode_table_header(&buf[n..]).unwrap();
+        assert_eq!(
+            header.key_type,
+            std::any::type_name::<String>(),
+            "the header must name the live table's key type, not the registry's"
+        );
+        // The key bytes travel verbatim; nothing is reinterpreted as a u64.
+        assert!(
+            buf.windows(8).any(|w| w == b"abcdefgh"),
+            "the encoded String key must reach the wire as-is"
+        );
+
+        // And a `u64`-keyed destination refuses it rather than decoding
+        // "abcdefgh" into 7017280452245743464.
+        let dst = Store::default();
+        dst.register_table::<Row>("t").unwrap();
+        match dst.install_snapshot_stream(Cursor::new(&buf), InstallOptions::default()) {
+            Err(SnapshotStreamError::KeyTypeMismatch { table, .. }) => assert_eq!(table, "t"),
+            other => panic!("expected KeyTypeMismatch, got: {other:?}"),
+        }
+    }
+
+    /// Install side. Registry says `u64`, the destination's live table is
+    /// `String`-keyed. Checking only the registry let the install succeed,
+    /// replacing the `String` table with a `u64` one — flipping the key type
+    /// and destroying every pre-existing row, with no error. `build_from_raw_rows`
+    /// cannot catch it: it looks the existing table up through an `Option`
+    /// chain, so a mistyped destination degrades to "no index definitions".
+    #[test]
+    fn install_guard_reads_the_live_table_not_the_registry() {
+        let src = Store::default();
+        src.register_table::<Row>("t").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            tx.open_table::<Row>("t").unwrap().insert(Row { v: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::default();
+        dst.register_table::<Row>("t").unwrap();
+        force_live_table(&dst, "t", string_table("keep-me", 99));
+        let before = dst.begin_read(None).unwrap().version();
+
+        let res = dst.install_snapshot_stream(Cursor::new(&bytes), InstallOptions::default());
+        match res {
+            Err(SnapshotStreamError::KeyTypeMismatch { table, .. }) => assert_eq!(table, "t"),
+            other => panic!("expected KeyTypeMismatch, got: {other:?}"),
+        }
+
+        // Destination untouched: same version, same String-keyed table, and
+        // the row that the silent install destroyed is still there.
+        let rtx = dst.begin_read(None).unwrap();
+        assert_eq!(rtx.version(), before);
+        assert!(
+            rtx.open_table::<Row>("t").is_err(),
+            "the table must still be String-keyed, not flipped to u64"
+        );
+        let t = rtx.open_table_keyed::<Row, String>("t").unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get("keep-me".to_string()), Some(&Row { v: 99 }));
     }
 }

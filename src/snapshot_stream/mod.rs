@@ -22,7 +22,14 @@ use thiserror::Error;
 /// untrusted input and validates magic bytes, per-table and whole-file CRCs,
 /// and row counts before touching destination state; all install-path
 /// failures leave the destination `Store` untouched.
+///
+/// `#[non_exhaustive]`: match arms over this enum must include a wildcard.
+/// Added in 0.3.0, the release that already removes `NonU64Key` and adds
+/// `KeyTypeMismatch`/`KeyTooLong` — so downstream exhaustive matches break
+/// this cycle regardless, and this is the last free moment to make future
+/// variants non-breaking.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SnapshotStreamError {
     /// Underlying I/O failure while reading or writing the wire stream.
     #[error("io: {0}")]
@@ -85,6 +92,57 @@ pub enum SnapshotStreamError {
         table: String,
         /// Name of the custom index.
         index: String,
+    },
+    /// The incoming stream's row keys were encoded with a different
+    /// primary-key type than the destination uses for that table — either its
+    /// registration or its existing live table (the two are checked
+    /// separately, since they can disagree).
+    ///
+    /// This is a hard error rather than a best-effort reinterpretation
+    /// because the raw bytes are *decodable* as several key types — the
+    /// 8 bytes of `1u64`, for instance, are also a valid (NUL-filled)
+    /// `String` — so decoding them under the wrong type would install a table
+    /// full of garbage keys that passes every downstream ordering and CRC
+    /// check.
+    ///
+    /// The comparison is on `std::any::type_name`, which is neither stable
+    /// across compiler versions (so a cross-toolchain stream can be refused
+    /// when it would have decoded — safe) nor injective (so two binaries
+    /// linking different *versions* of the crate defining a key type produce
+    /// the same string, and a stream whose `encode` changed between them is
+    /// accepted and mis-decoded — not caught here, and not catchable without
+    /// a discriminant the key type declares itself). Both ends of an SMR
+    /// deployment run the same binary, where neither limit applies.
+    #[error(
+        "table '{table}': stream keys are encoded as {stream}, but this store \
+         uses {destination} for that table"
+    )]
+    KeyTypeMismatch {
+        /// Name of the offending table.
+        table: String,
+        /// Primary-key type the wire stream declares, as `std::any::type_name`.
+        stream: String,
+        /// Primary-key type this store uses, as `std::any::type_name`.
+        destination: &'static str,
+    },
+    /// A row's encoded primary key exceeds
+    /// [`MAX_ENCODED_KEY_LEN`](crate::primary_key::MAX_ENCODED_KEY_LEN)
+    /// (64 KiB), the same cap the WAL enforces.
+    ///
+    /// Checked at both ends and for different reasons. On **emit** the length
+    /// prefix is a `u32`, so an over-long key would truncate its own length
+    /// and produce a corrupt-but-CRC-valid stream — undetectable downstream.
+    /// On **install** the length comes off untrusted bytes and is read before
+    /// the key is allocated, so an implausible value must be rejected ahead of
+    /// the allocation rather than after it.
+    #[error("table '{table}': encoded primary key is {len} bytes, over the {max}-byte maximum")]
+    KeyTooLong {
+        /// Table the over-long key belongs to.
+        table: String,
+        /// Length claimed for (or measured on) the offending key.
+        len: usize,
+        /// The enforced maximum.
+        max: usize,
     },
     /// A row's bytes failed to deserialize into the destination table's
     /// record type.

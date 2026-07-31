@@ -30,7 +30,7 @@ Self-describing, single-pass encode/decode. Every field is little-endian.
 ```
 [file header]
     magic         8 bytes  b"ULTSNAP\0"
-    format_ver    u16      = 1
+    format_ver    u16      = 2   (v1 is rejected — see "Wire format v2")
     store_ver     u64      Snapshot version this came from
     table_count   u32
 
@@ -39,6 +39,8 @@ Self-describing, single-pass encode/decode. Every field is little-endian.
         name_len       u16
         name           utf-8
         record_type_id u64    (registry hash key — best-effort mismatch hint)
+        key_type_len   u16
+        key_type       utf-8  (`type_name` of the source table's primary key)
         row_count      u64
         index_count    u16
         for each index:
@@ -46,7 +48,8 @@ Self-describing, single-pass encode/decode. Every field is little-endian.
             name_len u16
             name     utf-8
     [row stream, row_count rows]
-        key      u64
+        key_len  u32      (<= 64 KiB, the same cap the WAL enforces)
+        key      PrimaryKey::encode bytes
         val_len  u32
         val      bincode bytes
     [table trailer]
@@ -57,6 +60,15 @@ Self-describing, single-pass encode/decode. Every field is little-endian.
     total_crc32   u32        CRC over all bytes preceding the trailer
     bookend       8 bytes    b"ULTSNAP\0"
 ```
+
+### Wire format v2 (arbitrary primary keys)
+
+`format_ver` was bumped to `2` when table primary keys became generic. Two breaking changes:
+
+- **Rows are length-framed.** v1 wrote a fixed 8-byte little-endian `u64` per row key, which cannot carry a `String`, `Vec<u8>`, or tuple key. v2 writes `key_len (u32) | key bytes`, where the bytes are `PrimaryKey::encode` output. That encoding is order-preserving by contract, so ascending encoded-byte order equals ascending key order — which is what lets the type-erased install path hand rows straight to `BTree::from_sorted` and validate ordering after decoding them with the right `K`.
+- **The table header names the key type.** Row keys are opaque bytes and several key types accept the same bytes (the eight bytes of `1u64` are also a valid NUL-padded `String`), so a stream aimed at a destination using a different `K` would decode cleanly, pass the strict-ascent check, and install garbage keys silently. The source records `type_name::<K>()` of the **live table** the rows came from; install compares it against both the destination's registration and its existing live table (which can disagree) and refuses a mismatch with `SnapshotStreamError::KeyTypeMismatch`. This replaces the interim `NonU64Key` guard, which refused non-`u64` keys outright.
+
+v1 payloads are rejected by version rather than parsed: there is no safe way to read a fixed 8-byte key field as a length-prefixed one.
 
 **Indexes are not shipped as key bytes.** The wire format ships only index *names* and *kinds* (per-table-header `IndexDef`). The receiver's destination store must already have the matching `define_index` calls in place — the `KeyExtractor` closures live in the binary, not in the wire format. At install, the install path looks up the destination's existing table by name, clones its `empty_index_defs()`, and `Table::from_bulk` rebuilds them from the new rows via the existing `IndexMaintainer::rebuild_from_sorted_data` pass. Trades a little CPU on receive for a meaningfully smaller wire payload, with the constraint that index definitions must be code-resident on both sides.
 
@@ -103,7 +115,7 @@ Algorithm:
 2. Decode file header. Validate magic + format_ver.
 3. For each declared table:
    - Decode header.
-   - Drain `row_count` rows accumulating raw `(u64, Vec<u8>)` pairs and updating both the table-CRC and the running total-CRC.
+   - Drain `row_count` rows accumulating raw `(Vec<u8>, Vec<u8>)` (encoded key, record) pairs and updating both the table-CRC and the running total-CRC.
    - Validate the table_crc trailer. Mismatch → `Err(BadCrc { table: Some(name) })`.
    - If table is registered: dispatch through `TableRegistry::build_table_from_raw(name, raw_rows)` which uses a per-type closure registered at `Store::register_table` time to deserialize each row's bytes into typed `R` and build a `Table<R>` via `Table::from_bulk`. Generic-free at the call site.
    - If unknown: `OnUnknown::Drop` → skip; `OnUnknown::Keep` → not yet implemented; `OnUnknown::Error` → `Err(UnknownTable { ... })`.
@@ -206,7 +218,8 @@ Microbenchmarks at 1 K / 10 K / 100 K rows for both build and install paths in `
 
 The v1 install path treats the wire stream as untrusted input. Several hardening passes after the initial implementation:
 
-- **Bounded pre-allocation.** `row_count` is capped against the remaining stream bytes (each row is ≥ 12 bytes on the wire) before `Vec::with_capacity`, so a corrupted or malicious `u64::MAX` can't abort the process via allocator failure before the CRC check runs. Same fix in `bulk_load_stream`.
+- **Bounded pre-allocation.** `row_count` is capped against the remaining stream bytes (each row is ≥ 8 bytes on the wire) before `Vec::with_capacity`, so a corrupted or malicious `u64::MAX` can't abort the process via allocator failure before the CRC check runs. Same fix in `bulk_load_stream`.
+- **Bounded key length.** Both ends enforce `primary_key::MAX_ENCODED_KEY_LEN` (64 KiB), the constant the WAL's `MAX_KEY_LEN` now aliases so the two wire formats cannot drift apart. On emit an over-long key would truncate its own `u32` length prefix into a corrupt-but-CRC-valid stream; on install the length comes off untrusted bytes and is rejected before the key is allocated. Either way: `SnapshotStreamError::KeyTooLong`.
 - **Strict-ascending key check.** `build_from_raw_rows` validates strict-monotonic keys before calling `BTree::from_sorted` (which only `debug_assert!`s). Out-of-order or duplicate keys fail with `Error::Persistence` instead of silently corrupting the tree in release builds.
 - **`next_id` overflow guard.** `last_id + 1` uses `checked_add`; a wire stream with `u64::MAX` as the last key surfaces as a clean error rather than a debug-build panic / release-build wrap-to-0.
 - **Custom-index detection.** Before `Table::from_bulk` (which would `panic!` for `IndexKind::Custom`), the install path walks the destination's `index_list()` and returns `SnapshotStreamError::CustomIndexUnsupported { table, index }` if any custom index is present.

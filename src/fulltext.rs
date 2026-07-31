@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::Result;
 use crate::btree::BTree;
 use crate::index::CustomIndex;
 use crate::persistence::Record;
+use crate::primary_key::PrimaryKey;
 
 /// One match from [`FullTextIndex::search`]/`search_with_limit`, sorted by
 /// descending `score`.
 #[derive(Debug, Clone)]
-pub struct SearchResult {
+pub struct SearchResult<K = u64> {
     /// Primary key of the matching record.
-    pub id: u64,
+    pub id: K,
     /// BM25 relevance score for the query; higher is more relevant. Not
     /// normalized to a fixed range — only meaningful relative to other
     /// results of the same query.
@@ -41,10 +42,10 @@ pub struct SearchResult {
 /// let idx = table.custom_index::<FullTextIndex<String>>("search").unwrap();
 /// assert_eq!(idx.search("rust")[0].id, id);
 /// ```
-pub struct FullTextIndex<R: Record> {
-    postings: BTree<(String, u64), u32>,
+pub struct FullTextIndex<R: Record, K: PrimaryKey = u64> {
+    postings: BTree<(String, K), u32>,
     doc_freq: BTree<String, u32>,
-    doc_lengths: BTree<u64, u32>,
+    doc_lengths: BTree<K, u32>,
     total_docs: u64,
     total_doc_length: u64,
     k1: f64,
@@ -52,7 +53,7 @@ pub struct FullTextIndex<R: Record> {
     extractor: Arc<dyn Fn(&R) -> String + Send + Sync>,
 }
 
-impl<R: Record> Clone for FullTextIndex<R> {
+impl<R: Record, K: PrimaryKey> Clone for FullTextIndex<R, K> {
     fn clone(&self) -> Self {
         Self {
             postings: self.postings.clone(),
@@ -67,7 +68,7 @@ impl<R: Record> Clone for FullTextIndex<R> {
     }
 }
 
-impl<R: Record> FullTextIndex<R> {
+impl<R: Record, K: PrimaryKey> FullTextIndex<R, K> {
     /// Creates an empty index. `extractor` pulls the searchable text out of
     /// each record (e.g. concatenating title and body); it is called on
     /// every insert/update/delete to (re)tokenize the record. Defaults to
@@ -101,39 +102,36 @@ impl<R: Record> FullTextIndex<R> {
     /// descending BM25 score (AND-of-terms is not enforced — any document
     /// matching at least one token scores and is returned). Returns an
     /// empty `Vec` if the query has no tokens or the index is empty.
-    pub fn search(&self, query: &str) -> Vec<SearchResult> {
+    pub fn search(&self, query: &str) -> Vec<SearchResult<K>> {
         self.search_with_limit(query, usize::MAX)
     }
 
     /// Like [`search`](Self::search), but truncates the ranked results to
     /// at most `limit` entries.
-    pub fn search_with_limit(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+    pub fn search_with_limit(&self, query: &str, limit: usize) -> Vec<SearchResult<K>> {
         let tokens = tokenize(query);
         if tokens.is_empty() || self.total_docs == 0 {
             return Vec::new();
         }
 
         let avgdl = self.total_doc_length as f64 / self.total_docs as f64;
-        let mut scores: HashMap<u64, f64> = HashMap::new();
+        let mut scores: BTreeMap<K, f64> = BTreeMap::new();
 
         for token in &tokens {
             let df = self.doc_freq.get(token).copied().unwrap_or(0) as f64;
             let idf = ((self.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
             let idf = idf.max(0.0);
 
-            for ((_, doc_id), tf) in self
-                .postings
-                .range((token.clone(), 0u64)..=(token.clone(), u64::MAX))
-            {
+            for ((_, doc_id), tf) in self.postings.range_prefix(token) {
                 let tf = *tf as f64;
                 let dl = self.doc_lengths.get(doc_id).copied().unwrap_or(0) as f64;
                 let score = idf * (tf * (self.k1 + 1.0))
                     / (tf + self.k1 * (1.0 - self.b + self.b * dl / avgdl));
-                *scores.entry(*doc_id).or_insert(0.0) += score;
+                *scores.entry(doc_id.clone()).or_insert(0.0) += score;
             }
         }
 
-        let mut results: Vec<SearchResult> = scores
+        let mut results: Vec<SearchResult<K>> = scores
             .into_iter()
             .map(|(id, score)| SearchResult { id, score })
             .collect();
@@ -148,7 +146,7 @@ impl<R: Record> FullTextIndex<R> {
         results
     }
 
-    fn add_doc(&mut self, id: u64, record: &R) {
+    fn add_doc(&mut self, id: K, record: &R) {
         let text = (self.extractor)(record);
         let tokens = tokenize(&text);
         if tokens.is_empty() {
@@ -161,7 +159,7 @@ impl<R: Record> FullTextIndex<R> {
         }
 
         for (term, tf) in term_freqs {
-            self.postings = self.postings.insert((term.to_string(), id), tf);
+            self.postings = self.postings.insert((term.to_string(), id.clone()), tf);
             let new_df = self.doc_freq.get(&term.to_string()).copied().unwrap_or(0) + 1;
             self.doc_freq = self.doc_freq.insert(term.to_string(), new_df);
         }
@@ -171,7 +169,7 @@ impl<R: Record> FullTextIndex<R> {
         self.total_doc_length += tokens.len() as u64;
     }
 
-    fn remove_doc(&mut self, id: u64, record: &R) {
+    fn remove_doc(&mut self, id: K, record: &R) {
         let text = (self.extractor)(record);
         let tokens = tokenize(&text);
         if tokens.is_empty() {
@@ -183,7 +181,7 @@ impl<R: Record> FullTextIndex<R> {
             if seen.insert(token, true).is_some() {
                 continue;
             }
-            if let Ok(new_postings) = self.postings.remove(&(token.to_string(), id)) {
+            if let Ok(new_postings) = self.postings.remove(&(token.to_string(), id.clone())) {
                 self.postings = new_postings;
             }
             let df = self.doc_freq.get(&token.to_string()).copied().unwrap_or(1);
@@ -205,20 +203,20 @@ impl<R: Record> FullTextIndex<R> {
     }
 }
 
-impl<R: Record> CustomIndex<R> for FullTextIndex<R> {
-    fn on_insert(&mut self, id: u64, record: &R) -> Result<()> {
-        self.add_doc(id, record);
+impl<R: Record, K: PrimaryKey> CustomIndex<R, K> for FullTextIndex<R, K> {
+    fn on_insert(&mut self, key: K, record: &R) -> Result<()> {
+        self.add_doc(key, record);
         Ok(())
     }
 
-    fn on_update(&mut self, id: u64, old: &R, new: &R) -> Result<()> {
-        self.remove_doc(id, old);
-        self.add_doc(id, new);
+    fn on_update(&mut self, key: K, old: &R, new: &R) -> Result<()> {
+        self.remove_doc(key.clone(), old);
+        self.add_doc(key, new);
         Ok(())
     }
 
-    fn on_delete(&mut self, id: u64, record: &R) {
-        self.remove_doc(id, record);
+    fn on_delete(&mut self, key: K, record: &R) {
+        self.remove_doc(key, record);
     }
 }
 
@@ -560,5 +558,59 @@ mod tests {
         let idx = FullTextIndex::<Article>::new(|a| a.title.clone()).with_bm25_params(2.0, 0.5);
         assert_eq!(idx.k1, 2.0);
         assert_eq!(idx.b, 0.5);
+    }
+
+    #[test]
+    fn full_text_search_over_a_string_keyed_table() {
+        #[derive(Clone, Debug)]
+        #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+        struct Doc {
+            body: String,
+        }
+
+        let mut idx: FullTextIndex<Doc, String> =
+            FullTextIndex::new(|d: &Doc| d.body.clone());
+
+        idx.on_insert(
+            "doc-a".to_string(),
+            &Doc {
+                body: "the quick brown fox".into(),
+            },
+        )
+        .unwrap();
+        idx.on_insert(
+            "doc-b".to_string(),
+            &Doc {
+                body: "the lazy brown dog".into(),
+            },
+        )
+        .unwrap();
+        idx.on_insert(
+            "doc-c".to_string(),
+            &Doc {
+                body: "unrelated content".into(),
+            },
+        )
+        .unwrap();
+
+        let hits = idx.search("brown");
+        let mut ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["doc-a".to_string(), "doc-b".to_string()]);
+
+        // "fox" is unique to doc-a.
+        let hits = idx.search("fox");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "doc-a".to_string());
+
+        // Deleting removes the document from future results.
+        idx.on_delete(
+            "doc-a".to_string(),
+            &Doc {
+                body: "the quick brown fox".into(),
+            },
+        );
+        assert!(idx.search("fox").is_empty());
+        assert_eq!(idx.search("brown").len(), 1);
     }
 }
