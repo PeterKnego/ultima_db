@@ -38,6 +38,7 @@ Read these before Task 1; several tasks depend on them and they are not re-deriv
 | `src/primary_key.rs` (new) | The `PrimaryKey` trait, `AutoKey` marker, order-preserving encode/decode, blanket impls | 1 |
 | `src/index.rs` | Secondary index storage generic over the *row* key type | 2 |
 | `src/btree.rs` | `range_prefix` primitive so a prefix scan needs no min/max key values | 2b |
+| `src/fulltext.rs` | `CustomIndex` + `FullTextIndex` widened over the row key | 3b |
 | `src/table.rs` | `Table<R, K>`; `MergeableTable` reworked for type erasure | 3 |
 | `src/registry.rs` | Type-erased closures carry encoded key bytes; table serialization format v2 | 4 |
 | `src/wal.rs` | `WalOp` carries key bytes; format version bump; recovery rejects v1 | 5 |
@@ -994,6 +995,164 @@ AutoKey bound so it exists only for u64; other keys use put(). MergeableTable
 stays object-safe: merge_keys_from takes an erased &BTreeSet<K> and
 collect_serialized_rows returns encoded key bytes, because a snapshot holds
 heterogeneous key types."
+```
+
+---
+
+### Task 3b: Widen `CustomIndex` and `FullTextIndex` over the row key
+
+**Inserted 2026-07-31, after Task 3's review.** `CustomIndex` hard-codes
+`id: u64` (`src/index.rs:396-402`), so Task 3 had to pin `define_custom_index`
+and `custom_index` to `Table<R, u64>`. The consequence is that a non-`u64`-keyed
+table can define **zero** custom indexes — including the built-in BM25
+`FullTextIndex`. You could key a table by email but not full-text-search it.
+Peter's ruling: widen it, so the feature ships without an asterisk.
+
+**Files:**
+- Modify: `src/index.rs` (`CustomIndex` trait at `:394-418`, `CustomIndexAdapter`)
+- Modify: `src/fulltext.rs` (`SearchResult`, `FullTextIndex` fields and methods)
+- Modify: `src/table.rs` (unpin `define_custom_index`/`custom_index` from the `Table<R, u64>` block)
+- Test: `src/fulltext.rs` in-file tests, `tests/fulltext_integration.rs`, `tests/custom_index_api.rs`
+
+**Interfaces:**
+- Consumes: `PrimaryKey` (Task 1), `BTree::range_prefix` (Task 2b), `Table<R, K>` (Task 3).
+- Produces:
+  - `pub trait CustomIndex<R: Record, K: PrimaryKey = u64>: Send + Sync + Clone + 'static` with `on_insert(&mut self, key: K, record: &R)`, `on_update(&mut self, key: K, old: &R, new: &R)`, `on_delete(&mut self, key: K, record: &R)`, and `rebuild<'a>(&mut self, data: impl Iterator<Item = (K, &'a R)>)`.
+  - `pub struct SearchResult<K = u64> { pub id: K, pub score: f64 }`
+  - `pub struct FullTextIndex<R, K = u64>` with `postings: BTree<(String, K), u32>` and `doc_lengths: BTree<K, u32>`.
+  - `Table<R, K>::define_custom_index` / `custom_index` available for **all** `K`.
+
+**The defaulted parameter is what makes this non-breaking:** every existing
+downstream `impl CustomIndex<R> for MyIndex` keeps compiling, because `K`
+defaults to `u64` in the trait's own parameter list exactly as it does on
+`Table`. Verify that claim with the existing `tests/custom_index_api.rs`, which
+implements the trait from outside the crate's own modules — it should need no
+edits at all. If it does, say so; that would mean the widening is breaking and
+the plan owner needs to know.
+
+**Two specifics that are not mechanical:**
+
+1. **`src/fulltext.rs:126` currently reads**
+   `postings.range((token.clone(), 0u64)..=(token.clone(), u64::MAX))`.
+   That construction has no generic equivalent — it is precisely the
+   min/max-value assumption that Task 2b removed from the index layer. Replace
+   it with `self.postings.range_prefix(token)`, the primitive Task 2b added.
+   This also drops two `String` clones per token from the BM25 scan.
+2. **`scores: HashMap<u64, f64>` at `src/fulltext.rs:117` cannot stay a
+   `HashMap`** — `PrimaryKey` requires `Ord`, not `Hash`. Use
+   `BTreeMap<K, f64>`. Do not add a `Hash` bound to `PrimaryKey` to preserve the
+   `HashMap`; that would constrain every key type for one call site's
+   convenience.
+
+`total_docs` and `total_doc_length` stay `u64` — they are counts, not keys.
+Do not widen them.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `#[cfg(test)] mod tests` in `src/fulltext.rs`:
+
+```rust
+    #[test]
+    fn full_text_search_over_a_string_keyed_table() {
+        #[derive(Clone, Debug)]
+        struct Doc {
+            body: String,
+        }
+
+        let mut idx: FullTextIndex<Doc, String> =
+            FullTextIndex::new(|d: &Doc| d.body.clone());
+
+        idx.on_insert("doc-a".to_string(), &Doc { body: "the quick brown fox".into() })
+            .unwrap();
+        idx.on_insert("doc-b".to_string(), &Doc { body: "the lazy brown dog".into() })
+            .unwrap();
+        idx.on_insert("doc-c".to_string(), &Doc { body: "unrelated content".into() })
+            .unwrap();
+
+        let hits = idx.search("brown", 10);
+        let mut ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["doc-a".to_string(), "doc-b".to_string()]);
+
+        // "fox" is unique to doc-a.
+        let hits = idx.search("fox", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "doc-a".to_string());
+
+        // Deleting removes the document from future results.
+        idx.on_delete("doc-a".to_string(), &Doc { body: "the quick brown fox".into() });
+        assert!(idx.search("fox", 10).is_empty());
+        assert_eq!(idx.search("brown", 10).len(), 1);
+    }
+```
+
+Adjust `FullTextIndex::new`'s constructor call to match its real signature —
+read it first; the extractor shape above is illustrative of intent, not
+necessarily its exact form.
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test --features fulltext --lib fulltext::tests::full_text_search_over_a_string_keyed_table`
+Expected: FAIL — `FullTextIndex` takes one type parameter.
+
+- [ ] **Step 3: Widen the `CustomIndex` trait and its adapter**
+
+In `src/index.rs`, add the defaulted `K: PrimaryKey = u64` parameter to
+`CustomIndex` and change the four `id: u64` occurrences (three methods plus
+`rebuild`'s iterator item) to `key: K`. Widen `CustomIndexAdapter` so it
+implements `IndexMaintainer<R, K>` rather than `IndexMaintainer<R, u64>`.
+
+- [ ] **Step 4: Widen `FullTextIndex`**
+
+In `src/fulltext.rs`: add `K = u64` to `SearchResult` and `FullTextIndex`,
+change `postings` to `BTree<(String, K), u32>` and `doc_lengths` to
+`BTree<K, u32>`, switch `scores` to `BTreeMap<K, f64>`, and replace the
+`(token, 0u64)..=(token, u64::MAX)` range with `range_prefix` per the note
+above. Leave `total_docs` and `total_doc_length` as `u64`.
+
+- [ ] **Step 5: Unpin `define_custom_index` / `custom_index`**
+
+In `src/table.rs`, move these two methods out of the `Table<R, u64>`-pinned
+block back into the general `impl<R: Record, K: PrimaryKey> Table<R, K>` block.
+Remove the pinned block if it becomes empty.
+
+- [ ] **Step 6: Confirm the widening is source-compatible for downstream implementors**
+
+Run: `cargo test --features fulltext --test custom_index_api`
+Expected: PASS **with no edits to that file.** If it required edits, stop and
+report exactly what changed — that would make the widening a breaking change
+rather than an additive one, which the plan owner must know before release.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test --features fulltext` and `cargo test --features persistence,fulltext`
+Expected: PASS, including the new String-keyed test.
+
+- [ ] **Step 8: Verify the full gate**
+
+```bash
+cargo test
+cargo test --features persistence
+cargo test --features fulltext
+cargo test -p ultima-vector
+cargo check --lib --no-default-features
+cargo clippy --all-targets --features persistence,fulltext -- -D warnings
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/index.rs src/fulltext.rs src/table.rs tests/
+git commit -m "feat(index): widen CustomIndex and FullTextIndex over the row key
+
+CustomIndex hard-coded id: u64, so Task 3 had to pin define_custom_index to
+u64-keyed tables — meaning a String-keyed table could define no custom index
+and no full-text search. Both now carry a defaulted K = u64, so every
+existing downstream impl stays source-compatible.
+
+FullTextIndex's posting scan used (token, 0u64)..=(token, u64::MAX), which
+has no generic equivalent; it now uses the range_prefix primitive added in
+task 2b, dropping two String clones per token as a side effect."
 ```
 
 ---
