@@ -26,8 +26,8 @@ mod tests {
     }
 
     /// The snapshot stream must start with the 8-byte magic `ULTSNAP\0`
-    /// followed by the format version (u16 LE = 1), the store version (u64 LE),
-    /// and the table count (u32 LE).
+    /// followed by the format version (u16 LE, currently 2), the store version
+    /// (u64 LE), and the table count (u32 LE).
     #[test]
     fn snapshot_stream_starts_with_magic_and_header() {
         let store = Store::new(StoreConfig::default()).unwrap();
@@ -1201,5 +1201,104 @@ mod tests {
         assert_eq!(header.name, "rows");
         assert_eq!(header.key_type, std::any::type_name::<String>());
         assert_eq!(header.row_count, 1);
+    }
+
+    /// The snapshot wire format and the WAL must enforce the *same* key-length
+    /// cap. A key one of them accepts and the other truncates is a row that
+    /// survives one durability path and is corrupted by the other.
+    ///
+    /// On emit the check is not defensive against a hostile caller — it is
+    /// against the `u32` length prefix: an over-long key truncates its own
+    /// length and produces a stream that still passes every CRC downstream.
+    #[test]
+    fn emit_refuses_an_over_long_key() {
+        const MAX: usize = 64 * 1024;
+
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table_keyed::<Row, String>("rows").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            let mut t = tx.open_table_keyed::<Row, String>("rows").unwrap();
+            // One byte over the shared cap.
+            t.put("k".repeat(MAX + 1), Row { value: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut bytes = Vec::new();
+        let err = src
+            .snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .expect_err("an over-long key must not reach the wire");
+        // `Read::read` stringifies the error (io::Error::other(e.to_string())),
+        // so the message is the only thing observable here; the typed
+        // `KeyTooLong` variant is asserted on the install side below.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&MAX.to_string()) && msg.contains(&(MAX + 1).to_string()),
+            "the error must name both the key length and the cap, got: {msg}"
+        );
+        assert!(
+            !bytes.windows(64).any(|w| w == [b'k'; 64]),
+            "no part of the over-long key may reach the wire"
+        );
+
+        // Exactly at the cap is fine — the bound is inclusive, as the WAL's is.
+        let ok_src = Store::new(StoreConfig::default()).unwrap();
+        ok_src.register_table_keyed::<Row, String>("rows").unwrap();
+        {
+            let mut tx = ok_src.begin_write(None).unwrap();
+            let mut t = tx.open_table_keyed::<Row, String>("rows").unwrap();
+            t.put("k".repeat(MAX), Row { value: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut ok_bytes = Vec::new();
+        ok_src
+            .snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut ok_bytes)
+            .expect("a key exactly at the cap must be emittable");
+    }
+
+    /// The install side of the same cap. The length comes off untrusted bytes,
+    /// so it must be rejected *before* the key is allocated — a corrupt
+    /// `key_len` near `u32::MAX` must not drive a multi-GB allocation.
+    #[test]
+    fn install_refuses_an_over_long_key_length() {
+        use ultima_db::SnapshotStreamError;
+        use ultima_db::snapshot_stream::codec::{
+            FileHeader, TableHeader, encode_file_header, encode_table_header,
+        };
+
+        let mut bytes = Vec::new();
+        encode_file_header(
+            &FileHeader {
+                format_ver: FILE_FORMAT_V,
+                store_ver: 1,
+                table_count: 1,
+            },
+            &mut bytes,
+        );
+        encode_table_header(
+            &TableHeader {
+                name: "rows".to_string(),
+                record_type_id: 0,
+                key_type: std::any::type_name::<u64>().to_string(),
+                row_count: 1,
+                indexes: Vec::new(),
+            },
+            &mut bytes,
+        );
+        // A row claiming a ~4 GB key, with no payload behind it.
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(FILE_MAGIC);
+
+        let dst = Store::new(StoreConfig::default()).unwrap();
+        dst.register_table::<Row>("rows").unwrap();
+        let res = dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default());
+        assert!(
+            matches!(res, Err(SnapshotStreamError::KeyTooLong { .. })),
+            "expected KeyTooLong, got {res:?}"
+        );
     }
 }

@@ -48,7 +48,7 @@ Self-describing, single-pass encode/decode. Every field is little-endian.
             name_len u16
             name     utf-8
     [row stream, row_count rows]
-        key_len  u32
+        key_len  u32      (<= 64 KiB, the same cap the WAL enforces)
         key      PrimaryKey::encode bytes
         val_len  u32
         val      bincode bytes
@@ -219,6 +219,7 @@ Microbenchmarks at 1 K / 10 K / 100 K rows for both build and install paths in `
 The v1 install path treats the wire stream as untrusted input. Several hardening passes after the initial implementation:
 
 - **Bounded pre-allocation.** `row_count` is capped against the remaining stream bytes (each row is ≥ 8 bytes on the wire) before `Vec::with_capacity`, so a corrupted or malicious `u64::MAX` can't abort the process via allocator failure before the CRC check runs. Same fix in `bulk_load_stream`.
+- **Bounded key length.** Both ends enforce `primary_key::MAX_ENCODED_KEY_LEN` (64 KiB), the constant the WAL's `MAX_KEY_LEN` now aliases so the two wire formats cannot drift apart. On emit an over-long key would truncate its own `u32` length prefix into a corrupt-but-CRC-valid stream; on install the length comes off untrusted bytes and is rejected before the key is allocated. Either way: `SnapshotStreamError::KeyTooLong`.
 - **Strict-ascending key check.** `build_from_raw_rows` validates strict-monotonic keys before calling `BTree::from_sorted` (which only `debug_assert!`s). Out-of-order or duplicate keys fail with `Error::Persistence` instead of silently corrupting the tree in release builds.
 - **`next_id` overflow guard.** `last_id + 1` uses `checked_add`; a wire stream with `u64::MAX` as the last key surfaces as a clean error rather than a debug-build panic / release-build wrap-to-0.
 - **Custom-index detection.** Before `Table::from_bulk` (which would `panic!` for `IndexKind::Custom`), the install path walks the destination's `index_list()` and returns `SnapshotStreamError::CustomIndexUnsupported { table, index }` if any custom index is present.

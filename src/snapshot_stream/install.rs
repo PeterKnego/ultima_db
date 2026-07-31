@@ -194,6 +194,16 @@ impl crate::store::Store {
                 }
                 let key_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
                 p += 4;
+                // Same 64 KiB cap the WAL enforces, checked before the key is
+                // allocated rather than after — this length came off untrusted
+                // bytes.
+                if key_len > crate::primary_key::MAX_ENCODED_KEY_LEN {
+                    return Err(SnapshotStreamError::KeyTooLong {
+                        table: table_header.name,
+                        len: key_len,
+                        max: crate::primary_key::MAX_ENCODED_KEY_LEN,
+                    });
+                }
                 // Saturating: a corrupt `key_len`/`val_len` is caller-supplied
                 // and near `u32::MAX`, which can wrap `p + len` on a 32-bit
                 // usize and turn a bounds check into an out-of-range slice.
@@ -276,18 +286,31 @@ impl crate::store::Store {
             // erroring, and the install lands a table of one key type on top
             // of another — flipping the key type and destroying every
             // pre-existing row without a word.
-            let live_key = existing_table.map(|t| t.key_type_name());
-            let registered_key = registry.key_type(&table_header.name).map(|(_, name)| name);
-            let mismatch = [live_key, registered_key]
+            let live = existing_table.map(|t| (t.key_type_id(), t.key_type_name()));
+            let registered = registry.key_type(&table_header.name);
+            let mismatch = [live, registered]
                 .into_iter()
                 .flatten()
-                .find(|name| *name != table_header.key_type);
-            if let Some(destination) = mismatch {
+                .find(|(_, name)| *name != table_header.key_type);
+            if let Some((_, destination)) = mismatch {
                 return Err(SnapshotStreamError::KeyTypeMismatch {
                     table: table_header.name,
                     stream: table_header.key_type,
                     destination,
                 });
+            }
+
+            // The name comparison above is only as good as `type_name` being
+            // injective, and it is not: two crate *versions* of the same key
+            // type print identically. `TypeId` is exact within a process, so
+            // comparing the two ends we hold in memory — registry and live
+            // table — closes the local half of that collision for free. (It
+            // cannot close the remote half; the stream carries no `TypeId`,
+            // and `TypeId` is not stable across builds anyway.)
+            if let (Some((live_id, _)), Some((registered_id, _))) = (live, registered)
+                && live_id != registered_id
+            {
+                return Err(crate::Error::TypeMismatch(table_header.name).into());
             }
 
             // Reject any custom secondary index up-front: the index-rebuild
@@ -395,11 +418,12 @@ impl crate::store::Store {
 // ---------------------------------------------------------------------------
 //
 // These live inside the crate because they need to construct a store whose
-// registry and whose *live table* disagree about the primary key type. Both
-// public routes into that state are now closed — `open_table_keyed` validates
-// against the registry when it creates a table from nothing, and
-// `register_table_keyed` validates against the latest snapshot — so the
-// disagreement is forced here directly. That is the point: it proves the wire
+// registry and whose *live table* disagree about the primary key type. Every
+// public route into that state is closed — `open_table_keyed` and
+// `Store::bulk_load_keyed` both validate against the registry when they create
+// a table from nothing, and `register_table_keyed` validates against the
+// latest snapshot — so the disagreement is forced here directly. That is the
+// point: it proves the wire
 // format's key-type identity is taken from (and checked against) the live
 // table, rather than passing only because something upstream happened to keep
 // the two in step.

@@ -110,6 +110,21 @@ fn malformed_escape() -> Error {
     Error::InvalidBulkLoadInput("primary key decode: malformed escape sequence".to_string())
 }
 
+/// Upper bound on one [`PrimaryKey::encode`] output, enforced by every wire
+/// format that carries a key as a length-prefixed byte string.
+///
+/// Both trust boundaries read a length off untrusted bytes before allocating,
+/// so both need a cap, and they need the *same* cap: a key the WAL accepts but
+/// the snapshot stream truncates (or vice versa) is a row that survives one
+/// durability path and is corrupted by the other. Defining it once is what
+/// makes them agree by construction rather than by coincidence.
+///
+/// 64 KiB is orders of magnitude above any sane key (a `u64` encodes to 8
+/// bytes; the largest plausible tuple-of-strings key is a few hundred) while
+/// keeping a corrupt length from driving a large allocation.
+#[cfg_attr(not(feature = "persistence"), allow(dead_code))]
+pub(crate) const MAX_ENCODED_KEY_LEN: usize = 64 * 1024;
+
 /// The `ENCODED_LEN`/`encode`/`decode` trio shared by every unsigned integer
 /// key. Split out of `impl_unsigned_key!` so `u64` — the one `AutoKey` type —
 /// can spell its own impl block and add `advance_auto_counter` to it.

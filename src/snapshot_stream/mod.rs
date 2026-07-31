@@ -98,10 +98,14 @@ pub enum SnapshotStreamError {
     /// full of garbage keys that passes every downstream ordering and CRC
     /// check.
     ///
-    /// The comparison is on `std::any::type_name`, which Rust does not
-    /// promise to keep stable across compiler versions. Both ends of an SMR
-    /// deployment run the same binary, so this only bites a cross-toolchain
-    /// stream — and it bites as a refusal, never as a silent mis-decode.
+    /// The comparison is on `std::any::type_name`, which is neither stable
+    /// across compiler versions (so a cross-toolchain stream can be refused
+    /// when it would have decoded — safe) nor injective (so two binaries
+    /// linking different *versions* of the crate defining a key type produce
+    /// the same string, and a stream whose `encode` changed between them is
+    /// accepted and mis-decoded — not caught here, and not catchable without
+    /// a discriminant the key type declares itself). Both ends of an SMR
+    /// deployment run the same binary, where neither limit applies.
     #[error(
         "table '{table}': stream keys are encoded as {stream}, but this store \
          uses {destination} for that table"
@@ -113,6 +117,25 @@ pub enum SnapshotStreamError {
         stream: String,
         /// Primary-key type this store uses, as `std::any::type_name`.
         destination: &'static str,
+    },
+    /// A row's encoded primary key exceeds
+    /// [`MAX_ENCODED_KEY_LEN`](crate::primary_key::MAX_ENCODED_KEY_LEN)
+    /// (64 KiB), the same cap the WAL enforces.
+    ///
+    /// Checked at both ends and for different reasons. On **emit** the length
+    /// prefix is a `u32`, so an over-long key would truncate its own length
+    /// and produce a corrupt-but-CRC-valid stream — undetectable downstream.
+    /// On **install** the length comes off untrusted bytes and is read before
+    /// the key is allocated, so an implausible value must be rejected ahead of
+    /// the allocation rather than after it.
+    #[error("table '{table}': encoded primary key is {len} bytes, over the {max}-byte maximum")]
+    KeyTooLong {
+        /// Table the over-long key belongs to.
+        table: String,
+        /// Length claimed for (or measured on) the offending key.
+        len: usize,
+        /// The enforced maximum.
+        max: usize,
     },
     /// A row's bytes failed to deserialize into the destination table's
     /// record type.

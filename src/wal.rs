@@ -224,7 +224,11 @@ fn check_entry_header(data: &[u8]) -> Result<usize> {
 /// This mirrors the bounds-checked `take` helpers the registry reader grew for
 /// the same reason (task 4 follow-up), so both trust boundaries now validate
 /// lengths before acting on them.
-const MAX_KEY_LEN: usize = 64 * 1024;
+///
+/// The value is shared with the snapshot wire format rather than restated
+/// here — see [`crate::primary_key::MAX_ENCODED_KEY_LEN`] for why the two must
+/// not be allowed to drift apart.
+const MAX_KEY_LEN: usize = crate::primary_key::MAX_ENCODED_KEY_LEN;
 
 /// Read a length-prefixed encoded primary key at `data[offset..]`, returning
 /// the key and the number of bytes consumed.

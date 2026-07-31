@@ -1394,6 +1394,17 @@ impl Store {
     /// `opts` defaults to [`BulkLoadOptions::default`](crate::BulkLoadOptions)
     /// when `None`.
     ///
+    /// # Concurrency
+    ///
+    /// Same contract as [`Store::bulk_load`]. The base version is captured
+    /// before the table is built, so a commit that lands at any point during
+    /// the build — including inside a secondary index's extractor, which the
+    /// rebuild calls once per row — is refused with [`Error::WriteConflict`]
+    /// rather than silently overwritten. Retry against the new state. In
+    /// `WriterMode::SingleWriter` an open writer instead yields
+    /// [`Error::WriterBusy`], since that mode has no commit-time OCC to catch
+    /// the install.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1434,10 +1445,14 @@ impl Store {
         }
 
         let sorted: Vec<(K, Arc<R>)> = rows.into_iter().map(|(k, r)| (k, Arc::new(r))).collect();
-        let new_table =
+        // `base_version` comes back from the builder, captured under the same
+        // read lock as the snapshot it read index definitions from. Reading
+        // `latest_version()` here instead would compare a post-commit version
+        // against itself and silently overwrite any commit that landed during
+        // the build.
+        let (new_table, base_version) =
             self.build_table_from_sorted::<R, K>(table_name, sorted, opts.create_if_missing)?;
 
-        let base_version = self.latest_version();
         let new_version = self.install_batch(
             vec![crate::bulk_load::PendingTable {
                 name: table_name.to_string(),
@@ -1534,12 +1549,30 @@ impl Store {
         //    `u64`-keyed by construction (the auto-increment source shapes
         //    only make sense for an `AutoKey`); explicit keys of any type go
         //    through `Store::bulk_load_keyed` instead.
-        self.build_table_from_sorted::<R, u64>(name, mat.rows, create_if_missing)
+        //
+        //    The builder's captured version is discarded here: both callers of
+        //    this helper (`bulk_load`'s Replace arm and `BulkLoadBatch::add`)
+        //    install against the version their *batch* was opened at, which is
+        //    captured earlier still — so their OCC check is at least as strict
+        //    as the builder's.
+        let (table, _base_version) =
+            self.build_table_from_sorted::<R, u64>(name, mat.rows, create_if_missing)?;
+        Ok(table)
     }
 
     /// Build a table from strictly-ascending `(key, record)` rows, cloning
     /// the index *definitions* of the table that name currently holds (if
     /// any) so secondary indexes survive the load. Does not install.
+    ///
+    /// Returns the built table together with the `latest_version` observed
+    /// **under the same read lock** as the snapshot it read index definitions
+    /// from. Callers must use that value as the `base_version` they hand to
+    /// `install_batch`, not a fresh `latest_version()` read afterwards: this
+    /// function's index rebuild runs off-lock and can take a long time on a
+    /// large load, and any commit landing in that window must be visible to
+    /// the install's OCC check. Reading the version after the build compares
+    /// a post-commit version against itself and silently overwrites the
+    /// concurrent commit.
     ///
     /// Shared by the `u64` `BulkSource` path and by
     /// [`Store::bulk_load_keyed`]; nothing here is `u64`-specific.
@@ -1548,10 +1581,14 @@ impl Store {
         name: &str,
         sorted: Vec<(K, Arc<R>)>,
         create_if_missing: bool,
-    ) -> Result<crate::table::Table<R, K>> {
-        let base_snapshot = {
+    ) -> Result<(crate::table::Table<R, K>, u64)> {
+        // Snapshot and version together, under one lock — capturing them
+        // separately races a committer that lands between the two reads.
+        // Mirrors `install_snapshot_stream`'s capture.
+        let (base_snapshot, base_version) = {
             let inner = self.inner.read();
-            inner.snapshots[&inner.latest_version].clone()
+            let v = inner.latest_version;
+            (inner.snapshots[&v].clone(), v)
         };
 
         let index_defs: Vec<Box<dyn crate::index::IndexMaintainer<R, K>>> =
@@ -1562,6 +1599,15 @@ impl Store {
                     .ok_or_else(|| Error::TypeMismatch(name.to_string()))?;
                 typed.empty_index_defs()?
             } else if create_if_missing {
+                // Creating the table from nothing means nothing else fixes
+                // its key type, so hold it to any registration the store
+                // already has — otherwise a `Table<R, K>` built here is later
+                // handed to registry closures built for a different `K` and
+                // fails at checkpoint time with an opaque "table downcast
+                // failed", permanently. Same check, same arm, as
+                // `WriteTx::ensure_dirty_entry`.
+                #[cfg(feature = "persistence")]
+                self.inner.read().registry.validate_type_keyed::<R, K>(name)?;
                 Vec::new()
             } else {
                 return Err(Error::TableNotFound(name.to_string()));
@@ -1575,7 +1621,11 @@ impl Store {
             crate::primary_key::auto_counter_seed::<K>(),
             sorted.last().map(|(k, _)| k),
         )?;
-        crate::table::Table::from_bulk(sorted, next_id, index_defs)
+        // The index rebuild inside `from_bulk` calls a caller-supplied
+        // extractor once per row, so this is unbounded off-lock work — which
+        // is exactly why `base_version` was captured above rather than after.
+        let table = crate::table::Table::from_bulk(sorted, next_id, index_defs)?;
+        Ok((table, base_version))
     }
 
     /// Install N pre-built tables atomically as one snapshot. Mirrors

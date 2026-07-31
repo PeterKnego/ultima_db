@@ -17,6 +17,7 @@ use super::codec::{
     FILE_FORMAT_V, FILE_MAGIC, FileHeader, IndexDef, TableHeader, encode_file_header,
     encode_table_header,
 };
+use crate::primary_key::MAX_ENCODED_KEY_LEN;
 use crate::registry::TableRegistry;
 use crate::store::Snapshot;
 
@@ -160,6 +161,22 @@ impl SnapshotReader {
                 // is privileged and nothing is reinterpreted on the way out.
                 let serialized_rows: Vec<(Vec<u8>, Vec<u8>)> =
                     table_arc.collect_serialized_rows(serialize_fn)?;
+
+                // Same 64 KiB cap the WAL enforces. Checked before the table
+                // header goes out, and checked here rather than at emit time
+                // because the row's length prefix is a `u32`: an over-long key
+                // would silently truncate its own length into a stream that
+                // still passes every CRC on the other side.
+                if let Some((key, _)) = serialized_rows
+                    .iter()
+                    .find(|(k, _)| k.len() > MAX_ENCODED_KEY_LEN)
+                {
+                    return Err(SnapshotStreamError::KeyTooLong {
+                        table: name,
+                        len: key.len(),
+                        max: MAX_ENCODED_KEY_LEN,
+                    });
+                }
 
                 // The key type is asked of the *live table*, not of the
                 // registry. The two can disagree — `open_table_keyed` can

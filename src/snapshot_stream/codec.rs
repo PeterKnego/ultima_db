@@ -63,11 +63,23 @@ pub struct TableHeader {
     /// that at the trust boundary — see
     /// [`SnapshotStreamError::KeyTypeMismatch`](crate::SnapshotStreamError::KeyTypeMismatch).
     ///
-    /// The check is only as good as `type_name`'s stability, which Rust does
-    /// not guarantee across compiler versions. In the deployment this format
-    /// exists for (SMR replicas of one binary) both ends agree by
-    /// construction; a cross-toolchain mismatch would surface as a loud
-    /// refusal, never as a silent mis-decode.
+    /// Two limits, both accepted deliberately:
+    ///
+    /// - `type_name` is not **stable**: Rust does not guarantee the string
+    ///   across compiler versions, so a cross-toolchain stream can be refused
+    ///   when it would in fact have decoded. That direction is safe — a loud
+    ///   refusal, never a silent mis-decode.
+    /// - `type_name` is not **injective**: two binaries linking different
+    ///   *versions* of the crate that defines a key type produce the identical
+    ///   string, so a stream whose `encode` changed between those versions is
+    ///   accepted and mis-decoded silently. This check does not catch that
+    ///   case, and nothing on the wire can — closing it needs a discriminant
+    ///   the key type declares rather than one derived from Rust internals.
+    ///   The install path does compare `TypeId`s between the destination's
+    ///   registry and its live table, which closes the *local* half.
+    ///
+    /// In the deployment this format exists for (SMR replicas of one binary)
+    /// both ends agree by construction and neither limit applies.
     pub key_type: String,
     /// Number of rows in this table's row stream.
     pub row_count: u64,
