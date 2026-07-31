@@ -424,9 +424,13 @@ fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, 
         return Err(Error::Persistence(format!(
             "unsupported table format version: leading byte 0x{:02x} is not the v{} marker \
              (this looks like a pre-0.3.0 v1 table, whose row keys were fixed 8-byte ids). \
-             Table data written before 0.3.0 cannot be read: recover with the previous \
-             version, export the data, and re-import it into a 0.3.0+ store — or delete the \
-             checkpoint/WAL directory to start fresh.",
+             Table data written before 0.3.0 cannot be read by this build. To migrate: with \
+             the previous UltimaDB version, `Store::recover()` the old directory, read the \
+             rows out through a `ReadTx`, and load them into a 0.3.0+ store with \
+             `Store::bulk_load` / `Store::bulk_load_batch` (or move them over the wire with \
+             `Store::open_checkpoint_reader` + `Store::install_snapshot_stream`). To discard \
+             the old data instead, delete the checkpoint and WAL files in the persistence \
+             directory.",
             header[0], TABLE_FORMAT_V2
         )));
     }
@@ -465,6 +469,20 @@ fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, 
             bincode::serde::decode_from_slice(take(bytes, &mut at, rlen)?, config)
                 .map_err(|e| Error::Persistence(e.to_string()))?;
         rows.push((key, Arc::new(record)));
+    }
+
+    // The payload must be consumed exactly. Without this, a corrupted-but-not-
+    // truncated payload is accepted silently: understating `count` (2 → 0)
+    // yields an empty table with a live `next_id`, and appended junk is
+    // ignored outright. Callers hand us CRC-verified, `data_len`-delimited
+    // slices, so this is defense in depth — but "validate at the trust
+    // boundary" is this function's job, and every other malformed-input check
+    // here catches truncation, i.e. the opposite direction.
+    if at != bytes.len() {
+        return Err(Error::Persistence(format!(
+            "table payload has {} trailing bytes after {count} rows",
+            bytes.len() - at
+        )));
     }
 
     // `from_bulk` only debug-asserts ascending order — validate it here, at
@@ -971,6 +989,90 @@ mod tests {
                 (info.deserialize_table)(&full[..cut]).is_err(),
                 "truncation at {cut} bytes must error"
             );
+        }
+    }
+
+    /// Build a two-row `u64` payload and hand back its bytes. Also pins the
+    /// v2 header layout the corruption tests index into.
+    fn two_row_payload(info: &TableTypeInfo) -> Vec<u8> {
+        let mut table = Table::<TestUser>::new();
+        for (name, age) in [("Alice", 30u32), ("Bob", 25)] {
+            table
+                .insert(TestUser {
+                    name: name.into(),
+                    age,
+                })
+                .unwrap();
+        }
+        let bytes = (info.serialize_table)(&table).unwrap();
+        // [magic][version][has_next_id][next_id_len: u32-be][next_id: 8][count: u64-be]
+        assert_eq!(bytes[0], TABLE_MAGIC_V2);
+        assert_eq!(bytes[1], TABLE_FORMAT_V2);
+        assert_eq!(bytes[2], 1, "a u64 table carries a counter");
+        assert_eq!(u32::from_be_bytes(bytes[3..7].try_into().unwrap()), 8);
+        assert_eq!(u64::from_be_bytes(bytes[7..15].try_into().unwrap()), 3);
+        assert_eq!(u64::from_be_bytes(bytes[COUNT_AT..COUNT_AT + 8].try_into().unwrap()), 2);
+        bytes
+    }
+
+    /// Offset of the `num_entries` field for a `u64`-keyed payload.
+    const COUNT_AT: usize = 15;
+
+    /// Corrupted-but-*not*-truncated input: understating `count` must not be
+    /// read as a smaller table. Before the trailing-byte check this returned
+    /// an empty table carrying a live `next_id == 3` and no error at all —
+    /// every other malformed-input test here is a prefix truncation, which is
+    /// why the gap survived.
+    #[test]
+    fn deserialize_rejects_understated_row_count() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut bytes = two_row_payload(info);
+        bytes[COUNT_AT..COUNT_AT + 8].copy_from_slice(&0u64.to_be_bytes());
+
+        let Err(err) = (info.deserialize_table)(&bytes) else {
+            panic!("an understated row count must be rejected");
+        };
+        assert!(
+            format!("{err}").contains("trailing bytes"),
+            "expected a trailing-bytes error, got: {err}"
+        );
+    }
+
+    /// The other direction: bytes appended after the last row.
+    #[test]
+    fn deserialize_rejects_trailing_junk() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let mut bytes = two_row_payload(info);
+        bytes.extend_from_slice(&[0xABu8; 32]);
+
+        let Err(err) = (info.deserialize_table)(&bytes) else {
+            panic!("trailing junk must be rejected");
+        };
+        assert!(
+            format!("{err}").contains("trailing bytes"),
+            "expected a trailing-bytes error, got: {err}"
+        );
+    }
+
+    /// The rejection message must point at APIs that exist.
+    #[test]
+    fn v1_rejection_message_names_a_real_migration_path() {
+        let mut reg = TableRegistry::default();
+        reg.register::<TestUser, u64>("users").unwrap();
+        let info = reg.get("users").unwrap();
+
+        let Err(err) = (info.deserialize_table)(&[0u8; 24]) else {
+            panic!("a v1 payload must be rejected");
+        };
+        let msg = format!("{err}");
+        for expected in ["format version", "Store::recover", "bulk_load", "delete"] {
+            assert!(msg.contains(expected), "message missing {expected:?}: {msg}");
         }
     }
 

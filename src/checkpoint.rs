@@ -153,7 +153,17 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
         let info = registry
             .get(&name)
             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
-        let table_any = (info.deserialize_table)(table_bytes)?;
+        // Name the table in format/corruption errors: `deserialize_table` sees
+        // only an anonymous byte slice, and the message an operator hits after
+        // upgrading with existing data on disk ("unsupported table format
+        // version") is useless without knowing *which* table it came from.
+        // Only `Persistence` — the variant this file's format errors use — is
+        // rewritten; a `UniqueConstraintViolation` from the index rebuild
+        // keeps its own variant so callers can still match on it.
+        let table_any = (info.deserialize_table)(table_bytes).map_err(|e| match e {
+            Error::Persistence(msg) => Error::Persistence(format!("table '{name}': {msg}")),
+            other => other,
+        })?;
         tables.insert(name, std::sync::Arc::from(table_any));
     }
 
@@ -530,6 +540,50 @@ mod tests {
         assert!(
             matches!(result, Err(Error::CheckpointCorrupted(ref msg)) if msg.contains("truncated"))
         );
+    }
+
+    /// The upgrade an operator actually performs: a checkpoint written by a
+    /// pre-0.3.0 build, whose table bodies are in table format v1. It must be
+    /// rejected, and the error must name *which* table — `deserialize_table`
+    /// sees only an anonymous byte slice.
+    #[test]
+    fn deserialize_v1_table_body_errors_and_names_the_table() {
+        let config = bincode::config::standard();
+
+        // A real v1 body: [next_id][count][id, record]*, all bincode varint.
+        let mut body = Vec::new();
+        bincode::encode_into_std_write(2u64, &mut body, config).unwrap();
+        bincode::encode_into_std_write(1u64, &mut body, config).unwrap();
+        bincode::encode_into_std_write(1u64, &mut body, config).unwrap();
+        bincode::serde::encode_into_std_write(
+            &User {
+                name: "Alice".into(),
+                age: 30,
+            },
+            &mut body,
+            config,
+        )
+        .unwrap();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // snapshot version
+        bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // num_tables
+        bincode::encode_into_std_write("users", &mut data, config).unwrap();
+        bincode::encode_into_std_write(body.len() as u64, &mut data, config).unwrap();
+        data.extend_from_slice(&body);
+        let crc = crc32(&data);
+        data.extend_from_slice(&crc.to_le_bytes());
+
+        let mut reg = TableRegistry::default();
+        reg.register::<User, u64>("users").unwrap();
+        let Err(err) = deserialize_snapshot(&data, &reg) else {
+            panic!("a v1 table body must be rejected");
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("format version"), "{msg}");
+        assert!(msg.contains("users"), "the error must name the table: {msg}");
     }
 
     #[test]
