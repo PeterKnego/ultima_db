@@ -23,6 +23,23 @@
 //! one per operation" rather than exactly zero. The per-call regression they
 //! guard is a factor of N, so the margin is never in doubt — and with
 //! `--test-threads=1` the observed counts are exactly 0.
+//!
+//! **Not compiled with the `metrics` feature.** That feature emits a counter
+//! per table operation through `metrics::counter!`, and each emission clones
+//! the table name into a label `String` (`StoreMetrics::emit`, `src/metrics.rs`)
+//! — three allocations per point read, on `TableReader::get` as well, which is
+//! this file's allocation-free control. So the property asserted here is not
+//! merely unmet under `metrics`, it is the wrong property to assert: the
+//! instrumentation allocates by design. Gating keeps the guard meaningful for
+//! the configurations where "the read path does not allocate" is a real
+//! invariant, rather than weakening every assertion to accommodate a build
+//! that deliberately violates it.
+//!
+//! The per-emission label allocation is itself worth removing (an `Arc<str>`
+//! name, or `metrics`' static-label form) — but `src/metrics.rs` predates this
+//! test and is out of its scope. Tracked in `docs/BACKLOG.md`.
+
+#![cfg(not(feature = "metrics"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

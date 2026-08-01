@@ -89,6 +89,16 @@ Set aside 2026-07-30. Correctness and robustness work for a stable release.
 
 ## Smaller loose ends
 
+- **The `metrics` feature allocates three times per point read.** Every
+  `TableMetrics::inc_*` emits through `metrics::counter!` and clones the table
+  name into a label `String` (`emit`, `src/metrics.rs`). It lands on
+  `TableReader::get` too, so it is not specific to the write path. Fix is an
+  `Arc<str>` name or `metrics`' static-label form. Until then
+  `tests/hot_path_allocations.rs` is `#![cfg(not(feature = "metrics"))]` —
+  the no-allocation invariant it guards is real for every other configuration,
+  and asserting it under instrumentation that allocates by design would only
+  force the assertions to be weakened.
+
 - **YCSB workloads D/E** grow the dataset across iterations, so absolute
   numbers drift between runs. Cross-engine comparisons stay fair (all engines
   see the same drift). Fix only if absolute D/E numbers are ever published.
