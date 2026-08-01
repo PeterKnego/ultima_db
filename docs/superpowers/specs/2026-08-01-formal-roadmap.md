@@ -14,8 +14,18 @@ drift-guarded in CI) and costs ~nothing to maintain. This doc records what is
 comes from **code-tight models of new, concurrent, or crash-facing surfaces**.
 Four real shipped bugs came from theorem-proving over faithful models; zero
 came from abstraction-first bounded checking of already-fixed surfaces. Prefer
-the siege engine (Lean/Aeneas) for lasting guarantees, a scout (small
-explicit-state model, loom, kani) to find shallow counterexamples first.
+the siege engine (Lean/Aeneas) for lasting guarantees, a scout to find shallow
+counterexamples first.
+
+**Tool portfolio (decided 2026-08-01, shared with ultima_cluster — full
+rationale in `../ultima_cluster/docs/superpowers/specs/2026-08-01-uc2-formal-roadmap.md`
+§"Tool portfolio"):** deliberately minimal — **Lean (incl. Aeneas)** as the
+prover and sole record, **TLA+/TLC** as the ONE model-checking scout
+(Veil is retired permanently; Specula is at most a gated harness over the
+TLA+ slot), and **loom** for weak-memory interleavings. kani is dropped
+(covered by loom + proptest/differential habits). A tool's real cost is the
+standing overhead — toolchain rot, model drift, DSL tuition — so new tools
+enter only through a gated spike with an exit-cheap clause.
 
 ---
 
@@ -131,13 +141,16 @@ cluster's Veil arc; read `../ultima_cluster/proofs-veil/spike-ledger.md`
    prefix ≤ durable, drop all volatile state) / recover. Model each of the
    three `WalWrite` modes' durability step distinctly — `CoalescedPrealloc`'s
    crash step must allow a torn batch *and* stale pre-zeroed space after it.
-2. **Scout (optional but recommended):** a small explicit-state enumeration
-   of the model (a few hundred lines of Rust or Lean `#eval`, or Veil if the
-   toolchain is at hand) hunting the two safety properties below at small
-   bounds. Adjudicate every counterexample against the Rust before "fixing"
-   the model — the cluster arc's counterexamples were model artifacts ~11
-   times before they were ever real, and each adjudication is itself a
-   fidelity audit of the Rust.
+2. **Scout (recommended): TLA+/TLC** — the portfolio's designated checker,
+   and this is its home turf (fsync/crash/recover state machines are the
+   canonical industrial TLA+ use). Expect a 300–500-line spec with
+   crash-at-any-prefix as a one-line disjunct; TLC runs in minutes at this
+   state-space size. Hunt the two safety properties below at small bounds
+   before proving anything. Adjudicate every counterexample against the
+   Rust before "fixing" the model — the cluster arc's counterexamples were
+   model artifacts ~11 times before they were ever real, and each
+   adjudication is itself a fidelity audit of the Rust. The debugged TLA+
+   model is then the porting source for step 3's Lean model.
 3. **Prove (Lean, hand model — NOT Aeneas; concurrency + IO are out of its
    scope):** `recovery_sound` — after any crash, recovery yields exactly a
    prefix of submission order containing every acked commit
@@ -186,10 +199,11 @@ Three independent sub-tasks, each picks up the `formal/` framework as-is:
   direction" per the README).
 - **(d, small) FixedVec side-proof.** The kernel models node storage as `Vec`;
   the documented representation gap (slot bookkeeping, `u8` length) is
-  covered only by unit tests + a compile-time `T ≤ 127` guard. Either a
-  standalone Aeneas proof that `FixedVec`'s ops are Vec-equivalent on the
-  initialized prefix, or a `kani` harness exhaustively checking small
-  capacities. Discharges the last caveat in the README's task52 note.
+  covered only by unit tests + a compile-time `T ≤ 127` guard. A standalone
+  Aeneas proof that `FixedVec`'s ops are Vec-equivalent on the initialized
+  prefix (kani is out per the portfolio decision; if a proof is too costly,
+  exhaustive small-capacity differential tests are the fallback). Discharges
+  the last caveat in the README's task52 note.
 
 ---
 
