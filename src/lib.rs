@@ -22,8 +22,9 @@
 //! - Bulk restores and deltas go through `Store::bulk_load` /
 //!   `Store::bulk_load_batch`.
 //!
-//! Design documents for each subsystem live in `docs/tasks/` in the
-//! repository.
+//! Design documents for each subsystem live in
+//! [`docs/tasks/`](https://github.com/PeterKnego/ultima_db/tree/main/docs/tasks)
+//! in the repository.
 
 #![warn(missing_docs)]
 
@@ -38,7 +39,9 @@ pub(crate) mod checkpoint;
 /// table, and transaction operations.
 pub mod error;
 /// BM25 full-text search over a table's records, gated by the `fulltext`
-/// cargo feature. See `docs/tasks/task43_unicode_tokenizer.md` for tokenization details.
+/// cargo feature. See
+/// [the task43 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task43_unicode_tokenizer.md)
+/// for tokenization details.
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
 /// Secondary index infrastructure: unique, non-unique, and custom indexes

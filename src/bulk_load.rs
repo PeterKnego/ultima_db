@@ -6,7 +6,8 @@
 //! Provides a fast path for ingesting many rows at once, primarily for full
 //! restores and incremental delta application. Builds a fresh data B-tree
 //! and indexes from sorted input, then atomically installs the result as a
-//! new MVCC snapshot. See `docs/tasks/task23_bulk_load.md`.
+//! new MVCC snapshot. See
+//! [the task23 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task23_bulk_load.md).
 
 #![allow(dead_code)]
 

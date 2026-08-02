@@ -224,7 +224,8 @@ impl<R: Record, K: PrimaryKey> CustomIndex<R, K> for FullTextIndex<R, K> {
 /// boundaries. `char::is_alphanumeric` covers all scripts, so Unicode
 /// punctuation/symbols/whitespace all split tokens (not just ASCII).
 ///
-/// Known limitations (see `docs/tasks/task43_unicode_tokenizer.md`):
+/// Known limitations (see
+/// [the task43 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task43_unicode_tokenizer.md)):
 /// CJK runs have no spaces and stay a single token; NFD combining marks are
 /// treated as boundaries, so NFC-normalized input is recommended.
 fn tokenize(text: &str) -> Vec<String> {

@@ -1502,7 +1502,7 @@ pub(crate) struct WalHandle {
     /// eliminates the enqueue→wake-writer→fsync→wake-waiter handoff
     /// (~20–35µs/commit) that only pays off when commits can batch. Wired for
     /// `SingleWriter + Consistent` (serial commits never batch). See
-    /// `docs/tasks/task38_wal_inline_fsync.md`.
+    /// [the task38 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task38_wal_inline_fsync.md).
     sync_sink: Option<Arc<Mutex<Box<dyn WalSink>>>>,
 }
 

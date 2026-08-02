@@ -27,8 +27,9 @@ pub const FILE_MAGIC: &[u8; 8] = b"ULTSNAP\0";
 pub const FILE_FORMAT_V: u16 = 2;
 
 /// Decoded file-level header: format version, source snapshot version, and
-/// declared table count. See `docs/tasks/task27_snapshot_stream.md` for the
-/// full wire layout.
+/// declared table count. See
+/// [the task27 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task27_snapshot_stream.md)
+/// for the full wire layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     /// Wire format version this payload was encoded with; must equal
@@ -42,7 +43,8 @@ pub struct FileHeader {
 
 /// Decoded per-table header: name, best-effort type hint, row count, and
 /// index definitions (names/kinds only — no key bytes; see
-/// `docs/tasks/task27_snapshot_stream.md` "Wire format").
+/// [the task27 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task27_snapshot_stream.md),
+/// "Wire format").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableHeader {
     /// Table name, used by the install path to look up the destination

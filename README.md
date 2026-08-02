@@ -118,7 +118,7 @@ cargo clippy -- -D warnings      # lint (zero warnings policy)
 cargo bench                      # criterion benchmarks (YCSB, SmallBank, ...)
 ```
 
-Design notes for every feature live in [`docs/tasks/`](docs/tasks/). The full configuration reference is [docs/configuration.md](docs/configuration.md).
+Documentation lives in [`docs/`](docs/README.md): a [getting-started tutorial](docs/tutorials/getting-started.md), [how-to guides](docs/how-to/README.md), [reference pages](docs/reference/README.md) (configuration, formats, isolation, performance), and [explanations](docs/explanation/README.md) of the architecture and design. The API reference is on [docs.rs](https://docs.rs/ultima-db). Per-feature design records for contributors live in [`docs/tasks/`](docs/tasks/).
 
 ## License
 

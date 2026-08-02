@@ -21,7 +21,8 @@ pub enum Error {
 
     /// An embedding or query contained a NaN or ±Infinity component.
     /// Rejected at every `VectorCollection` boundary so the graph can never
-    /// contain a non-finite value (see `docs/tasks/task40`).
+    /// contain a non-finite value (see
+    /// [the task40 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task40_vector_input_validation.md)).
     #[error("non-finite value ({value}) at index {index} in vector")]
     NonFinite {
         /// Position of the offending component within the vector.

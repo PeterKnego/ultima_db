@@ -1334,7 +1334,7 @@ impl Store {
     /// `MIN_KEYS`; reads, writes, and deletes against the loaded table are
     /// unaffected, and a delete touching that leaf restores the floor.
     ///
-    /// See `docs/tasks/task23_bulk_load.md`.
+    /// See [the task23 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task23_bulk_load.md).
     ///
     /// # Examples
     ///
@@ -2091,8 +2091,9 @@ impl std::fmt::Debug for VersionPin {
 /// `ReadTx` is `Send + Sync`: it can be moved to another thread or shared by
 /// reference, and it keeps its version alive from wherever it is held. See
 /// [`VersionPin`] for a lighter handle that pins a version without holding a
-/// whole read view, and `docs/tasks/task55_send_audit.md` for the audit
-/// behind these bounds (`tests/send_bounds.rs` asserts them).
+/// whole read view, and
+/// [the task55 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task55_send_audit.md)
+/// for the audit behind these bounds (`tests/send_bounds.rs` asserts them).
 pub struct ReadTx {
     snapshot: Arc<Snapshot>,
     metrics: Arc<StoreMetrics>,
@@ -2266,8 +2267,8 @@ struct DirtyEntry {
 /// open/use/commit-or-drop sequence belongs inside `spawn_blocking`, not on
 /// a worker thread.
 ///
-/// See `docs/tasks/task55_send_audit.md`; `tests/send_bounds.rs` asserts the
-/// bounds.
+/// See [the task55 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task55_send_audit.md);
+/// `tests/send_bounds.rs` asserts the bounds.
 pub struct WriteTx {
     base: Arc<Snapshot>,
     /// Mutable working copies of tables opened for writing, with their
@@ -4402,7 +4403,7 @@ impl WriteTx {
 /// is correct from any thread (nothing here is thread-keyed), but since
 /// `WriteTx` is `Send` an implicit drop can now land on an async worker
 /// thread — see the hazard list on [`WriteTx`] and
-/// `docs/tasks/task55_send_audit.md`.
+/// [the task55 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task55_send_audit.md).
 impl Drop for WriteTx {
     fn drop(&mut self) {
         if self.needs_cleanup {

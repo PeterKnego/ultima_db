@@ -25,7 +25,11 @@ assert_eq!(hits[0].0, 1); // id of the closest match, "doc-a"
 ```
 
 More in [`examples/`](examples/): quick search, filtered search, bulk
-restore, transactional composition, and persistence.
+restore, transactional composition, and persistence. For a task-oriented
+walkthrough see
+[How to add vector search to your data](../docs/how-to/add-vector-search.md);
+for how HNSW works and what the parameters trade, see
+[the vector-search explanation](../docs/explanation/vector-search.md).
 
 ## Distance metrics
 

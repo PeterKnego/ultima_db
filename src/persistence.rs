@@ -125,7 +125,8 @@ impl Persistence {
     /// Recommended fast durable config for a **single-writer** store: inline-fsync
     /// ([`Durability::ConsistentInline`]) + preallocation ([`WalWrite::CoalescedPrealloc`])
     /// — the lowest durable-commit latency (validated ~3.8× vs the `PerEntry` default
-    /// on NVMe; see `docs/tasks/task38_wal_inline_fsync.md`).
+    /// on NVMe; see
+    /// [the task38 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task38_wal_inline_fsync.md)).
     ///
     /// Same durability guarantee as [`Durability::Consistent`] (commit blocks until
     /// fsynced; no data loss on crash). **SingleWriter only** — building a store with

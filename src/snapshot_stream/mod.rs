@@ -3,11 +3,15 @@
 
 //! Streaming wire format for UltimaDB checkpoints.
 
+/// Build path: streaming a wire payload out of a frozen snapshot. Gated on
+/// the `persistence` cargo feature.
 #[cfg(feature = "persistence")]
 pub mod build;
 /// Wire-format encode/decode primitives (file/table headers, magic bytes,
 /// version constants) shared by the build and install paths.
 pub mod codec;
+/// Install path: validating an untrusted wire payload and atomically
+/// installing it into a live `Store`.
 pub mod install;
 
 #[cfg(feature = "persistence")]

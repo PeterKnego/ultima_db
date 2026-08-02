@@ -95,6 +95,9 @@ where
     S: 'static,
     R: 'static,
 {
+    /// Creates a managed index of the given `kind`, pairing `extractor`
+    /// (computes the index key for each record) with its backing `storage`.
+    /// `name` is reported in errors (e.g. duplicate keys on a unique index).
     pub fn new(
         name: String,
         kind: IndexKind,
@@ -109,6 +112,9 @@ where
         }
     }
 
+    /// Read access to the backing storage. The `Table` query paths
+    /// (`get_unique`, `get_by_index`, `index_range`) downcast the type-erased
+    /// maintainer to a concrete `ManagedIndex` and query through this.
     pub fn storage(&self) -> &S {
         &self.storage
     }
@@ -286,10 +292,13 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
         Self { tree }
     }
 
+    /// The row key indexed under `key`, if present.
     pub fn get(&self, key: &IK) -> Option<K> {
         self.tree.get(key).cloned()
     }
 
+    /// `(index key, row key)` pairs whose index key falls in `range`,
+    /// ascending by index key.
     pub fn range_ids<'a>(
         &'a self,
         range: impl std::ops::RangeBounds<IK> + 'a,
@@ -428,6 +437,8 @@ pub(crate) struct CustomIndexAdapter<R: Record, K: PrimaryKey, I: CustomIndex<R,
 }
 
 impl<R: Record, K: PrimaryKey, I: CustomIndex<R, K>> CustomIndexAdapter<R, K, I> {
+    /// Wraps `index` under registration name `name` so it can live in the
+    /// table's type-erased maintainer map alongside the built-in indexes.
     pub fn new(name: String, index: I) -> Self {
         Self {
             inner: index,
@@ -436,6 +447,9 @@ impl<R: Record, K: PrimaryKey, I: CustomIndex<R, K>> CustomIndexAdapter<R, K, I>
         }
     }
 
+    /// The wrapped user index. `Table::custom_index` downcasts the erased
+    /// maintainer to this adapter and hands the caller this reference for
+    /// queries.
     pub fn inner(&self) -> &I {
         &self.inner
     }

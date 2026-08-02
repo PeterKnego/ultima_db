@@ -9,6 +9,8 @@ before upgrading a store that has data on disk.**
 
 ### Migration from 0.2.x — required if you use `persistence`
 
+> Step-by-step guide: [How to migrate a persistent store from 0.2.x to 0.3.0](docs/how-to/migrate-from-0-2-to-0-3.md).
+
 There is no in-place upgrade, and **checkpointing on 0.2.x does not help**:
 0.3.0 rejects pre-0.3.0 checkpoints as well as pre-0.3.0 WALs. The path is:
 
