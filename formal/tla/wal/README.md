@@ -1,10 +1,10 @@
 # TLA+ WAL crash-safety scout
 
-**Status: S0 gate + S1 Task 1** (steady-state commit pipeline, no crash yet).
-`S0Smoke`/`S0Canary` are the toolchain gate: proof that TLC runs here, checks
-invariants, and — the part that matters — *reports a violation when there is
-one*. `WalCrash.tla` is the model proper, so far covering the three-phase
-Consistent commit at steady state.
+**Status: S0 gate + S1 Tasks 1–2** (steady-state commit pipeline, plus crash
+and recovery). `S0Smoke`/`S0Canary` are the toolchain gate: proof that TLC runs
+here, checks invariants, and — the part that matters — *reports a violation when
+there is one*. `WalCrash.tla` is the model proper, covering the three-phase
+Consistent commit, a crash with per-frame tearing, and `Store::recover`.
 
 Brief: `docs/superpowers/specs/2026-08-02-wal-crash-safety-tla-scout-brief.md`.
 Roadmap: `docs/superpowers/specs/2026-08-01-formal-roadmap.md` (task F-DB-2).
@@ -27,7 +27,7 @@ The jar is committed, version-named, following the precedent set by
 
 ```bash
 make formal/tla-smoke   # S0 toolchain gate
-make formal/tla-model   # S1 model: vacuity canary (must go red) then baseline
+make formal/tla-model   # S1 model: three baselines, each after a canary that must go red
 ```
 
 Two constraints are not optional on this box, both learned the hard way and
@@ -64,7 +64,7 @@ gate is lying.
 
 ## The model: `WalCrash.tla`
 
-Task 1 of the S1 plan. Steady-state three-phase commit — `Begin` (allocate a
+Tasks 1–2 of the S1 plan. Steady-state three-phase commit — `Begin` (allocate a
 candidate version), `Submit` (phase 1 PREPARE: finalize the version against
 `max(latest, lastSubmitted)`, buffer the WAL entry, take a `PromoteGate`
 ticket), `Fsync` (the background thread's batch barrier, covering a prefix of
@@ -84,15 +84,50 @@ through the fsync wait is its *only* protection. Modelling them
 unconditionally would hand SingleWriter protections the code lacks, and would
 mask M1.
 
+### Crash and recovery (Task 2)
+
+`Crash` fires at most once per behaviour. Volatile state is destroyed; frames
+already covered by a durability barrier survive intact; every merely-buffered
+frame independently lands whole, lands **torn** (present, CRC-bad), or never
+lands. Tearing is per-frame and **positional** — an absent frame is a hole at
+its own byte offset, not a removal that slides later frames forward, because
+`scan_wal` walks offsets in order and `break`s at the first record it cannot
+accept (`src/wal.rs:574-607`). `Recover` is `Store::recover`
+(`src/store.rs:984`): install the checkpoint, scan, replay entries past the
+checkpoint version. `tail_tolerant` is true for `CoalescedPrealloc` only
+(`src/store.rs:1017-1022`), and that is the whole of `SinkKind`'s influence.
+
+`RecoverySound` is S1: after a successful crash+recover, the recovered state is
+the replay of a **prefix of submission order**, contains every
+`Consistent`/`ConsistentInline`-acked commit, replays no torn frame, and has
+strictly monotone versions. A strict-mode scan error is excluded — that is a
+*loud* failure (`recover()` returns `Err`, the store never opens), not the
+silent acked-write loss S1 is about.
+
 | Config | Expected | Actual |
 |---|---|---|
 | `Vacuity.cfg` | **violated** | violated (exit 12), 14 distinct, depth 5 |
-| `WalCrash.cfg` — SingleWriter | no error | no error, **49 distinct**, depth 9 |
+| `VacuityCrash.cfg` | **violated** | violated (exit 12) |
+| `WalCrash.cfg` — SingleWriter | no error | no error, **147 distinct**, depth 11 |
 | `VacuityMW.cfg` | **violated** | violated (exit 12), 59 distinct, depth 5 |
-| `WalCrashMW.cfg` — MultiWriter | no error | no error, **169 distinct**, depth 8 |
+| `VacuityCrashMW.cfg` | **violated** | violated (exit 12) |
+| `WalCrashMW.cfg` — MultiWriter | no error | no error, **651 distinct**, depth 10 |
+| `VacuityCrashPrealloc.cfg` | **violated** | violated (exit 12) |
+| `WalCrashPrealloc.cfg` — MW + prealloc | no error | no error, **651 distinct**, depth 10 |
 
 Constants otherwise: `MaxCommits = 2`, `Tables = {t1, t2}`, `Consistent`,
-`FsWrite`, `MUTATION = "NONE"`.
+`MUTATION = "NONE"`; `SinkKind = FsWrite` except in the prealloc config.
+Task 1's no-crash counts were 49 (SingleWriter) and 169 (MultiWriter); crash
+and recovery multiply them 3.0× and 3.9×. All three baselines are exhaustive
+(0 states left on queue).
+
+**Why a third baseline.** `FsWrite` and `Coalesced` are both *strict* scans, so
+under them `TailTolerant` is constantly false and the tolerant half of
+`scan_wal` — recovery truncating at a torn tail and carrying on, the branch M4
+attacks — is unreachable. Measured, not assumed: a scratch reachability
+assertion asserting that branch is never taken **holds** under `WalCrash.cfg`
+and `WalCrashMW.cfg`, and is violated under `WalCrashPrealloc.cfg`. Without the
+third config, `RecoverySound` would be green over dead code there.
 
 **SingleWriter is strictly serial by construction and is not the interesting
 config.** Because the writer slot is held from `begin_write` through
@@ -113,12 +148,21 @@ nothing.
 
 ## Not yet done
 
-Crash and recovery (Task 2) — `crashed` is declared and pinned `FALSE` so
-Task 2 adds an action, not a variable, to every config. `SinkKind` is carried
-but not yet behaviour-differentiating: `FsWrite`/`Coalesced`/`CoalescedPrealloc`
-only diverge under a crash (`sync_data` vs `sync_all`, torn tails). Also
-pending: fsync *failure* (the "advance the gate without promoting" rule),
-checkpoint/prune, and the S1/S3/S4/S5/L1 battery.
+Fsync *failure* — task15's "a commit whose fsync fails advances the gate
+without promoting". Crash did **not** give it a home: a crash removes a parked
+commit by destroying the whole gate, whereas a failed fsync must remove *one*
+ticket and let the rest of the FIFO proceed. That needs a per-ticket outcome on
+`Fsync`. L1 (liveness) stays inexpressible until then.
+
+Checkpoint and prune — `checkpointVersion` is carried and `Recover` honours it
+as the replay floor (`src/store.rs:1027-1030`), but no action moves it off 0, so
+no committed config exercises a non-zero floor. A `Checkpoint` action also drags
+in WAL pruning (`src/wal.rs:628`), which is where checkpoint/prune/crash
+interleavings would actually bite.
+
+`FsWrite` vs `Coalesced` still do not diverge: they differ in write
+granularity, not in sync granularity or in what the recovery scan does. Also
+pending: the S3/S4/S5 properties and the M2–M5 battery.
 
 M1 is already gated on `MUTATION` (one spec, never forked `.tla` copies) — it
 was needed to prove the SingleWriter path is no longer over-protected. It has

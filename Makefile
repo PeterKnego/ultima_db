@@ -57,6 +57,11 @@ formal/tla-smoke:
 # construction (the writer slot is held through the fsync wait), so it cannot
 # reach parking-while-another-writer-proceeds, batched fsync, or the version
 # bump — MultiWriter is the config that exercises the protocol.
+#
+# Three baselines, each preceded by a canary that MUST go red. The third
+# (CoalescedPrealloc) exists because it is the only sink for which
+# Store::recover passes tail_tolerant = true, and therefore the only config
+# that reaches the tolerant half of scan_wal.
 formal/tla-model:
 	@mkdir -p $(TLC_METADIR)
 	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
@@ -79,6 +84,27 @@ formal/tla-model:
 	@cd formal/tla/wal && $(TLC) -config WalCrashMW.cfg WalCrash.tla > /dev/null; rc=$$?; \
 	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (MultiWriter) FAILED (TLC exit $$rc)"; exit 1; fi; \
 	  echo "WalCrash baseline (MultiWriter): no error (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityCrash.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "crash canary (SingleWriter) FAILED — TLC exit $$rc, expected 12."; \
+	    echo "  0 = no behaviour crashes and recovers, so RecoverySound is checked"; \
+	    echo "  over zero crash behaviours; 150/151 = the canary checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "crash canary (SingleWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityCrashMW.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "crash canary (MultiWriter) FAILED — TLC exit $$rc, expected 12."; exit 1; \
+	  fi; \
+	  echo "crash canary (MultiWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityCrashPrealloc.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "crash canary (CoalescedPrealloc) FAILED — TLC exit $$rc, expected 12."; exit 1; \
+	  fi; \
+	  echo "crash canary (CoalescedPrealloc): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrashPrealloc.cfg WalCrash.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (CoalescedPrealloc) FAILED (TLC exit $$rc)"; exit 1; fi; \
+	  echo "WalCrash baseline (CoalescedPrealloc): no error (expected)"
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
