@@ -20,8 +20,9 @@ test/formal-kernel:
 test/formal-key-kernel:
 	cargo test --manifest-path formal/key_kernel/Cargo.toml
 
-# Drift guard: fail if src/btree.rs changed without a matching formal/ update.
-# Override for changes outside the verified insert/get path: ACK_NO_FORMAL=1.
+# Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
+# matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
+# Override for changes outside the verified surface: ACK_NO_FORMAL=1.
 formal/drift-check:
 	formal/scripts/check-drift.sh
 

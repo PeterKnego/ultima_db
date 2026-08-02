@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Drift guard between the Rust B-tree and its Aeneas/Lean model.
+# Drift guard between the Rust sources and their Aeneas/Lean models.
 #
-# src/btree.rs is the source of truth; formal/kernel/src/lib.rs is a hand-synced
-# port of its insert/get and remove/rebalance paths, and formal/proofs/
-# machine-checks that port. Nothing forces the two to stay in step — this does:
-# if src/btree.rs changed in a diff but nothing under formal/ did, it fails and
-# tells you how to re-sync (or to acknowledge a change that doesn't touch the
-# verified surface).
+# Two watched files, two kernels: src/btree.rs is the source of truth for
+# formal/kernel/src/lib.rs (a hand-synced port of its insert/get and
+# remove/rebalance paths), and src/primary_key.rs is the source of truth for
+# formal/key_kernel/src/lib.rs (a hand-synced port of the order-preserving key
+# encoding). formal/proofs/ machine-checks both ports. Nothing forces the Rust
+# and the kernels to stay in step — this does: if a watched file changed in a
+# diff but nothing under formal/ did, it fails and tells you how to re-sync
+# (or to acknowledge a change that doesn't touch the verified surface).
 #
 # It is a *prompt to re-verify*, not a proof of equivalence. It fires on any
-# btree.rs edit; the author resolves it by either updating + re-checking formal/,
-# or acknowledging that the edit is outside the modeled path (range iterators,
-# comments, unrelated methods).
+# watched-file edit; the author resolves it by either updating + re-checking
+# formal/, or acknowledging that the edit is outside the modeled path (range
+# iterators, comments, unrelated methods).
 #
 # Usage:
 #   formal/scripts/check-drift.sh [BASE_REF]

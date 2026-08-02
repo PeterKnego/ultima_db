@@ -114,9 +114,10 @@ jobs:
           #print axioms key_kernel.encode_mono_pair
           #print axioms key_kernel.encode_mono_triple
           EOF
+          set -o pipefail
           lake env lean _AxiomCheck.lean 2>&1 | tee _axioms.txt
           rm -f _AxiomCheck.lean
-          if grep -qiE 'sorryAx|sorry|admit' _axioms.txt; then
-            echo "::error::proofs depend on sorry/admit — verification is incomplete"
-            exit 1
-          fi
+          grep -qE "depends on axioms" _axioms.txt || { echo "::error::no axiom lines — check ran vacuously"; exit 1; }
+          grep -E "depends on axioms" _axioms.txt \
+            | grep -vE "\[propext(, (Classical\.choice|Quot\.sound))*\]$" \
+            && { echo "::error::non-standard axiom"; exit 1; } || true

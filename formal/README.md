@@ -78,7 +78,7 @@ all in `namespace key_kernel`, all sorry-free, `#print axioms` =
 | `framed_prefix_lt_literal` (`KeyFraming.lean`) | a framed prefix that ends (terminator) sorts before any continuation that instead has a literal non-zero byte at that position |
 | `framed_prefix_lt_escaped_zero` (`KeyFraming.lean`) | a framed prefix that ends sorts before a continuation that instead has an escaped `0x00` at that position |
 | `escaped_byte_order` (`KeyFraming.lean`) | escaped bytes preserve the order of the underlying byte at a divergence point |
-| `framing_no_confusion` (`KeyFraming.lean`) | headline lemma: no two distinct byte strings produce framed encodings where neither is lexicographically related as expected — the framing has no confusion between "ended" and "continues" |
+| `framing_no_confusion` (`KeyFraming.lean`) | headline lemma: for any two distinct byte strings, comparing their framed encodings followed by arbitrary suffixes gives exactly the order of the byte strings themselves — the framing never confuses "ended" with "continues" |
 | `framing_no_confusion_kernel` (`KeyFraming.lean`) | the same no-confusion property restated directly over the kernel's `escape_and_terminate` |
 | `framed_element_lex` (`KeyFraming.lean`) | the reusable composition primitive: comparing two framed elements followed by arbitrary suffixes reduces to comparing the framed elements alone |
 | `encode_mono_pair` (`KeyFraming.lean`) | the `(Vec<u8>, u64)` pair encoding is order-preserving (lexicographic on the pair) |
@@ -99,12 +99,14 @@ than glossed over:
   side of `String` IS covered: `String::encode` is `as_bytes().to_vec()`, and
   `Ord for String` is bytewise over UTF-8, agreeing with `Ord for Vec<u8>`, so
   `encode_mono_bytes` applies transitively.
-- **Fixed-width *leading* tuple elements are unmodeled.** The real `(A, B)` /
+- **Fixed-width *non-final* tuple elements are unmodeled.** The real `(A, B)` /
   `(A, B, C)` impls (`src/primary_key.rs:443-505`) skip the escape/terminate
-  framing when `A::ENCODED_LEN == Some(_)` (fixed-width elements are already
-  self-delimiting by their constant length). The kernel only models the
-  variable-length-leading branch, so that half of the tuple encoder — "a
-  fixed-width lead needs no framing" — has no theorem.
+  framing for any non-final element whose `ENCODED_LEN == Some(_)` (fixed-width
+  elements are already self-delimiting by their constant length) — this isn't
+  limited to a leading `A`: in the 3-tuple, `B` is a middle element and gets
+  the same treatment (`src/primary_key.rs:496-500`). The kernel only models
+  the variable-length branch, so that half of the tuple encoder — "a
+  fixed-width non-final element needs no framing" — has no theorem.
 - **The rejection path is uncharacterized.** The proofs only talk about
   outputs of `escape_and_terminate`; inside the kernel's decoder the `bad`
   branch was proved *unreachable* on those outputs, not characterized in
@@ -253,6 +255,8 @@ committed.
   listed in "What is proved: primary-key encoding" above (all in
   `namespace key_kernel`) — only the three standard Lean axioms are
   acceptable. The scheduled `lean` CI job (weekly + `workflow_dispatch`)
-  rebuilds the proofs and re-runs both axiom checks (`make
-  test/formal-kernel` / `make test/formal-key-kernel` differential tests,
-  plus the `#print axioms` step in `.github/workflows/formal.yml`).
+  rebuilds the proofs and re-runs both differential tests (`make
+  test/formal-kernel` / `make test/formal-key-kernel` — each checked against a
+  reproduced oracle: `std::BTreeMap` for the B-tree kernel, reproduced copies
+  of the real impls for the key kernel), plus the actual axiom check: the
+  `#print axioms` step in `.github/workflows/formal.yml`.
