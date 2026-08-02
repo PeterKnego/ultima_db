@@ -2,7 +2,11 @@
 
 Durable record of the documentation runs. Last full run: 2026-08-02
 (all four quadrants written; plan approved by the user, reference scope
-approved as its own item).
+approved as its own item). Run 2 (2026-08-02, skill v1.2.0): approved
+register repairs — architecture/comparison pages rewritten to explanation
+register, embedded tutorial removed from prevent-write-skew, StoreConfig
+field table deferred to rustdoc, unpinned SSI cost numbers removed,
+docs/tasks/ links dropped from landing pages.
 
 ## Output format and location
 
@@ -117,3 +121,7 @@ outside the user-facing set.
   `commit_version` is ignored (it is honored now); the pre-refresh
   comparison doc claimed SingleWriter was unenforced (it returns
   WriterBusy).
+
+- Reference pages state no measured numbers without an archived
+  `docs/benchmarks/` record (SSI cost numbers removed 2026-08-02 for lack
+  of one; restore them only together with such a record).

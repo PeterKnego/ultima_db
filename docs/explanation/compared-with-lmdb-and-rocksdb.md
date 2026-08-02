@@ -16,23 +16,22 @@ and full-text indexes. Vector search lives in the companion
 
 ---
 
-## At a glance
+## The three in a sentence each
 
-| | UltimaDB | LMDB | RocksDB |
-|---|---|---|---|
-| **Language** | Rust | C | C++ |
-| **Storage** | In-memory CoW B-tree; opt-in WAL + checkpoints on disk | Memory-mapped file (B+ tree) | On-disk LSM tree + WAL |
-| **Data structure** | Persistent CoW B-tree (Arc nodes) | CoW B+ tree (page-level CoW) | LSM tree (memtable → SST files) |
-| **Concurrency** | Single writer (enforced) or multi-writer with key-level OCC | Single-writer, multi-reader (mutex-enforced) | Concurrent writers (group commit) + lock-free readers |
-| **MVCC mechanism** | Immutable snapshots via Arc | Two alternating meta pages | Sequence numbers on every key |
-| **Isolation level** | Snapshot Isolation (default); Serializable/SSI (opt-in) | Serializable (single writer) | Snapshot Isolation (default); Serializable (optional) |
-| **Durability** | Opt-in: WAL + checkpoints with fsync-acknowledged or async commits; checkpoint-only SMR mode | fsync on commit; OS page cache | WAL + configurable fsync modes |
-| **Max DB size** | Process memory | Address space (mmap) | Disk |
-| **Core dependencies** | `thiserror`, `dashmap`, `crc32fast`, `parking_lot` (`serde`/`bincode` behind the `persistence` feature) | None (single .c file) | ~100K+ lines of C++ |
-
-The durability and concurrency options behind the UltimaDB column are
-enumerated in the [configuration reference](../reference/configuration.md);
-this page is about why the columns differ, not how to set them.
+LMDB is a single C file mapping a copy-on-write B+ tree straight into your
+address space: one writer at a time, readers never block, durability by
+fsync, and a database bounded by what mmap can address. RocksDB is the
+opposite bet — an LSM tree of a hundred thousand lines of C++, built to
+absorb concurrent writes through a memtable and pay for them later in
+compaction, bounded only by disk. UltimaDB sits at a third corner: the
+copy-on-write tree idea from LMDB, but lifted off the page cache into
+plain heap memory with `Arc`-shared nodes so versions are ordinary Rust
+values; writes go through one enforced writer or key-level OCC; the
+database is bounded by process memory; and durability — WAL plus
+checkpoints, or checkpoint-only under a consensus log — is opted into
+rather than built around. (How to set those knobs is the
+[configuration reference](../reference/configuration.md)'s business; this
+page is about why the corners differ.)
 
 ---
 
@@ -191,27 +190,20 @@ machinery.
 
 ## Isolation guarantees
 
-| Anomaly | UltimaDB (default) | UltimaDB (Serializable) | LMDB | RocksDB (default) | RocksDB (pessimistic txn) |
-|---|---|---|---|---|---|
-| Dirty read | Prevented | Prevented | Prevented | Prevented | Prevented |
-| Nonrepeatable read | Prevented | Prevented | Prevented | Prevented | Prevented |
-| Phantom read | Prevented | Prevented | Prevented | Prevented | Prevented |
-| Write skew | **Possible** | Prevented (SSI) | Prevented* | **Possible** | Prevented |
-
-\* LMDB prevents write skew trivially: only one writer can exist at a
-time, so all write transactions are effectively serialized. There is no
-concurrent write to conflict with.
-
-UltimaDB defaults to Snapshot Isolation and offers Serializable Snapshot
-Isolation (read-set tracking, write-skew detection at commit) as an
-opt-in `IsolationLevel` — see the
-[isolation levels reference](../reference/isolation-levels.md) and
-[preventing write skew](../how-to/prevent-write-skew.md). This mirrors
-the shape of RocksDB's offering: snapshot isolation by default, stronger
-guarantees when you ask for them. The interesting difference is *where*
-the serializability comes from — LMDB gets it for free from its single
-writer, RocksDB from lock-based transactions, UltimaDB from optimistic
-validation over tracked read sets.
+On the classic read anomalies — dirty reads, non-repeatable reads,
+phantoms — all three engines are equally safe; MVCC of any flavor prevents
+them. The one anomaly that separates the engines is write skew, and each
+handles it in a way that follows directly from its architecture. LMDB
+prevents it trivially: with only one writer alive at a time there is no
+concurrent write to skew against — serializability as a free consequence
+of the concurrency model. UltimaDB and RocksDB both default to Snapshot
+Isolation, which permits write skew, and both offer a stronger opt-in;
+the interesting difference is *where* the serializability comes from.
+RocksDB buys it pessimistically, with lock-based transactions. UltimaDB
+buys it optimistically, validating tracked read sets at commit (SSI). The
+exact per-anomaly guarantees for UltimaDB's two levels are tabulated in
+the [isolation levels reference](../reference/isolation-levels.md); the
+working recipe is [preventing write skew](../how-to/prevent-write-skew.md).
 
 ---
 

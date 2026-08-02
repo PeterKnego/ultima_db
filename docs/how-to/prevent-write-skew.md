@@ -1,10 +1,9 @@
 # How to prevent write skew with Serializable isolation
 
-Write skew is the anomaly Snapshot Isolation permits: two transactions each
-read an overlapping set of rows, then write disjoint rows based on what they
-read, and both commit — producing a state no serial order could. If your
-transactions decide what to write from reads of rows they do not write,
-enable SSI:
+If your transactions decide what to write from reads of rows they do not
+write, the default Snapshot Isolation permits write skew — see
+[the isolation explanation](../explanation/isolation.md) for what the
+anomaly is and why SI allows it. To prevent it, enable SSI:
 
 ```rust
 let store = Store::new(
@@ -94,106 +93,22 @@ records a coarse whole-table flag, so a scanning transaction conflicts with
 read. Retry loops must tolerate this; the granularity table is in the
 [isolation levels reference](../reference/isolation-levels.md).
 
-## Verify the guarantee in your own tests
+## Verify the guarantee
 
-Construct the anomaly deliberately: two writers from the same base, each
-scanning the table before writing a disjoint key. Under the default SI, both
-commits succeed and the invariant breaks; the store's own versions of these
-tests are `si_allows_write_skew_table_scan` and
-`ssi_prevents_write_skew_via_table_scan` in `tests/store_integration.rs`.
+The store ships both sides of the anomaly as integration tests —
+`si_allows_write_skew_table_scan` and `ssi_prevents_write_skew_via_table_scan`
+in `tests/store_integration.rs`:
 
-```rust
-// SI permits write skew: both commits succeed.
-let store = Store::new(
-    StoreConfig::builder()
-        .writer_mode(WriterMode::MultiWriter)
-        .isolation_level(IsolationLevel::SnapshotIsolation)
-        .build(),
-).unwrap();
-
-// Seed two doctors on call.
-{
-    let mut wtx = store.begin_write(None).unwrap();
-    let mut t = wtx.open_table::<String>("doctors").unwrap();
-    t.insert("on".to_string()).unwrap();
-    t.insert("on".to_string()).unwrap();
-    wtx.commit().unwrap();
-}
-
-// Two concurrent writers from the same base.
-let mut wtx_a = store.begin_write(None).unwrap();
-let mut wtx_b = store.begin_write(None).unwrap();
-
-// A scans + writes id=1.
-{ let _: Vec<_> = wtx_a.open_table::<String>("doctors").unwrap().iter().collect(); }
-wtx_a.open_table::<String>("doctors").unwrap().update(1, "off".to_string()).unwrap();
-
-// B scans + writes id=2.
-{ let _: Vec<_> = wtx_b.open_table::<String>("doctors").unwrap().iter().collect(); }
-wtx_b.open_table::<String>("doctors").unwrap().update(2, "off".to_string()).unwrap();
-
-wtx_a.commit().expect("A commits");
-wtx_b.commit().expect("B commits — write skew permitted under SI");
-
-// Invariant violated: 0 doctors on call.
+```console
+$ cargo test --test store_integration write_skew
 ```
 
-The same scenario under `IsolationLevel::Serializable` aborts the second
-committer:
-
-```rust
-// SSI prevents write skew: A commits; B aborts with SerializationFailure.
-let store = Store::new(
-    StoreConfig::builder()
-        .writer_mode(WriterMode::MultiWriter)
-        .isolation_level(IsolationLevel::Serializable)
-        .build(),
-).unwrap();
-
-// Same seed as the SI version.
-{
-    let mut wtx = store.begin_write(None).unwrap();
-    let mut t = wtx.open_table::<String>("doctors").unwrap();
-    t.insert("on".to_string()).unwrap();
-    t.insert("on".to_string()).unwrap();
-    wtx.commit().unwrap();
-}
-
-let mut wtx_a = store.begin_write(None).unwrap();
-let mut wtx_b = store.begin_write(None).unwrap();
-
-// A scans (records table_scan flag) + writes id=1.
-{
-    let t = wtx_a.open_table::<String>("doctors").unwrap();
-    assert!(t.iter().filter(|(_, s)| *s == "on").count() >= 2);
-}
-wtx_a.open_table::<String>("doctors").unwrap().update(1, "off".to_string()).unwrap();
-
-// B scans (records table_scan flag) + writes id=2.
-{
-    let t = wtx_b.open_table::<String>("doctors").unwrap();
-    assert!(t.iter().filter(|(_, s)| *s == "on").count() >= 2);
-}
-wtx_b.open_table::<String>("doctors").unwrap().update(2, "off".to_string()).unwrap();
-
-wtx_a.commit().expect("A commits");
-
-// B's iter() recorded a table scan on "doctors"; A's commit modified a key
-// there after B's base version — SSI flags the conflict.
-let res = wtx_b.commit();
-assert!(matches!(
-    res,
-    Err(Error::SerializationFailure { ref table, .. }) if table == "doctors"
-));
-```
-
-The SI-side anomalies work the same way with a pinned `ReadTx`: open a
-`ReadTx`, commit a change from a `WriteTx`, and assert the reader still sees
-its original snapshot — that one recipe verifies no dirty reads (read before
-the writer commits), no nonrepeatable reads (re-read the same key after a
-committed update), and no phantoms (re-count after a committed insert).
-Both isolation levels give these three guarantees; only write skew separates
-them.
+To verify your own invariants, adapt that pair: run two writers from the
+same base version, each scanning before writing a disjoint key, and assert
+that the second commit returns `SerializationFailure` under `Serializable`
+but succeeds under `SnapshotIsolation`. If you need to convince yourself of
+the anomaly itself first, the walked-through scenario is in
+[the isolation explanation](../explanation/isolation.md).
 
 ## Related
 

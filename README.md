@@ -124,7 +124,7 @@ cargo clippy -- -D warnings      # lint (zero warnings policy)
 cargo bench                      # criterion benchmarks (YCSB, SmallBank, ...)
 ```
 
-Documentation lives in [`docs/`](docs/README.md): a [getting-started tutorial](docs/tutorials/getting-started.md), [how-to guides](docs/how-to/README.md), [reference pages](docs/reference/README.md) (configuration, formats, isolation, performance), and [explanations](docs/explanation/README.md) of the architecture and design. The API reference is on [docs.rs](https://docs.rs/ultima-db). Per-feature design records for contributors live in [`docs/tasks/`](docs/tasks/).
+Documentation lives in [`docs/`](docs/README.md): a [getting-started tutorial](docs/tutorials/getting-started.md), [how-to guides](docs/how-to/README.md), [reference pages](docs/reference/README.md) (configuration, formats, isolation, performance), and [explanations](docs/explanation/README.md) of the architecture and design. The API reference is on [docs.rs](https://docs.rs/ultima-db). Per-feature design records for contributors live in the repo's `docs/tasks/` directory (internal, unlinked from the user docs).
 
 ## License
 

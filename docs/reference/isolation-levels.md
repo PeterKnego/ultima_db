@@ -86,11 +86,10 @@ requires a fresh `begin_write` against the new base.
 | `Serializable` + `MultiWriter` | One `BTreeSet::insert` per point read, one flag write per scan, one committed-write-sets walk at commit. |
 | `ReadTx` (any configuration) | Zero. |
 
-Measured (`examples/ssi_cost.rs`, SmallBank, 16 writers, 10 hot keys,
-500 bursts × 50 ops/writer): SnapshotIsolation ≈ 10.4–10.8 k commits/s,
-Serializable ≈ 10.3–10.5 k commits/s; slowdown −0.4 % to +4.9 % across runs,
-mean ≈ 1–2 %. Retry ratios are not elevated under SSI (~6.5–6.9 in both
-modes). Read-heavy workloads (YCSB-B) are not measured.
+`examples/ssi_cost.rs` measures this overhead under SmallBank-style
+contention; writer count and key hotness are configurable. No archived
+record under `docs/benchmarks/` currently covers SSI cost, so this page
+states no measured numbers.
 
 ## Limitations (v1)
 

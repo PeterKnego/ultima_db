@@ -17,14 +17,13 @@ let store = Store::new(
 
 ## `StoreConfig` fields
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `num_snapshots_retained` | `usize` | `10` | How many most-recent snapshots `Store::gc()` keeps. The latest is always kept regardless. |
-| `auto_snapshot_gc` | `bool` | `true` | Run `gc()` automatically after each `commit()`. |
-| `writer_mode` | `WriterMode` | `SingleWriter` | Writer concurrency model. |
-| `isolation_level` | `IsolationLevel` | `SnapshotIsolation` | Transaction isolation. |
-| `require_explicit_version` | `bool` | `false` | If `true`, `begin_write(None)` returns `Error::ExplicitVersionRequired`; a version must be passed as `Some(v)`. Intended for SMR deployments, where the consensus layer assigns versions. |
-| `persistence` | `Persistence` | `Persistence::None` | Durability mode. Requires the `persistence` cargo feature. |
+The fields are `num_snapshots_retained`, `auto_snapshot_gc`, `writer_mode`,
+`isolation_level`, `require_explicit_version`, and `persistence`. Per-field
+semantics and defaults are documented on the struct itself:
+[`StoreConfig` on docs.rs](https://docs.rs/ultima-db/latest/ultima_db/struct.StoreConfig.html).
+This page covers what no single field's documentation carries: the behavior
+of the enums behind `writer_mode`, `isolation_level`, and `persistence`, and
+the legal combinations across fields.
 
 ## `WriterMode`
 

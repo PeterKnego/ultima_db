@@ -50,7 +50,11 @@ Each Snapshot contains:
 
 ## Module structure
 
-The crate is small enough to hold in your head: `btree` is the persistent copy-on-write B-tree everything else stands on (re-exported at the crate root as a building block for custom indexes); `table` wraps it into typed collections and defines the `MergeableTable` trait used for type-erased storage in snapshots; `index` provides secondary indexes (built-in `ManagedIndex` plus the public `CustomIndex` trait); `bulk_load` is the O(N) restore path; `store` holds `Store`, `Snapshot`, `ReadTx`, `WriteTx`, and all version-history and OCC bookkeeping, with `transaction` as a pure re-export (see [circular dependency note](#circular-dependency-resolution)); `intents` is the write-intent map for early-fail conflict detection in MultiWriter mode; `primary_key` defines the order-preserving key encoding; `metrics` and `error` are what they sound like. Behind the `persistence` feature sit `wal`, `checkpoint`, and `registry`; behind `fulltext` sits an optional full-text index. Per-module details live in the rustdoc — this page stays at the level of why the pieces are shaped the way they are.
+The crate's module map — what each module is and does — lives in
+[the rustdoc](https://docs.rs/ultima-db), which documents every public
+module in place. This page stays at the level of why the pieces are shaped
+the way they are; the one structural oddity worth explaining here is the
+[circular dependency note](#circular-dependency-resolution) below.
 
 ---
 
@@ -154,43 +158,24 @@ Custom indexes are rebuilt from table data on recovery. The `rebuild` method (wi
 
 **File:** `src/store.rs`
 
-`Store` is the entry point. It is a cheap, cloneable handle around interior-mutable state. The version history and OCC bookkeeping live in `StoreInner` behind an `RwLock`:
+`Store` is the entry point: a cheap, cloneable handle whose shared state
+lives behind an `RwLock`. That inner state is the version history itself —
+a map from version number to retained snapshot — plus the machinery of
+concurrency: the latest and next version counters, the count and base
+versions of in-flight writers, and the committed write sets that OCC
+validation walks. Deliberately *outside* the lock sit the pieces that must
+not serialize through it: the write-intent map (early-fail conflict
+detection), a writer-id counter, and per-table commit locks.
 
-```rust
-pub struct Store {
-    inner: Arc<RwLock<StoreInner>>,
-    intents: Arc<IntentMap>,            // write-intent map for early-fail OCC
-    next_writer_id: Arc<AtomicU64>,
-    table_locks: Arc<...>,              // per-table commit locks
-}
-
-pub(crate) struct StoreInner {
-    snapshots: BTreeMap<u64, Arc<Snapshot>>,
-    latest_version: u64,
-    next_version: u64,
-    config: StoreConfig,
-    active_writer_count: usize,
-    active_writer_base_versions: Vec<u64>,        // for write-set pruning
-    committed_write_sets: Vec<CommittedWriteSet>, // OCC validation
-    metrics: Arc<StoreMetrics>,
-    // ... persistence-feature fields: wal_handle, registry
-}
-```
-
-`StoreInner.snapshots` holds every retained version. The default `StoreConfig` keeps the 10 most recent snapshots and runs `gc()` automatically after each commit; retention, GC, writer mode, and isolation level are all knobs on `StoreConfig` — see [configuration](../reference/configuration.md). A `VersionPin` can hold one version alive across `gc()` runs independently of the retention window, which is the snapshot-handoff primitive replication needs (see [replicate with snapshot streams](../how-to/replicate-with-snapshot-streams.md)).
+The snapshot map holds every retained version. The default `StoreConfig` keeps the 10 most recent snapshots and runs `gc()` automatically after each commit; retention, GC, writer mode, and isolation level are all knobs on `StoreConfig` — see [configuration](../reference/configuration.md). A `VersionPin` can hold one version alive across `gc()` runs independently of the retention window, which is the snapshot-handoff primitive replication needs (see [replicate with snapshot streams](../how-to/replicate-with-snapshot-streams.md)).
 
 The `intents` map and per-table `table_locks` exist so that disjoint-key MultiWriter commits don't serialize through `inner.write()`. See [Writer modes](#writer-modes) below.
 
 ### Snapshots
 
-A `Snapshot` is an immutable, versioned view of all tables:
-
-```rust
-pub(crate) struct Snapshot {
-    pub(crate) version: u64,
-    pub(crate) tables: BTreeMap<String, Arc<dyn MergeableTable>>,
-}
-```
+A `Snapshot` is an immutable, versioned view of all tables: nothing more
+than a version number paired with a map from table name to
+`Arc<dyn MergeableTable>`.
 
 **Why `Arc<dyn MergeableTable>` for tables?**
 
@@ -219,34 +204,19 @@ The downcast to `Table<R, K>` happens at `open_table` time, returning `Error::Ty
 
 ### ReadTx
 
-```rust
-pub struct ReadTx {
-    snapshot: Arc<Snapshot>,
-    metrics: Arc<StoreMetrics>,
-}
-```
-
-`ReadTx` is a read-only view pinned to a specific version. It holds an `Arc<Snapshot>`, which keeps that version's data alive independently of subsequent commits. Multiple `ReadTx` instances at different versions coexist freely.
+`ReadTx` is barely a struct at all — an `Arc` to its snapshot and a metrics
+handle. It is a read-only view pinned to a specific version. It holds an `Arc<Snapshot>`, which keeps that version's data alive independently of subsequent commits. Multiple `ReadTx` instances at different versions coexist freely.
 
 `open_table<R>` returns a `TableReader<'_, R>` (a thin wrapper that records read metrics and downcasts to `&Table<R>`). The reader borrows from the snapshot — no copying occurs.
 
 ### WriteTx
 
-A `WriteTx` is built around three ideas: a read-only `base` snapshot it forked from, a private `dirty` map of working table copies, and the bookkeeping that conflict detection needs. The essential fields:
-
-```rust
-pub struct WriteTx {
-    base: Arc<Snapshot>,
-    dirty: BTreeMap<String, DirtyEntry>,         // Box<dyn MergeableTable> + per-table handles
-    version: u64,
-    explicit_version: bool,
-    write_set: BTreeMap<String, BTreeSet<u64>>,  // hash64 digests of modified keys (MultiWriter OCC)
-    read_set: Option<RefCell<...>>,              // Serializable + MultiWriter only
-    ddl_tables: RefCell<BTreeSet<String>>,       // index DDL, for conflict refusal
-    // ... deleted-table tracking, intents, table locks, metrics,
-    //     persistence-feature fields (wal_ops)
-}
-```
+A `WriteTx` is built around three ideas: a read-only `base` snapshot it
+forked from, a private `dirty` map of working table copies, and the
+bookkeeping that conflict detection needs — a write set of modified-key
+digests, an optional read set (allocated only when SSI can actually use
+it), and the set of tables whose indexes this writer altered. Everything a
+writer does stays inside these private structures until commit.
 
 `WriteTx` implements lazy copy-on-write at the table level:
 
@@ -358,32 +328,24 @@ This gives users a semantically clear import path (`use ultima_db::WriteTx` or `
 
 ---
 
-## Design decisions summary
+## The shape of the decisions
 
-| Decision | Alternative considered | Why this way |
-|---|---|---|
-| Persistent CoW B-tree | `std::BTreeMap` with deep copy or mutex | O(log n) per mutation instead of O(n); no locking; multiple versions coexist for free |
-| `T = 32` default fanout, `T = 8` behind `fanout-t8` | One fixed fanout for all workloads | Fanout pulls reads and CoW writes in opposite directions (shallower tree vs. bigger node clone); no single value wins both. T=32 balances; T=8 favors write-dominated SMR apply loops |
-| Inline fixed-capacity node storage (`FixedVec`) | `Vec` entries/children per node | One allocation per CoW node clone instead of three; node cloning dominates the write path |
-| `Arc<R>` for values | Store `R` directly, require `R: Clone` | Avoids cloning potentially large values on every node reconstruction; removes `Clone` bound from the public API |
-| `Arc<BTreeNode>` for children | `Box<BTreeNode>` | Structural sharing — unchanged subtrees are shared across versions |
-| `Arc<dyn MergeableTable>` in Snapshot | `Box<dyn MergeableTable>` | Must be cloneable (O(1) per table at commit time); `Box` is not `Clone`. `MergeableTable: Any + Send + Sync` so existing downcasts still work via `.as_any()` |
-| `Box<dyn MergeableTable>` in WriteTx dirty | `Arc<dyn MergeableTable>` | Need `&mut` access for table mutations; `Box` provides `downcast_mut` through `.as_any_mut()` |
-| `WriteTx` / `ReadTx` are `Send` (`WriteTx` is `!Sync` via its `RefCell`s) | Keep the `PhantomData<*const ()>` `!Send` marker | The marker was a footgun guard, not a correctness requirement: no thread-local, thread-id-keyed, or non-`Send` state exists on the write path, so it only cost async users the ability to hold a transaction across an `.await` |
-| Key-level OCC in MultiWriter mode | Table-level OCC | Fewer spurious conflicts on same-table disjoint-key writes. Cost: commit clones latest table + replays writer's keys via `upsert_arc` (index-preserving). Fast-path wholesale install when no concurrent writer touched the table keeps single-writer commits cheap |
-| `hash64` digests in the OCC write set, exact keys in `DirtyEntry` | Exact keys everywhere | Conflict detection compares sets across writers that need not agree on `K`; digests make that comparison type-free. A collision is a spurious retry, never a missed conflict — the safe direction. The merge, which needs exact keys, gets them from `DirtyEntry` |
-| `WriteTx::commit` rebases onto latest + per-key merge | Whole-table swap from dirty | Preserves non-conflicting concurrent commits in the final snapshot. Merge uses Arc-level record sharing (no `R: Clone` bound) via `BTree::insert_arc` |
-| Auto-assigned commit version bumped to `latest + 1` | Keep pre-assigned version | Pre-assigned versions can land out of commit order under MultiWriter; rebase chain would lose updates. SMR explicit versions are left alone |
-| Bottom-up splitting | Pre-emptive (top-down) splitting | Simpler with immutable nodes — no need to prepare nodes on the way down |
-| Check-before-delete | Always enter deletion path | Avoids O(log n) CoW cost when the key doesn't exist |
-| All core types in `store.rs` | Separate `transaction.rs` module | Avoids circular module dependency |
-| Explicit version support | Auto-increment only | Supports external ordering (replication, distributed sequence numbers) |
-| Auto-increment gated on `AutoKey` (u64 only) | Auto-increment for every key type, or none | There is no sensible "next" `String`; the gate turns a meaningless runtime question into a compile error, while `u64` tables keep the ergonomic `insert` |
-| Self-declared `KEY_TYPE_ID` in every durable format | `std::any::type_name`, `TypeId`, or no tag | `type_name` is neither stable nor injective; `TypeId` is process-local; no tag means silent key reinterpretation that passes order validation. A frozen `u32` is stable, comparable across processes, and printable |
-| 64 KiB key cap enforced on write and read | Read-side enforcement only | Write-side-unchecked keys produce acknowledged commits that recovery cannot read (or silently drops); failing at the offending mutation leaves the table untouched |
-| Snapshot Isolation by default, SSI as opt-in | Force SSI for everyone | SI has zero validation overhead and is sufficient for most workloads; SSI is opt-in for callers that need write-skew prevention. See [isolation](isolation.md) |
-| Persistence opt-in (cargo feature) | Persistence always on | In-memory is the common case for embedded use and tests; gating on a feature keeps the dependency surface and binary size small for callers that don't need durability. Standalone (WAL + checkpoints) and SMR (checkpoints only) cover the durability cases that exist |
-| `thiserror` for errors | Manual `Display`/`Error` impls | Less boilerplate, same result |
+Reading back over the design, one bias runs through almost every choice:
+when forced to pick a direction to be wrong in, the store picks the
+direction that fails loudly and early. Digest collisions cause a spurious
+retry, never a missed conflict. An oversized key fails at the offending
+write, never at recovery. A key-type mismatch refuses to open, never
+silently reinterprets. Auto-increment on a `String` table is a compile
+error, never a runtime surprise. Index DDL that can't merge refuses the
+commit rather than dropping the index. The alternatives each of these
+rejected — and why — are argued in their own sections above; the pattern
+is the summary.
+
+The second recurring bias is paying for nothing you didn't ask for: the
+read set isn't allocated unless SSI can use it, `Serializable` costs
+nothing under a single writer, persistence is compiled out entirely when
+unused, and the whole system rests on a structure whose clone is a pointer
+bump.
 
 ---
 

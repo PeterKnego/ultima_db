@@ -37,6 +37,6 @@ how it compares with LMDB and RocksDB.
 
 ---
 
-Contributors: per-feature design records live in [`tasks/`](tasks/), dated
+Contributors: per-feature design records live in the repo's `docs/tasks/` directory, dated
 benchmark run records in [`benchmarks/`](benchmarks/), and the build/test
 workflow in the repository root's `CLAUDE.md`.
