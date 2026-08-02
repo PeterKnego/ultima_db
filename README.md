@@ -6,6 +6,12 @@ WAL/checkpoint durability; every commit produces a new immutable MVCC
 snapshot that shares unchanged subtrees with its predecessors, so
 point-in-time reads are zero-copy and old versions stay alive for free.
 
+**Documentation:** [tutorial](docs/tutorials/getting-started.md) ·
+[how-to guides](docs/how-to/README.md) ·
+[reference](docs/reference/README.md) ·
+[explanation](docs/explanation/README.md) ·
+[API docs](https://docs.rs/ultima-db)
+
 ## Performance
 
 Durable YCSB on an AWS local-NVMe host (8 vCPU), every operation its own
