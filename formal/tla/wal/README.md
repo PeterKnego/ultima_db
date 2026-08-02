@@ -109,10 +109,12 @@ table*), contains every `Consistent`/`ConsistentInline`-acked commit, replays no
 torn frame, and has strictly monotone versions. A strict-mode scan error is
 excluded — see "Not yet done", where it has its own named invariant.
 
-All four of its clauses are calibrated: (a)/(d) by M1–M3, (b) by M5Strand, and
-the "replays no torn frame" clause (c) by **M6** (Task 5b), which was added
-precisely because that clause had no mutation until then. See "Calibration: the
-mutations".
+Its four clauses are **not equally well calibrated**, and the difference matters
+if you are about to read an S2 green off this model: (b), (c) and (d) each have
+a mutation that falsifies them — (b) at `M5.cfg`/`M5Strand.cfg` depth 8, (c) at
+`M6.cfg` depth 9 (Task 5b, added because it had none), (d) at
+`M3.cfg`/`M3Dup.cfg` depth 7 — and the **prefix-of-submission-order clause (a)
+has none**. See "Not yet done".
 
 Two things to know before building on this. The post-`Recover` value of
 `promoted` is the **replay sequence, not the Rust's snapshot chain**: recovery
@@ -322,6 +324,38 @@ CRC-bad frame (`src/wal.rs:585-592`) and the clause goes red at depth 9,
 exactly as this paragraph priced it before the mutation existed. See the
 calibration table below.
 
+**`RecoverySound` clause (a) — the recovered state is the replay of a *prefix
+of submission order* — is checked but uncalibrated. This is the clause-(c) hole
+again, one clause over, and closing (c) did not close it.** Measured, not
+argued: split into its own invariant and run alone, clause (a) is **exit 0
+under all ten mutation configs** — M1, M2, M2Fork, M3, M3Dup, M4, M4Abort, M5,
+M5Strand, M6.
+
+The natural assumption is that M1 and M2 cover it, since they are *the*
+ordering mutations. **They do not, and this README said they did until Task
+5b.** `RecoverySound` as a whole is clean on `M1.cfg` and `M2.cfg`: their break
+lands on `PromotionFaithful`, which is a claim about the **live promotion
+chain**, whereas clause (a) is a claim about the **recovered prefix** after a
+crash. Different property, different variable, no overlap — so clause (a)'s
+green rests on no evidence that the model would go red if it were false.
+
+It is a **gap, not a dead clause**, and the follow-up is priced exactly as
+clause (c)'s was. Clause (a) is **not structurally unfalsifiable** — unlike
+`TailTolerance` clause 2, which this spec documents as holding by construction
+and says so out loud. A scratch `Replay` that reverses the replayed order makes
+clause (a) red at **depth 9 on `modes/ConsistentPrealloc.cfg`**, with
+`promoted[1].cid = 2` against `submitted[1].cid = 1` — the same config, same
+depth and same ~1 s M6 cost. One `MUTATION` arm and one config would close it.
+
+Two things whoever writes that mutation should know. A bare order reversal is
+**not clause-(a)-exclusive**: reversing also descends the versions, so clause
+(d) and `PromotionFaithful` go red at the same depth, and on the Task 4
+standard that is a red for a neighbouring reason as much as for this one. What
+clause (a) uniquely owns is a replay that is mis-ordered or mis-tabled at
+*monotone* versions — a `Replay` that keeps the version sequence ascending
+while permuting `cid`/`tbl`. That is the witness to aim at. Whether to write it
+is the plan owner's call, as M6's was.
+
 **No mutation touches table identity.** `RecoverySound` clause (a) matches on
 cid, version *and* table, but every erasure M1–M6 produces is visible through
 version and fork-source alone (Task 4 §3 has the full ruling and the evidence
@@ -438,13 +472,26 @@ count: its shallowest counterexample already *is* the documented mechanism (a
 `torn` frame standing in the recovered `promoted` chain), and its control is
 `modes/ConsistentPrealloc.cfg`, the committed mode config it mutates.
 
-**A mutation row's state count is not reproducible; its invariant and depth
-are.** TLC aborts the level it is on when an invariant fails, so how many
-states the *other* worker had already generated is a race: `M6.cfg` reports
-455–474 generated / 188–198 distinct across repeat runs under the gate's
-`-workers 2`, and a deterministic 461/188 under `-workers 1`. Compare
-mutation rows on the invariant name and the depth, which were stable across
-every repeat. The clean controls explore exhaustively and *are* exact.
+**A mutation row's state count and its counterexample trace are not
+reproducible. Only the DEPTH is.** TLC aborts the level it is on when an
+invariant fails, so how many states the other worker had already generated —
+and which of that level's violating states it reported — is a race. Under the
+gate's `-workers 2`, repeat runs of `M6.cfg` return different state counts
+(observed spread roughly 435–474 generated; that is an illustration, **not** a
+bound — do not treat any published range as one) and different witness traces
+for the same violation. `-workers 1` is deterministic: `M6.cfg` is 461/188
+every time. The **depth** is guaranteed by the breadth-first search and was
+identical across every run, worker count and witness.
+
+The **invariant name is not** guaranteed, even though it happens to be stable
+for most rows. Where two invariants are first violated at the same depth, which
+one TLC reports is decided by declaration order in the `.cfg`:
+`mutations/M3.cfg` has **two** — `PromotionFaithful` and `RecoverySound`'s
+clause (d) — both first violated at depth 7 (confirmed separately, one
+invariant at a time). Compare mutation rows on the depth; read the invariant
+name as *a* property the mutation breaks, not *the* one. The clean controls
+explore exhaustively and their counts *are* exact, which is why the four
+committed baselines reproduce byte-for-byte.
 
 † `NoAckLossAfterLiveExtend` is **implied by `RecoverySound`**, which that
 config already checks, so listing it there adds no detection power and none is
