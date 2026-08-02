@@ -143,10 +143,11 @@
 (*     action also drags in WAL pruning (src/wal.rs:628 prune_wal), which   *)
 (*     is where checkpoint/prune/crash interleavings would actually bite.   *)
 (*     Out of scope for Task 2's brief; see the report.                     *)
-(*   (MUTATION is no longer on this list: M1-M6 all exist and are gated in  *)
+(*   (MUTATION is no longer on this list: M1-M7 all exist and are gated in  *)
 (*     mutations/. M1 = WriterSlotFree, M2 = GateApplies, M3 = the pre-fix  *)
 (*     bump in Submit, M4 = ScanIsTolerant, M5 = SyncData's metaDurable       *)
-(*     guard, M6 = ScanLen's stop-at-first-bad-frame. Each is ONE conjunct, *)
+(*     guard, M6 = ScanLen's stop-at-first-bad-frame, M7 = Replay's         *)
+(*     per-position row identity. Each is ONE conjunct or one substitution, *)
 (*     in the operator that carries the protection it removes.)             *)
 (*   write_head RECONSTRUCTION on open (task37 §4 invariant 3,              *)
 (*     src/wal.rs:1023-1024: PreallocFileSink::open runs a TOLERANT         *)
@@ -174,14 +175,14 @@ CONSTANTS
     SinkKind,       \* "FsWrite" | "Coalesced" | "CoalescedPrealloc"
     WriterMode,     \* "SingleWriter" | "MultiWriter"
     ChunkSize,      \* prealloc grow quantum, in FRAME SLOTS (WAL_PREALLOC_CHUNK)
-    MUTATION        \* "NONE" | "M1".."M6" -- calibration mutation selector
+    MUTATION        \* "NONE" | "M1".."M7" -- calibration mutation selector
 
 ASSUME MaxCommits \in Nat
 ASSUME Durability \in {"Consistent", "ConsistentInline", "Eventual"}
 ASSUME SinkKind   \in {"FsWrite", "Coalesced", "CoalescedPrealloc"}
 ASSUME WriterMode \in {"SingleWriter", "MultiWriter"}
 ASSUME ChunkSize  \in Nat /\ ChunkSize >= 1
-ASSUME MUTATION   \in {"NONE", "M1", "M2", "M3", "M4", "M5", "M6"}
+ASSUME MUTATION   \in {"NONE", "M1", "M2", "M3", "M4", "M5", "M6", "M7"}
 
 (* ConsistentInline is SingleWriter-ONLY: Store::new returns an error for   *)
 (* the MultiWriter combination (task38, and CLAUDE.md §Persistence). This   *)
@@ -696,15 +697,52 @@ ScanFails(log, tolerant) ==
 (* the forkedFrom chain; `sub` is looked up in the submission history so    *)
 (* that "replay order = submission order" stays a CHECKED property rather   *)
 (* than one the construction assumes.                                       *)
+(*                                                                         *)
+(* M7 -- the CALIBRATION for RecoverySound clause (a). Clause (a) is the    *)
+(* claim that the RECOVERED chain is the replay of a PREFIX OF SUBMISSION   *)
+(* ORDER, matched position by position on cid, version AND table. The real  *)
+(* replay gets that identity from the frame itself: scan_wal hands back     *)
+(* records in offset order and Store::recover applies each one to the table *)
+(* its own entry names (src/store.rs:1027-1030 -> the per-entry apply),     *)
+(* so position i of the recovered chain carries submission i's row.         *)
+(*                                                                         *)
+(* M7 SWAPS the (cid, tbl) identity of chain positions 1 and 2 and CHANGES  *)
+(* NOTHING ELSE: `ver`, `sub` and `forkedFrom` stay exactly as the correct  *)
+(* Replay computed them, at the positions it computed them for. That is a   *)
+(* replay that applies commit 2's row where commit 1's belongs -- the       *)
+(* mis-ordered / mis-tabled apply clause (a) exists to forbid -- while the  *)
+(* version sequence stays strictly monotone and the fork chain stays intact *)
+(* underneath it. It is deliberately NOT an order reversal: reversing the   *)
+(* replayed list drags the VERSIONS down with it, which reddens             *)
+(* PromoteOrderIsSubmitOrder, ForkFromPromotePredecessor and clause (d) at  *)
+(* the same depth, so the red would be as much about the neighbouring       *)
+(* properties as about this clause. Permuting identity alone leaves every   *)
+(* one of them green and puts clause (a) on its own.                        *)
+(*                                                                         *)
+(* Positions 1 and 2 rather than "some two": TLC evaluates this on every    *)
+(* Recover, and the shallowest violating behaviour has a two-entry chain    *)
+(* anyway. The guard is Len >= 2, so on a 0- or 1-entry chain M7 is the     *)
+(* identity -- a permutation of one element is not a permutation.           *)
+(*                                                                         *)
+(* At every other MUTATION value the result is `chain` unchanged, which is  *)
+(* the original expression verbatim, so this is an identity there.          *)
 Replay(log, cpVer, tolerant) ==
     LET accepted == SubSeq(log, 1, ScanLen(log))
         live     == SelectSeq(accepted, LAMBDA fr : fr.ver > cpVer)
-    IN [i \in 1..Len(live) |->
-           [cid        |-> live[i].cid,
-            ver        |-> live[i].ver,
-            tbl        |-> live[i].tbl,
-            sub        |-> SubIndex(live[i].cid),
-            forkedFrom |-> IF i = 1 THEN cpVer ELSE live[i-1].ver]]
+        chain    == [i \in 1..Len(live) |->
+                        [cid        |-> live[i].cid,
+                         ver        |-> live[i].ver,
+                         tbl        |-> live[i].tbl,
+                         sub        |-> SubIndex(live[i].cid),
+                         forkedFrom |-> IF i = 1 THEN cpVer ELSE live[i-1].ver]]
+    IN IF MUTATION = "M7" /\ Len(chain) >= 2
+         THEN [i \in 1..Len(chain) |->
+                  CASE i = 1 -> [chain[1] EXCEPT !.cid = chain[2].cid,
+                                                 !.tbl = chain[2].tbl]
+                    [] i = 2 -> [chain[2] EXCEPT !.cid = chain[1].cid,
+                                                 !.tbl = chain[1].tbl]
+                    [] OTHER -> chain[i]]
+         ELSE chain
 
 (* Every buffered frame independently survives, tears, or vanishes; durable *)
 (* frames always survive. All volatile store state resets -- the process is *)
@@ -976,14 +1014,16 @@ DurableAck == Durability \in {"Consistent", "ConsistentInline"}
 (* S1 RecoverySound -- the acked-write-loss property, clause by clause.     *)
 (*                                                                         *)
 (*  (a) the recovered state is the replay of a PREFIX of submission order:  *)
-(*      no reordering, and no hole (recovering commit 2 without commit 1).  *)
-(*      CHECKED BUT UNCALIBRATED, and do not assume M1/M2 cover it: run     *)
-(*      alone this clause is clean under ALL of M1-M6, because M1/M2's      *)
-(*      ordering break lands on PromotionFaithful -- the LIVE promotion     *)
-(*      chain -- not on the recovered prefix. It is falsifiable (a Replay   *)
-(*      that reverses the replayed order reddens it at depth 9 on           *)
-(*      modes/ConsistentPrealloc.cfg), just not yet falsified. See the      *)
-(*      README's "Not yet done" and the Task 5b report.                     *)
+(*      no reordering, and no hole (recovering commit 2 without commit 1),  *)
+(*      matched position by position on cid, version AND table. Do not      *)
+(*      assume M1/M2 cover it -- run alone this clause is clean under ALL   *)
+(*      of M1-M6, because M1/M2's ordering break lands on                   *)
+(*      PromotionFaithful, a claim about the LIVE promotion chain, not      *)
+(*      about the recovered prefix. M7 closes it: mutations/M7.cfg swaps    *)
+(*      the (cid, tbl) identity of two positions of the replayed chain      *)
+(*      while leaving ver/sub/forkedFrom as Replay computed them, and this  *)
+(*      clause -- and only this clause -- goes red at depth 9. See the      *)
+(*      Task 5c report.                                                     *)
 (*  (b) it contains every Consistent / ConsistentInline acked commit -- the *)
 (*      failure class this scout exists for: the store said "durable" and   *)
 (*      it was not;                                                         *)

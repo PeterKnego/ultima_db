@@ -159,8 +159,9 @@ formal/tla-model:
 # one symptom in isolation, and each has a same-bound MUTATION = "NONE"
 # control: mutations/CalibrationControl3.cfg for the first two,
 # modes/ConsistentPreallocScanErrCheck.cfg for M4Abort,
-# modes/ConsistentPrealloc3.cfg for M5Strand. Re-bounding or deleting one of
-# those silently removes the evidence while the gate stays green.
+# modes/ConsistentPrealloc3.cfg for M5Strand, modes/ConsistentPrealloc.cfg for
+# M6 and M7. Re-bounding or deleting one of those silently removes the
+# evidence while the gate stays green.
 #
 # STATE COUNTS ARE NOT TRIPWIRES FOR THE RED CONFIGS. TLC halts at the first
 # counterexample, so with -workers 2 the reported counts vary run to run --
@@ -200,6 +201,7 @@ TLA_MODES = \
   mutations/M5.cfg:12 \
   mutations/M5Strand.cfg:12 \
   mutations/M6.cfg:12 \
+  mutations/M7.cfg:12 \
   mutations/CalibrationControl3.cfg:0
 
 formal/tla-modes:
