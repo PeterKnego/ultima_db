@@ -109,6 +109,11 @@ table*), contains every `Consistent`/`ConsistentInline`-acked commit, replays no
 torn frame, and has strictly monotone versions. A strict-mode scan error is
 excluded — see "Not yet done", where it has its own named invariant.
 
+Its four clauses are **not equally well calibrated**, and the difference matters
+if you are about to read an S2 green off this model: (a), (b) and (d) each have
+a mutation that breaks them, and the "replays no torn frame" clause (c) has
+none. See "Not yet done".
+
 Two things to know before building on this. The post-`Recover` value of
 `promoted` is the **replay sequence, not the Rust's snapshot chain**: recovery
 installs exactly one snapshot, at `latest_version` (`src/store.rs:1150-1156`),
@@ -156,7 +161,7 @@ because `Extend` is a step. The tolerant-truncation branch survived: measured,
 see the Task 3 report (assertion R11).
 
 **Why a third baseline.** `FsWrite` and `Coalesced` are both *strict* scans, so
-under them `TailTolerant` is constantly false and the tolerant half of
+under them `ScanIsTolerant` is constantly false and the tolerant half of
 `scan_wal` — recovery truncating at a torn tail and carrying on, the branch M4
 attacks — is unreachable. Measured, not assumed: a scratch reachability
 assertion asserting that branch is never taken **holds** under `WalCrash.cfg`
@@ -299,6 +304,43 @@ and `make formal/tla-model` asserts exit 12 for it like a canary. A green there
 means either the strict error path stopped being reachable or the behaviour
 changed; in the second case, write the real property and delete this one.
 
+**Before deleting it, note what else depends on it.** `mutations/M4Abort.cfg`
+uses this same invariant as its target — under M4 a *prealloc* store inherits
+the gap, which is how M4's harm (a durably-acked commit made unreachable by a
+later frame tearing) gets a witness at all. Resolving the gap and deleting the
+property therefore costs M4 that witness, and `M4.cfg`'s abort would be the
+only evidence left. Re-home the harm before you delete.
+
+**`RecoverySound` clause (c) — "replays no torn frame" — is checked but
+uncalibrated.** Clauses (a), (b) and (d) all have a mutation in the battery
+that breaks them (M1/M2 the ordering, M5 the acked-containment, M3 the version
+monotonicity). Clause (c) has **none**: M4 is task37 §7's *other* direction — a
+strict scan that refuses the whole log, not a tolerant one that replays past
+the tear — and nothing else in M1–M5 replays a torn frame either. So that
+clause's green rests on no evidence that the model would go red if it were
+false, which is exactly the thing the calibration battery exists to rule out.
+
+It is a **gap, not a dead clause**, and the follow-up is priced. A clause-(c)
+mutation — tolerant `ScanLen` accepting non-`absent` frames, i.e. a scan that
+takes the torn record as good and keeps going — comes back **red on
+`RecoverySound` at depth 9**: 461 generated / 188 distinct on
+`modes/ConsistentPrealloc.cfg`, 905 / 368 on `WalCrashPrealloc.cfg`, ~1 s
+either way. Measured twice, in the Task 5 review and again when this paragraph
+was written (in place, from a backup, restored byte-for-byte and the gate
+re-run — no forked `.tla`). One `MUTATION` arm and one config would close it.
+It is outside this plan's five, and until someone spends that minute, treat
+clause (c) the way you would treat any invariant no mutation has ever
+falsified.
+
+**No mutation touches table identity.** `RecoverySound` clause (a) matches on
+cid, version *and* table, but every erasure M1–M5 produces is visible through
+version and fork-source alone (Task 4 §3 has the full ruling and the evidence
+that the fork-source proxy is as strong as the table statement *for these
+mutations*). The residual is unchanged and unclosed: a mutation that installed
+the **wrong table set** at a *correct* version with a *correct* fork chain
+would be invisible to this model. None of M1–M5 does that. If S3/S5 ever adds
+one, `M2`'s per-table last-writer map becomes necessary after all.
+
 Fsync *failure* — task15's "a commit whose fsync fails advances the gate
 without promoting". Crash did **not** give it a home: a crash removes a parked
 commit by destroying the whole gate, whereas a failed fsync must remove *one*
@@ -353,7 +395,7 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
 | `mutations/M5Strand.cfg` | `modes/ConsistentPrealloc3.cfg` | **violated** | `NoAckLossAfterLiveExtend`, depth 16 |
 | `mutations/CalibrationControl3.cfg` | control for M2Fork/M3Dup | no error | clean, 27843 states |
 | `modes/ConsistentPreallocScanErrCheck.cfg` | control for M4Abort | no error | clean, 281 states |
-| `modes/ConsistentPrealloc3.cfg` | control for M5Strand | no error | clean, 14934 states |
+| `modes/ConsistentPrealloc3.cfg` | control for M5Strand | no error | clean, 14934 states † |
 
 - **M1** — `WriterSlotFree` drops its `parked = <<>>` conjunct: the pre-fix
   code decremented `active_writer_count` in phase 1, so `begin_write` admitted
@@ -364,7 +406,7 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
   compare against `latest_version` alone **and** allocate `latest_version + 1`.
   Both halves are the bug; see the Task 4 report for why mutating only the
   comparison cannot produce the documented duplicate.
-- **M4** — `TailTolerant` loses its `CoalescedPrealloc` arm: the tolerance
+- **M4** — `ScanIsTolerant` loses its `CoalescedPrealloc` arm: the tolerance
   selection at `src/store.rs:1017-1022` goes away and a preallocated WAL is
   scanned *strictly*. task37 §7 is the whole reason that arm exists —
   preallocation puts a partially-written record in front of durable zeros, so a
@@ -387,6 +429,12 @@ Deleting one, or re-bounding it, silently removes that evidence while the gate
 stays green. Each has a same-bound, same-shape `MUTATION = "NONE"` control:
 `CalibrationControl3.cfg`, `modes/ConsistentPreallocScanErrCheck.cfg`,
 `modes/ConsistentPrealloc3.cfg`.
+
+† `NoAckLossAfterLiveExtend` is **implied by `RecoverySound`**, which that
+config already checks, so listing it there adds no detection power and none is
+claimed. It is listed so the control row and `M5Strand.cfg`'s row name the
+*same invariant at the same bound* — a reader comparing them should not have to
+derive the implication to see that the comparison is like-for-like.
 
 `PromotionFaithful` is a conjunction of four *named* clauses
 (`PromoteOrderIsSubmitOrder`, `LatestStrictlyAdvances`,
@@ -426,9 +474,18 @@ claims:
    (`src/wal.rs:586-588`) instead of returning `Err(WalCorrupted)`
    (`:589-591`), so the store opens;
 2. it stops at the **last good frame, not before it** — every frame in the
-   maximal present-prefix of the on-disk log is replayed. Without clause 2 a
-   "tolerant" scan that threw the whole log away would satisfy the property,
-   which is not hypothetical: it is what the strict path actually does.
+   maximal present-prefix of the on-disk log is replayed.
+
+**Clause 2 has no independent detection power today.** `Recover` sets
+`promoted = Replay(walAfterCrash, …)` and `Replay` *is* the accepted prefix by
+construction, so clause 2 holds in every state clause 1 admits and cannot fail
+alone. An earlier draft justified it by pointing at the strict path throwing the
+whole log away; that justification was wrong, because the strict path always
+sets `recoverErr`, which clause 1 already catches. It is kept as a claim staked
+against a mutation nobody has written yet — anything that returns *successfully*
+while replaying less than the accepted prefix (a truncating replay, a floor bug,
+a mis-filtering `Checkpoint` action) lands there and nowhere else. Read it as
+future-proofing, not as a check currently doing work.
 
 Its vacuity guard is `modes/ConsistentPreallocTornTailCanary.cfg`
 (`NoTornTailTruncation` must go **red**), which demands specifically that
