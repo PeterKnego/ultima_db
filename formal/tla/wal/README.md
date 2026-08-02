@@ -134,13 +134,25 @@ so their totals are partial and vary run to run with worker interleaving. Only
 the clean runs are exhaustive (0 states left on queue) and reproducible.
 
 `WalCrashPrealloc.cfg` moved from Task 2's 651/depth 10 to 559/depth 11 when
-Task 3 made the sink real. Deeper because `Extend` is a step; *smaller* because
-the crash rule now truncates the surviving log at `syncedCapacity`, so a
-buffered batch that no `sync_all` has covered can only be absent — collapsing
-crash outcomes that Task 2 enumerated as physically distinct but which no
-filesystem can produce (bytes cannot land past a file's durable end). The
-tolerant-truncation branch survived the change: measured, see the Task 3 report
-(assertion R11).
+Task 3 made the sink real. The net −92 hides two much larger, opposite effects,
+and the components are the evidence, not the net:
+
+| | distinct | what changed |
+|---|---|---|
+| Task 2 | 651 | inert sink |
+| Task 3, `SlotSafe` neutered to `TRUE` | **1135** | the sink layer alone adds **+484** |
+| Task 3, as committed | **559** | the frontier cut removes **−576** |
+
+Measured by editing `SlotSafe` to `TRUE` and rerunning `WalCrashPrealloc.cfg`
+(still clean, 1135/depth 11). So `syncedCapacity` gates 576 of 1135 states —
+just over half — and `Extend`/`SyncData`/`SyncAll` between them nearly doubled
+the space before the cut. A sink contributing +484 states is not inert; the cut
+removing 576 is not cosmetic.
+
+The removed states are crash outcomes Task 2 enumerated as distinct but which no
+filesystem can produce: bytes cannot land past a file's durable end. Depth rises
+because `Extend` is a step. The tolerant-truncation branch survived: measured,
+see the Task 3 report (assertion R11).
 
 **Why a third baseline.** `FsWrite` and `Coalesced` are both *strict* scans, so
 under them `TailTolerant` is constantly false and the tolerant half of
@@ -197,11 +209,23 @@ Task 1–2 baselines, so their committed counts stay comparable across tasks.
 | `modes/ConsistentFsWrite.cfg` | no error | **327**, depth 10 |
 | `modes/ConsistentCoalesced.cfg` | no error | **327**, depth 10 |
 | `modes/ConsistentPrealloc.cfg` | no error | **281**, depth 11 |
+| `modes/ConsistentPrealloc3.cfg` (`MaxCommits = 3`) | no error | **14934**, depth 14 |
 | `modes/InlineFsWrite.cfg` | no error | **75**, depth 11 |
 | `modes/InlinePrealloc.cfg` | no error | **77**, depth 12 |
 | `modes/EventualFsWrite.cfg` | no error | **221**, depth 7 |
 | `modes/ConsistentAckKeptCheck.cfg` | no error | **327**, depth 10 |
-| `modes/*Canary.cfg` (9) | **violated** | all violated (exit 12) |
+| `modes/*Canary.cfg` (12) | **violated** | all violated (exit 12) |
+
+**Why a `MaxCommits = 3` config.** Every other config uses `MaxCommits = 2`,
+and at that bound there is exactly one `Extend` per behaviour, always from
+`capacity = 0` on an empty log. So the *production* shape — records already
+durable, the next batch overruns the region, `preallocate_to` zero-fills a
+**suffix** of an existing file (`src/wal.rs:536-551` with `from != 0`) and
+`need.div_ceil(chunk)*chunk` (`:1041`) crosses a chunk boundary — never happens.
+Measured, not assumed: `NoExtendFromLiveLog` and `NoSecondChunk` are both
+**exit 0** (unreachable) at `MaxCommits = 2` and both **exit 12** at 3. That is
+also the region M5's *already-durable-and-acked* failure lives in. 14934 states,
+depth 14, ~1.4 s — inside the plan's ≤4-commit bound and effectively free.
 
 Two of those numbers are results, not bookkeeping:
 
@@ -244,6 +268,13 @@ nothing. The `modes/` loop writes its expected exit code down *per config*
 rename cannot silently reclassify a config. Verified by injecting a typo'd
 invariant name into `modes/ConsistentFsWrite.cfg`: TLC exits 151 and the target
 fails.
+
+Measured TLC exit codes on tla2tools 1.7.4 / TLC 2.19: **0** clean, **10**
+assumption false, **12** invariant violated, **150** parse error, **151**
+invariant undefined. 10 matters because `ConsistentInline` under MultiWriter is
+a store `Store::new` rejects (task38); before the `ASSUME` in `WalCrash.tla` it
+model-checked cleanly at exit 0 over a configuration no user can construct.
+Now it exits 10, which fails whatever the table expects.
 
 ## Not yet done
 

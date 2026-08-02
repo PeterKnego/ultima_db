@@ -132,7 +132,13 @@ formal/tla-model:
 #
 # ConsistentInline appears only with SingleWriter: Store::new rejects it under
 # MultiWriter (task38), so a MultiWriter config would model a store that
-# cannot be constructed.
+# cannot be constructed. That restriction is now enforced by an ASSUME in
+# WalCrash.tla, not by this comment — a comment cannot stop a config from
+# quietly coming back exit 0 over an unconstructible store. A violated ASSUME
+# is TLC exit 10, which fails every entry in this table whatever it expects.
+#
+# modes/ConsistentPrealloc3.cfg is MaxCommits = 3 and is the only config that
+# reaches an extend from a non-empty log (the production shape). ~1.4 s.
 TLA_MODES = \
   modes/ConsistentFsWriteCanary.cfg:12 \
   modes/ConsistentFsWrite.cfg:0 \
@@ -141,6 +147,10 @@ TLA_MODES = \
   modes/ConsistentPreallocCanary.cfg:12 \
   modes/ConsistentPreallocExtendCanary.cfg:12 \
   modes/ConsistentPrealloc.cfg:0 \
+  modes/ConsistentPrealloc3Canary.cfg:12 \
+  modes/ConsistentPrealloc3LiveLogCanary.cfg:12 \
+  modes/ConsistentPrealloc3ChunkCanary.cfg:12 \
+  modes/ConsistentPrealloc3.cfg:0 \
   modes/InlineFsWriteCanary.cfg:12 \
   modes/InlineFsWrite.cfg:0 \
   modes/InlinePreallocCanary.cfg:12 \
