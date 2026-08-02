@@ -1,10 +1,12 @@
 # TLA+ WAL crash-safety scout
 
-**Status: S0 gate + S1 Tasks 1–2** (steady-state commit pipeline, plus crash
-and recovery). `S0Smoke`/`S0Canary` are the toolchain gate: proof that TLC runs
-here, checks invariants, and — the part that matters — *reports a violation when
-there is one*. `WalCrash.tla` is the model proper, covering the three-phase
-Consistent commit, a crash with per-frame tearing, and `Store::recover`.
+**Status: S0 gate + S1 Tasks 1–3** (steady-state commit pipeline, crash and
+recovery, and the three production WAL sinks). `S0Smoke`/`S0Canary` are the
+toolchain gate: proof that TLC runs here, checks invariants, and — the part that
+matters — *reports a violation when there is one*. `WalCrash.tla` is the model
+proper, covering the three-phase Consistent commit, a crash with per-frame
+tearing, `Store::recover`, and the `sync_data`/`sync_all` barrier split that
+distinguishes `CoalescedPrealloc` from the two append-mode sinks.
 
 Brief: `docs/superpowers/specs/2026-08-02-wal-crash-safety-tla-scout-brief.md`.
 Roadmap: `docs/superpowers/specs/2026-08-01-formal-roadmap.md` (task F-DB-2).
@@ -27,8 +29,11 @@ The jar is committed, version-named, following the precedent set by
 
 ```bash
 make formal/tla-smoke   # S0 toolchain gate
-make formal/tla-model   # S1 model: three baselines, each after a canary that must go red
+make formal/tla-model   # S1 model: baselines + the durability matrix (runs tla-modes)
+make formal/tla-modes   # just the Durability x WalWrite matrix (modes/*.cfg)
 ```
+
+Whole gate: ~22 s.
 
 Two constraints are not optional on this box, both learned the hard way and
 both encoded in the Makefile target:
@@ -114,21 +119,28 @@ outside this state space.
 
 | Config | Expected | Actual |
 |---|---|---|
-| `Vacuity.cfg` | **violated** | violated (exit 12), 14 distinct, depth 5 |
-| `VacuityCrash.cfg` | **violated** | violated (exit 12) |
+| `Vacuity.cfg` | **violated** | violated (exit 12) |
 | `WalCrash.cfg` — SingleWriter | no error | no error, **147 distinct**, depth 11 |
-| `VacuityMW.cfg` | **violated** | violated (exit 12), 59 distinct, depth 5 |
-| `VacuityCrashMW.cfg` | **violated** | violated (exit 12) |
+| `VacuityMW.cfg` | **violated** | violated (exit 12) |
 | `WalCrashMW.cfg` — MultiWriter | no error | no error, **651 distinct**, depth 10 |
+| `VacuityCrash.cfg` | **violated** | violated (exit 12) |
+| `VacuityCrashMW.cfg` | **violated** | violated (exit 12) |
 | `VacuityCrashPrealloc.cfg` | **violated** | violated (exit 12) |
-| `WalCrashPrealloc.cfg` — MW + prealloc | no error | no error, **651 distinct**, depth 10 |
+| `WalCrashPrealloc.cfg` — MW + prealloc | no error | no error, **559 distinct**, depth 11 |
 | `StrictScanErr.cfg` — owed property | **violated** | violated (exit 12), depth 9 |
 
-Constants otherwise: `MaxCommits = 2`, `Tables = {t1, t2}`, `Consistent`,
-`MUTATION = "NONE"`; `SinkKind = FsWrite` except in the prealloc config.
-Task 1's no-crash counts were 49 (SingleWriter) and 169 (MultiWriter); crash
-and recovery multiply them 3.0× and 3.9×. All three baselines are exhaustive
-(0 states left on queue).
+Canary rows carry no state count on purpose: TLC halts at the first violation,
+so their totals are partial and vary run to run with worker interleaving. Only
+the clean runs are exhaustive (0 states left on queue) and reproducible.
+
+`WalCrashPrealloc.cfg` moved from Task 2's 651/depth 10 to 559/depth 11 when
+Task 3 made the sink real. Deeper because `Extend` is a step; *smaller* because
+the crash rule now truncates the surviving log at `syncedCapacity`, so a
+buffered batch that no `sync_all` has covered can only be absent — collapsing
+crash outcomes that Task 2 enumerated as physically distinct but which no
+filesystem can produce (bytes cannot land past a file's durable end). The
+tolerant-truncation branch survived the change: measured, see the Task 3 report
+(assertion R11).
 
 **Why a third baseline.** `FsWrite` and `Coalesced` are both *strict* scans, so
 under them `TailTolerant` is constantly false and the tolerant half of
@@ -147,13 +159,91 @@ is ever buffered), and the version bump is dead code. All four are reachable
 only under `WalCrashMW.cfg`. Both are checked; treat 169, not 49, as the
 tripwire that the model is still exploring.
 
+### The sink modes and the durability matrix (Task 3)
+
+Task 1–2 had one `Fsync` action. Task 3 splits it by **what the barrier
+covers**, because that difference is the entire preallocation bug surface.
+
+| Action | Gloss |
+|---|---|
+| `SyncData` | `fdatasync` — a barrier over frame *data* inside an already-durable file size. Reached by `PreallocFileSink` and nothing else in production (`src/wal.rs:1050-1051`), and only in steady state (`metaDurable` guard). |
+| `SyncAll` | `fsync` — data **and** metadata, so the physical file size becomes durable. Every append-mode sink uses it for every batch (`src/wal.rs:912-916`, `:966-970`) because every append changes the size; `PreallocFileSink` reaches it only as `preallocate_to`'s sync (`src/wal.rs:549`), i.e. only on an extend. |
+| `Extend` | The batch overruns `capacity`, so grow by whole chunks of physically written zeros (`src/wal.rs:1038-1044`, `:531-551`) and drop `metaDurable` until a `SyncAll` covers the new size. |
+
+`sync_data` does **not** make a new file *size* durable. So bytes past the last
+`sync_all`-covered size can vanish **wholesale** on a crash — including frames a
+`sync_data` "covered", because the filesystem may still present the old size and
+those offsets simply are not there. `syncedCapacity` is that frontier and
+`SlotSafe` is the crash rule. This is why `preallocate_to` ends in `sync_all`
+*before* any record is written into the new region, and it is what M5 attacks in
+Task 5.
+
+`PreallocInvariant` is task37 §4 stated on its own, so a sink-layer model bug
+surfaces as an invariant break rather than a confusing downstream
+`RecoverySound` trace. Its load-bearing clause is `writeHead ≤ syncedCapacity`
+— barrier discipline. At `MUTATION = "NONE"` that is an **invariant**, not a
+reachable state; the brief's suggested canary shape `~(writeHead > capacity)` is
+the same family of claim and would have reported failure exactly when the model
+is correct, so the reachability canary is `NoPreallocExtend` instead (see the
+Task 3 report, "Adjudication").
+
+`modes/` is the `Durability × WalWrite` matrix, one config per combination the
+Standalone pipeline actually offers, each with at least one paired canary at
+exit 12. `SYMMETRY TableSymmetry` is declared here and deliberately *not* on the
+Task 1–2 baselines, so their committed counts stay comparable across tasks.
+
+| Config | Expected | Actual |
+|---|---|---|
+| `modes/ConsistentFsWrite.cfg` | no error | **327**, depth 10 |
+| `modes/ConsistentCoalesced.cfg` | no error | **327**, depth 10 |
+| `modes/ConsistentPrealloc.cfg` | no error | **281**, depth 11 |
+| `modes/InlineFsWrite.cfg` | no error | **75**, depth 11 |
+| `modes/InlinePrealloc.cfg` | no error | **77**, depth 12 |
+| `modes/EventualFsWrite.cfg` | no error | **221**, depth 7 |
+| `modes/ConsistentAckKeptCheck.cfg` | no error | **327**, depth 10 |
+| `modes/*Canary.cfg` (9) | **violated** | all violated (exit 12) |
+
+Two of those numbers are results, not bookkeeping:
+
+- **`FsWrite` and `Coalesced` are identical — 327/10, exactly.** They still do
+  not diverge, but now for a stated reason rather than an unexamined one: both
+  are `O_APPEND` sinks that `sync_all` every batch and are scanned strictly, so
+  they agree on every variable this model has. They differ only in *when* bytes
+  reach the file (per entry at append vs. one `write_all` per batch inside
+  `sync`), and that is invisible because the crash rule already gives every
+  unbarriered frame an independent {present, torn, absent} outcome — a superset
+  of both "some of the per-entry writes landed" and "a byte prefix of one big
+  write landed".
+- **`ConsistentInline` equals `Consistent` under SingleWriter** — 75/11 and
+  77/12 respectively, confirmed by rerunning both configs with only that one
+  constant changed. Inline fsync changes *who* issues the barrier (the
+  committing thread, off the store lock) not *what* it covers, and it is
+  SingleWriter-only, where at most one frame is ever buffered, so the batching
+  it removes is already degenerate. Modelled as equal, and then checked.
+
+`EventualFsWrite.cfg` carries `EventualHonest` as well as `RecoverySound`.
+`RecoverySound`'s acked-containment clause is gated on `DurableAck`, so under
+`Eventual` it is silently switched off — a reader who missed the gate would take
+the green for a promise the store does not make. `EventualHonest` states the
+promise it *does* make: whatever survives is a submission-order prefix, nothing
+reordered, nothing partial. Its vacuity guard is
+`modes/EventualFsWriteLossCanary.cfg` (`NoEventualAckLoss` must go **red** — an
+acked commit really is lost), paired with `modes/ConsistentAckKeptCheck.cfg`,
+which runs the *same invariant* with one constant changed and must come back
+**clean**. That pair is what shows the two durability tiers genuinely differ in
+this model instead of the red being an artifact of the crash rule.
+
 The canary is not decoration. A model in which nothing ever promotes satisfies
 every safety property below it, silently. Each baseline is paired with a
 canary that runs first; `make formal/tla-model` enforces the ordering, and
 asserts TLC exit code **12** specifically rather than "nonzero" — 150 (parse
 error) and 151 (undefined invariant) are also nonzero, so a typo in an
 invariant name would otherwise print "violated (expected)" having checked
-nothing.
+nothing. The `modes/` loop writes its expected exit code down *per config*
+(`TLA_MODES` in the Makefile) rather than inferring it from the filename, so a
+rename cannot silently reclassify a config. Verified by injecting a typo'd
+invariant name into `modes/ConsistentFsWrite.cfg`: TLC exits 151 and the target
+fails.
 
 ## Not yet done
 
@@ -188,9 +278,23 @@ no committed config exercises a non-zero floor. A `Checkpoint` action also drags
 in WAL pruning (`src/wal.rs:628`), which is where checkpoint/prune/crash
 interleavings would actually bite.
 
-`FsWrite` vs `Coalesced` still do not diverge: they differ in write
-granularity, not in sync granularity or in what the recovery scan does. Also
-pending: the S3/S4/S5 properties and the M2–M5 battery.
+`write_head` **reconstruction on open** (task37 §4 invariant 3) is declared but
+inert. `PreallocFileSink::open` rebuilds the head with a *tolerant* `scan_wal`
+and takes `capacity` from `metadata().len()` (`src/wal.rs:1023-1024`); there is
+no persisted head pointer to corrupt. `Crash` sets `writeHead` to 0 and
+`Recover` leaves it there, because the bound is "no operation after recovery",
+so nothing would consume a reconstructed head. When S2 lifts that bound the
+reconstruction is `writeHead' = ScanLen(walAfterCrash)` in `Recover`.
+
+**WAL prune**, including the preallocating prune (`src/wal.rs:672-707`, task37
+§6 strategy P2), which resets `write_head`/`capacity` from a pre-sized
+tmp+rename. It is reachable only from `Checkpoint`, which this model does not
+have, so no action moves `writeHead` backwards and `writeHead = Len(walDurable)`
+is currently a *checked* `PreallocInvariant` clause rather than an assumption. A
+`Checkpoint` action would break that clause, on purpose — which makes it a
+useful tripwire for whoever adds one.
+
+Also pending: the remaining S3/S5 properties and the M2–M5 battery.
 
 M1 is already gated on `MUTATION` (one spec, never forked `.tla` copies) — it
 was needed to prove the SingleWriter path is no longer over-protected. It has

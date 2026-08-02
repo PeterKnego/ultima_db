@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model formal/tla-modes
 
 build:
 	cargo build
@@ -119,6 +119,52 @@ formal/tla-model:
 	    exit 1; \
 	  fi; \
 	  echo "owed property StrictScanErrLosesDurableAck: violated, TLC exit 12 (expected — known gap, still there)"
+	@$(MAKE) --no-print-directory formal/tla-modes
+
+# The Durability x WalWrite matrix (Task 3): every combination the Standalone
+# pipeline actually offers, each paired with at least one canary that must go
+# red. The expected exit code is written down PER CONFIG rather than inferred
+# from the filename — a naming convention would silently reclassify a config
+# the day someone renames it, and the whole point of these gates is that they
+# cannot quietly pass. 0 = clean, 12 = invariant violated; 150 (parse error)
+# and 151 (undefined invariant) fail either way, which is the hole this
+# discipline exists to close.
+#
+# ConsistentInline appears only with SingleWriter: Store::new rejects it under
+# MultiWriter (task38), so a MultiWriter config would model a store that
+# cannot be constructed.
+TLA_MODES = \
+  modes/ConsistentFsWriteCanary.cfg:12 \
+  modes/ConsistentFsWrite.cfg:0 \
+  modes/ConsistentCoalescedCanary.cfg:12 \
+  modes/ConsistentCoalesced.cfg:0 \
+  modes/ConsistentPreallocCanary.cfg:12 \
+  modes/ConsistentPreallocExtendCanary.cfg:12 \
+  modes/ConsistentPrealloc.cfg:0 \
+  modes/InlineFsWriteCanary.cfg:12 \
+  modes/InlineFsWrite.cfg:0 \
+  modes/InlinePreallocCanary.cfg:12 \
+  modes/InlinePreallocExtendCanary.cfg:12 \
+  modes/InlinePrealloc.cfg:0 \
+  modes/EventualFsWriteCanary.cfg:12 \
+  modes/EventualFsWriteLossCanary.cfg:12 \
+  modes/EventualFsWrite.cfg:0 \
+  modes/ConsistentAckKeptCheck.cfg:0
+
+formal/tla-modes:
+	@mkdir -p $(TLC_METADIR)
+	@cd formal/tla/wal && for pair in $(TLA_MODES); do \
+	  cfg=$${pair%:*}; want=$${pair##*:}; \
+	  $(TLC) -config $$cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne $$want ]; then \
+	    echo "$$cfg FAILED — TLC exit $$rc, expected $$want."; \
+	    echo "  12 expected but 0 seen = the canary's mechanism is unreachable and"; \
+	    echo "  the paired baseline is green over dead code; 0 expected but 12 seen"; \
+	    echo "  = a real property broke; 150/151 = the run checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "$$cfg: TLC exit $$rc (expected $$want)"; \
+	done
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
