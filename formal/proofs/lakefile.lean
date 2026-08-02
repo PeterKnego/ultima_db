@@ -10,6 +10,7 @@ package «btree_proofs»
 require aeneas from "../.toolchain/backends/lean"
 
 lean_lib «BtreeKernel»
+lean_lib «KeyKernel»
 lean_lib «BtreeInvariant»
 lean_lib «ListLemmas»
 lean_lib «AlignedLemmas»
@@ -46,3 +47,12 @@ lean_lib «RemoveFrame»
 
 @[default_target]
 lean_lib «RemoveTotal»
+
+@[default_target]
+lean_lib «KeyRoundTrip»
+
+@[default_target]
+lean_lib «KeyMonoFixed»
+
+@[default_target]
+lean_lib «KeyFraming»

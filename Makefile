@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check
 
 build:
 	cargo build
@@ -16,8 +16,13 @@ test/integration:
 test/formal-kernel:
 	cargo test --manifest-path formal/kernel/Cargo.toml
 
-# Drift guard: fail if src/btree.rs changed without a matching formal/ update.
-# Override for changes outside the verified insert/get path: ACK_NO_FORMAL=1.
+# Key-encoding kernel port (formal/key_kernel). Lean proofs: see formal/README.md.
+test/formal-key-kernel:
+	cargo test --manifest-path formal/key_kernel/Cargo.toml
+
+# Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
+# matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
+# Override for changes outside the verified surface: ACK_NO_FORMAL=1.
 formal/drift-check:
 	formal/scripts/check-drift.sh
 

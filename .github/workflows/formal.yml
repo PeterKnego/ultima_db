@@ -1,8 +1,9 @@
 name: formal
 
-# Formal-verification CI for the B-tree (formal/).
-#   * drift  — gates PRs: src/btree.rs may not diverge from its Lean model unnoticed.
-#              Cheap (git + cargo only), so it runs on every PR.
+# Formal-verification CI for the B-tree and the primary-key encoding (formal/).
+#   * drift  — gates PRs: src/btree.rs and src/primary_key.rs may not diverge
+#              from their Lean models unnoticed. Cheap (git + cargo only), so it
+#              runs on every PR.
 #   * lean   — rebuilds the Lean proofs and re-checks their axioms. Heavy (fetches
 #              the pinned Aeneas/Charon/Lean toolchain), so it runs on a weekly
 #              schedule and on demand only — never blocking a PR on a toolchain hiccup.
@@ -19,6 +20,7 @@ on:
     branches: [main]
     paths:
       - 'src/btree.rs'
+      - 'src/primary_key.rs'
       - 'formal/**'
       - '.github/workflows/formal.yml'
   schedule:
@@ -36,15 +38,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # need the PR base commit for the range diff
-      - name: Drift guard (src/btree.rs <-> formal/)
+      - name: Drift guard (src/btree.rs, src/primary_key.rs <-> formal/)
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          # Bypass for a btree.rs change outside the verified insert/get path
+          # Bypass for a watched-file change outside the verified surface
           # by putting [skip-formal-drift] in the PR title.
           ACK_NO_FORMAL: ${{ contains(github.event.pull_request.title, '[skip-formal-drift]') && '1' || '' }}
         run: formal/scripts/check-drift.sh
-      - name: Kernel differential test (vs std BTreeMap)
-        run: make test/formal-kernel
+      - name: Kernel differential tests (vs std BTreeMap / reproduced impls)
+        run: |
+          make test/formal-kernel
+          make test/formal-key-kernel
 
   lean:
     if: github.event_name != 'pull_request'
@@ -61,6 +65,10 @@ jobs:
       - name: Build proofs
         working-directory: formal/proofs
         run: lake build
+      - name: Kernel differential tests (vs std BTreeMap / reproduced impls)
+        run: |
+          make test/formal-kernel
+          make test/formal-key-kernel
       - name: Check axioms (no sorry; only propext/Classical.choice/Quot.sound)
         working-directory: formal/proofs
         run: |
@@ -73,6 +81,9 @@ jobs:
           import RemoveFrame
           import RemoveTotal
           import MinKeysPreserve
+          import KeyRoundTrip
+          import KeyMonoFixed
+          import KeyFraming
           #print axioms btree_kernel.BTree.insert_inv
           #print axioms btree_kernel.BTree.insert_get
           #print axioms btree_kernel.BTree.insert_frame
@@ -83,10 +94,30 @@ jobs:
           #print axioms btree_kernel.BTree.remove_spec
           #print axioms btree_kernel.BTree.remove_minkeys
           #print axioms btree_kernel.BTree.remove_balanced_spec
+          #print axioms key_kernel.decode_encode_u64
+          #print axioms key_kernel.decode_encode_i64
+          #print axioms key_kernel.escape_prefix_scan
+          #print axioms key_kernel.unescape_escape
+          #print axioms key_kernel.decode_encode_pair
+          #print axioms key_kernel.encode_mono_u64
+          #print axioms key_kernel.encode_mono_i64
+          #print axioms key_kernel.sign_flip_order_iso
+          #print axioms key_kernel.encode_inj_u64
+          #print axioms key_kernel.encode_inj_i64
+          #print axioms key_kernel.encode_mono_bytes
+          #print axioms key_kernel.framed_prefix_lt_literal
+          #print axioms key_kernel.framed_prefix_lt_escaped_zero
+          #print axioms key_kernel.escaped_byte_order
+          #print axioms key_kernel.framing_no_confusion
+          #print axioms key_kernel.framing_no_confusion_kernel
+          #print axioms key_kernel.framed_element_lex
+          #print axioms key_kernel.encode_mono_pair
+          #print axioms key_kernel.encode_mono_triple
           EOF
+          set -o pipefail
           lake env lean _AxiomCheck.lean 2>&1 | tee _axioms.txt
           rm -f _AxiomCheck.lean
-          if grep -qiE 'sorryAx|sorry|admit' _axioms.txt; then
-            echo "::error::proofs depend on sorry/admit — verification is incomplete"
-            exit 1
-          fi
+          grep -qE "depends on axioms" _axioms.txt || { echo "::error::no axiom lines — check ran vacuously"; exit 1; }
+          grep -E "depends on axioms" _axioms.txt \
+            | grep -vE "\[propext(, (Classical\.choice|Quot\.sound))*\]$" \
+            && { echo "::error::non-standard axiom"; exit 1; } || true
