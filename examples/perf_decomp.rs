@@ -9,6 +9,10 @@
 //
 // Run: cargo run --release --features persistence --example perf_decomp
 
+#[cfg(feature = "bench-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::hint::black_box;
 use std::time::Instant;
 

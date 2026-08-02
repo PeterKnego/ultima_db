@@ -13,6 +13,10 @@
 //
 // Run: cargo run --release --features persistence --example wal_spin_ab
 
+#[cfg(feature = "bench-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::time::Instant;
 
 use rand::SeedableRng;
