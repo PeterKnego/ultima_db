@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model formal/tla-modes
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
 
 build:
 	cargo build
@@ -69,6 +69,7 @@ formal/tla-smoke:
 # "we know about this" is re-checked rather than remembered.
 formal/tla-model:
 	@mkdir -p $(TLC_METADIR)
+	@$(MAKE) --no-print-directory formal/tla-manifest
 	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
 	  if [ $$rc -ne 12 ]; then \
 	    echo "vacuity canary (SingleWriter) FAILED — TLC exit $$rc, expected 12."; \
@@ -214,6 +215,114 @@ formal/tla-modes:
 	    echo "  12 expected but 0 seen = the canary's mechanism is unreachable and"; \
 	    echo "  the paired baseline is green over dead code; 0 expected but 12 seen"; \
 	    echo "  = a real property broke; 150/151 = the run checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "$$cfg: TLC exit $$rc (expected $$want)"; \
+	done
+
+# The calibration manifest (Task 6). Until now, the only thing standing
+# between M2's and M3's documented symptoms and oblivion was a PROSE COMMENT
+# above TLA_MODES saying "deleting one, or re-bounding it, silently removes
+# that evidence". M2.cfg and M3.cfg keep passing without M2Fork.cfg and
+# M3Dup.cfg -- they just stop matching the shipped bug, which is the entire
+# claim the calibration makes. A comment cannot fail a build.
+#
+# Each row pins the four things that carry a mutation's evidence:
+#
+#   cfg : invariant : MUTATION : MaxCommits : expected TLC exit code
+#
+# and the check asserts all five, plus that the config is still listed in
+# TLA_MODES at the same exit code. So deleting the file fails; renaming it
+# fails; dropping it from TLA_MODES fails; swapping its target invariant
+# fails; and re-bounding MaxCommits 3 -> 2 fails -- which is the silent one,
+# because M2Fork/M3Dup/M5Strand at MaxCommits = 2 would still be *green* while
+# checking a state space that cannot reach the symptom (see "Which config
+# carries which mechanism" in formal/tla/wal/README.md).
+#
+# The invariant named per row is the evidence-carrying one, not the whole
+# INVARIANT list: baseline-shaped configs declare five and only one is the
+# reason that row exists.
+#
+# Controls are here too, at exit 0. A mutation row proving "violated" means
+# nothing without a same-bound MUTATION = "NONE" run proving the bound itself
+# is not what went red.
+TLA_CALIB = \
+  mutations/M1.cfg:PromotionFaithful:M1:2:12 \
+  mutations/M2.cfg:PromotionFaithful:M2:2:12 \
+  mutations/M2Fork.cfg:ForkFromPromotePredecessor:M2:3:12 \
+  mutations/M3.cfg:PromotionFaithful:M3:2:12 \
+  mutations/M3Dup.cfg:NoDupLive:M3:3:12 \
+  mutations/M4.cfg:TailTolerance:M4:2:12 \
+  mutations/M4Abort.cfg:StrictScanErrLosesDurableAck:M4:2:12 \
+  mutations/M5.cfg:PreallocInvariant:M5:2:12 \
+  mutations/M5Strand.cfg:NoAckLossAfterLiveExtend:M5:3:12 \
+  mutations/M6.cfg:RecoverySound:M6:2:12 \
+  mutations/M7.cfg:RecoverySound:M7:2:12 \
+  mutations/CalibrationControl3.cfg:ForkFromPromotePredecessor:NONE:3:0 \
+  modes/ConsistentPrealloc.cfg:RecoverySound:NONE:2:0 \
+  modes/ConsistentPrealloc3.cfg:NoAckLossAfterLiveExtend:NONE:3:0 \
+  modes/ConsistentPreallocScanErrCheck.cfg:StrictScanErrLosesDurableAck:NONE:2:0
+
+# Structural half: no TLC, runs in well under a second, and is therefore
+# wired into formal/tla-model so the guard rides on the target people already
+# run rather than on one they have to remember.
+formal/tla-manifest:
+	@cd formal/tla/wal && for spec in $(TLA_CALIB); do \
+	  cfg=`echo $$spec | cut -d: -f1`; inv=`echo $$spec | cut -d: -f2`; \
+	  mut=`echo $$spec | cut -d: -f3`; bound=`echo $$spec | cut -d: -f4`; \
+	  want=`echo $$spec | cut -d: -f5`; \
+	  if [ ! -f "$$cfg" ]; then \
+	    echo "calibration manifest FAILED — $$cfg is missing."; \
+	    echo "  It carries the MUTATION = \"$$mut\" evidence at MaxCommits = $$bound."; \
+	    echo "  If the mutation is genuinely retired, delete its manifest row too"; \
+	    echo "  and say so in formal/tla/wal/RESULTS.md — do not just delete the file."; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -qE "^INVARIANT[[:space:]]+$$inv[[:space:]]*$$" "$$cfg"; then \
+	    echo "calibration manifest FAILED — $$cfg no longer declares INVARIANT $$inv."; \
+	    echo "  That invariant is the evidence this config exists to carry."; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -qE "^[[:space:]]*MUTATION[[:space:]]*=[[:space:]]*\"$$mut\"[[:space:]]*$$" "$$cfg"; then \
+	    echo "calibration manifest FAILED — $$cfg is no longer MUTATION = \"$$mut\"."; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -qE "^[[:space:]]*MaxCommits[[:space:]]*=[[:space:]]*$$bound[[:space:]]*$$" "$$cfg"; then \
+	    echo "calibration manifest FAILED — $$cfg is no longer MaxCommits = $$bound."; \
+	    echo "  Re-bounding is the SILENT failure: the config stays green while"; \
+	    echo "  checking a state space too small to reach the symptom."; \
+	    exit 1; \
+	  fi; \
+	  case " $(TLA_MODES) " in \
+	    *" $$cfg:$$want "*) ;; \
+	    *) echo "calibration manifest FAILED — $$cfg is not in TLA_MODES at exit $$want."; \
+	       echo "  A calibration config outside TLA_MODES is never run by any gate."; \
+	       exit 1;; \
+	  esac; \
+	  echo "$$cfg: INVARIANT $$inv, MUTATION \"$$mut\", MaxCommits $$bound, TLA_MODES:$$want (ok)"; \
+	done
+
+# Behavioural half: re-run every mutation and every control and assert the
+# exit code. Same discipline as the canaries -- exact code, never "nonzero",
+# because 150 (parse error) and 151 (undefined invariant) are nonzero too and
+# mean the run checked nothing. Overlaps formal/tla-modes by design: this is
+# the standing guard for "the model is still discriminating", runnable on its
+# own without the full matrix.
+formal/tla-calibrate:
+	@mkdir -p $(TLC_METADIR)
+	@$(MAKE) --no-print-directory formal/tla-manifest
+	@cd formal/tla/wal && for spec in $(TLA_CALIB); do \
+	  cfg=`echo $$spec | cut -d: -f1`; mut=`echo $$spec | cut -d: -f3`; \
+	  want=`echo $$spec | cut -d: -f5`; \
+	  $(TLC) -config $$cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne $$want ]; then \
+	    echo "$$cfg FAILED — TLC exit $$rc, expected $$want (MUTATION = \"$$mut\")."; \
+	    echo "  12 expected but 0 seen = the model STOPPED BEING DISCRIMINATING:"; \
+	    echo "  it can no longer re-find a bug it was calibrated against, so every"; \
+	    echo "  green verdict elsewhere is a green with nothing behind it."; \
+	    echo "  0 expected but 12 seen = a control broke; the bound, not the"; \
+	    echo "  mutation, is what the neighbouring red was measuring."; \
+	    echo "  150/151 = the run checked nothing."; \
 	    exit 1; \
 	  fi; \
 	  echo "$$cfg: TLC exit $$rc (expected $$want)"; \

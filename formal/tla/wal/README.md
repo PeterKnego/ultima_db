@@ -1,8 +1,10 @@
 # TLA+ WAL crash-safety scout
 
-**Status: S0 gate + S1 Tasks 1–5c** (steady-state commit pipeline, crash and
-recovery, the three production WAL sinks, and the full M1–M7 calibration
-battery). `S0Smoke`/`S0Canary` are the
+**Status: S0 gate + S1 complete, Tasks 1–6** (steady-state commit pipeline,
+crash and recovery, the three production WAL sinks, and the full M1–M7
+calibration battery). **The S1 exit verdict and everything it did and did not
+establish is in [`RESULTS.md`](RESULTS.md)** — read that first if you are
+deciding whether to fund S2. `S0Smoke`/`S0Canary` are the
 toolchain gate: proof that TLC runs here, checks invariants, and — the part that
 matters — *reports a violation when there is one*. `WalCrash.tla` is the model
 proper, covering the three-phase Consistent commit, a crash with per-frame
@@ -29,12 +31,30 @@ The jar is committed, version-named, following the precedent set by
 ## Running
 
 ```bash
-make formal/tla-smoke   # S0 toolchain gate
-make formal/tla-model   # S1 model: baselines + the durability matrix (runs tla-modes)
-make formal/tla-modes   # just the Durability x WalWrite matrix (modes/*.cfg)
+make formal/tla-smoke     # S0 toolchain gate
+make formal/tla-model     # S1 model: baselines + the durability matrix (runs tla-manifest, then tla-modes)
+make formal/tla-modes     # just the Durability x WalWrite matrix (modes/*.cfg)
+make formal/tla-calibrate # standing guard: every mutation still violates, every control still clean
+make formal/tla-manifest  # structural half of the above, no TLC, sub-second
 ```
 
-Whole gate: ~22 s.
+`make formal/tla-model` is ~50 s on this box (it was ~22 s before Tasks 5b/5c
+added M6 and M7; the figure had gone stale and was re-measured in Task 6).
+`formal/tla-calibrate` is ~18 s and overlaps `tla-modes` by design — it is the
+target to run when the question is specifically "is the model still
+discriminating?". Both are wall-clock on a noisy shared box: treat them as
+orders of magnitude, not benchmarks.
+
+`formal/tla-manifest` is the mechanical guard on the calibration battery. Four
+things carry a mutation's evidence — the config file, the invariant it
+declares, its `MUTATION` constant and its `MaxCommits` bound — plus its
+presence in `TLA_MODES`. Prose used to be the only thing protecting them, and
+prose cannot fail a build: `M2.cfg` and `M3.cfg` keep passing perfectly well
+without `M2Fork.cfg` and `M3Dup.cfg`, which are the *only* configs where M2 and
+M3 reproduce their documented symptoms. Re-bounding is the quiet one — those
+configs at `MaxCommits = 2` stay **green** while checking a state space too
+small to reach the symptom. All five checks were verified by breaking them one
+at a time; see `RESULTS.md`, "The gate".
 
 Two constraints are not optional on this box, both learned the hard way and
 both encoded in the Makefile target:
@@ -309,7 +329,56 @@ a store `Store::new` rejects (task38); before the `ASSUME` in `WalCrash.tla` it
 model-checked cleanly at exit 0 over a configuration no user can construct.
 Now it exits 10, which fails whatever the table expects.
 
+## Abstraction obligations
+
+Every green in this model is conditional on five assumptions about the world
+below it. They are not modelled, they are *assumed*, and each is a place where
+a real failure would be invisible here. Anyone porting this to Lean, or reading
+a green as reassurance, is taking these on:
+
+1. **fsync is a barrier — total, atomic, and honest.** `SyncData`/`SyncAll` are
+   single steps that make a set of frames durable instantly. Real barriers can
+   fail partway, and on Linux a failed writeback can be reported once and then
+   forgotten while the page is dropped (the "fsyncgate" class). This model has
+   **no fsync-failure action at all** — see "Open behaviour and model gaps".
+   So the model cannot see any bug whose trigger is a barrier that reported
+   success without providing one.
+2. **Tearing is frame-granular and CRC-detectable.** A merely-buffered frame
+   independently lands whole, lands torn, or is absent. Real tearing is
+   sector-granular; a frame spanning sectors is modelled as "present, CRC-bad",
+   which is what a sector-boundary tear produces *given that the CRC catches
+   it*. A tear that survives CRC32 is outside the state space. The CRC is 32
+   bits (`crc32fast`), so that probability is small, not zero.
+3. **Rename is atomic, and `sync_dir` makes it durable.** The preallocating
+   prune (`src/wal.rs:672-707`) rebuilds the WAL through tmp+rename. S1 has no
+   `Checkpoint` action, so this obligation is **inherited without being
+   exercised** — the weakest of the five, because nothing here would notice if
+   it were false.
+4. **The `sync_data`/`sync_all` split is real.** `sync_data` makes frame bytes
+   durable *within an already-durable file size*; only `sync_all` makes a new
+   size durable. `syncedCapacity` is that frontier and `SlotSafe` is the crash
+   rule built on it. On a filesystem where `fdatasync` also persists size
+   growth the model is merely conservative; on one where `sync_all` does not,
+   it is wrong, and M5's whole mechanism is mis-stated.
+5. **Commits are opaque.** A commit is a `<version, table>` pair
+   (`WalCrash.tla:45`, `:197`). Rows, keys, index maintenance and merge
+   semantics are all invisible. "The recovered state is correct" therefore
+   means *the right commit identities, in the right order, into the right
+   tables* — **not** the right contents. A replay that applies the correct
+   commit with the wrong rows in it is outside this model by construction.
+
 ## Not yet done
+
+**Open work only.** This section used to mix two different things: work
+that is genuinely open, and calibration holes that had since been CLOSED
+but whose history is worth keeping. A reader scanning for "what is left"
+had to read two paragraphs headlined CLOSED to find out they were not it.
+They are now separated. Closed holes, with the narrative of how each was
+found and shut, are in **"Closed calibration holes"** below. What is still
+open splits in two: behaviour and model gaps first, then the one
+calibration hole that is only *half* closed.
+
+### Open behaviour and model gaps
 
 **A torn tail costs a strict-scan store its whole log — including durable,
 acked commits.** `scan_wal` treats a CRC mismatch as end-of-log only when
@@ -336,6 +405,81 @@ the gap, which is how M4's harm (a durably-acked commit made unreachable by a
 later frame tearing) gets a witness at all. Resolving the gap and deleting the
 property therefore costs M4 that witness, and `M4.cfg`'s abort would be the
 only evidence left. Re-home the harm before you delete.
+
+Fsync *failure* — task15's "a commit whose fsync fails advances the gate
+without promoting". Crash did **not** give it a home: a crash removes a parked
+commit by destroying the whole gate, whereas a failed fsync must remove *one*
+ticket and let the rest of the FIFO proceed. That needs a per-ticket outcome on
+`Fsync`. L1 (liveness) stays inexpressible until then.
+
+Checkpoint and prune — `checkpointVersion` is carried and `Recover` honours it
+as the replay floor (`src/store.rs:1027-1030`), but no action moves it off 0, so
+no committed config exercises a non-zero floor. A `Checkpoint` action also drags
+in WAL pruning (`src/wal.rs:628`), which is where checkpoint/prune/crash
+interleavings would actually bite.
+
+`write_head` **reconstruction on open** (task37 §4 invariant 3) is declared but
+inert. `PreallocFileSink::open` rebuilds the head with a *tolerant* `scan_wal`
+and takes `capacity` from `metadata().len()` (`src/wal.rs:1023-1024`); there is
+no persisted head pointer to corrupt. `Crash` sets `writeHead` to 0 and
+`Recover` leaves it there, because the bound is "no operation after recovery",
+so nothing would consume a reconstructed head. When S2 lifts that bound the
+reconstruction is `writeHead' = ScanLen(walAfterCrash)` in `Recover`.
+
+**WAL prune**, including the preallocating prune (`src/wal.rs:672-707`, task37
+§6 strategy P2), which resets `write_head`/`capacity` from a pre-sized
+tmp+rename. It is reachable only from `Checkpoint`, which this model does not
+have, so no action moves `writeHead` backwards and `writeHead = Len(walDurable)`
+is currently a *checked* `PreallocInvariant` clause rather than an assumption. A
+`Checkpoint` action would break that clause, on purpose — which makes it a
+useful tripwire for whoever adds one.
+
+Also pending: the remaining S3 properties. S5 (`TailTolerance`) and the M4–M5
+battery landed in Task 5, below; M6 in Task 5b, M7 in Task 5c.
+
+### Calibration holes still open
+
+**Calibration at CLAUSE granularity is not calibration at CONJUNCT
+granularity, and the gap between them is open.** Clause (a)'s `ver`-match
+and `Len(promoted) <= Len(submitted)` conjuncts are *checked by everything
+and falsified by nothing* — the same species of hole Task 5c closed one
+conjunct over. They may be unfalsifiable by construction at this bound, the
+way `TailTolerance` clause 2 is, and nobody has done the work to decide
+which; until someone does, neither the clause table above nor anything in
+`RESULTS.md` should be read as a blanket all-clear. The full statement is
+in "Calibration: the mutations" as well as here, deliberately: a prior
+round of this work published exactly that all-clear and had to retract it.
+
+**Table identity: half-closed by M7, and the residual is a different claim.**
+Clause (a) matches on cid, version *and* table, and until Task 5c no mutation
+moved a table at all — every erasure M1–M6 produces is visible through version
+and fork-source alone (Task 4 §3 has the ruling and the evidence that the
+fork-source proxy is as strong as the table statement *for those* mutations).
+M7 does move it: run with **only** the `tbl` conjunct of clause (a), `M7.cfg`
+is violated at depth 9, on a witness where version 1's row is recovered into
+`t2` and version 2's into `t1` while the versions stay monotone. So the `tbl`
+conjunct is no longer a conjunct nothing can falsify — and since this paragraph
+is already at conjunct granularity, the rest of that audit belongs here too: M7
+falsifies clause (a)'s `cid` and `tbl` conjuncts **only**, and its
+**`ver`-match and length-prefix conjuncts
+remain checked but unfalsified**, possibly unfalsifiable by construction at this
+bound (§`RecoverySound` above, and compare `TailTolerance` clause 2, which the
+spec documents as holding by construction and says so out loud). What is
+**still open** on table identity specifically is
+narrower than it was: M7 *permutes* identity between two positions, it does not
+install the **wrong table set at a correct cid**, so a mutation that kept every
+cid, version and fork source right and simply applied a commit's rows to
+another table would still be invisible here. If S3/S5 adds one, `M2`'s
+per-table last-writer map becomes necessary after all.
+
+## Closed calibration holes
+
+Both of these were, at the time they were written, entries in "Not yet
+done" — a clause of `RecoverySound` that every config checked and no
+mutation could falsify. Each is now shut by a named mutation. They are kept
+in full rather than deleted because *how* a checked-by-everything clause
+goes unnoticed is the reusable lesson, and in clause (a)'s case this README
+asserted the hole was already covered when it was not.
 
 **`RecoverySound` clause (c) — "replays no torn frame" — was checked but
 uncalibrated. CLOSED in Task 5b by `mutations/M6.cfg`.** Clauses (b) and (d)
@@ -378,59 +522,6 @@ the Task 4 standard that would be a red for the neighbouring properties as much
 as for this clause — the "merely violating" outcome M2 and M3 land in on their
 primary configs. What clause (a) uniquely owns is a replay that is mis-ordered
 or mis-tabled at *monotone* versions, and that is what M7 pins.
-
-**Table identity: half-closed by M7, and the residual is a different claim.**
-Clause (a) matches on cid, version *and* table, and until Task 5c no mutation
-moved a table at all — every erasure M1–M6 produces is visible through version
-and fork-source alone (Task 4 §3 has the ruling and the evidence that the
-fork-source proxy is as strong as the table statement *for those* mutations).
-M7 does move it: run with **only** the `tbl` conjunct of clause (a), `M7.cfg`
-is violated at depth 9, on a witness where version 1's row is recovered into
-`t2` and version 2's into `t1` while the versions stay monotone. So the `tbl`
-conjunct is no longer a conjunct nothing can falsify — and since this paragraph
-is already at conjunct granularity, the rest of that audit belongs here too: M7
-falsifies clause (a)'s `cid` and `tbl` conjuncts **only**, and its
-**`ver`-match and length-prefix conjuncts
-remain checked but unfalsified**, possibly unfalsifiable by construction at this
-bound (§`RecoverySound` above, and compare `TailTolerance` clause 2, which the
-spec documents as holding by construction and says so out loud). What is
-**still open** on table identity specifically is
-narrower than it was: M7 *permutes* identity between two positions, it does not
-install the **wrong table set at a correct cid**, so a mutation that kept every
-cid, version and fork source right and simply applied a commit's rows to
-another table would still be invisible here. If S3/S5 adds one, `M2`'s
-per-table last-writer map becomes necessary after all.
-
-Fsync *failure* — task15's "a commit whose fsync fails advances the gate
-without promoting". Crash did **not** give it a home: a crash removes a parked
-commit by destroying the whole gate, whereas a failed fsync must remove *one*
-ticket and let the rest of the FIFO proceed. That needs a per-ticket outcome on
-`Fsync`. L1 (liveness) stays inexpressible until then.
-
-Checkpoint and prune — `checkpointVersion` is carried and `Recover` honours it
-as the replay floor (`src/store.rs:1027-1030`), but no action moves it off 0, so
-no committed config exercises a non-zero floor. A `Checkpoint` action also drags
-in WAL pruning (`src/wal.rs:628`), which is where checkpoint/prune/crash
-interleavings would actually bite.
-
-`write_head` **reconstruction on open** (task37 §4 invariant 3) is declared but
-inert. `PreallocFileSink::open` rebuilds the head with a *tolerant* `scan_wal`
-and takes `capacity` from `metadata().len()` (`src/wal.rs:1023-1024`); there is
-no persisted head pointer to corrupt. `Crash` sets `writeHead` to 0 and
-`Recover` leaves it there, because the bound is "no operation after recovery",
-so nothing would consume a reconstructed head. When S2 lifts that bound the
-reconstruction is `writeHead' = ScanLen(walAfterCrash)` in `Recover`.
-
-**WAL prune**, including the preallocating prune (`src/wal.rs:672-707`, task37
-§6 strategy P2), which resets `write_head`/`capacity` from a pre-sized
-tmp+rename. It is reachable only from `Checkpoint`, which this model does not
-have, so no action moves `writeHead` backwards and `writeHead = Len(walDurable)`
-is currently a *checked* `PreallocInvariant` clause rather than an assumption. A
-`Checkpoint` action would break that clause, on purpose — which makes it a
-useful tripwire for whoever adds one.
-
-Also pending: the remaining S3 properties. S5 (`TailTolerance`) and the M4–M5
-battery landed in Task 5, below; M6 in Task 5b, M7 in Task 5c.
 
 ## Calibration: the mutations (Tasks 4–5c)
 
