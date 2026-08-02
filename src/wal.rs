@@ -1716,54 +1716,6 @@ impl WalHandle {
     }
 }
 
-/// How long the WAL thread busy-polls an empty channel before parking in
-/// `recv()`. A serial commit stream delivers entries only a few microseconds
-/// apart, and waking a parked receiver costs the *committer* ~1.5µs in futex
-/// traffic per commit; a short spin keeps the receiver hot in that regime
-/// while an idle store still parks (zero CPU) once the window expires.
-/// `ULTIMA_WAL_RECV_SPIN_US` overrides (0 disables the spin; read once per
-/// store at WAL-thread spawn — an A/B escape hatch, not a public knob).
-///
-/// Default 0 (park immediately, the pre-existing behavior): the local sandbox
-/// A/B was inconclusive (core-starved — the spin steals CPU from the
-/// committer), so the spin stays opt-in until an NVMe fleet A/B proves it.
-const RECV_SPIN_DEFAULT_US: u64 = 0;
-
-fn recv_spin_window() -> std::time::Duration {
-    let us = std::env::var("ULTIMA_WAL_RECV_SPIN_US")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(RECV_SPIN_DEFAULT_US);
-    std::time::Duration::from_micros(us)
-}
-
-/// `rx.recv()` with a bounded busy-poll prefix (see [`RECV_SPIN_DEFAULT_US`]).
-fn recv_spin(
-    rx: &mpsc::Receiver<WalMsg>,
-    spin: std::time::Duration,
-) -> std::result::Result<WalMsg, mpsc::RecvError> {
-    if spin.is_zero() {
-        return rx.recv();
-    }
-    let deadline = std::time::Instant::now() + spin;
-    loop {
-        match rx.try_recv() {
-            Ok(msg) => return Ok(msg),
-            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
-            Err(mpsc::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return rx.recv();
-                }
-                // Space the polls out so the spin doesn't contend with the
-                // producer for the channel's cache lines.
-                for _ in 0..64 {
-                    std::hint::spin_loop();
-                }
-            }
-        }
-    }
-}
-
 /// Background WAL writer loop. Drains a batch, writes it, fsyncs once, and
 /// advances the synced epoch. On any append/fsync failure, poisons the latch,
 /// wakes all waiters, and stops.
@@ -1775,9 +1727,8 @@ fn spawn_wal_thread<S: WalSink + 'static>(
     poison: Arc<WalPoison>,
     durability: Arc<WalDurability>,
 ) -> thread::JoinHandle<()> {
-    let spin = recv_spin_window();
     thread::spawn(move || {
-        while let Ok(first) = recv_spin(&rx, spin) {
+        while let Ok(first) = rx.recv() {
             // Collect a batch of entries; stop draining at a prune request
             // so it executes after this batch is flushed (and before any
             // later appends — they stay queued in the channel).

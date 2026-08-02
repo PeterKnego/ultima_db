@@ -2,66 +2,76 @@
 
 Timing decomposition of the one-op-per-txn eventual-durability update (the
 regime where UltimaDB trails Fjall 1.38–1.60× on YCSB A/F,
-`competitor-nvme-2026-08-02.md`). **All numbers are sandbox (direction-only,
-per the local-vs-remote rule); shares were stable across repeated runs even
-as absolutes moved with machine load.** Harnesses: `examples/perf_decomp.rs`
-(component cells), `examples/wal_spin_ab.rs` (paired A/Bs),
+`competitor-nvme-2026-08-02.md`), first on the sandbox and then validated
+same-day on a bench-infra c6id.2xlarge (local NVMe, 8 vcpu, idle; results
+`bench-infra/bench-out/dist/20260802T181146Z-spin-ab/`, ultima git
+`78ef9ec`). Harnesses: `examples/perf_decomp.rs` (component cells),
+`examples/wal_spin_ab.rs` (paired A/Bs + noise floor),
 `examples/wal_commit_micro.rs` (BenchWal committer-side isolation).
 
-## Decomposition (update op ≈ 5–7 µs/op total, ultima git f8caa46 + spin knob)
+## Decomposition — NVMe host (authoritative; sandbox shares agreed)
 
-| Component | ns/op (typ.) | Share | How measured |
+Total eventual update: **7528 ns/op** (p10 7400, p90 7826 — tight).
+
+| Component | ns/op | Share | How measured |
 |---|--:|--:|---|
-| WAL committer-side work | ~2000 | ~40% | `store_eventual − store_none`; reproduced in isolation by `wal_commit_micro` |
-| MVCC path-clone tax | ~1200–1700 | ~25–33% | `table_warm − table_cold` (O(1) table clone refreshed per op) |
-| Record construction (harness) | ~400–900 | ~10–15% | `YcsbRecord::new` alone — all engines pay an equivalent |
-| Txn+commit bookkeeping | ~400 | ~8% | empty `begin_write/open_table/commit` |
-| Tree op floor (cold, in-place) | ~200–275 | ~4% | raw `Table::update`, uniquely owned tree |
-| Store install residual | noisy 75–1000 | — | remainder; within-run noise dominates it |
+| WAL committer-side work | **3883** | **52%** | `store_eventual − store_none`; `wal_commit_micro` reproduces ~2.9 µs net of record build |
+| MVCC path-clone tax | **1975** | **26%** | `table_warm − table_cold` (O(1) table clone refreshed per op) |
+| Record construction (harness) | 731 | 10% | `YcsbRecord::new` alone — all engines pay an equivalent |
+| Txn+commit bookkeeping | 529 | 7% | empty `begin_write/open_table/commit` |
+| Tree op floor (cold, in-place) | 246 | 3% | raw `Table::update`, uniquely owned tree |
+| Store install residual | 164 | 2% | remainder |
 
-Sub-decomposition of the WAL bucket:
+Within the WAL bucket: bincode serialize of the ~1 KB record is only
+**~560 ns**; the remaining ~2.4–2.9 µs is *not* explained by serialization.
 
-- bincode serialize of the ~1 KB record: **~250 ns** — small.
-- send to a **parked** mpsc receiver: **~0.5–1.5 µs** (run-dependent) — the
-  futex wake, the largest single suspect.
-- remainder ~0.5 µs: per-op allocs (record `encode_to_vec` Vec, key `Vec`,
-  `WalOp.table` String clone, entry/channel node churn).
+## Hypotheses tested and REFUTED on the NVMe host
 
-## Hypotheses tested and killed (locally)
-
-1. **WAL recv-spin** (bg thread busy-polls before parking, so serial commits
-   never pay the wake): paired same-process A/B measured **+2% (noise)**.
-   *Caveat:* the sandbox had 4 cores at load ≈ 2 — a spinning receiver steals
-   CPU from the committer, which can cancel exactly the effect being measured.
-   The lever is implemented behind `ULTIMA_WAL_RECV_SPIN_US` (default 0 = old
-   behavior) and **needs a quiet 8-vcpu NVMe A/B to be judged**.
-2. **`CoalescedPrealloc` under Eventual** (cheaper bg fsync): paired A/B
-   **+5.6% (noise)**. Consistent with the committer never waiting on the bg
-   thread in Eventual mode — bg-side fsync cost does not backpressure
-   the commit path at this rate.
+1. **WAL recv-spin** (bg thread busy-polls before parking so serial commits
+   skip the futex wake — motivated by an isolated mpsc microbench where a
+   send to a parked receiver costs 1.5–2.4 µs): paired same-process A/B
+   **+0.8/+1.2/+1.3%** across three reps (slightly worse), and end-to-end
+   criterion cells (2 interleaved reps): **YCSB A +4–7% worse, F ±2%**.
+   The spin was removed. Explanation: in the real store the WAL thread is
+   busy in `append+fsync` when the next commit arrives, so sends rarely hit
+   a parked receiver — the wake microbench does not model the system.
+2. **`CoalescedPrealloc` under Eventual** (cheaper bg fsync):
+   **+6.8/−0.9/+3.6%** — null. The committer never waits on the bg thread in
+   Eventual mode, and bg-side fsync cost does not backpressure the commit
+   path at this rate.
+3. (Sandbox-only footnote: both A/Bs were first run on a loaded 4-core
+   sandbox and were unresolvable there; the NVMe reps came with a same-run
+   noise floor of ~±1–2% and are decisive.)
 
 ## Conclusions
 
-- The eventual-tier write gap vs Fjall (~2.5 µs/update on the 07/18–08/02
-  NVMe cells) is ≈ fully explained by **(a)** the per-commit WAL handoff
-  (~2 µs, committer-side) and **(b)** the per-txn CoW path-clone tax
-  (~1.2–1.7 µs). Fjall pays neither: its eventual write is a memtable insert
-  plus an unsynced log append, with structure maintenance amortized into
-  flushes.
+- The eventual-tier write gap vs Fjall (~2.5 µs/update on the NVMe cells) is
+  ≈ fully explained by **(a)** the per-commit WAL handoff (~3.9 µs on NVMe,
+  committer-side) and **(b)** the per-txn CoW path-clone tax (~2 µs). Fjall
+  pays neither: its eventual write is a memtable insert plus an unsynced log
+  append, with structure maintenance amortized into flushes.
 - B-tree fanout tuning is confirmed to be the wrong lever for this regime
-  (see `btree-fanout-t-sweep-2026-07-09.md`): it changes the *width
-  coefficient* of tax (b) but not its per-transaction nature, and moves
-  nothing in bucket (a).
+  (see `btree-fanout-t-sweep-2026-07-09.md`): the tree op floor is 3% of the
+  op; T changes the width coefficient of tax (b), and moves nothing in (a).
+- **Open question — the ~2.4 µs unexplained WAL-bucket remainder.** Leading
+  hypothesis: cross-thread allocator churn. Every op allocates the payload
+  chain on the committer (record `encode_to_vec` Vec ≈1 KB, key `Vec`,
+  `WalOp.table` String, `WalEntry.ops` Vec, mpsc node) and the WAL thread
+  frees all of it after the write — the same cross-thread free pattern that
+  made the snapshot-reclaim thread a 3.1× p99 regression in the fanout
+  study. Also plausible: commit-path submission bookkeeping that only runs
+  with a WAL configured.
 - Next levers, in expected-value order:
-  1. **NVMe A/B of the recv-spin knob** (this branch; 3 arms on one host:
-     main, branch spin=0, branch spin=30). If the wake is ~1 µs there too,
-     that alone is ~15–20% of the update op.
+  1. **Allocator/pooling A/B**: global mimalloc/jemalloc as a cheap
+     discriminator; if it moves the cell, pool the payload buffers (recycle
+     them back to the committer) instead of shipping an allocator.
   2. **Alloc-slimming the per-op WAL path** (reuse an encode buffer across
-     ops; slim `WalOp` churn). Bounded by ~0.5 µs/op; only fleet-measurable.
+     ops; slim `WalOp` churn).
   3. **A mutable write overlay in front of the B-tree** (mini-memtable):
      the structural fix for tax (b) and the only path that beats — rather
      than approaches — the LSM write cost profile. Design work; snapshots
      hold (frozen overlay, tree root) pairs; merge via the existing
      `BulkBuilder`/`extend_from_sorted` primitives.
-- Measured dead end (do not retry locally): judging spin/prealloc effects on
-  a loaded ≤4-core sandbox — both A/Bs are core-starved there.
+- Measured dead ends (do not retry): recv-spin before park (harmless-looking,
+  measurably negative); prealloc-under-Eventual as a committer-side lever;
+  judging either on a loaded ≤4-core sandbox.

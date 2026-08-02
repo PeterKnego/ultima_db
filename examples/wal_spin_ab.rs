@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 //
-// Paired A/B of the WAL recv-spin: two Eventual stores whose WAL threads were
-// spawned with the spin disabled (A) and enabled (B), exercised in interleaved
-// bursts so machine drift cancels. Reports per-burst paired deltas.
+// Paired A/B harness for WAL configs: two Eventual stores exercised in
+// interleaved bursts so machine drift cancels; reports per-burst paired
+// deltas. A/B #1 compares two identical stores — a live noise-floor check
+// that calibrates how small a real effect this harness can resolve. A/B #2
+// compares Coalesced vs CoalescedPrealloc.
+//
+// (This file started as the recv-spin A/B; the spin was refuted on the NVMe
+// fleet host — see docs/benchmarks/ycsb-eventual-write-decomposition-2026-08-02.md
+// — and removed, but the paired harness earned its keep.)
 //
 // Run: cargo run --release --features persistence --example wal_spin_ab
 
@@ -125,52 +131,12 @@ fn main() {
     let dir_a = tempfile::tempdir_in(&base).unwrap();
     let dir_b = tempfile::tempdir_in(&base).unwrap();
 
-    // The env var is read once at WAL-thread spawn, so each store freezes
-    // the setting that was live when it was constructed.
-    unsafe { std::env::set_var("ULTIMA_WAL_RECV_SPIN_US", "0") };
-    let store_off = make_store(dir_a.path());
-    unsafe { std::env::set_var("ULTIMA_WAL_RECV_SPIN_US", "30") };
-    let store_on = make_store(dir_b.path());
-
-    let mut off = Vec::new();
-    let mut on = Vec::new();
-    let mut deltas = Vec::new();
-    for i in 0..(REPS + WARMUP) {
-        // Alternate which arm goes first within the pair.
-        let (a, b) = if i % 2 == 0 {
-            let a = burst(&store_off, &keys);
-            let b = burst(&store_on, &keys);
-            (a, b)
-        } else {
-            let b = burst(&store_on, &keys);
-            let a = burst(&store_off, &keys);
-            (a, b)
-        };
-        if i >= WARMUP {
-            off.push(a);
-            on.push(b);
-            deltas.push(b - a);
-        }
-    }
-    for v in [&mut off, &mut on, &mut deltas] {
-        v.sort_by(f64::total_cmp);
-    }
-    let med = |v: &Vec<f64>| v[v.len() / 2];
-    println!("eventual update, ns/op ({} paired bursts):", REPS);
-    println!("  spin OFF  median {:8.0}", med(&off));
-    println!("  spin ON   median {:8.0}", med(&on));
-    println!(
-        "  paired delta (on-off) median {:8.0}  p10 {:8.0}  p90 {:8.0}",
-        med(&deltas),
-        deltas[deltas.len() / 10],
-        deltas[deltas.len() * 9 / 10]
-    );
-    println!(
-        "  => spin ON is {:+.1}% vs OFF",
-        100.0 * med(&deltas) / med(&off)
-    );
-    drop(store_off);
-    drop(store_on);
+    // Noise floor: two identical stores. Any "effect" here is harness noise.
+    let store_x = make_store(dir_a.path());
+    let store_y = make_store(dir_b.path());
+    paired_ab("null-a", &store_x, "null-b", &store_y, &keys);
+    drop(store_x);
+    drop(store_y);
 
     // Second A/B: Coalesced vs CoalescedPrealloc under Eventual.
     let dir_c = tempfile::tempdir_in(&base).unwrap();
