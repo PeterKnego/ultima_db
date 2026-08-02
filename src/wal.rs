@@ -333,8 +333,14 @@ fn serialize_key(buf: &mut Vec<u8>, key_type: u32, key: &[u8]) -> Result<()> {
 }
 
 fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
-    let config = bincode::config::standard();
     let mut buf = Vec::new();
+    serialize_entry_into(entry, &mut buf)?;
+    Ok(buf)
+}
+
+/// Append `entry`'s v2 payload to `buf` (no clear — the caller owns framing).
+fn serialize_entry_into(entry: &WalEntry, mut buf: &mut Vec<u8>) -> Result<()> {
+    let config = bincode::config::standard();
 
     buf.push(WAL_ENTRY_MAGIC);
     buf.push(WAL_FORMAT_VERSION);
@@ -354,7 +360,7 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
                 buf.push(TAG_INSERT);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                serialize_key(&mut buf, *key_type, key)?;
+                serialize_key(buf, *key_type, key)?;
                 bincode::encode_into_std_write(data.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
@@ -367,7 +373,7 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
                 buf.push(TAG_UPDATE);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                serialize_key(&mut buf, *key_type, key)?;
+                serialize_key(buf, *key_type, key)?;
                 bincode::encode_into_std_write(data.as_slice(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
             }
@@ -379,7 +385,7 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
                 buf.push(TAG_DELETE);
                 bincode::encode_into_std_write(table.as_str(), &mut buf, config)
                     .map_err(|e| Error::Persistence(e.to_string()))?;
-                serialize_key(&mut buf, *key_type, key)?;
+                serialize_key(buf, *key_type, key)?;
             }
             WalOp::CreateTable { name } => {
                 buf.push(TAG_CREATE_TABLE);
@@ -399,7 +405,79 @@ fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>> {
         }
     }
 
-    Ok(buf)
+    Ok(())
+}
+
+/// A WAL entry already serialized to its on-disk `[len][payload][crc]` frame.
+///
+/// Built once on the *committing* thread ([`frame_entry_into`]) and handed to
+/// the WAL thread, which just writes `bytes`. This keeps every per-op
+/// allocation (record bytes, keys, op vectors) allocated *and* freed on the
+/// committer — the cross-thread free of that chain was measured at ~2–2.5 µs
+/// per eventual-tier commit under glibc (see
+/// `docs/benchmarks/ycsb-eventual-write-decomposition-2026-08-02.md`).
+pub(crate) struct FramedEntry {
+    pub(crate) version: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl FramedEntry {
+    #[cfg(test)]
+    pub(crate) fn new(entry: &WalEntry) -> Result<Self> {
+        let mut bytes = Vec::new();
+        frame_entry_into(entry, &mut bytes)?;
+        Ok(FramedEntry {
+            version: entry.version,
+            bytes,
+        })
+    }
+}
+
+/// Bounded pool recycling [`FramedEntry`] buffers from the WAL thread back to
+/// committers. Without it, every commit's framed bytes are allocated on the
+/// committing thread and freed on the WAL thread — a cross-thread pattern
+/// glibc malloc handles poorly (measured ~2–2.5 µs/commit on the eventual
+/// tier; a mimalloc A/B recovered 27–29% of YCSB A/F, see the 2026-08-02
+/// decomposition doc). Recycling keeps the buffer's whole lifecycle
+/// effectively committer-owned.
+pub(crate) struct BufPool {
+    bufs: Mutex<Vec<Vec<u8>>>,
+}
+
+/// Max buffers retained; beyond this, returned buffers are simply dropped.
+/// Sized for bursts of in-flight eventual commits, not for correctness.
+const BUF_POOL_CAP: usize = 64;
+
+/// A returned buffer whose capacity exceeds this is dropped instead of pooled,
+/// so one jumbo entry (bulk-load marker, giant record) can't pin memory.
+const BUF_POOL_MAX_RETAIN: usize = 1 << 20;
+
+impl BufPool {
+    fn new() -> Arc<Self> {
+        Arc::new(BufPool {
+            bufs: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Pop a recycled buffer (cleared by `frame_entry_into`) or a fresh one.
+    fn take(&self) -> Vec<u8> {
+        self.bufs.lock().pop().unwrap_or_default()
+    }
+
+    fn put(&self, buf: Vec<u8>) {
+        if buf.capacity() > BUF_POOL_MAX_RETAIN {
+            return;
+        }
+        let mut bufs = self.bufs.lock();
+        if bufs.len() < BUF_POOL_CAP {
+            bufs.push(buf);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.bufs.lock().len()
+    }
 }
 
 fn deserialize_entry(data: &[u8]) -> Result<WalEntry> {
@@ -513,16 +591,26 @@ const WAL_FILENAME: &str = "wal.bin";
 /// Frame one entry as the on-disk WAL record: `[len: u32 LE][bincode][crc32: u32 LE]`.
 /// Shared by every `WalSink` so all backends produce a byte-identical format.
 fn frame_entry(entry: &WalEntry) -> Result<Vec<u8>> {
-    let data = serialize_entry(entry)?;
-    let len = data.len() as u32;
-    let checksum = crc32(&data);
-    let mut buf = Vec::with_capacity(4 + data.len() + 4);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(&data);
-    buf.extend_from_slice(&checksum.to_le_bytes());
+    let mut buf = Vec::new();
+    frame_entry_into(entry, &mut buf)?;
     Ok(buf)
 }
 
+/// Build the on-disk `[len][payload][crc]` record for `entry` in `buf`,
+/// clearing it first — one serialization pass, no intermediate payload Vec,
+/// and a cleared `buf` keeps its capacity so pooled buffers are reused.
+fn frame_entry_into(entry: &WalEntry, buf: &mut Vec<u8>) -> Result<()> {
+    buf.clear();
+    buf.extend_from_slice(&[0u8; 4]); // len placeholder, patched below
+    serialize_entry_into(entry, buf)?;
+    let len = (buf.len() - 4) as u32;
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+    let checksum = crc32(&buf[4..]);
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    Ok(())
+}
+
+#[cfg(test)]
 fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
     file.write_all(&frame_entry(entry)?)
         .map_err(|e| Error::Persistence(e.to_string()))
@@ -735,9 +823,10 @@ pub(crate) enum SyncWaiter {
     /// append+fsync in `wait()`, off the store lock. Durable on `Ok`.
     InlineSync {
         sink: Arc<Mutex<Box<dyn WalSink>>>,
-        entry: WalEntry,
+        entry: FramedEntry,
         durability: Arc<WalDurability>,
         poison: Arc<WalPoison>,
+        pool: Arc<BufPool>,
     },
 }
 
@@ -762,7 +851,7 @@ impl SyncWaiter {
                     state.condvar.wait(&mut guard);
                 }
             }
-            SyncWaiter::InlineSync { sink, entry, durability, poison } => {
+            SyncWaiter::InlineSync { sink, entry, durability, poison, pool } => {
                 poison.check()?;
                 let version = entry.version;
                 let mut s = sink.lock();
@@ -772,6 +861,7 @@ impl SyncWaiter {
                 })();
                 match res {
                     Ok(()) => {
+                        pool.put(entry.bytes);
                         durability.publish(version);
                         Ok(())
                     }
@@ -794,7 +884,7 @@ impl SyncWaiter {
 /// Abstraction over the WAL's durable backing store, so failures can be
 /// injected in tests. `append` writes one entry; `sync` fsyncs.
 pub(crate) trait WalSink: Send {
-    fn append(&mut self, entry: &WalEntry) -> Result<()>;
+    fn append(&mut self, entry: &FramedEntry) -> Result<()>;
     fn sync(&mut self) -> Result<()>;
     /// Remove entries with version <= `up_to_version` from the backing
     /// store. Runs on the WAL background thread between batches, so it is
@@ -906,8 +996,10 @@ fn reject_unreadable_wal(path: &Path) -> Result<()> {
 }
 
 impl WalSink for FileSink {
-    fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        write_entry_to_file(&mut self.file, entry)
+    fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+        self.file
+            .write_all(&entry.bytes)
+            .map_err(|e| Error::Persistence(e.to_string()))
     }
     fn sync(&mut self) -> Result<()> {
         self.file
@@ -954,8 +1046,8 @@ impl BufferedFileSink {
 }
 
 impl WalSink for BufferedFileSink {
-    fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        self.buf.extend_from_slice(&frame_entry(entry)?);
+    fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+        self.buf.extend_from_slice(&entry.bytes);
         Ok(())
     }
     fn sync(&mut self) -> Result<()> {
@@ -1027,8 +1119,8 @@ impl PreallocFileSink {
 }
 
 impl WalSink for PreallocFileSink {
-    fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        self.buf.extend_from_slice(&frame_entry(entry)?);
+    fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+        self.buf.extend_from_slice(&entry.bytes);
         Ok(())
     }
 
@@ -1136,11 +1228,11 @@ impl MmapSink {
 
 #[cfg(feature = "bench-internals")]
 impl WalSink for MmapSink {
-    fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        let framed = frame_entry(entry)?;
-        self.ensure_capacity(framed.len())?;
-        self.map[self.write_head..self.write_head + framed.len()].copy_from_slice(&framed);
-        self.write_head += framed.len();
+    fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+        self.ensure_capacity(entry.bytes.len())?;
+        self.map[self.write_head..self.write_head + entry.bytes.len()]
+            .copy_from_slice(&entry.bytes);
+        self.write_head += entry.bytes.len();
         Ok(())
     }
     fn sync(&mut self) -> Result<()> {
@@ -1199,8 +1291,8 @@ impl IoUringSink {
 
 #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
 impl WalSink for IoUringSink {
-    fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        self.buf.extend_from_slice(&frame_entry(entry)?);
+    fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+        self.buf.extend_from_slice(&entry.bytes);
         Ok(())
     }
 
@@ -1467,7 +1559,7 @@ fn drain_le(callbacks: &mut Vec<(u64, DurabilityCallback)>, version: u64) -> Vec
 /// Message processed by the WAL background thread: an entry to append, or a
 /// prune request (executed between batches, serialized with appends).
 pub(crate) enum WalMsg {
-    Entry(WalEntry),
+    Entry(FramedEntry),
     Prune {
         up_to_version: u64,
         /// Completion ack; the requester blocks on the paired receiver.
@@ -1496,6 +1588,8 @@ pub(crate) struct WalHandle {
     durability: Arc<WalDurability>,
     /// Number of WAL entries sent but not yet fsynced (Eventual mode).
     pub(crate) in_flight: Arc<std::sync::atomic::AtomicU64>,
+    /// Recycled framed-entry buffers (see [`BufPool`]).
+    pool: Arc<BufPool>,
     /// When `Some`, this handle has NO background thread —
     /// `write()` stages an `InlineSync` waiter (no I/O yet); the caller drives
     /// the actual append+fsync by calling `wait()` off the store lock. This
@@ -1567,6 +1661,7 @@ impl WalHandle {
         let bg_poison = poison.clone();
         let bg_durability = durability.clone();
 
+        let pool = BufPool::new();
         let handle = spawn_wal_thread(
             sink,
             rx,
@@ -1574,6 +1669,7 @@ impl WalHandle {
             bg_sync_state,
             bg_poison,
             bg_durability,
+            Arc::clone(&pool),
         );
 
         Self {
@@ -1585,6 +1681,7 @@ impl WalHandle {
             durability,
             in_flight,
             sync_sink: None,
+            pool,
         }
     }
 
@@ -1605,6 +1702,7 @@ impl WalHandle {
             durability: WalDurability::new(),
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_sink: Some(Arc::new(Mutex::new(Box::new(sink)))),
+            pool: BufPool::new(),
         }
     }
 
@@ -1633,28 +1731,46 @@ impl WalHandle {
         })
     }
 
+    /// Number of recycled framed-entry buffers currently pooled.
+    #[cfg(test)]
+    pub(crate) fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
     /// Submit a WAL entry to the background thread.
     ///
     /// - **Consistent**: returns `SyncWaiter::WaitForEpoch` — caller must
     ///   call `wait()` outside the store lock to block until fsync.
     /// - **Eventual**: returns `SyncWaiter::Done` — no wait needed.
     pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
+        // Frame here, on the committing thread: one serialization pass, and
+        // the entry's whole ops chain (record bytes, keys, vectors) is freed
+        // on this thread when `entry` drops at the end of this call, instead
+        // of crossing to the WAL thread — cross-thread frees of that chain
+        // cost ~2–2.5 µs/commit under glibc.
+        let mut bytes = self.pool.take();
+        frame_entry_into(&entry, &mut bytes)?;
+        let framed = FramedEntry {
+            version: entry.version,
+            bytes,
+        };
         // Inline (no bg thread): do NO I/O here (this runs under store_inner).
         // Return a waiter; the committer does append+fsync off-lock in wait().
         if let Some(sink) = &self.sync_sink {
             self.poison.check()?;
             return Ok(SyncWaiter::InlineSync {
                 sink: Arc::clone(sink),
-                entry,
+                entry: framed,
                 durability: Arc::clone(&self.durability),
                 poison: Arc::clone(&self.poison),
+                pool: Arc::clone(&self.pool),
             });
         }
         let sender = self.sender.as_ref().expect("WalHandle used after drop");
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         sender
-            .send(WalMsg::Entry(entry))
+            .send(WalMsg::Entry(framed))
             .map_err(|e| Error::Persistence(e.to_string()))?;
 
         if self.consistent {
@@ -1726,6 +1842,7 @@ fn spawn_wal_thread<S: WalSink + 'static>(
     sync_state: Option<Arc<WalSyncState>>,
     poison: Arc<WalPoison>,
     durability: Arc<WalDurability>,
+    pool: Arc<BufPool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(first) = rx.recv() {
@@ -1778,6 +1895,13 @@ fn spawn_wal_thread<S: WalSink + 'static>(
             })();
 
             in_flight.fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+
+            // Recycle the batch's buffers before publishing durability, so a
+            // committer that observes the watermark also sees the pool
+            // refilled (keeps tests deterministic; harmless otherwise).
+            for e in batch {
+                pool.put(e.bytes);
+            }
 
             match result {
                 Ok(()) => {
@@ -2024,6 +2148,91 @@ mod tests {
 
     /// The key-type tag every `u64`-keyed fixture carries, spelled once.
     const KT: u32 = <u64 as PrimaryKey>::KEY_TYPE_ID;
+
+    fn one_op_entry(version: u64) -> WalEntry {
+        WalEntry {
+            version,
+            ops: vec![WalOp::Insert {
+                table: "t".into(),
+                key_type: KT,
+                key: k(version),
+                data: vec![7; 256],
+            }],
+        }
+    }
+
+    #[test]
+    fn eventual_write_recycles_framed_buffers_through_the_pool() {
+        let dir = crate::test_scratch::scratch_dir();
+        let handle = WalHandle::with_sink_kind(
+            dir.path(),
+            false,
+            Arc::new(WalPoison::new()),
+            WalSinkKind::Coalesced,
+        )
+        .unwrap();
+        assert_eq!(handle.pool_len(), 0, "pool starts empty");
+
+        handle.write(one_op_entry(1)).unwrap();
+        handle.durability().wait(1).unwrap();
+        assert_eq!(handle.pool_len(), 1, "flushed buffer returned to the pool");
+
+        handle.write(one_op_entry(2)).unwrap();
+        handle.durability().wait(2).unwrap();
+        assert_eq!(
+            handle.pool_len(),
+            1,
+            "second write reused the pooled buffer instead of allocating"
+        );
+    }
+
+    #[test]
+    fn inline_write_recycles_framed_buffers_through_the_pool() {
+        let dir = crate::test_scratch::scratch_dir();
+        let handle = WalHandle::with_sink_kind_inline(
+            dir.path(),
+            true,
+            Arc::new(WalPoison::new()),
+            WalSinkKind::Coalesced,
+        )
+        .unwrap();
+        assert_eq!(handle.pool_len(), 0, "pool starts empty");
+
+        handle.write(one_op_entry(1)).unwrap().wait().unwrap();
+        assert_eq!(handle.pool_len(), 1, "driven waiter returned its buffer");
+
+        handle.write(one_op_entry(2)).unwrap().wait().unwrap();
+        assert_eq!(handle.pool_len(), 1, "buffer was reused, not re-allocated");
+    }
+
+    #[test]
+    fn frame_entry_into_matches_frame_entry_and_reuses_the_buffer() {
+        let entry = WalEntry {
+            version: 7,
+            ops: vec![
+                WalOp::Insert {
+                    table: "t".into(),
+                    key_type: KT,
+                    key: k(1),
+                    data: vec![9; 300],
+                },
+                WalOp::Delete {
+                    table: "t".into(),
+                    key_type: KT,
+                    key: k(2),
+                },
+            ],
+        };
+        let expected = frame_entry(&entry).unwrap();
+
+        // Start from a dirty, over-capacity buffer: the into-variant must
+        // clear it, produce identical bytes, and keep the capacity.
+        let mut buf = vec![0xAA_u8; 4096];
+        let cap_before = buf.capacity();
+        frame_entry_into(&entry, &mut buf).unwrap();
+        assert_eq!(buf, expected);
+        assert!(buf.capacity() >= cap_before, "buffer capacity was not reused");
+    }
 
     /// Frame a `u64` key the way [`serialize_key`] does, for the `decode_key`
     /// tests that assemble a key field by hand.
@@ -3271,7 +3480,7 @@ mod tests {
         sync_count: usize,
     }
     impl WalSink for FaultySink {
-        fn append(&mut self, _entry: &WalEntry) -> Result<()> {
+        fn append(&mut self, _entry: &FramedEntry) -> Result<()> {
             Ok(())
         }
         fn sync(&mut self) -> Result<()> {
@@ -3376,7 +3585,7 @@ mod tests {
         {
             let mut sink = BufferedFileSink::open(dir.path(), true).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap()).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -3391,7 +3600,7 @@ mod tests {
         {
             let mut sink = BufferedFileSink::open(dir.path(), false).unwrap(); // sync_all
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap()).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -3421,7 +3630,7 @@ mod tests {
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap();
+                sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![v as u8; 32] }] }).unwrap()).unwrap();
             }
             sink.sync().unwrap();
         } // Drop truncates to logical length + syncs
@@ -3439,7 +3648,7 @@ mod tests {
         {
             let mut sink = MmapSink::open(dir.path()).unwrap();
             for v in 1..=n {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![0u8; 16 * 1024] }] }).unwrap();
+                sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::Insert { table: "t".into(), key_type: KT, key: k(v), data: vec![0u8; 16 * 1024] }] }).unwrap()).unwrap();
             }
             sink.sync().unwrap();
         }
@@ -3455,7 +3664,7 @@ mod tests {
         {
             let mut sink = IoUringSink::open(dir.path()).unwrap();
             for v in 1..=5u64 {
-                sink.append(&WalEntry {
+                sink.append(&FramedEntry::new(&WalEntry {
                     version: v,
                     ops: vec![WalOp::Insert {
                         table: "t".into(),
@@ -3463,7 +3672,7 @@ mod tests {
                         key: k(v),
                         data: vec![v as u8; 32],
                     }],
-                })
+                }).unwrap())
                 .unwrap();
             }
             sink.sync().unwrap();
@@ -3502,8 +3711,8 @@ mod tests {
     fn prealloc_sink_roundtrips_like_buffered() {
         let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open(dir.path()).unwrap();
-        sink.append(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
-        sink.append(&WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap();
+        sink.append(&FramedEntry::new(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap()).unwrap();
+        sink.append(&FramedEntry::new(&WalEntry { version: 2, ops: vec![WalOp::DeleteTable { name: "t".into() }] }).unwrap()).unwrap();
         sink.sync().unwrap();
         let entries = read_wal(&dir.path().join(WAL_FILENAME)).unwrap();
         assert_eq!(entries.len(), 2);
@@ -3520,7 +3729,7 @@ mod tests {
         let path = dir.path().join(WAL_FILENAME);
 
         for v in 1..=20u64 {
-            sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("table-{v}") }] }).unwrap();
+            sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("table-{v}") }] }).unwrap()).unwrap();
             sink.sync().unwrap();
             // Invariant: write_head <= capacity <= physical_len, capacity chunk-aligned.
             assert!(sink.write_head <= sink.capacity);
@@ -3535,11 +3744,11 @@ mod tests {
         let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 1 << 20).unwrap();
         let path = dir.path().join(WAL_FILENAME);
-        sink.append(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        sink.append(&FramedEntry::new(&WalEntry { version: 1, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap()).unwrap();
         sink.sync().unwrap();
         let after_first = std::fs::metadata(&path).unwrap().len();
         // A second small batch fits in the existing chunk: no physical growth.
-        sink.append(&WalEntry { version: 2, ops: vec![WalOp::CreateTable { name: "u".into() }] }).unwrap();
+        sink.append(&FramedEntry::new(&WalEntry { version: 2, ops: vec![WalOp::CreateTable { name: "u".into() }] }).unwrap()).unwrap();
         sink.sync().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), after_first);
     }
@@ -3549,7 +3758,7 @@ mod tests {
         let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
         for v in 1..=5u64 {
-            sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap();
+            sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap()).unwrap();
             sink.sync().unwrap();
         }
         // Prune everything <= version 3.
@@ -3570,11 +3779,11 @@ mod tests {
         {
             let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
             for v in 1..=4u64 {
-                sink.append(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap();
+                sink.append(&FramedEntry::new(&WalEntry { version: v, ops: vec![WalOp::CreateTable { name: format!("t{v}") }] }).unwrap()).unwrap();
                 sink.sync().unwrap();
             }
             sink.prune(2).unwrap();
-            sink.append(&WalEntry { version: 5, ops: vec![WalOp::CreateTable { name: "t5".into() }] }).unwrap();
+            sink.append(&FramedEntry::new(&WalEntry { version: 5, ops: vec![WalOp::CreateTable { name: "t5".into() }] }).unwrap()).unwrap();
             sink.sync().unwrap();
         } // drop = simulated crash (no clean truncation)
         // Reopen and confirm the post-prune appends survive with no gap.
@@ -3588,7 +3797,7 @@ mod tests {
     fn prune_wal_prealloc_noop_when_nothing_to_prune() {
         let dir = crate::test_scratch::scratch_dir();
         let mut sink = PreallocFileSink::open_with_chunk(dir.path(), 4096).unwrap();
-        sink.append(&WalEntry { version: 9, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap();
+        sink.append(&FramedEntry::new(&WalEntry { version: 9, ops: vec![WalOp::CreateTable { name: "t".into() }] }).unwrap()).unwrap();
         sink.sync().unwrap();
         // up_to_version below the only entry's version: nothing removed.
         assert!(prune_wal_prealloc(&dir.path().join(WAL_FILENAME), 1, 4096).unwrap().is_none());
