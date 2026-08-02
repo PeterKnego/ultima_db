@@ -152,9 +152,10 @@ formal/tla-model:
 # stops testing the real model.
 #
 # STATE COUNTS ARE NOT TRIPWIRES FOR THE RED CONFIGS. TLC halts at the first
-# counterexample, so with -workers 2 the reported counts vary run to run
-# (M1: 238 at -workers 1, 248-256 at -workers 2). The trace DEPTH is stable
-# and is what the Task 4 report records.
+# counterexample, so with -workers 2 the reported counts vary run to run --
+# widely, and do not treat any observed range as a band: M1 came back 221,
+# 246, 249, 251 and 256 across five runs, against a deterministic 238 at
+# -workers 1. The trace DEPTH is stable and is what the Task 4 report records.
 TLA_MODES = \
   modes/ConsistentFsWriteCanary.cfg:12 \
   modes/ConsistentFsWrite.cfg:0 \

@@ -342,7 +342,7 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
 | `mutations/M2.cfg` | `WalCrashMW.cfg` (MultiWriter) | **violated** | `PromotionFaithful`, depth 7 |
 | `mutations/M2Fork.cfg` | — (`MaxCommits = 3`) | **violated** | `ForkFromPromotePredecessor`, depth 11 |
 | `mutations/M3.cfg` | `WalCrashMW.cfg` | **violated** | `PromotionFaithful`, depth 7 |
-| `mutations/M3Dup.cfg` | — (`MaxCommits = 3`) | **violated** | `NoDuplicateVersion`, depth 11 |
+| `mutations/M3Dup.cfg` | — (`MaxCommits = 3`) | **violated** | `NoDupLive`, depth 12 |
 | `mutations/CalibrationControl3.cfg` | control for the two above | no error | clean, 27843 states |
 
 - **M1** — `WriterSlotFree` drops its `parked = <<>>` conjunct: the pre-fix
@@ -355,6 +355,15 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
   Both halves are the bug; see the Task 4 report for why mutating only the
   comparison cannot produce the documented duplicate.
 
+**Which config carries which mechanism.** `M1.cfg`, `M2.cfg` and `M3.cfg` prove
+each mutation is *caught*; the "Actual" column above is the shallowest
+counterexample, which for M2 and M3 is a shallower **consequence** of the break,
+not the documented symptom. The documented symptoms are carried entirely by the
+two clause-focused configs: `M2Fork.cfg` is the only committed config that
+witnesses M2's disjoint-table erasure, and `M3Dup.cfg` the only one that
+witnesses M3's duplicate `snapshots.insert`. Deleting either, or re-bounding it
+to 2, silently removes that evidence while the gate stays green.
+
 `PromotionFaithful` is a conjunction of four *named* clauses
 (`PromoteOrderIsSubmitOrder`, `LatestStrictlyAdvances`,
 `ForkFromPromotePredecessor`, `NoDuplicateVersion`) so a mutation can be
@@ -364,3 +373,21 @@ bug's documented *symptom* — M2's disjoint-table erasure and M3's duplicate
 insert both need `MaxCommits = 3` and a deeper trace than the ordering break
 that masks them at 2. That is what `M2Fork.cfg` and `M3Dup.cfg` pin, and why
 they carry a shared control at the same bound.
+
+Two corners are worth knowing before touching those two configs:
+
+- **`ForkFromPromotePredecessor` is a tautology below three promotions.**
+  `Promote` sets `forkedFrom := latestVersion`, and `latestVersion` is the
+  running max over promoted versions, so promotion 1 forks from 0 and promotion
+  2 forks from exactly `promoted[1].ver` — divergence *requires* a third
+  promotion. It is also satisfied by construction over a post-`Recover` chain,
+  since `Replay` defines `forkedFrom` as `live[i-1].ver`. So the clause can fire
+  only on a **crash-free live chain of ≥ 3 promotions**, and `M2Fork.cfg` is the
+  only committed config that reaches it.
+- **`M3Dup.cfg` checks `NoDupLive`, not `NoDuplicateVersion`.** After a crash
+  `promoted` is the replay sequence rather than the snapshot chain, so a
+  duplicate found there is a WAL duplicate — a real consequence of the same bug,
+  but not task15's "the second `snapshots.insert(v, ..)` silently replaced the
+  first". `NoDupLive` switches off once `crashed`, so its counterexample is the
+  live chain: depth 12, `crashed = FALSE`, `acked = {1,2,3}`, two live snapshots
+  at version 3.

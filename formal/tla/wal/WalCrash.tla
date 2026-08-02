@@ -343,7 +343,9 @@ Begin(c, t) ==
 Submit(r) ==
     /\ ~crashed
     /\ r \in begun
-    \* M3 restores the pre-fix bump VERBATIM (e60f8ce^, src/store.rs):
+    \* M3 restores the pre-fix bump VERBATIM -- e60f8ce^ src/store.rs:2361-2366,
+    \* inside commit_multi_writer (:2253); the fix is e60f8ce:
+
     \*     if !self.explicit_version && self.version <= inner.latest_version {
     \*         self.version = inner.latest_version + 1;
     \*         if self.version >= inner.next_version {
@@ -839,6 +841,16 @@ ForkFromPromotePredecessor ==
 
 NoDuplicateVersion ==
     \A i, j \in 1..Len(promoted) : (i # j) => promoted[i].ver # promoted[j].ver
+
+(* NoDuplicateVersion restricted to the LIVE snapshot chain. After a crash  *)
+(* `promoted` is the REPLAY sequence, not the Rust's snapshot chain (see    *)
+(* the header note on `promoted`), so a duplicate found there is a WAL      *)
+(* duplicate -- real, but a different statement from task15 mode 3's        *)
+(* "the second snapshots.insert(v, ..) silently replaced the first". This   *)
+(* is the version that pins the documented symptom, and it is what          *)
+(* mutations/M3Dup.cfg checks. `crashed` is monotone, so this switches off  *)
+(* for the whole post-crash suffix rather than just the Recover step.       *)
+NoDupLive == crashed \/ NoDuplicateVersion
 
 PromotionFaithful ==
     /\ PromoteOrderIsSubmitOrder
