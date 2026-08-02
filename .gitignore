@@ -27,3 +27,6 @@ perf.data.old
 /formal/key_kernel/target
 /formal/key_kernel/*.llbc
 /formal/key_kernel/KeyKernel.lean
+
+# TLC model-checking state (kept off /tmp, which is tmpfs here)
+formal/tla/**/states/
