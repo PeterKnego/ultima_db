@@ -143,3 +143,15 @@ harness = false
 [[example]]
 name = "profile_commit"
 required-features = ["persistence"]
+
+[[example]]
+name = "perf_decomp"
+required-features = ["persistence"]
+
+[[example]]
+name = "wal_spin_ab"
+required-features = ["persistence"]
+
+[[example]]
+name = "wal_commit_micro"
+required-features = ["persistence"]
