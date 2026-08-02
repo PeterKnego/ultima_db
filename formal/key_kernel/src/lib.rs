@@ -58,6 +58,99 @@ pub fn decode_i64(b: &[u8]) -> Option<i64> {
     }
 }
 
+pub const ESCAPE: u8 = 0xFF;
+pub const TERMINATOR: u8 = 0x01;
+
+/// Escape every 0x00 as [0x00, ESCAPE], then append [0x00, TERMINATOR].
+pub fn escape_and_terminate(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i: usize = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(ESCAPE);
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    out.push(0x00);
+    out.push(TERMINATOR);
+    out
+}
+
+/// Scan from `at` to the first unescaped [0x00, TERMINATOR], unescaping as we
+/// go. Returns the element and the position just past the terminator.
+pub fn unescape_until_terminator(bytes: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut i: usize = at;
+    let mut done = false;
+    let mut bad = false;
+    while i < bytes.len() && !done && !bad {
+        let b = bytes[i];
+        if b == 0x00 {
+            if i + 1 >= bytes.len() {
+                bad = true;
+            } else {
+                let next = bytes[i + 1];
+                if next == TERMINATOR {
+                    i += 2;
+                    done = true;
+                } else if next == ESCAPE {
+                    out.push(0x00);
+                    i += 2;
+                } else {
+                    bad = true;
+                }
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    if done { Some((out, i)) } else { None }
+}
+
+pub fn encode_bytes(b: &[u8]) -> Vec<u8> {
+    b.to_vec()
+}
+
+pub fn decode_bytes(b: &[u8]) -> Option<Vec<u8>> {
+    Some(b.to_vec())
+}
+
+/// A variable-length leading element followed by a fixed-width one — the
+/// tuple shape the original length-prefixed design encoded out of order.
+pub fn encode_pair_bytes_u64(a: &[u8], b: u64) -> Vec<u8> {
+    let mut out = escape_and_terminate(a);
+    let tail = encode_u64(b);
+    let mut i: usize = 0;
+    while i < tail.len() {
+        out.push(tail[i]);
+        i += 1;
+    }
+    out
+}
+
+pub fn decode_pair_bytes_u64(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
+    match unescape_until_terminator(bytes, 0) {
+        None => None,
+        Some((head, at)) => {
+            let mut tail = Vec::new();
+            let mut i: usize = at;
+            while i < bytes.len() {
+                tail.push(bytes[i]);
+                i += 1;
+            }
+            match decode_u64(&tail) {
+                None => None,
+                Some(v) => Some((head, v)),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +201,95 @@ mod tests {
     fn decode_rejects_wrong_length() {
         assert_eq!(decode_u64(&[0, 1, 2]), None);
         assert_eq!(decode_i64(&[0; 9]), None);
+    }
+
+    fn oracle_escape(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            if b == 0x00 {
+                out.push(0x00);
+                out.push(0xFF);
+            } else {
+                out.push(b);
+            }
+        }
+        out.push(0x00);
+        out.push(0x01);
+        out
+    }
+
+    #[test]
+    fn escaping_matches_the_real_framing() {
+        for case in [
+            vec![],
+            vec![0x00],
+            vec![0x00, 0x00],
+            vec![0x01],
+            vec![0xFF],
+            vec![0x00, 0xFF, 0x00],
+            b"alice@example.com".to_vec(),
+        ] {
+            assert_eq!(escape_and_terminate(&case), oracle_escape(&case), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn unescape_inverts_escape() {
+        for case in [
+            vec![],
+            vec![0x00],
+            vec![0x00, 0x01, 0x00, 0xFF],
+            b"bob".to_vec(),
+        ] {
+            let framed = escape_and_terminate(&case);
+            let got = unescape_until_terminator(&framed, 0);
+            assert_eq!(got, Some((case.clone(), framed.len())), "{case:?}");
+        }
+    }
+
+    /// The bug the original length-prefix design had: a longer leading element
+    /// that sorts EARLIER must still encode earlier.
+    #[test]
+    fn pair_encoding_preserves_order_for_variable_length_leads() {
+        let mut cases = vec![
+            (b"aa".to_vec(), 0u64),
+            (b"b".to_vec(), 0u64),
+            (b"".to_vec(), 1u64),
+            (b"a".to_vec(), 0u64),
+            (vec![0x00], 0u64),
+            (vec![0x00, 0x00], 0u64),
+            (vec![0x00, 0x01], 0u64),
+            (vec![0x01], 0u64),
+        ];
+        cases.sort();
+        for w in cases.windows(2) {
+            let (lo, hi) = (&w[0], &w[1]);
+            assert!(
+                encode_pair_bytes_u64(&lo.0, lo.1) < encode_pair_bytes_u64(&hi.0, hi.1),
+                "order not preserved: {lo:?} -> {hi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_roundtrips_including_embedded_nuls() {
+        for case in [
+            (vec![], 0u64),
+            (vec![0x00, 0xFF, 0x00], 7u64),
+            (b"alice".to_vec(), u64::MAX),
+        ] {
+            let enc = encode_pair_bytes_u64(&case.0, case.1);
+            assert_eq!(decode_pair_bytes_u64(&enc), Some(case.clone()), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn unescape_rejects_malformed_input() {
+        // No terminator at all.
+        assert_eq!(unescape_until_terminator(&[0x01, 0x02], 0), None);
+        // Truncated mid-escape: a trailing lone 0x00.
+        assert_eq!(unescape_until_terminator(&[0x01, 0x00], 0), None);
+        // 0x00 followed by neither 0x01 nor 0xFF.
+        assert_eq!(unescape_until_terminator(&[0x00, 0x07], 0), None);
     }
 }
