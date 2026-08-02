@@ -296,8 +296,83 @@ def encode_pair_bytes_u64
   let tail ← encode_u64 b
   encode_pair_bytes_u64_loop out tail 0#usize
 
+/-- [key_kernel::encode_triple_bytes_bytes_u64]: loop body 0:
+    Source: 'src/lib.rs', lines 142:4-145:5
+    Visibility: public -/
+@[rust_loop_body]
+def encode_triple_bytes_bytes_u64_loop0.body
+  (mid : alloc.vec.Vec Std.U8) (out : alloc.vec.Vec Std.U8) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U8) × Std.Usize) (alloc.vec.Vec
+    Std.U8))
+  := do
+  let i1 := alloc.vec.Vec.len mid
+  if i < i1
+  then
+    let i2 ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U8) mid i
+    let out1 ← alloc.vec.Vec.push out i2
+    let i3 ← i + 1#usize
+    ok (cont (out1, i3))
+  else ok (done out)
+
+/-- [key_kernel::encode_triple_bytes_bytes_u64]: loop 0:
+    Source: 'src/lib.rs', lines 142:4-145:5
+    Visibility: public -/
+@[rust_loop]
+def encode_triple_bytes_bytes_u64_loop0
+  (out : alloc.vec.Vec Std.U8) (mid : alloc.vec.Vec Std.U8) (i : Std.Usize) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  loop
+    (fun (out1, i1) => encode_triple_bytes_bytes_u64_loop0.body mid out1 i1)
+    (out, i)
+
+/-- [key_kernel::encode_triple_bytes_bytes_u64]: loop body 1:
+    Source: 'src/lib.rs', lines 148:4-151:5
+    Visibility: public -/
+@[rust_loop_body]
+def encode_triple_bytes_bytes_u64_loop1.body
+  (tail : alloc.vec.Vec Std.U8) (out : alloc.vec.Vec Std.U8) (j : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U8) × Std.Usize) (alloc.vec.Vec
+    Std.U8))
+  := do
+  let i := alloc.vec.Vec.len tail
+  if j < i
+  then
+    let i1 ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U8) tail j
+    let out1 ← alloc.vec.Vec.push out i1
+    let j1 ← j + 1#usize
+    ok (cont (out1, j1))
+  else ok (done out)
+
+/-- [key_kernel::encode_triple_bytes_bytes_u64]: loop 1:
+    Source: 'src/lib.rs', lines 148:4-151:5
+    Visibility: public -/
+@[rust_loop]
+def encode_triple_bytes_bytes_u64_loop1
+  (out : alloc.vec.Vec Std.U8) (tail : alloc.vec.Vec Std.U8) (j : Std.Usize) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  loop
+    (fun (out1, j1) => encode_triple_bytes_bytes_u64_loop1.body tail out1 j1)
+    (out, j)
+
+/-- [key_kernel::encode_triple_bytes_bytes_u64]:
+    Source: 'src/lib.rs', lines 138:0-153:1
+    Visibility: public -/
+def encode_triple_bytes_bytes_u64
+  (a : Slice Std.U8) (b : Slice Std.U8) (c : Std.U64) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let out ← escape_and_terminate a
+  let mid ← escape_and_terminate b
+  let out1 ← encode_triple_bytes_bytes_u64_loop0 out mid 0#usize
+  let tail ← encode_u64 c
+  encode_triple_bytes_bytes_u64_loop1 out1 tail 0#usize
+
 /-- [key_kernel::decode_pair_bytes_u64]: loop body 0:
-    Source: 'src/lib.rs', lines 142:12-145:13
+    Source: 'src/lib.rs', lines 161:12-164:13
     Visibility: public -/
 @[rust_loop_body]
 def decode_pair_bytes_u64_loop.body
@@ -315,7 +390,7 @@ def decode_pair_bytes_u64_loop.body
   else ok (done tail)
 
 /-- [key_kernel::decode_pair_bytes_u64]: loop 0:
-    Source: 'src/lib.rs', lines 142:12-145:13
+    Source: 'src/lib.rs', lines 161:12-164:13
     Visibility: public -/
 @[rust_loop]
 def decode_pair_bytes_u64_loop
@@ -327,7 +402,7 @@ def decode_pair_bytes_u64_loop
     (tail, i)
 
 /-- [key_kernel::decode_pair_bytes_u64]:
-    Source: 'src/lib.rs', lines 136:0-152:1
+    Source: 'src/lib.rs', lines 155:0-171:1
     Visibility: public -/
 def decode_pair_bytes_u64
   (bytes : Slice Std.U8) :

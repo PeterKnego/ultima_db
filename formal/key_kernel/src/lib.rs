@@ -133,6 +133,25 @@ pub fn encode_pair_bytes_u64(a: &[u8], b: u64) -> Vec<u8> {
     out
 }
 
+/// Two variable-length leading elements followed by a fixed-width one.
+/// Both leading elements are framed; only the last is raw.
+pub fn encode_triple_bytes_bytes_u64(a: &[u8], b: &[u8], c: u64) -> Vec<u8> {
+    let mut out = escape_and_terminate(a);
+    let mid = escape_and_terminate(b);
+    let mut i: usize = 0;
+    while i < mid.len() {
+        out.push(mid[i]);
+        i += 1;
+    }
+    let tail = encode_u64(c);
+    let mut j: usize = 0;
+    while j < tail.len() {
+        out.push(tail[j]);
+        j += 1;
+    }
+    out
+}
+
 pub fn decode_pair_bytes_u64(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
     match unescape_until_terminator(bytes, 0) {
         None => None,
@@ -266,6 +285,28 @@ mod tests {
             let (lo, hi) = (&w[0], &w[1]);
             assert!(
                 encode_pair_bytes_u64(&lo.0, lo.1) < encode_pair_bytes_u64(&hi.0, hi.1),
+                "order not preserved: {lo:?} -> {hi:?}"
+            );
+        }
+    }
+
+    /// The case only the 3-tuple reaches: the first element ties, so the
+    /// comparison is decided inside the *second* framed region.
+    #[test]
+    fn triple_encoding_preserves_order_when_the_first_element_ties() {
+        let mut cases = vec![
+            (b"t".to_vec(), b"aa".to_vec(), 0u64),
+            (b"t".to_vec(), b"b".to_vec(), 0u64),
+            (b"t".to_vec(), vec![0x00], 0u64),
+            (b"t".to_vec(), vec![0x00, 0x00], 0u64),
+            (b"s".to_vec(), b"zzz".to_vec(), 0u64),
+        ];
+        cases.sort();
+        for w in cases.windows(2) {
+            let (lo, hi) = (&w[0], &w[1]);
+            assert!(
+                encode_triple_bytes_bytes_u64(&lo.0, &lo.1, lo.2)
+                    < encode_triple_bytes_bytes_u64(&hi.0, &hi.1, hi.2),
                 "order not preserved: {lo:?} -> {hi:?}"
             );
         }

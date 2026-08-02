@@ -53,3 +53,6 @@ lean_lib «KeyRoundTrip»
 
 @[default_target]
 lean_lib «KeyMonoFixed»
+
+@[default_target]
+lean_lib «KeyFraming»
