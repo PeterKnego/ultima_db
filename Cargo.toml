@@ -47,6 +47,11 @@ wal-iouring = ["persistence", "dep:io-uring"]
 # Test-only fault injection for the Elle mutation-testing harness (task47).
 # Off by default; compiled into no normal build. Inert unless ULTIMA_MUTATION is set.
 mutation-testing = []
+# Swap the global allocator to mimalloc in the perf-diagnostic examples and the
+# YCSB bench ONLY (the library itself never sets an allocator). A/B
+# discriminator for the cross-thread-alloc-churn hypothesis — see
+# docs/benchmarks/ycsb-eventual-write-decomposition-2026-08-02.md.
+bench-mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 thiserror = "2"
@@ -57,6 +62,7 @@ memmap2 = { version = "0.9", optional = true }
 dashmap = "6"
 crc32fast = "1"
 io-uring = { version = "0.7", optional = true }
+mimalloc = { version = "0.1", optional = true, default-features = false }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 
 [dev-dependencies]
@@ -142,4 +148,16 @@ harness = false
 
 [[example]]
 name = "profile_commit"
+required-features = ["persistence"]
+
+[[example]]
+name = "perf_decomp"
+required-features = ["persistence"]
+
+[[example]]
+name = "wal_spin_ab"
+required-features = ["persistence"]
+
+[[example]]
+name = "wal_commit_micro"
 required-features = ["persistence"]
