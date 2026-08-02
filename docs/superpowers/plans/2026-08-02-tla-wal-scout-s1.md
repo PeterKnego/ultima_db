@@ -408,6 +408,64 @@ though good. Re-gate re-counted as M1-M6."
 
 ---
 
+### Task 5c: M7 — calibrate `RecoverySound` clause (a)
+
+**Inserted 2026-08-02, after M6 landed.** Closing clause (c) as M6 surfaced that clause (a) — the recovered state is a prefix of submission order — is in the same condition: checked by every config, falsified by none. Peter has authorised closing it. **The re-gate re-counts as M1–M7.**
+
+**Files:**
+- Modify: `formal/tla/wal/WalCrash.tla` (a `MUTATION = "M7"` arm on `Replay`, around `:699-707`)
+- Create: `formal/tla/wal/mutations/M7.cfg`
+- Modify: `Makefile` (`TLA_MODES` entry), `formal/tla/wal/README.md`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–5b.
+- Produces: `MUTATION = "M7"` gating a `Replay` that permutes row identity between chain positions.
+
+**The construction is already verified — do not invent your own.** Two were tested:
+
+- **A bare order reversal is the WRONG construction.** Reversing the replayed list also descends the versions, so it reddens `PromotionFaithful`, `PromoteOrderIsSubmitOrder`, `ForkFromPromotePredecessor` *and* clause (d) at the same depth. By the standard this project holds mutations to (Task 4), that lands as *merely violating* — the same trap M2 and M3 fell into.
+- **The correct construction:** permute `cid`/`tbl` identity between two positions of the correctly-computed chain, leaving `ver`, `sub` and `forkedFrom` exactly as `Replay` computed them. This attacks only the "cid/ver/tbl matches submission order" conjunct and leaves the ordering and fork-chain structure intact.
+
+**Measured, on `modes/ConsistentPrealloc.cfg` at `MaxCommits = 2`:** violates **only** `RecoverySound`, **463/190 states, depth 9**, with clause (a) alone red at depth 9 (469/194) while clause (d) and `PromotionFaithful` hold everywhere (exit 0, 569/281 — identical to the clean control's own count). If your numbers differ materially, say so rather than adjusting to match.
+
+**Held to Task 4's standard.** The counterexample must show the documented mechanism: a recovered chain whose row identity does not match submission order, *with* versions still monotone and the fork chain intact. Verify clause (a) is the sole failing clause by isolating all four clauses, as Task 5b did — do not rely on reading one trace.
+
+- [ ] **Step 1: Add the `M7` arm and its config**
+
+Gate the permuting `Replay` behind `MUTATION = "M7"` so it is an identity at every other value. Point `mutations/M7.cfg` at `RecoverySound`, on the same shape M6 uses.
+
+- [ ] **Step 2: Run it and isolate the clauses**
+
+Expected: `RecoverySound` violated, exit 12, depth 9. Then split `RecoverySound` into its four clauses and run each alone under M7 — clause (a) must be the only red, and `PromotionFaithful` must be clean.
+
+- [ ] **Step 3: Confirm the same-bound control is clean**
+
+`modes/ConsistentPrealloc.cfg` must come back exit 0, so the red is attributable to M7 alone.
+
+- [ ] **Step 4: Confirm the four baselines are bit-identical**
+
+SingleWriter 147/depth 11, MultiWriter 651/depth 10, CoalescedPrealloc 559/depth 11, ConsistentPrealloc3 14,934/depth 14.
+
+- [ ] **Step 5: Re-count the re-gate as M1–M7**
+
+State the tally with the matching-vs-merely-violating split. **Restate M1–M6, do not re-derive them.**
+
+- [ ] **Step 6: Update the docs and commit**
+
+`TLA_MODES` entry with its exact expected code; README's calibration table; and replace the clause-(a) gap paragraph in "Not yet done" with the result. `RecoverySound` is now fully calibrated — say so *only* if all four clauses genuinely have a falsifying mutation, and name which mutation falsifies each.
+
+```bash
+git add formal/tla/wal Makefile
+git commit -m "formal(tla): M7 — calibrate RecoverySound clause (a)
+
+Clause (a) was checked by every config and falsified by none. M7 permutes
+row identity between chain positions while leaving versions monotone and
+the fork chain intact, so clause (a) is the sole failing clause. Re-gate
+re-counted as M1-M7."
+```
+
+---
+
 ### Task 6: The scout memo
 
 **Files:**
