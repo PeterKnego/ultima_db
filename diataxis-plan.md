@@ -125,3 +125,8 @@ outside the user-facing set.
 - Reference pages state no measured numbers without an archived
   `docs/benchmarks/` record (SSI cost numbers removed 2026-08-02 for lack
   of one; restore them only together with such a record).
+- The Overview diagram in `explanation/architecture.md` names struct fields
+  in ASCII-art form. Reviewed 2026-08-02 and accepted: it is an
+  illustration of relationships, which the explanation sheet permits —
+  the sheet forbids reference *tables*, not diagrams. Future runs should
+  not flag or convert it.
