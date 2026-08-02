@@ -99,6 +99,11 @@ tolerated by design, nothing to prove).
 
 ## Task F-DB-2 — WAL / recovery crash-safety protocol model
 
+**Scout phase is briefed and ready to dispatch:**
+`docs/superpowers/specs/2026-08-02-wal-crash-safety-tla-scout-brief.md`
+(TLA+/TLC, 2 sessions + a toolchain gate, calibrated against task15's three
+shipped pre-fix interleavings). Start there; the Lean phase below follows it.
+
 **Priority: HIGH — the biggest uncovered data-loss surface in the repo.**
 This is the db's equivalent of consensus safety: the failure class is
 *acked-write loss / un-acked-write visibility*, the same class as the
