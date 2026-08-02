@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke
 
 build:
 	cargo build
@@ -19,6 +19,23 @@ test/formal-kernel:
 # Key-encoding kernel port (formal/key_kernel). Lean proofs: see formal/README.md.
 test/formal-key-kernel:
 	cargo test --manifest-path formal/key_kernel/Cargo.toml
+
+# TLA+ toolchain gate (S0) for the WAL crash-safety scout. Runs a tiny
+# durability spec plus a canary that MUST fail — a checker that only ever
+# reports success is indistinguishable from a broken one. See
+# formal/tla/wal/README.md. State goes on real disk: /tmp here is tmpfs.
+TLC_JAR ?= tools/tla/tla2tools-1.7.4.jar
+TLC_METADIR ?= $(HOME)/tlc-states
+TLC = java -XX:+UseSerialGC -Xmx2g -cp ../../../$(TLC_JAR) tlc2.TLC -metadir $(TLC_METADIR) -workers 2
+
+formal/tla-smoke:
+	@mkdir -p $(TLC_METADIR)
+	@cd formal/tla/wal && $(TLC) S0Smoke.tla > /dev/null \
+	  && echo "S0Smoke: no error (expected)" \
+	  || { echo "S0Smoke FAILED — the gate spec should verify clean"; exit 1; }
+	@cd formal/tla/wal && ! $(TLC) S0Canary.tla > /dev/null 2>&1 \
+	  && echo "S0Canary: invariant violated (expected — TLC discriminates)" \
+	  || { echo "S0Canary FAILED — TLC did not catch a broken invariant; the gate is lying"; exit 1; }
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
