@@ -102,11 +102,35 @@ IsDurable(c) == \E i \in 1..Len(walDurable) : walDurable[i].cid = c
 
 SubIndex(c) == CHOOSE i \in 1..Len(submitted) : submitted[i].cid = c
 
+(***************************************************************************)
+(* Which protection applies to which writer mode -- this asymmetry is the   *)
+(* whole reason M1 is a distinct calibration bug from M2/M3.                *)
+(*                                                                         *)
+(* commit_multi_writer (src/store.rs:3844) has BOTH the version bump        *)
+(* (:3992) and the PromoteGate FIFO (:4050 take, :4104/:4121 wait).         *)
+(* commit_single_writer (src/store.rs:3737-3843) has NEITHER. Its only      *)
+(* protection is holding the writer slot through the fsync wait             *)
+(* (:3786-3801, and begin_write's active_writer_count check at :668).       *)
+(*                                                                         *)
+(* Modelling the bump and the gate unconditionally would hand SingleWriter  *)
+(* two protections the code does not have, and breaking its one real        *)
+(* protection would then change nothing observable -- M1 would be masked.   *)
+(***************************************************************************)
+GateApplies == WriterMode = "MultiWriter"
+BumpApplies == WriterMode = "MultiWriter"
+
 (* SingleWriter holds the writer slot (active_writer_count) from            *)
-(* begin_write through promotion -- through the fsync wait -- so a second   *)
+(* begin_write through PROMOTION -- through the fsync wait -- so a second   *)
 (* writer cannot be admitted and fork from a latest that lacks the parked   *)
 (* commit (task15, "Promotion ordering", failure mode 1).                   *)
-WriterSlotFree == (WriterMode = "MultiWriter") \/ (begun = {} /\ parked = <<>>)
+(*                                                                         *)
+(* M1 re-creates the pre-fix code: the slot was released in phase 1, at     *)
+(* submission, so a second writer was admitted while the first was still    *)
+(* parked in the fsync wait. Only the `parked = <<>>` conjunct drops --     *)
+(* one writer at a time before submission is unchanged.                     *)
+WriterSlotFree ==
+    \/ WriterMode = "MultiWriter"
+    \/ IF MUTATION = "M1" THEN begun = {} ELSE (begun = {} /\ parked = <<>>)
 
 ----------------------------------------------------------------------------
 
@@ -142,10 +166,13 @@ Begin(c, t) ==
 Submit(r) ==
     /\ ~crashed
     /\ r \in begun
-    /\ LET bump == r.ver <= Max2(lastSubmitted, latestVersion)
+    /\ LET bump == BumpApplies /\ r.ver <= Max2(lastSubmitted, latestVersion)
            v    == IF bump THEN nextVersion ELSE r.ver
            e    == [cid |-> r.cid, ver |-> v, tbl |-> r.tbl]
        IN /\ nextVersion'   = IF bump THEN nextVersion + 1 ELSE nextVersion
+          \* `last_submitted_version` is maintained only by commit_multi_writer
+          \* (src/store.rs:3997). Kept unconditional here because it is read
+          \* only by the bump, which BumpApplies already gates off.
           /\ lastSubmitted' = Max2(lastSubmitted, v)
           /\ begun'         = begun \ {r}
           /\ submitted'     = Append(submitted, e)
@@ -177,24 +204,34 @@ Fsync ==
     /\ UNCHANGED <<begun, submitted, parked, promoted, latestVersion,
                    lastSubmitted, nextVersion, acked, crashed>>
 
-(* Phase 3 PROMOTE. Only the head of the PromoteGate FIFO may promote, and  *)
-(* only once its entry is durable. It forks from latestVersion AS OF NOW    *)
-(* (not from its own base) and installs; latest_version advances only when  *)
-(* strictly greater -- exactly `if v > inner.latest_version`.               *)
+(* Phase 3 PROMOTE. A parked commit may promote once its entry is durable.  *)
+(* Under MultiWriter the PromoteGate restricts that to the FIFO head        *)
+(* (k = 1); commit_single_writer has no gate at all, so any parked commit   *)
+(* may promote as its own fsync wait completes. At MUTATION = "NONE" that   *)
+(* is behaviour-preserving -- WriterSlotFree keeps Len(parked) <= 1 under   *)
+(* SingleWriter, so k = 1 is the only choice anyway. It stops being         *)
+(* behaviour-preserving under M1, which is exactly the point.               *)
+(*                                                                         *)
+(* Promotion forks from latestVersion AS OF NOW (not from its own base) and *)
+(* installs; latest_version advances only when strictly greater -- exactly  *)
+(* `snapshots.insert(v, ..); if v > inner.latest_version { .. }`.           *)
 Promote ==
     /\ ~crashed
     /\ parked # <<>>
-    /\ LET h == Head(parked)
-       IN /\ IsDurable(h.cid)
-          /\ parked'   = Tail(parked)
-          /\ promoted' = Append(promoted,
-                 [cid        |-> h.cid,
-                  ver        |-> h.ver,
-                  tbl        |-> h.tbl,
-                  sub        |-> SubIndex(h.cid),
-                  forkedFrom |-> latestVersion])
-          /\ latestVersion' = Max2(latestVersion, h.ver)
-          /\ acked'         = acked \cup {h.cid}
+    /\ \E k \in 1..Len(parked) :
+       /\ GateApplies => (k = 1)
+       /\ LET h == parked[k]
+          IN /\ IsDurable(h.cid)
+             /\ parked'   = SubSeq(parked, 1, k - 1)
+                            \o SubSeq(parked, k + 1, Len(parked))
+             /\ promoted' = Append(promoted,
+                    [cid        |-> h.cid,
+                     ver        |-> h.ver,
+                     tbl        |-> h.tbl,
+                     sub        |-> SubIndex(h.cid),
+                     forkedFrom |-> latestVersion])
+             /\ latestVersion' = Max2(latestVersion, h.ver)
+             /\ acked'         = acked \cup {h.cid}
     /\ UNCHANGED <<walBuffered, walDurable, begun, submitted, lastSubmitted,
                    nextVersion, crashed>>
 

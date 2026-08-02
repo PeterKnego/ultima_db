@@ -76,17 +76,40 @@ The invariant is task15's load-bearing sentence — *`latest_version` strictly
 advances at every promotion, and every promotion forks from the latest at
 promote time* — as `PromotionFaithful`.
 
+The version bump and the `PromoteGate` FIFO are gated on
+`WriterMode = "MultiWriter"`, because in the Rust they exist only in
+`commit_multi_writer` (`src/store.rs:3992`, `:4050`/`:4104`).
+`commit_single_writer` (`:3737-3843`) has neither — holding the writer slot
+through the fsync wait is its *only* protection. Modelling them
+unconditionally would hand SingleWriter protections the code lacks, and would
+mask M1.
+
 | Config | Expected | Actual |
 |---|---|---|
-| `Vacuity.cfg` (`NoCommitEverPromotes`) | **violated** | violated, 15 states, depth 5 |
-| `WalCrash.cfg` (`TypeOK`, `PromotionFaithful`) | no error | no error, **49 distinct states**, depth 9 |
+| `Vacuity.cfg` | **violated** | violated (exit 12), 14 distinct, depth 5 |
+| `WalCrash.cfg` — SingleWriter | no error | no error, **49 distinct**, depth 9 |
+| `VacuityMW.cfg` | **violated** | violated (exit 12), 59 distinct, depth 5 |
+| `WalCrashMW.cfg` — MultiWriter | no error | no error, **169 distinct**, depth 8 |
 
-Baseline constants: `MaxCommits = 2`, `Tables = {t1, t2}`, `Consistent`,
-`FsWrite`, `SingleWriter`, `MUTATION = "NONE"`.
+Constants otherwise: `MaxCommits = 2`, `Tables = {t1, t2}`, `Consistent`,
+`FsWrite`, `MUTATION = "NONE"`.
+
+**SingleWriter is strictly serial by construction and is not the interesting
+config.** Because the writer slot is held from `begin_write` through
+promotion, `Len(parked) + Cardinality(begun) <= 1` is an invariant of it: no
+commit is ever parked while another writer proceeds, the FIFO never holds two
+tickets, `Fsync`'s batch-prefix nondeterminism never fires (at most one frame
+is ever buffered), and the version bump is dead code. All four are reachable
+only under `WalCrashMW.cfg`. Both are checked; treat 169, not 49, as the
+tripwire that the model is still exploring.
 
 The canary is not decoration. A model in which nothing ever promotes satisfies
-every safety property below it, silently. Run `Vacuity.cfg` first, every time;
-`make formal/tla-model` enforces the ordering and fails if the canary *passes*.
+every safety property below it, silently. Each baseline is paired with a
+canary that runs first; `make formal/tla-model` enforces the ordering, and
+asserts TLC exit code **12** specifically rather than "nonzero" — 150 (parse
+error) and 151 (undefined invariant) are also nonzero, so a typo in an
+invariant name would otherwise print "violated (expected)" having checked
+nothing.
 
 ## Not yet done
 
@@ -95,5 +118,17 @@ Task 2 adds an action, not a variable, to every config. `SinkKind` is carried
 but not yet behaviour-differentiating: `FsWrite`/`Coalesced`/`CoalescedPrealloc`
 only diverge under a crash (`sync_data` vs `sync_all`, torn tails). Also
 pending: fsync *failure* (the "advance the gate without promoting" rule),
-checkpoint/prune, the S1/S3/S4/S5/L1 battery, and the M1–M5 calibration
-mutations (gated on `MUTATION`, one spec, never forked `.tla` copies).
+checkpoint/prune, and the S1/S3/S4/S5/L1 battery.
+
+M1 is already gated on `MUTATION` (one spec, never forked `.tla` copies) — it
+was needed to prove the SingleWriter path is no longer over-protected. It has
+no committed config yet; run it with:
+
+```bash
+cd formal/tla/wal && sed 's/MUTATION = "NONE"/MUTATION = "M1"/' WalCrash.cfg > _m1.cfg
+java -XX:+UseSerialGC -Xmx2g -cp ../../../tools/tla/tla2tools-1.7.4.jar tlc2.TLC \
+  -metadir $HOME/tlc-states -workers 2 -config _m1.cfg WalCrash.tla; rm _m1.cfg
+```
+
+It violates `PromotionFaithful` (exit 12). M2–M5 and the mutation configs are
+still to come.

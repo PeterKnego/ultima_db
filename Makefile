@@ -28,27 +28,57 @@ TLC_JAR ?= tools/tla/tla2tools-1.7.4.jar
 TLC_METADIR ?= $(HOME)/tlc-states
 TLC = java -XX:+UseSerialGC -Xmx2g -cp ../../../$(TLC_JAR) tlc2.TLC -metadir $(TLC_METADIR) -workers 2
 
+# A canary must be asserted on TLC's exit code 12 (invariant violated), never
+# on "nonzero". Measured on tla2tools 1.7.4 / TLC 2.19: 0 = clean,
+# 12 = invariant violated, 150 = parse error, 151 = invariant undefined.
+# A `|| echo "violated (expected)"` therefore reports success for a TYPO in
+# the invariant name — the one gate whose whole purpose is that it cannot
+# lie, quietly lying.
 formal/tla-smoke:
 	@mkdir -p $(TLC_METADIR)
-	@cd formal/tla/wal && $(TLC) S0Smoke.tla > /dev/null \
-	  && echo "S0Smoke: no error (expected)" \
-	  || { echo "S0Smoke FAILED — the gate spec should verify clean"; exit 1; }
-	@cd formal/tla/wal && ! $(TLC) S0Canary.tla > /dev/null 2>&1 \
-	  && echo "S0Canary: invariant violated (expected — TLC discriminates)" \
-	  || { echo "S0Canary FAILED — TLC did not catch a broken invariant; the gate is lying"; exit 1; }
+	@cd formal/tla/wal && $(TLC) S0Smoke.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "S0Smoke FAILED — the gate spec should verify clean (TLC exit $$rc)"; exit 1; fi; \
+	  echo "S0Smoke: no error (expected)"
+	@cd formal/tla/wal && $(TLC) S0Canary.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "S0Canary FAILED — TLC exit $$rc, expected 12 (invariant violated)."; \
+	    echo "  0 = TLC did not catch a broken invariant; 150/151 = parse error or"; \
+	    echo "  undefined invariant, i.e. the gate checked nothing. Either way it is lying."; \
+	    exit 1; \
+	  fi; \
+	  echo "S0Canary: invariant violated, TLC exit 12 (expected — TLC discriminates)"
 
-# S1 model: the Standalone commit pipeline (WalCrash.tla). The vacuity canary
-# runs FIRST and must go red — a model where nothing ever promotes verifies
-# every safety property trivially, which is how a checking effort produces
-# confident, meaningless greens.
+# S1 model: the Standalone commit pipeline (WalCrash.tla). Each baseline is
+# paired with a vacuity canary that runs FIRST and must go red — a model where
+# nothing ever promotes verifies every safety property trivially, which is how
+# a checking effort produces confident, meaningless greens.
+#
+# Both writer modes are checked. SingleWriter is strictly serial by
+# construction (the writer slot is held through the fsync wait), so it cannot
+# reach parking-while-another-writer-proceeds, batched fsync, or the version
+# bump — MultiWriter is the config that exercises the protocol.
 formal/tla-model:
 	@mkdir -p $(TLC_METADIR)
-	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1 \
-	  && { echo "vacuity canary FAILED — nothing promotes; every green below is meaningless"; exit 1; } \
-	  || echo "vacuity canary: violated (expected)"
-	@cd formal/tla/wal && $(TLC) -config WalCrash.cfg WalCrash.tla > /dev/null \
-	  && echo "WalCrash baseline: no error (expected)" \
-	  || { echo "WalCrash baseline FAILED"; exit 1; }
+	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "vacuity canary (SingleWriter) FAILED — TLC exit $$rc, expected 12."; \
+	    echo "  0 = nothing promotes, the model is inert and every green below is"; \
+	    echo "  meaningless; 150/151 = the canary checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "vacuity canary (SingleWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrash.cfg WalCrash.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (SingleWriter) FAILED (TLC exit $$rc)"; exit 1; fi; \
+	  echo "WalCrash baseline (SingleWriter): no error (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityMW.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "vacuity canary (MultiWriter) FAILED — TLC exit $$rc, expected 12."; \
+	    exit 1; \
+	  fi; \
+	  echo "vacuity canary (MultiWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrashMW.cfg WalCrash.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (MultiWriter) FAILED (TLC exit $$rc)"; exit 1; fi; \
+	  echo "WalCrash baseline (MultiWriter): no error (expected)"
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
