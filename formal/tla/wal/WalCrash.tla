@@ -37,7 +37,7 @@
 (* version and only advances latest_version when strictly greater -- this   *)
 (* mirrors `snapshots.insert(v, ..); if v > latest_version { .. }` in       *)
 (* src/store.rs. The model does NOT assume the good property; the invariant *)
-(* detects its absence. That is what gives the M1-M5 mutations teeth.       *)
+(* detects its absence. That is what gives the M1-M7 mutations teeth.       *)
 (*                                                                         *)
 (* NON-GOALS (§4 of the scout brief), not modelled here:                    *)
 (*   SMR / explicit-version commits; MultiWriter OCC validation semantics   *)

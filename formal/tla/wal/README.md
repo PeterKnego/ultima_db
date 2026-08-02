@@ -117,13 +117,28 @@ mutation config, not argued:
 | Clause | Falsified by | Depth |
 |---|---|---|
 | (a) prefix of submission order (cid, version, table) | `M7.cfg` **only** | 9 |
-| (b) every `Consistent`-acked commit survives | `M5.cfg`, `M5Strand.cfg` | 8 |
+| (b) every `Consistent`/`ConsistentInline`-acked commit survives | `M5.cfg`, `M5Strand.cfg` | 8 |
 | (c) no replayed torn frame | `M6.cfg` **only** | 9 |
 | (d) strictly monotone recovered versions | `M3.cfg`, `M3Dup.cfg` | 7 |
 
 Clause (a) was the last one open — it was checked by every config and falsified
 by none until Task 5c, and this README asserted M1/M2 covered it, which was
 false; see "Not yet done" for what that error was and how it was closed.
+
+**Calibrated at CLAUSE granularity, and that is not the same as conjunct
+granularity.** Clause (a) is itself a conjunction of four things, and M7 does
+not reach all of them: isolated and run alone under `M7.cfg`, the **`cid`**
+match is red (depth 9) and the **`tbl`** match is red (depth 9), while the
+**`ver`** match and the **`Len(promoted) <= Len(submitted)`** length bound both
+come back clean at the control's own 569/281. Since full clause (a) runs clean
+to exhaustion under the other ten mutation configs, its weaker conjuncts do
+too — so those two are still *checked by everything and falsified by nothing*,
+which is the same species of hole Task 5c just closed one conjunct over. They
+may well be **unfalsifiable by construction at this bound**, the way
+`TailTolerance` clause 2 is — this spec's discipline is to say so out loud when
+a clause holds by construction rather than by evidence (see `TailTolerance`'s
+own comment in `WalCrash.tla`), and nobody has yet done the work to decide
+which of the two these are. Do not read the table above as conjunct coverage.
 
 Two things to know before building on this. The post-`Recover` value of
 `promoted` is the **replay sequence, not the Rust's snapshot chain**: recovery
@@ -372,7 +387,14 @@ fork-source proxy is as strong as the table statement *for those* mutations).
 M7 does move it: run with **only** the `tbl` conjunct of clause (a), `M7.cfg`
 is violated at depth 9, on a witness where version 1's row is recovered into
 `t2` and version 2's into `t1` while the versions stay monotone. So the `tbl`
-conjunct is no longer a clause nothing can falsify. What is **still open** is
+conjunct is no longer a conjunct nothing can falsify — and since this paragraph
+is already at conjunct granularity, the rest of that audit belongs here too: M7
+falsifies clause (a)'s `cid` and `tbl` conjuncts **only**, and its
+**`ver`-match and length-prefix conjuncts
+remain checked but unfalsified**, possibly unfalsifiable by construction at this
+bound (§`RecoverySound` above, and compare `TailTolerance` clause 2, which the
+spec documents as holding by construction and says so out loud). What is
+**still open** on table identity specifically is
 narrower than it was: M7 *permutes* identity between two positions, it does not
 install the **wrong table set at a correct cid**, so a mutation that kept every
 cid, version and fork source right and simply applied a commit's rows to
@@ -414,13 +436,20 @@ battery landed in Task 5, below; M6 in Task 5b, M7 in Task 5c.
 
 A model that verifies clean but cannot re-find bugs that actually shipped
 produces confident greens that mean nothing. `mutations/` re-runs a committed
-baseline with the `MUTATION` constant flipped, re-creating each of the three
-lost-update interleavings task15 documents as *reproducible failure modes*
+baseline with the `MUTATION` constant flipped. **M1–M6 are code-derived**: each
+removes a protection the codebase actually carries, or re-creates a failure mode
+it documents — the three lost-update interleavings task15 records as
+*reproducible failure modes*
 (`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`), the two
-preallocation subtleties task37 is built around (§4 invariant 2, §7), the
-scan's stop-at-first-bad-frame (`src/wal.rs:585-592`) and the replay's
-per-position row identity. They are gated in `TLA_MODES` at exit **12** exactly
-like the canaries.
+preallocation subtleties task37 is built around (§4 invariant 2, §7), and the
+scan's stop-at-first-bad-frame (`src/wal.rs:585-592`). **M7 is
+clause-targeted**, and the distinction is worth keeping. No shipped bug ever
+permuted a replayed row's identity; M7 exists because `RecoverySound` clause (a)
+was checked by every config and falsified by none, and a clause with no
+falsifying mutation is a green with nothing behind it. It is faithful to what
+the code *would* do wrong (`Store::recover` applying commit 2's row where
+commit 1's belongs), not to something it once did. All of them are gated in
+`TLA_MODES` at exit **12** exactly like the canaries.
 
 | Config | Baseline it mutates | Expected | Actual |
 |---|---|---|---|
