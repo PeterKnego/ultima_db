@@ -50,3 +50,6 @@ lean_lib «RemoveTotal»
 
 @[default_target]
 lean_lib «KeyRoundTrip»
+
+@[default_target]
+lean_lib «KeyMonoFixed»
