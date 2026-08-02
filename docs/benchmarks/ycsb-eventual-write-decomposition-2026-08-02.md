@@ -61,17 +61,42 @@ Within the WAL bucket: bincode serialize of the ~1 KB record is only
   made the snapshot-reclaim thread a 3.1× p99 regression in the fanout
   study. Also plausible: commit-path submission bookkeeping that only runs
   with a WAL configured.
-- Next levers, in expected-value order:
-  1. **Allocator/pooling A/B**: global mimalloc/jemalloc as a cheap
-     discriminator; if it moves the cell, pool the payload buffers (recycle
-     them back to the committer) instead of shipping an allocator.
-  2. **Alloc-slimming the per-op WAL path** (reuse an encode buffer across
-     ops; slim `WalOp` churn).
-  3. **A mutable write overlay in front of the B-tree** (mini-memtable):
-     the structural fix for tax (b) and the only path that beats — rather
-     than approaches — the LSM write cost profile. Design work; snapshots
-     hold (frozen overlay, tree root) pairs; merge via the existing
-     `BulkBuilder`/`extend_from_sorted` primitives.
 - Measured dead ends (do not retry): recv-spin before park (harmless-looking,
   measurably negative); prealloc-under-Eventual as a committer-side lever;
   judging either on a loaded ≤4-core sandbox.
+
+## Allocator A/B — hypothesis CONFIRMED (same-day follow-up)
+
+Second c6id.2xlarge run (`dist/20260802T192105Z-alloc-ab/`, ultima git
+`7d86f56`): identical binaries except the global allocator in the *bench
+executables* (`bench-mimalloc` feature — the library never sets one).
+Interleaved arms, 2 e2e criterion reps + 3 decomposition reps each.
+
+End-to-end eventual tier: **YCSB A 3.84/3.76 → 2.74/2.80 ms (−27%), YCSB F
+3.55/3.55 → 2.52/2.50 ms (−29%)** — criterion's change detection confirms in
+both directions across the interleaving, p = 0.00.
+
+Decomposition localizes it exactly where predicted: the WAL bucket falls
+**3.4–4.2 µs → 1.2–1.9 µs** (the entire "unexplained remainder" was
+cross-thread allocator churn — payload chain allocated on the committer,
+freed on the WAL thread, glibc malloc's worst pattern), while the MVCC tax
+(~2.0 vs ~2.15 µs) and txn bookkeeping (~520 ns) are allocator-insensitive.
+Total update op 7.1–7.8 → 5.3–6.0 µs. (Curiosity, unexplained: the cold-tree
+floor cell reads ~250 ns under glibc but ~590 ns under mimalloc — small
+either way.)
+
+For context, Fjall's eventual A/F cells sat at 2.7/3.0 ms in
+`competitor-nvme-2026-08-02.md` — an ultima-with-mimalloc A cell of ~2.74 ms
+suggests the gap ≈ closes, but that claim needs a same-host competitor rerun
+(and a decision on whether competitors get the same allocator) before it goes
+in a comparison doc.
+
+Follow-ups this opens, in order:
+1. **Ship the fix without shipping an allocator**: pool/recycle the WAL
+   payload buffers back to the committer (bounded ring of `Vec<u8>`s over a
+   return channel), so the allocation/free stays thread-local under glibc
+   too. The A/B bounds the prize at ~2–2.5 µs/op.
+2. Document the mimalloc option for embedders (application-level
+   `#[global_allocator]` — they own `main`, we don't).
+3. Re-run the competitor matrix once either lands; then the write overlay
+   (mini-memtable) remains the structural attack on the remaining MVCC tax.
