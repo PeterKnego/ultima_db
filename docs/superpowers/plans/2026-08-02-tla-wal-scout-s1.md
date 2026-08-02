@@ -354,6 +354,60 @@ and the scout stops rather than producing meaningless greens."
 
 ---
 
+### Task 5b: M6 — calibrate `RecoverySound` clause (c)
+
+**Inserted 2026-08-02, after the S1 re-gate was counted and reported.** The re-gate came back 5 of 5 with matching mechanisms. In counting it, Task 5 found that `RecoverySound`'s clause (c) — the recovered state replays no torn frame — is **uncalibrated**: none of M1–M5 exercises it, so its greens rest on nothing. Task 5 deliberately did *not* close it, because adding a sixth mutation unilaterally would have changed what "5 of 5" meant after the count had already gone to the plan owner. Peter has now authorised closing it. **The re-gate is re-counted as M1–M6.**
+
+**Files:**
+- Modify: `formal/tla/wal/WalCrash.tla` (a `MUTATION = "M6"` arm on `ScanLen`, around `:654-667`)
+- Create: `formal/tla/wal/mutations/M6.cfg`
+- Modify: `Makefile` (`TLA_MODES` entry), `formal/tla/wal/README.md`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–5.
+- Produces: `MUTATION = "M6"` gating a tolerant `ScanLen` that accepts non-`absent` frames — i.e. a scan that keeps going *past* a torn frame instead of stopping at it.
+
+**The mechanism.** Real `scan_wal` (`src/wal.rs:574-607`) is a sequential offset walk that stops at the first frame it cannot accept. Clause (c) asserts recovery therefore never replays a torn frame. M6 removes that stop, so a torn frame is replayed as though good — the corruption-passes-CRC failure `scan_wal`'s `break`/`return Err` exists to prevent.
+
+**The price is already measured**, so this is a confirmation rather than a search: a clause-(c) mutation is red on `RecoverySound` at **depth 9, 461/188 states on `modes/ConsistentPrealloc.cfg`** (905/368 on `WalCrashPrealloc.cfg`, which differs only by `SYMMETRY`), about one second. If your numbers differ materially, say so rather than adjusting to match.
+
+**Held to Task 4's standard: a violation is not enough.** The counterexample must show the documented mechanism — a `torn` frame appearing in the recovered `promoted` chain. A red for any other reason does not count, and must be reported as such rather than credited.
+
+- [ ] **Step 1: Add the `M6` arm and its config**
+
+Gate the tolerant `ScanLen` behind `MUTATION = "M6"` so it is an identity at every other value. Point `mutations/M6.cfg` at `RecoverySound`, on the prealloc shape at `MaxCommits = 2`.
+
+- [ ] **Step 2: Run it and read the trace**
+
+Expected: `RecoverySound` violated, exit 12, depth 9. Confirm the recovered `promoted` chain contains a frame whose `walAfterCrash` entry is `torn` — that is the mechanism. Record the state count.
+
+- [ ] **Step 3: Confirm the same-bound control is clean**
+
+The matching `MUTATION = "NONE"` config must come back exit 0, so the red is attributable to M6 alone.
+
+- [ ] **Step 4: Confirm M6 is inert everywhere else**
+
+Run the four baselines with `MUTATION = "M6"` unset and confirm they are bit-identical: SingleWriter 147/depth 11, MultiWriter 651/depth 10, CoalescedPrealloc 559/depth 11, ConsistentPrealloc3 14,934/depth 14.
+
+- [ ] **Step 5: Re-count the re-gate as M1–M6**
+
+State the tally with the matching-vs-merely-violating split, exactly as Task 5 did. **Do not adjust any earlier classification** — M1 and M4 match on their primary config; M2, M3 and M5 match only on clause-focused secondaries.
+
+- [ ] **Step 6: Wire it into the gate and commit**
+
+`TLA_MODES` entry with the exact expected exit code, README's calibration table updated, and the "Not yet done" paragraph that priced this follow-up replaced with the result.
+
+```bash
+git add formal/tla/wal Makefile
+git commit -m "formal(tla): M6 — calibrate RecoverySound clause (c)
+
+Clause (c) had no mutation exercising it, so its greens rested on nothing.
+M6 removes scan_wal's stop-at-first-bad-frame, replaying a torn frame as
+though good. Re-gate re-counted as M1-M6."
+```
+
+---
+
 ### Task 6: The scout memo
 
 **Files:**
