@@ -47,3 +47,6 @@ lean_lib «RemoveFrame»
 
 @[default_target]
 lean_lib «RemoveTotal»
+
+@[default_target]
+lean_lib «KeyRoundTrip»
