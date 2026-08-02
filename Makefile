@@ -62,6 +62,11 @@ formal/tla-smoke:
 # (CoalescedPrealloc) exists because it is the only sink for which
 # Store::recover passes tail_tolerant = true, and therefore the only config
 # that reaches the tolerant half of scan_wal.
+#
+# The last run is not a canary but an OWED PROPERTY, also expected red:
+# StrictScanErrLosesDurableAck records a known gap (a torn tail costs a
+# strict-scan store its whole log, durable acked commits included) so that
+# "we know about this" is re-checked rather than remembered.
 formal/tla-model:
 	@mkdir -p $(TLC_METADIR)
 	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
@@ -105,6 +110,15 @@ formal/tla-model:
 	@cd formal/tla/wal && $(TLC) -config WalCrashPrealloc.cfg WalCrash.tla > /dev/null; rc=$$?; \
 	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (CoalescedPrealloc) FAILED (TLC exit $$rc)"; exit 1; fi; \
 	  echo "WalCrash baseline (CoalescedPrealloc): no error (expected)"
+	@cd formal/tla/wal && $(TLC) -config StrictScanErr.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "owed property StrictScanErrLosesDurableAck FAILED — TLC exit $$rc, expected 12."; \
+	    echo "  0 = either the strict-scan error path stopped being reachable (the model"; \
+	    echo "  rotted) or the behaviour changed — in which case write the real property"; \
+	    echo "  and delete this one; 150/151 = the check checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "owed property StrictScanErrLosesDurableAck: violated, TLC exit 12 (expected — known gap, still there)"
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).

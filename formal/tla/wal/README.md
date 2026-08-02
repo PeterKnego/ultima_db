@@ -98,11 +98,19 @@ checkpoint version. `tail_tolerant` is true for `CoalescedPrealloc` only
 (`src/store.rs:1017-1022`), and that is the whole of `SinkKind`'s influence.
 
 `RecoverySound` is S1: after a successful crash+recover, the recovered state is
-the replay of a **prefix of submission order**, contains every
-`Consistent`/`ConsistentInline`-acked commit, replays no torn frame, and has
-strictly monotone versions. A strict-mode scan error is excluded — that is a
-*loud* failure (`recover()` returns `Err`, the store never opens), not the
-silent acked-write loss S1 is about.
+the replay of a **prefix of submission order** (matching on cid, version *and
+table*), contains every `Consistent`/`ConsistentInline`-acked commit, replays no
+torn frame, and has strictly monotone versions. A strict-mode scan error is
+excluded — see "Not yet done", where it has its own named invariant.
+
+Two things to know before building on this. The post-`Recover` value of
+`promoted` is the **replay sequence, not the Rust's snapshot chain**: recovery
+installs exactly one snapshot, at `latest_version` (`src/store.rs:1150-1156`),
+so a property like "every acked version is *readable* after recovery" must not
+be built on it. And the bound is **≤1 crash *and no operation after
+recovery*** — every steady-state action requires `~crashed` and `Recover`
+requires `~recovered`, so "does a restarted store re-issue versions safely?" is
+outside this state space.
 
 | Config | Expected | Actual |
 |---|---|---|
@@ -114,6 +122,7 @@ silent acked-write loss S1 is about.
 | `WalCrashMW.cfg` — MultiWriter | no error | no error, **651 distinct**, depth 10 |
 | `VacuityCrashPrealloc.cfg` | **violated** | violated (exit 12) |
 | `WalCrashPrealloc.cfg` — MW + prealloc | no error | no error, **651 distinct**, depth 10 |
+| `StrictScanErr.cfg` — owed property | **violated** | violated (exit 12), depth 9 |
 
 Constants otherwise: `MaxCommits = 2`, `Tables = {t1, t2}`, `Consistent`,
 `MUTATION = "NONE"`; `SinkKind = FsWrite` except in the prealloc config.
@@ -147,6 +156,25 @@ invariant name would otherwise print "violated (expected)" having checked
 nothing.
 
 ## Not yet done
+
+**A torn tail costs a strict-scan store its whole log — including durable,
+acked commits.** `scan_wal` treats a CRC mismatch as end-of-log only when
+`tail_tolerant`, which `Store::recover` passes for `CoalescedPrealloc` and
+nothing else (`src/store.rs:1017-1022`). Every other sink gets
+`Err(WalCorrupted)` (`src/wal.rs:589-591`), which `recover` propagates with `?`
+(`src/store.rs:1023`) *before applying any entry* — so frames the scan had
+already accepted, at offsets before the tear, are discarded too. This is
+reachable on the **default** Standalone configuration (`Consistent` +
+`WalWrite::PerEntry`), not an exotic one, and a full-length-but-CRC-bad tail is
+physically ordinary on an appending sink. It is deliberately **not** a
+`RecoverySound` clause: `recover()` returned `Err`, so there is no recovered
+state to predicate over, and folding it in would turn a safety claim into an
+availability one. Nobody has yet decided whether the behaviour should change,
+so until someone does it is checked as a **known gap** —
+`StrictScanErrLosesDurableAck` (`StrictScanErr.cfg`) must report **violated**,
+and `make formal/tla-model` asserts exit 12 for it like a canary. A green there
+means either the strict error path stopped being reachable or the behaviour
+changed; in the second case, write the real property and delete this one.
 
 Fsync *failure* — task15's "a commit whose fsync fails advances the gate
 without promoting". Crash did **not** give it a home: a crash removes a parked

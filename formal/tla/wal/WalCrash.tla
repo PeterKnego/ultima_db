@@ -57,6 +57,21 @@
 (*              exceeds the checkpoint's. tail_tolerant is passed TRUE      *)
 (*              exactly for CoalescedPrealloc (src/store.rs:1017-1022).     *)
 (*                                                                         *)
+(* CAUTION for later tasks -- the post-Recover value of `promoted` is the   *)
+(* REPLAY SEQUENCE, not the Rust's snapshot chain. Recovery installs        *)
+(* exactly ONE snapshot, at latest_version (src/store.rs:1150-1156);        *)
+(* intermediate replayed versions never enter inner.snapshots. Reusing      *)
+(* `promoted` for the replay makes all four RecoverySound clauses           *)
+(* expressible and is harmless for them, but do NOT build a property like   *)
+(* "every acked version is READABLE after recovery" on it -- in the Rust    *)
+(* those intermediate versions are not readable, and the model would say    *)
+(* they are.                                                                *)
+(*                                                                         *)
+(* BOUND: at most one crash per behaviour AND no operation after recovery.  *)
+(* Every steady-state action requires ~crashed and Recover requires         *)
+(* ~recovered, so a restarted store never commits again. "Does a restarted  *)
+(* store re-issue versions safely?" is outside this state space.            *)
+(*                                                                         *)
 (* SinkKind is now load-bearing, but only through TailTolerant: FsWrite and *)
 (* Coalesced are both strict scans and remain indistinguishable at this     *)
 (* altitude (they differ in write granularity, not in sync granularity or   *)
@@ -498,11 +513,11 @@ DurableAck == Durability \in {"Consistent", "ConsistentInline"}
 (*      commit record. This is what M4 (replay past a torn frame) attacks;  *)
 (*  (d) recovered versions are strictly monotone.                           *)
 (*                                                                         *)
-(* Scoped to a SUCCESSFUL recovery. A strict-mode scan error is a LOUD      *)
-(* failure -- recover() returns Err, the store never opens -- not the       *)
-(* silent acked-write loss S1 is about. That asymmetry (a torn tail costs   *)
-(* FsWrite/Coalesced the whole log, and costs CoalescedPrealloc nothing) is *)
-(* real, is visible in the model, and is recorded in the Task 2 report.     *)
+(* Scoped to a SUCCESSFUL recovery: when recover() returns Err there is no  *)
+(* recovered state to predicate over, and folding that case in would turn a *)
+(* safety claim into an availability one. The exclusion is deliberate --    *)
+(* but the excluded case is NOT benign, and it has its own named invariant  *)
+(* below: StrictScanErrLosesDurableAck.                                     *)
 (***************************************************************************)
 RecoverySound ==
     (recovered /\ ~recoverErr) =>
@@ -510,11 +525,39 @@ RecoverySound ==
       /\ \A i \in 1..Len(promoted) :
              /\ promoted[i].cid = submitted[i].cid
              /\ promoted[i].ver = submitted[i].ver
+             \* The WAL entry names its table and Replay carries it through;
+             \* without this a table mix-up during replay would pass.
+             /\ promoted[i].tbl = submitted[i].tbl
       /\ DurableAck =>
              \A c \in acked : \E i \in 1..Len(promoted) : promoted[i].cid = c
       /\ \A i \in 1..Len(walAfterCrash) :
              (\E k \in 1..Len(promoted) : promoted[k].cid = walAfterCrash[i].cid)
                  => walAfterCrash[i].st = "present"
       /\ \A i \in 2..Len(promoted) : promoted[i].ver > promoted[i-1].ver
+
+(***************************************************************************)
+(* OWED PROPERTY -- expected RED, and checked so that it stays known.       *)
+(*                                                                         *)
+(* Under a STRICT scan (every sink except CoalescedPrealloc, which is every *)
+(* sink except the opt-in one -- so this includes the DEFAULT Standalone    *)
+(* configuration, Consistent + WalWrite::PerEntry), a single torn frame     *)
+(* anywhere in the log costs the WHOLE log, including durable commits the   *)
+(* scan had ALREADY ACCEPTED and whose commit() returned Ok under           *)
+(* Consistent. src/wal.rs:589-591 returns Err(WalCorrupted); Store::recover *)
+(* propagates it with `?` at src/store.rs:1023, before any entry is         *)
+(* applied. A full-length-but-CRC-bad tail is physically ordinary on an     *)
+(* appending sink, so this is not an exotic state.                          *)
+(*                                                                         *)
+(* This is NOT a RecoverySound clause: recover() returned Err, so there is  *)
+(* no recovered state, and the loss is loud (the store refuses to open)     *)
+(* rather than silent. It is an AVAILABILITY property about durably-acked   *)
+(* data, and nobody has yet decided whether the behaviour should change.    *)
+(* Until someone does, it is checked as a known gap: TLC must report it     *)
+(* VIOLATED. A green here means either the strict error path stopped being  *)
+(* reachable (the model rotted) or the behaviour changed (write the real    *)
+(* property and delete this one).                                          *)
+(***************************************************************************)
+StrictScanErrLosesDurableAck ==
+    ~(recovered /\ recoverErr /\ DurableAck /\ acked # {})
 
 =============================================================================
