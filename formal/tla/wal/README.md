@@ -1,7 +1,8 @@
 # TLA+ WAL crash-safety scout
 
-**Status: S0 gate + S1 Tasks 1–3** (steady-state commit pipeline, crash and
-recovery, and the three production WAL sinks). `S0Smoke`/`S0Canary` are the
+**Status: S0 gate + S1 Tasks 1–5** (steady-state commit pipeline, crash and
+recovery, the three production WAL sinks, and the full M1–M5 calibration
+battery). `S0Smoke`/`S0Canary` are the
 toolchain gate: proof that TLC runs here, checks invariants, and — the part that
 matters — *reports a violation when there is one*. `WalCrash.tla` is the model
 proper, covering the three-phase Consistent commit, a crash with per-frame
@@ -209,12 +210,13 @@ Task 1–2 baselines, so their committed counts stay comparable across tasks.
 | `modes/ConsistentFsWrite.cfg` | no error | **327**, depth 10 |
 | `modes/ConsistentCoalesced.cfg` | no error | **327**, depth 10 |
 | `modes/ConsistentPrealloc.cfg` | no error | **281**, depth 11 |
+| `modes/ConsistentPreallocScanErrCheck.cfg` | no error | **281**, depth 11 |
 | `modes/ConsistentPrealloc3.cfg` (`MaxCommits = 3`) | no error | **14934**, depth 14 |
 | `modes/InlineFsWrite.cfg` | no error | **75**, depth 11 |
 | `modes/InlinePrealloc.cfg` | no error | **77**, depth 12 |
 | `modes/EventualFsWrite.cfg` | no error | **221**, depth 7 |
 | `modes/ConsistentAckKeptCheck.cfg` | no error | **327**, depth 10 |
-| `modes/*Canary.cfg` (12) | **violated** | all violated (exit 12) |
+| `modes/*Canary.cfg` (13) | **violated** | all violated (exit 12) |
 
 **Why a `MaxCommits = 3` config.** Every other config uses `MaxCommits = 2`,
 and at that bound there is exactly one `Extend` per behaviour, always from
@@ -325,15 +327,17 @@ is currently a *checked* `PreallocInvariant` clause rather than an assumption. A
 `Checkpoint` action would break that clause, on purpose — which makes it a
 useful tripwire for whoever adds one.
 
-Also pending: the remaining S3/S5 properties and the M4–M5 battery.
+Also pending: the remaining S3 properties. S5 (`TailTolerance`) and the M4–M5
+battery landed in Task 5, below.
 
-## Calibration: the mutations (Task 4)
+## Calibration: the mutations (Tasks 4–5)
 
 A model that verifies clean but cannot re-find bugs that actually shipped
 produces confident greens that mean nothing. `mutations/` re-runs a committed
 baseline with the `MUTATION` constant flipped, re-creating each of the three
 lost-update interleavings task15 documents as *reproducible failure modes*
-(`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`). They are
+(`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`) plus the two
+preallocation subtleties task37 is built around (§4 invariant 2, §7). They are
 gated in `TLA_MODES` at exit **12** exactly like the canaries.
 
 | Config | Baseline it mutates | Expected | Actual |
@@ -343,7 +347,13 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
 | `mutations/M2Fork.cfg` | — (`MaxCommits = 3`) | **violated** | `ForkFromPromotePredecessor`, depth 11 |
 | `mutations/M3.cfg` | `WalCrashMW.cfg` | **violated** | `PromotionFaithful`, depth 7 |
 | `mutations/M3Dup.cfg` | — (`MaxCommits = 3`) | **violated** | `NoDupLive`, depth 12 |
-| `mutations/CalibrationControl3.cfg` | control for the two above | no error | clean, 27843 states |
+| `mutations/M4.cfg` | `WalCrashPrealloc.cfg` | **violated** | `TailTolerance`, depth 9 |
+| `mutations/M4Abort.cfg` | `modes/ConsistentPrealloc.cfg` | **violated** | `StrictScanErrLosesDurableAck`, depth 10 |
+| `mutations/M5.cfg` | `WalCrashPrealloc.cfg` | **violated** | `PreallocInvariant`, depth 5 |
+| `mutations/M5Strand.cfg` | `modes/ConsistentPrealloc3.cfg` | **violated** | `NoAckLossAfterLiveExtend`, depth 16 |
+| `mutations/CalibrationControl3.cfg` | control for M2Fork/M3Dup | no error | clean, 27843 states |
+| `modes/ConsistentPreallocScanErrCheck.cfg` | control for M4Abort | no error | clean, 281 states |
+| `modes/ConsistentPrealloc3.cfg` | control for M5Strand | no error | clean, 14934 states |
 
 - **M1** — `WriterSlotFree` drops its `parked = <<>>` conjunct: the pre-fix
   code decremented `active_writer_count` in phase 1, so `begin_write` admitted
@@ -354,15 +364,29 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
   compare against `latest_version` alone **and** allocate `latest_version + 1`.
   Both halves are the bug; see the Task 4 report for why mutating only the
   comparison cannot produce the documented duplicate.
+- **M4** — `TailTolerant` loses its `CoalescedPrealloc` arm: the tolerance
+  selection at `src/store.rs:1017-1022` goes away and a preallocated WAL is
+  scanned *strictly*. task37 §7 is the whole reason that arm exists —
+  preallocation puts a partially-written record in front of durable zeros, so a
+  torn tail *looks* like a complete frame whose CRC fails, and the pre-task37
+  rule aborts recovery for it.
+- **M5** — `SyncData` loses its `metaDurable` guard: the batch is written into a
+  freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s
+  `sync_all` (`src/wal.rs:549`) never ran before the positioned write at
+  `:1046`. task37 §4 invariant 2 — "new size must be durable before use".
 
-**Which config carries which mechanism.** `M1.cfg`, `M2.cfg` and `M3.cfg` prove
-each mutation is *caught*; the "Actual" column above is the shallowest
-counterexample, which for M2 and M3 is a shallower **consequence** of the break,
-not the documented symptom. The documented symptoms are carried entirely by the
-two clause-focused configs: `M2Fork.cfg` is the only committed config that
-witnesses M2's disjoint-table erasure, and `M3Dup.cfg` the only one that
-witnesses M3's duplicate `snapshots.insert`. Deleting either, or re-bounding it
-to 2, silently removes that evidence while the gate stays green.
+**Which config carries which mechanism.** `M1.cfg` … `M5.cfg` prove each
+mutation is *caught*; the "Actual" column above is the shallowest
+counterexample, which for M2, M3 and M5 is a shallower **consequence** (or, for
+M5, the mechanism rather than the harm) of the break. The documented symptoms
+are carried entirely by the four clause-focused configs: `M2Fork.cfg` witnesses
+M2's disjoint-table erasure, `M3Dup.cfg` M3's duplicate `snapshots.insert`,
+`M4Abort.cfg` the durably-acked commit that a strict scan makes unreachable,
+and `M5Strand.cfg` the acked commit lost behind an un-synced *live-log* extend.
+Deleting one, or re-bounding it, silently removes that evidence while the gate
+stays green. Each has a same-bound, same-shape `MUTATION = "NONE"` control:
+`CalibrationControl3.cfg`, `modes/ConsistentPreallocScanErrCheck.cfg`,
+`modes/ConsistentPrealloc3.cfg`.
 
 `PromotionFaithful` is a conjunction of four *named* clauses
 (`PromoteOrderIsSubmitOrder`, `LatestStrictlyAdvances`,
@@ -391,3 +415,47 @@ Two corners are worth knowing before touching those two configs:
   first". `NoDupLive` switches off once `crashed`, so its counterexample is the
   live chain: depth 12, `crashed = FALSE`, `acked = {1,2,3}`, two live snapshots
   at version 3.
+
+## `TailTolerance` — S5, and what it says about the strict sinks (Task 5)
+
+task37 §7: under `CoalescedPrealloc` a torn **tail** is end-of-log, not an
+error. `TailTolerance` is that sentence, in two clauses that are different
+claims:
+
+1. recovery never **aborts** — `scan_wal` breaks out on an undecodable frame
+   (`src/wal.rs:586-588`) instead of returning `Err(WalCorrupted)`
+   (`:589-591`), so the store opens;
+2. it stops at the **last good frame, not before it** — every frame in the
+   maximal present-prefix of the on-disk log is replayed. Without clause 2 a
+   "tolerant" scan that threw the whole log away would satisfy the property,
+   which is not hypothetical: it is what the strict path actually does.
+
+Its vacuity guard is `modes/ConsistentPreallocTornTailCanary.cfg`
+(`NoTornTailTruncation` must go **red**), which demands specifically that
+recovery truncated at a **torn** frame. An *absent* frame is a clean
+end-of-log in both scan modes (`src/wal.rs:576-581`, unconditional `break`), so
+reaching only that case would prove nothing about tolerance. Task 2 measured
+the same fact with a scratch assertion and wrote it down in prose; prose is not
+a gate, and this is the same measurement as a committed config.
+
+**The property is scoped to `Prealloc`, and that scope is a finding rather than
+a convenience.** Asked what the model says about the strict sinks, it says the
+unscoped property is **false** for them — and the model is right. task37 §7
+notes that the tolerant path "cannot distinguish a torn tail from tail
+corruption"; the strict path has the same blindness pointing the other way and
+treats both as fatal, so a legal torn tail after an ordinary crash *does* abort
+recovery under `FsWrite`/`Coalesced`. That is not new and it is not papered
+over: it is exactly `StrictScanErrLosesDurableAck`, already committed as an
+**owed property**, already red on the *default* Standalone configuration
+(`StrictScanErr.cfg`). Asserting `TailTolerance` unscoped would re-report that
+known gap under a name claiming a promise no append-mode sink ever made, and
+would make the property falsifiable by the sink choice instead of by M4.
+
+The `M4Abort.cfg` / `ConsistentPreallocScanErrCheck.cfg` pair is where the two
+meet: the *same* invariant, the *same* bound, one constant apart. Under
+`MUTATION = "NONE"` the prealloc store is **clean** — the tolerant scan means
+`recover()` never returns `Err`, so the default config's availability gap does
+not exist on this sink. Under M4 it is **violated** at depth 10, with `cid 1`
+durable, CRC-clean and `Consistent`-acked, and unreachable because a *later*
+frame tore. Tail tolerance is what buys the immunity; remove it and the
+immunity goes too.

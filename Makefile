@@ -140,16 +140,27 @@ formal/tla-model:
 # modes/ConsistentPrealloc3.cfg is MaxCommits = 3 and is the only config that
 # reaches an extend from a non-empty log (the production shape). ~1.4 s.
 #
-# mutations/ is the CALIBRATION battery (Task 4): each config re-runs a
-# committed baseline with the MUTATION constant flipped, re-creating one of
-# the three lost-update interleavings that actually shipped
+# mutations/ is the CALIBRATION battery (Tasks 4-5): each config re-runs a
+# committed baseline with the MUTATION constant flipped. M1–M3 re-create the
+# three lost-update interleavings that actually shipped
 # (docs/tasks/task15_three_phase_consistent_persistence.md, "Promotion
-# ordering"). They must go RED. A model that verifies clean but cannot
-# re-find the bugs it was built for produces confident greens that mean
-# nothing, so these are gated exactly like the canaries — exit 12, not
-# "nonzero". Mutations are constant-gated inside WalCrash.tla and never
-# forked .tla copies: a forked copy drifts from the baseline and silently
-# stops testing the real model.
+# ordering"); M4–M5 re-create the two preallocation subtleties task37 is
+# built around — M4 scans a preallocated WAL strictly, so a legal torn tail
+# aborts recovery (task37 §7), and M5 writes a batch into a freshly extended
+# region whose size was never sync_all'd (task37 §4 invariant 2). They must
+# go RED. A model that verifies clean but cannot re-find the bugs it was
+# built for produces confident greens that mean nothing, so these are gated
+# exactly like the canaries — exit 12, not "nonzero". Mutations are
+# constant-gated inside WalCrash.tla and never forked .tla copies: a forked
+# copy drifts from the baseline and silently stops testing the real model.
+#
+# Several mutation configs report the SHALLOWEST counterexample, which is not
+# always the documented symptom. M2Fork / M3Dup / M4Abort / M5Strand each pin
+# one symptom in isolation, and each has a same-bound MUTATION = "NONE"
+# control: mutations/CalibrationControl3.cfg for the first two,
+# modes/ConsistentPreallocScanErrCheck.cfg for M4Abort,
+# modes/ConsistentPrealloc3.cfg for M5Strand. Re-bounding or deleting one of
+# those silently removes the evidence while the gate stays green.
 #
 # STATE COUNTS ARE NOT TRIPWIRES FOR THE RED CONFIGS. TLC halts at the first
 # counterexample, so with -workers 2 the reported counts vary run to run --
@@ -163,7 +174,9 @@ TLA_MODES = \
   modes/ConsistentCoalesced.cfg:0 \
   modes/ConsistentPreallocCanary.cfg:12 \
   modes/ConsistentPreallocExtendCanary.cfg:12 \
+  modes/ConsistentPreallocTornTailCanary.cfg:12 \
   modes/ConsistentPrealloc.cfg:0 \
+  modes/ConsistentPreallocScanErrCheck.cfg:0 \
   modes/ConsistentPrealloc3Canary.cfg:12 \
   modes/ConsistentPrealloc3LiveLogCanary.cfg:12 \
   modes/ConsistentPrealloc3ChunkCanary.cfg:12 \
@@ -182,6 +195,10 @@ TLA_MODES = \
   mutations/M2Fork.cfg:12 \
   mutations/M3.cfg:12 \
   mutations/M3Dup.cfg:12 \
+  mutations/M4.cfg:12 \
+  mutations/M4Abort.cfg:12 \
+  mutations/M5.cfg:12 \
+  mutations/M5Strand.cfg:12 \
   mutations/CalibrationControl3.cfg:0
 
 formal/tla-modes:
