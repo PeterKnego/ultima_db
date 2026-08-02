@@ -1,7 +1,7 @@
 # TLA+ WAL crash-safety scout
 
-**Status: S0 gate + S1 Tasks 1–5** (steady-state commit pipeline, crash and
-recovery, the three production WAL sinks, and the full M1–M5 calibration
+**Status: S0 gate + S1 Tasks 1–5b** (steady-state commit pipeline, crash and
+recovery, the three production WAL sinks, and the full M1–M6 calibration
 battery). `S0Smoke`/`S0Canary` are the
 toolchain gate: proof that TLC runs here, checks invariants, and — the part that
 matters — *reports a violation when there is one*. `WalCrash.tla` is the model
@@ -63,7 +63,7 @@ advancing durability — the phantom-durability bug in one line.
 
 The canary is the point. A model checker that only ever reports success is
 indistinguishable from one that is broken, and the brief's calibration
-discipline (M1–M5, §5) is this same idea at full scale: every green verdict is
+discipline (M1–M6, §5) is this same idea at full scale: every green verdict is
 only meaningful once the model has been shown to go red for a bug that really
 existed. Keep the canary passing-as-failing; if it ever reports success, the
 gate is lying.
@@ -109,10 +109,10 @@ table*), contains every `Consistent`/`ConsistentInline`-acked commit, replays no
 torn frame, and has strictly monotone versions. A strict-mode scan error is
 excluded — see "Not yet done", where it has its own named invariant.
 
-Its four clauses are **not equally well calibrated**, and the difference matters
-if you are about to read an S2 green off this model: (a), (b) and (d) each have
-a mutation that breaks them, and the "replays no torn frame" clause (c) has
-none. See "Not yet done".
+All four of its clauses are calibrated: (a)/(d) by M1–M3, (b) by M5Strand, and
+the "replays no torn frame" clause (c) by **M6** (Task 5b), which was added
+precisely because that clause had no mutation until then. See "Calibration: the
+mutations".
 
 Two things to know before building on this. The post-`Recover` value of
 `promoted` is the **replay sequence, not the Rust's snapshot chain**: recovery
@@ -311,35 +311,26 @@ later frame tearing) gets a witness at all. Resolving the gap and deleting the
 property therefore costs M4 that witness, and `M4.cfg`'s abort would be the
 only evidence left. Re-home the harm before you delete.
 
-**`RecoverySound` clause (c) — "replays no torn frame" — is checked but
-uncalibrated.** Clauses (a), (b) and (d) all have a mutation in the battery
-that breaks them (M1/M2 the ordering, M5 the acked-containment, M3 the version
-monotonicity). Clause (c) has **none**: M4 is task37 §7's *other* direction — a
-strict scan that refuses the whole log, not a tolerant one that replays past
-the tear — and nothing else in M1–M5 replays a torn frame either. So that
-clause's green rests on no evidence that the model would go red if it were
-false, which is exactly the thing the calibration battery exists to rule out.
-
-It is a **gap, not a dead clause**, and the follow-up is priced. A clause-(c)
-mutation — tolerant `ScanLen` accepting non-`absent` frames, i.e. a scan that
-takes the torn record as good and keeps going — comes back **red on
-`RecoverySound` at depth 9**: 461 generated / 188 distinct on
-`modes/ConsistentPrealloc.cfg`, 905 / 368 on `WalCrashPrealloc.cfg`, ~1 s
-either way. Measured twice, in the Task 5 review and again when this paragraph
-was written (in place, from a backup, restored byte-for-byte and the gate
-re-run — no forked `.tla`). One `MUTATION` arm and one config would close it.
-It is outside this plan's five, and until someone spends that minute, treat
-clause (c) the way you would treat any invariant no mutation has ever
-falsified.
+**`RecoverySound` clause (c) — "replays no torn frame" — was checked but
+uncalibrated. CLOSED in Task 5b by `mutations/M6.cfg`.** Clauses (a), (b) and
+(d) each already had a mutation that breaks them (M1/M2 the ordering, M5 the
+acked-containment, M3 the version monotonicity); clause (c) had **none**,
+because M4 is task37 §7's *other* direction — a strict scan that refuses the
+whole log, not a tolerant one that replays past the tear — and nothing in
+M1–M5 replayed a torn frame either. M6 deletes `ScanLen`'s stop at a
+CRC-bad frame (`src/wal.rs:585-592`) and the clause goes red at depth 9,
+exactly as this paragraph priced it before the mutation existed. See the
+calibration table below.
 
 **No mutation touches table identity.** `RecoverySound` clause (a) matches on
-cid, version *and* table, but every erasure M1–M5 produces is visible through
+cid, version *and* table, but every erasure M1–M6 produces is visible through
 version and fork-source alone (Task 4 §3 has the full ruling and the evidence
 that the fork-source proxy is as strong as the table statement *for these
 mutations*). The residual is unchanged and unclosed: a mutation that installed
 the **wrong table set** at a *correct* version with a *correct* fork chain
-would be invisible to this model. None of M1–M5 does that. If S3/S5 ever adds
-one, `M2`'s per-table last-writer map becomes necessary after all.
+would be invisible to this model. None of M1–M6 does that — M6 replays a frame
+whose *table is right* and whose only fault is that it is torn. If S3/S5 ever
+adds one, `M2`'s per-table last-writer map becomes necessary after all.
 
 Fsync *failure* — task15's "a commit whose fsync fails advances the gate
 without promoting". Crash did **not** give it a home: a crash removes a parked
@@ -370,17 +361,18 @@ is currently a *checked* `PreallocInvariant` clause rather than an assumption. A
 useful tripwire for whoever adds one.
 
 Also pending: the remaining S3 properties. S5 (`TailTolerance`) and the M4–M5
-battery landed in Task 5, below.
+battery landed in Task 5, below; M6 in Task 5b.
 
-## Calibration: the mutations (Tasks 4–5)
+## Calibration: the mutations (Tasks 4–5b)
 
 A model that verifies clean but cannot re-find bugs that actually shipped
 produces confident greens that mean nothing. `mutations/` re-runs a committed
 baseline with the `MUTATION` constant flipped, re-creating each of the three
 lost-update interleavings task15 documents as *reproducible failure modes*
-(`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`) plus the two
-preallocation subtleties task37 is built around (§4 invariant 2, §7). They are
-gated in `TLA_MODES` at exit **12** exactly like the canaries.
+(`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`), the two
+preallocation subtleties task37 is built around (§4 invariant 2, §7), and the
+scan's stop-at-first-bad-frame (`src/wal.rs:585-592`). They are gated in
+`TLA_MODES` at exit **12** exactly like the canaries.
 
 | Config | Baseline it mutates | Expected | Actual |
 |---|---|---|---|
@@ -393,9 +385,11 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
 | `mutations/M4Abort.cfg` | `modes/ConsistentPrealloc.cfg` | **violated** | `StrictScanErrLosesDurableAck`, depth 10 |
 | `mutations/M5.cfg` | `WalCrashPrealloc.cfg` | **violated** | `PreallocInvariant`, depth 5 |
 | `mutations/M5Strand.cfg` | `modes/ConsistentPrealloc3.cfg` | **violated** | `NoAckLossAfterLiveExtend`, depth 16 |
+| `mutations/M6.cfg` | `modes/ConsistentPrealloc.cfg` | **violated** | `RecoverySound` clause (c), depth 9 |
 | `mutations/CalibrationControl3.cfg` | control for M2Fork/M3Dup | no error | clean, 27843 states |
 | `modes/ConsistentPreallocScanErrCheck.cfg` | control for M4Abort | no error | clean, 281 states |
 | `modes/ConsistentPrealloc3.cfg` | control for M5Strand | no error | clean, 14934 states † |
+| `modes/ConsistentPrealloc.cfg` | control for M6 | no error | clean, 281 states, depth 11 |
 
 - **M1** — `WriterSlotFree` drops its `parked = <<>>` conjunct: the pre-fix
   code decremented `active_writer_count` in phase 1, so `begin_write` admitted
@@ -416,6 +410,17 @@ gated in `TLA_MODES` at exit **12** exactly like the canaries.
   freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s
   `sync_all` (`src/wal.rs:549`) never ran before the positioned write at
   `:1046`. task37 §4 invariant 2 — "new size must be durable before use".
+- **M6** — `ScanLen` loses the stop at a CRC-bad frame, keeping only the
+  end-of-log stop (zero len-prefix / short tail, `src/wal.rs:576-581`). Real
+  `scan_wal` walks offsets in order and halts at the first frame it cannot
+  accept — `break` under `tail_tolerant` (`:586-588`), `return Err` without it
+  (`:589-591`) — so a torn frame is never replayed. M6 takes it as good and
+  keeps going: corruption passes CRC, half a commit record lands in the store,
+  and recovery reports success. That is `RecoverySound` clause (c), and M6 is
+  the only mutation that touches it. Carried on a **tolerant** sink on purpose:
+  under `CoalescedPrealloc` the abort arm was never taken anyway, so the only
+  observable change is the replayed tear rather than a suppressed
+  `ScanFails`.
 
 **Which config carries which mechanism.** `M1.cfg` … `M5.cfg` prove each
 mutation is *caught*; the "Actual" column above is the shallowest
@@ -428,7 +433,18 @@ and `M5Strand.cfg` the acked commit lost behind an un-synced *live-log* extend.
 Deleting one, or re-bounding it, silently removes that evidence while the gate
 stays green. Each has a same-bound, same-shape `MUTATION = "NONE"` control:
 `CalibrationControl3.cfg`, `modes/ConsistentPreallocScanErrCheck.cfg`,
-`modes/ConsistentPrealloc3.cfg`.
+`modes/ConsistentPrealloc3.cfg`. `M6.cfg` needs no extra config on either
+count: its shallowest counterexample already *is* the documented mechanism (a
+`torn` frame standing in the recovered `promoted` chain), and its control is
+`modes/ConsistentPrealloc.cfg`, the committed mode config it mutates.
+
+**A mutation row's state count is not reproducible; its invariant and depth
+are.** TLC aborts the level it is on when an invariant fails, so how many
+states the *other* worker had already generated is a race: `M6.cfg` reports
+455–474 generated / 188–198 distinct across repeat runs under the gate's
+`-workers 2`, and a deterministic 461/188 under `-workers 1`. Compare
+mutation rows on the invariant name and the depth, which were stable across
+every repeat. The clean controls explore exhaustively and *are* exact.
 
 † `NoAckLossAfterLiveExtend` is **implied by `RecoverySound`**, which that
 config already checks, so listing it there adds no detection power and none is

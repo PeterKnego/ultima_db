@@ -199,6 +199,7 @@ TLA_MODES = \
   mutations/M4Abort.cfg:12 \
   mutations/M5.cfg:12 \
   mutations/M5Strand.cfg:12 \
+  mutations/M6.cfg:12 \
   mutations/CalibrationControl3.cfg:0
 
 formal/tla-modes:

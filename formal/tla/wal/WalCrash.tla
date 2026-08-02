@@ -143,11 +143,11 @@
 (*     action also drags in WAL pruning (src/wal.rs:628 prune_wal), which   *)
 (*     is where checkpoint/prune/crash interleavings would actually bite.   *)
 (*     Out of scope for Task 2's brief; see the report.                     *)
-(*   (MUTATION is no longer on this list: M1-M5 all exist and are gated in  *)
+(*   (MUTATION is no longer on this list: M1-M6 all exist and are gated in  *)
 (*     mutations/. M1 = WriterSlotFree, M2 = GateApplies, M3 = the pre-fix  *)
 (*     bump in Submit, M4 = ScanIsTolerant, M5 = SyncData's metaDurable       *)
-(*     guard. Each is ONE conjunct, in the operator that carries the        *)
-(*     protection it removes.)                                              *)
+(*     guard, M6 = ScanLen's stop-at-first-bad-frame. Each is ONE conjunct, *)
+(*     in the operator that carries the protection it removes.)             *)
 (*   write_head RECONSTRUCTION on open (task37 §4 invariant 3,              *)
 (*     src/wal.rs:1023-1024: PreallocFileSink::open runs a TOLERANT         *)
 (*     scan_wal and takes `capacity` from metadata().len(); there is no     *)
@@ -174,14 +174,14 @@ CONSTANTS
     SinkKind,       \* "FsWrite" | "Coalesced" | "CoalescedPrealloc"
     WriterMode,     \* "SingleWriter" | "MultiWriter"
     ChunkSize,      \* prealloc grow quantum, in FRAME SLOTS (WAL_PREALLOC_CHUNK)
-    MUTATION        \* "NONE" | "M1".."M5" -- calibration mutation selector
+    MUTATION        \* "NONE" | "M1".."M6" -- calibration mutation selector
 
 ASSUME MaxCommits \in Nat
 ASSUME Durability \in {"Consistent", "ConsistentInline", "Eventual"}
 ASSUME SinkKind   \in {"FsWrite", "Coalesced", "CoalescedPrealloc"}
 ASSUME WriterMode \in {"SingleWriter", "MultiWriter"}
 ASSUME ChunkSize  \in Nat /\ ChunkSize >= 1
-ASSUME MUTATION   \in {"NONE", "M1", "M2", "M3", "M4", "M5"}
+ASSUME MUTATION   \in {"NONE", "M1", "M2", "M3", "M4", "M5", "M6"}
 
 (* ConsistentInline is SingleWriter-ONLY: Store::new returns an error for   *)
 (* the MultiWriter combination (task38, and CLAUDE.md §Persistence). This   *)
@@ -651,9 +651,32 @@ ScanIsTolerant(sk) == sk = "CoalescedPrealloc" /\ MUTATION # "M4"
 (* scan_wal walks frames at increasing offsets and STOPS at the first frame *)
 (* it cannot accept (src/wal.rs:574-607). ScanLen is the length of the      *)
 (* longest accepted prefix.                                                 *)
-ScanLen(log) == CHOOSE n \in 0..Len(log) :
-    /\ \A i \in 1..n : log[i].st = "present"
-    /\ (n < Len(log)) => log[n+1].st # "present"
+(*                                                                         *)
+(* M6 -- the CALIBRATION for RecoverySound clause (c). The real scan's stop *)
+(* at a CRC-bad frame is src/wal.rs:585-592: `break` when tail_tolerant,    *)
+(* `return Err(WalCorrupted)` when not -- either way the frame and          *)
+(* everything past it is NOT replayed, which is the whole of clause (c)'s   *)
+(* content. M6 removes that stop and keeps ONLY the end-of-log stop (a zero *)
+(* len-prefix or a short tail, src/wal.rs:576-581), so a torn frame is      *)
+(* accepted into the prefix and replayed as though its CRC had matched --   *)
+(* the corruption-passes-CRC failure the `break`/`return Err` exists to     *)
+(* prevent. Note what this also does by construction: with no torn frame    *)
+(* ever ending the scan, ScanFails below can no longer fire, so the strict  *)
+(* abort disappears too. That is correct for the mutation -- it is the ONE  *)
+(* stop being deleted, in both of its arms -- and it is why M6 is carried   *)
+(* on a TOLERANT (prealloc) config, where that arm was never taken anyway   *)
+(* and the only observable change is the replayed tear.                     *)
+(*                                                                         *)
+(* At every other MUTATION value the ELSE branch is the original expression *)
+(* verbatim, so this is an identity there.                                  *)
+ScanLen(log) ==
+    IF MUTATION = "M6"
+      THEN CHOOSE n \in 0..Len(log) :
+               /\ \A i \in 1..n : log[i].st # "absent"
+               /\ (n < Len(log)) => log[n+1].st = "absent"
+      ELSE CHOOSE n \in 0..Len(log) :
+               /\ \A i \in 1..n : log[i].st = "present"
+               /\ (n < Len(log)) => log[n+1].st # "present"
 
 (* WHICH stop it is decides whether recovery is silent or loud.             *)
 (* An absent record -- zero len-prefix or short tail -- is a clean          *)
@@ -961,9 +984,13 @@ DurableAck == Durability \in {"Consistent", "ConsistentInline"}
 (*      "partial" is "torn", and replaying a torn frame is replaying half a *)
 (*      commit record. (Task 3's header claimed M4 attacks this clause. It  *)
 (*      does not: M4 is task37 §7's OTHER direction -- a strict scan that   *)
-(*      refuses the whole log rather than one that replays past the tear.   *)
-(*      Nothing in M1-M5 replays a torn frame, so clause (c) is checked but *)
-(*      not exercised by the calibration battery; see the Task 5 report.)   *)
+(*      refuses the whole log rather than one that replays past the tear,   *)
+(*      and nothing in M1-M5 replayed a torn frame either, which left this  *)
+(*      clause checked but UNCALIBRATED through Task 5. M6 closes it:       *)
+(*      mutations/M6.cfg deletes ScanLen's stop at a CRC-bad frame and this *)
+(*      clause -- and only this clause -- goes red at depth 9, with the     *)
+(*      torn frame standing in the recovered `promoted` chain. See the      *)
+(*      Task 5b report.)                                                    *)
 (*  (d) recovered versions are strictly monotone.                           *)
 (*                                                                         *)
 (* Scoped to a SUCCESSFUL recovery: when recover() returns Err there is no  *)
@@ -1089,9 +1116,11 @@ NoAckLossAfterLiveExtend ==
 (* sets recoverErr, which clause (1) already catches, so it is not an       *)
 (* example only clause (2) sees.                                           *)
 (*                                                                         *)
-(* It is kept as a GUARD AGAINST A MUTATION NOBODY HAS WRITTEN YET: any     *)
-(* change that makes recovery return successfully while replaying LESS than *)
-(* the accepted prefix -- a truncating replay, a floor bug, a Checkpoint    *)
+(* It is kept as a GUARD AGAINST A MUTATION NOBODY HAS WRITTEN YET (M6 is   *)
+(* NOT it -- M6 replays MORE than the accepted prefix, which is             *)
+(* RecoverySound clause (c), the opposite direction): any change that makes *)
+(* recovery return successfully while replaying LESS than the accepted      *)
+(* prefix -- a truncating replay, a floor bug, a Checkpoint                 *)
 (* action that mis-filters -- lands here and nowhere else. Read it as a     *)
 (* claim staked for the future, not as a check currently doing work. If a   *)
 (* later task adds such a mutation, this is the clause that should go red   *)
