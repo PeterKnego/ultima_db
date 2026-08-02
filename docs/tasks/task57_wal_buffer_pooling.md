@@ -65,10 +65,28 @@ the only allocation that crosses threads at all is the mpsc channel node.
 - Full suites green in `persistence`, `persistence+bench-internals`, and
   `persistence+bench-internals+wal-iouring` configs (780 tests).
 
-## Validation
+## Validation — fleet A/B 2026-08-02 (MEASURED)
 
-Sandbox direction checks are unresolvable for this change (loaded ≤4-core
-host; see the decomposition doc's dead-end note). The decision measurement
-is a fleet A/B: main vs this branch under glibc, expected to recover most of
-the mimalloc delta (~25%+ on eventual A/F); a third arm (branch + mimalloc)
-bounds what allocator swapping still adds on top.
+Three arms on one c6id.2xlarge (`bench-infra/bench-out/dist/
+20260802T195738Z-pool-ab/`; branch `f5132a5`, main `782efd9`; interleaved
+criterion reps ×2, eventual tier; medians):
+
+| Arm | YCSB A | YCSB F |
+|---|--:|--:|
+| main, glibc | 4.01 / 3.93 ms | 3.77 / 3.60 ms |
+| **this branch, glibc** | **3.64 / 3.54 ms (−9%)** | **3.26 / 2.90 ms (−16%)** |
+| this branch + mimalloc | 2.93 / 2.94 ms (−26%) | 2.47 / 2.54 ms (−32%) |
+
+The branch decomposition on the same host shows the WAL bucket halved
+(3.4–4.2 µs on main-glibc → **1.9–2.0 µs**), total eventual update
+7.1–7.8 → **5.5–5.6 µs**, with unprecedentedly tight percentiles.
+
+Reading: pooling recovers the *cross-thread* share under the shipped
+allocator (−9%/−16% e2e), but mimalloc still adds ~18% on top — the residual
+is generic allocator throughput on the remaining same-thread churn (per-op
+`WalOp` chain, record encode, snapshot bookkeeping), not cross-thread frees.
+So: this change ships the structural fix; embedders who also swap in
+mimalloc get the full −26%/−32% vs pre-task57 main. For context, Fjall's
+same-day eventual cells were A 2.7 / F 3.0 ms (different host instance —
+ratios only): branch+mimalloc F now reads *ahead* of Fjall's F and A reads
+~even; claiming that requires a same-host competitor rerun.
