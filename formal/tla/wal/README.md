@@ -40,10 +40,12 @@ make formal/tla-manifest  # structural half of the above, no TLC, sub-second
 
 `make formal/tla-model` is ~50 s on this box (it was ~22 s before Tasks 5b/5c
 added M6 and M7; the figure had gone stale and was re-measured in Task 6).
-`formal/tla-calibrate` is ~18 s and overlaps `tla-modes` by design — it is the
-target to run when the question is specifically "is the model still
-discriminating?". Both are wall-clock on a noisy shared box: treat them as
-orders of magnitude, not benchmarks.
+`formal/tla-calibrate` is ~18–22 s and overlaps `tla-modes` by design — it is
+the target to run when the question is specifically "is the model still
+discriminating?". The spread is real and is the point: three runs here gave
+17.7 / 18.2 / 18.9 s and an independent run gave 22.1 s. Both figures are
+wall-clock on a noisy shared box — treat them as orders of magnitude, not
+benchmarks, and never as a regression signal.
 
 `formal/tla-manifest` is the mechanical guard on the calibration battery. Four
 things carry a mutation's evidence — the config file, the invariant it
@@ -387,8 +389,12 @@ nothing else (`src/store.rs:1017-1022`). Every other sink gets
 `Err(WalCorrupted)` (`src/wal.rs:589-591`), which `recover` propagates with `?`
 (`src/store.rs:1023`) *before applying any entry* — so frames the scan had
 already accepted, at offsets before the tear, are discarded too. This is
-reachable on the **default** Standalone configuration (`Consistent` +
-`WalWrite::PerEntry`), not an exotic one, and a full-length-but-CRC-bad tail is
+reachable on **2 of the 3 `WalWrite` variants — `PerEntry` (the `#[default]`
+one) and `Coalesced` — under either durable tier**, not an exotic corner.
+(Earlier drafts said "the default Standalone configuration". There is no such
+thing: `Durability` has no `Default` and `Persistence::standalone` takes both
+values explicitly. `RESULTS.md` §3 F1 has the precise statement and the
+cites.) A full-length-but-CRC-bad tail is
 physically ordinary on an appending sink. It is deliberately **not** a
 `RecoverySound` clause: `recover()` returned `Err`, so there is no recovered
 state to predicate over, and folding it in would turn a safety claim into an
@@ -718,8 +724,8 @@ corruption"; the strict path has the same blindness pointing the other way and
 treats both as fatal, so a legal torn tail after an ordinary crash *does* abort
 recovery under `FsWrite`/`Coalesced`. That is not new and it is not papered
 over: it is exactly `StrictScanErrLosesDurableAck`, already committed as an
-**owed property**, already red on the *default* Standalone configuration
-(`StrictScanErr.cfg`). Asserting `TailTolerance` unscoped would re-report that
+**owed property**, already red on a configuration built from the `#[default]`
+`WalWrite` (`StrictScanErr.cfg`; scope stated precisely in `RESULTS.md` §3 F1). Asserting `TailTolerance` unscoped would re-report that
 known gap under a name claiming a promise no append-mode sink ever made, and
 would make the property falsifiable by the sink choice instead of by M4.
 

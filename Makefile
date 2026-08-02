@@ -243,6 +243,16 @@ formal/tla-modes:
 # INVARIANT list: baseline-shaped configs declare five and only one is the
 # reason that row exists.
 #
+# TWO THINGS THIS DOES NOT CATCH -- see RESULTS.md §7, "What the manifest
+# still does not catch", before trusting it further than it goes:
+#   1. It checks the target invariant is DECLARED, not that it is the one TLC
+#      reported. ADDING a second INVARIANT line to a single-invariant config
+#      (M2Fork, M3Dup, M5Strand, M4Abort) keeps this green AND keeps exit 12
+#      while the red moves to the added invariant. If you are here to add an
+#      invariant to one of those four, that is the failure mode.
+#   2. M6/M7 pin RecoverySound, which most baselines also declare; their real
+#      evidence is a CLAUSE of it, which no config-level check can express.
+#
 # Controls are here too, at exit 0. A mutation row proving "violated" means
 # nothing without a same-bound MUTATION = "NONE" run proving the bound itself
 # is not what went red.

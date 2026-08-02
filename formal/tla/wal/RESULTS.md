@@ -7,8 +7,8 @@
 **Model:** `WalCrash.tla` + `modes/`, `mutations/`. How to run: `README.md`.
 
 **This is a scout record, not a proof.** Every verdict below is bounded — at
-`MaxCommits = 2` (three configs use 3), two tables, at most one crash, and no
-operation after recovery. Consolidation into a `docs/tasks/` doc happens only
+`MaxCommits = 2` for 36 of the 44 configs and 3 for the other 8, two tables, at
+most one crash, and no operation after recovery. Consolidation into a `docs/tasks/` doc happens only
 when F-DB-2 completes, including the Lean phase. Nothing here should be cited
 as "the WAL is verified".
 
@@ -49,18 +49,23 @@ that claim (§7 gates them mechanically).
 **Qualified yes, and the qualification is where the decision actually lives.**
 
 *What was bought.* Three findings about the shipping system (§3), one of which
-is reachable on the **default** Standalone config and is now a checked,
-re-verified owed property rather than tribal knowledge. A calibrated model
-that demonstrably re-finds all seven bugs it was aimed at. A precise, written
+is reachable on the `#[default]` `WalWrite` and is now a checked, re-verified
+owed property rather than tribal knowledge. A calibrated model that
+demonstrably re-finds all **seven injected faults** it was aimed at — of which
+three (M1–M3) re-create bugs that actually shipped, two (M4–M5) re-create
+documented task37 subtleties, one (M6) removes a protection the scan really
+carries, and one (M7) is clause-targeted rather than code-derived (§6). A
+precise, written
 statement of the five things the durability story assumes about the world
 (README, "Abstraction obligations") — which did not exist in any form before.
 And a gate that cannot quietly pass: exact exit codes, paired vacuity canaries,
 and now a manifest that fails the build if the calibration evidence is deleted
 or silently re-bounded.
 
-*What it cost.* Six tasks, of which **three were spent on calibration alone**
-(Tasks 4, 5, 5b, 5c) — and two of those existed only because a clause turned
-out to be checked-by-everything and falsified-by-nothing after it had already
+*What it cost.* Eight tasks (1, 2, 3, 4, 5, 5b, 5c, 6), of which **four —
+exactly half — were spent on calibration alone** (Tasks 4, 5, 5b, 5c), and two
+of those four (5b, 5c) were inserted mid-phase only because a clause turned out
+to be checked-by-everything and falsified-by-nothing *after* it had already
 been declared covered. That ratio is the honest headline: **adjudication and
 calibration, not model-checking, is where the time goes.** TLC itself runs the
 whole battery in under a minute.
@@ -96,8 +101,13 @@ the product; the act of writing the model precisely enough to check was.*
 Read this section before quoting any green above it.
 
 **The bounds are small, and a green at a small bound is not a proof.**
-`MaxCommits = 2` for every config except three (`ConsistentPrealloc3`,
-`CalibrationControl3`, and the `M2Fork`/`M3Dup`/`M5Strand` trio) which use 3.
+Of the 44 configs that bind `MaxCommits` (`S0Smoke.cfg`/`S0Canary.cfg` are a
+separate spec and bind none), **36 are at 2 and 8 are at 3**. The eight, in
+full: `modes/ConsistentPrealloc3.cfg`, its three canaries
+(`ConsistentPrealloc3Canary`, `ConsistentPrealloc3LiveLogCanary`,
+`ConsistentPrealloc3ChunkCanary`), `mutations/CalibrationControl3.cfg`, and the
+`M2Fork`/`M3Dup`/`M5Strand` trio. **Every other bound in this memo — including
+all three committed baselines and every mutation's primary config — is 2.**
 Two tables. At most **one** crash per behaviour. **No operation after
 recovery** — every steady-state action requires `~crashed` and `Recover`
 requires `~recovered`. So a whole class of questions is simply outside the
@@ -156,8 +166,20 @@ valuable output of the phase.
 
 ### F1 — A torn tail costs a strict-scan store its whole log, including durable acked commits
 
-**Reachable on the default Standalone configuration** (`Consistent` +
-`WalWrite::PerEntry`), not an exotic one.
+**Reachable on 2 of the 3 `WalWrite` variants — including the `#[default]`
+one — under both durable tiers.** Not an exotic corner.
+
+Precisely, because "the default Standalone configuration" is not a thing the
+API has: `WalWrite::PerEntry` is genuinely `#[default]`
+(`src/persistence.rs:70-75`), but `Durability` derives no `Default` and has no
+`impl Default` (`src/persistence.rs:44-46`), and `Persistence::standalone`
+takes **both** explicitly (`src/persistence.rs:147-151`). So there is no
+single configuration to call "the default". The true scope is wider than that
+phrasing anyway: `tail_tolerant` is passed for `CoalescedPrealloc` and nothing
+else, so F1 applies to `PerEntry` **and** `Coalesced` — 2 of the 3 `WalWrite`
+variants — and the "durable acked" harm lands under either durable tier,
+`Consistent` or `ConsistentInline`. The `#[default]` `WalWrite` is one of the
+two affected.
 
 `scan_wal` treats a CRC mismatch as end-of-log only when `tail_tolerant`,
 which `Store::recover` passes for `CoalescedPrealloc` and nothing else
@@ -470,7 +492,12 @@ target people already run.
 
 Re-bounding is the failure this exists for. `M2Fork`/`M3Dup`/`M5Strand` at
 `MaxCommits = 2` would stay **green** while checking a state space too small
-to reach the symptom. A green is not a signal there; only the bound is.
+to reach the symptom. A green is not a signal there; only the bound is. This
+was confirmed rather than argued: re-bounded to `MaxCommits = 2`, `M3Dup.cfg`
+exits **0** — 999 states, 739 distinct, depth 11, clean — so the config that
+carries M3's only symptom evidence would sit in the battery reporting success
+over a state space that cannot reach the duplicate. Nothing but the bound
+check catches that. (Measured independently during Task 6 review.)
 
 **All five checks were verified by breaking them, one at a time** — a gate
 whose failure path has never fired is not a gate:
@@ -482,6 +509,31 @@ whose failure path has never fired is not a gate:
 | `M2Fork.cfg` target invariant swapped | rc=2, "no longer declares INVARIANT ForkFromPromotePredecessor" |
 | `M5Strand.cfg` `MUTATION` flipped `"M5"` → `"M4"` | rc=2, "is no longer MUTATION = \"M5\"" |
 | `mutations/M3Dup.cfg` row dropped from `TLA_MODES` | rc=2, "is not in TLA_MODES at exit 12" |
+
+#### What the manifest still does not catch
+
+Two residual holes, named here so the guard is not read as stronger than it is.
+Both are limits of *config-level* checking, not oversights in the rows.
+
+- **Nothing asserts which invariant TLC actually reported.** The manifest
+  checks that the evidence-carrying `INVARIANT` is still *declared*
+  (`Makefile:274-277`); `formal/tla-modes` checks only the exit code. So
+  **adding** a second `INVARIANT` line to one of the single-invariant
+  calibration configs (`M2Fork`, `M3Dup`, `M5Strand`, `M4Abort`) passes both:
+  the target is still declared, and the run is still exit 12 — but the red may
+  now be coming from the *added* invariant, and "this is where M2's symptom
+  reproduces" quietly stops being guarded. Closing it needs the reported
+  invariant name parsed out of TLC's output, which is a different and more
+  brittle kind of check than anything here does today. §6's warning that TLC's
+  choice among same-depth violations is decided by `.cfg` declaration order is
+  the same fact from the other side.
+- **`M6.cfg` and `M7.cfg` pin a weaker property than the other rows.** Their
+  manifest invariant is `RecoverySound`, which nearly every baseline config
+  also declares; the evidence they actually carry is a specific **clause** of
+  it — (c) and (a) respectively — and no config-level check can express a
+  clause. So for those two rows, "the evidence-carrying `INVARIANT`" is a
+  weaker guarantee than it is for the four symptom-pinning configs, where the
+  named invariant is unique to that config's purpose.
 
 ---
 
@@ -544,3 +596,13 @@ the model or the Rust is wrong. This is the full list, classified.
 7. **Adjudicate F2 and F3** and decide F1's disposition — three findings
    currently recorded, none dispositioned.
 8. **Consider wiring the gate into CI.** It is not there today.
+9. **Close the manifest's two residual holes** (§7, "What the manifest still
+   does not catch"): assert *which* invariant TLC reported, so that **adding**
+   an invariant to a single-invariant calibration config cannot silently move
+   the red off the target; and find a way to pin `M6`/`M7` to the
+   `RecoverySound` **clause** they actually calibrate rather than to the whole
+   conjunction. Both need something the current config-level checks cannot
+   express — the first means parsing TLC's output, the second means the clauses
+   becoming named invariants in their own right in those two configs. Neither
+   is urgent; both are the difference between a guard that constrains the
+   evidence and one that constrains only its container.
