@@ -6,7 +6,13 @@ approved as its own item). Run 2 (2026-08-02, skill v1.2.0): approved
 register repairs — architecture/comparison pages rewritten to explanation
 register, embedded tutorial removed from prevent-write-skew, StoreConfig
 field table deferred to rustdoc, unpinned SSI cost numbers removed,
-docs/tasks/ links dropped from landing pages.
+docs/tasks/ links dropped from landing pages. Run 3 (2026-08-02, skill
+v1.3.0): C4 System Context + Container diagrams added to
+explanation/architecture.md (both levels user-approved — Container
+diagrams the deployment using the library, a deliberate exception to
+the thin-repo default; every element evidence-backed, verified
+rendered with Mermaid 11); reference/performance.md provenance
+refreshed to the 2026-08-02 archive.
 
 ## Output format and location
 
@@ -74,13 +80,16 @@ outside the user-facing set.
 - `reference/key-encoding-and-formats.md` — PrimaryKey encodings, type ids,
   64 KiB cap, v2 formats — src/primary_key.rs, task56 §formats.
 - `reference/performance.md` — provenance-pinned YCSB tables —
-  docs/benchmarks/competitor-nvme-2026-07-13.md.
+  docs/benchmarks/competitor-nvme-2026-08-02.md.
 
 ### Explanation
 - `explanation/architecture.md` — the CoW/MVCC design and its decision
   record — git-mv of docs/ARCHITECTURE.md, stale facts fixed 2026-08-02
   (T=32/FixedVec/digest write-sets/keyed tables), KEY_TYPE_ID + write-side
-  cap rationale added from task56.
+  cap rationale added from task56. Carries the C4 System Context and
+  Container diagrams (Mermaid, run 3) alongside the accepted ASCII
+  Overview — the C4 pair shows the system from outside, the ASCII art
+  the internal structs; future runs keep both.
 - `explanation/isolation.md` — SI vs SSI, write skew — former
   docs/isolation-levels.md theory half, task21.
 - `explanation/how-ultimadb-is-verified.md` — Elle, Lean/Aeneas proofs,

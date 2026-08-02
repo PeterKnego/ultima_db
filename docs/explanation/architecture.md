@@ -6,6 +6,72 @@ This page explains how UltimaDB works internally, why the design is the way it i
 
 ---
 
+## The system in context
+
+Why does UltimaDB look the way it does from the outside? Because it is a
+library, not a server. There is no daemon to operate and no network hop to
+pay: the "deployment" is your own process, and the API boundary is a
+function call. That single decision shapes everything in the context
+diagram below — the only actor is the developer embedding the crate, and
+every external system is something *your process* talks to, not something
+UltimaDB runs.
+
+```mermaid
+C4Context
+  title System Context — UltimaDB
+  Person(dev, "Rust application developer", "Builds and operates the application that embeds UltimaDB")
+  System(ultima, "UltimaDB", "Embedded transactional key-value store — an in-process Rust library")
+  System(vector, "ultima-vector", "Companion crate: HNSW vector search over UltimaDB tables")
+  System_Ext(fs, "Filesystem", "WAL and checkpoint files (persistence feature)")
+  System_Ext(collector, "Metrics collector", "Whatever sink the application wires to the metrics facade")
+  System_Ext(replica, "Replica process", "State-machine-replication consumer of snapshot streams")
+  Rel(dev, ultima, "Embeds and calls", "Rust API")
+  Rel(dev, vector, "Adds for similarity search", "Rust API")
+  Rel(vector, ultima, "Stores vectors and metadata in")
+  Rel(ultima, fs, "Appends WAL entries, writes checkpoints", "opt-in durability")
+  Rel(ultima, collector, "Emits counters and histograms", "metrics feature")
+  Rel(ultima, replica, "Streams snapshots to", "snapshot_stream")
+```
+
+Zooming in on a durable deployment, the interesting boundary is not
+between machines but between memory and disk. Commits are cheap because
+the durable artifact is split in two: an append-only write-ahead log that
+absorbs every commit sequentially, and periodic checkpoint files that
+bound how much of that log recovery must replay. Replication reuses the
+same machinery — a replica rebuilds state from streamed snapshots rather
+than copying files, which is why it appears as a separate process rather
+than a shared volume.
+
+```mermaid
+C4Container
+  title Container — a durable UltimaDB deployment
+  Person(dev, "Rust application developer", "Operates the deployment")
+  Container_Boundary(app, "Host application process") {
+    Container(code, "Application code", "Rust", "Business logic: opens the Store, runs transactions")
+    Container(db, "UltimaDB", "Rust library", "MVCC snapshots, CoW B-trees, WAL and checkpoint writers")
+    Container(vec, "ultima-vector", "Rust library", "Optional HNSW vector index over UltimaDB tables")
+  }
+  ContainerDb(wal, "Write-ahead log", "Append-only file, entry format v2", "Every committed write; replayed on recovery")
+  ContainerDb(ckpt, "Checkpoints", "Snapshot files, registry format v2", "Full-state anchors that bound WAL replay")
+  Container(replica, "Replica process", "Rust", "Rebuilds state from streamed snapshots (SMR)")
+  Rel(dev, code, "Operates")
+  Rel(code, db, "Calls", "Store / Table / transactions")
+  Rel(code, vec, "Queries", "similarity search")
+  Rel(vec, db, "Reads and writes", "tables and indexes")
+  Rel(db, wal, "Appends on commit", "fsync per commit, or async")
+  Rel(db, ckpt, "Writes periodically", "checkpoint policy")
+  Rel(db, replica, "Streams snapshots to", "snapshot_stream")
+```
+
+The trade-offs behind these shapes — why WAL-plus-checkpoints rather than
+one file, why fsync policy is a per-store choice, why replication streams
+snapshots — are unpacked in the sections below and in
+[how UltimaDB is verified](how-ultimadb-is-verified.md); the on-disk
+formats named in the boxes are specified in
+[key encoding and formats](../reference/key-encoding-and-formats.md).
+
+---
+
 ## Overview
 
 ```
