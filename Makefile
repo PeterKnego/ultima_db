@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model
 
 build:
 	cargo build
@@ -36,6 +36,19 @@ formal/tla-smoke:
 	@cd formal/tla/wal && ! $(TLC) S0Canary.tla > /dev/null 2>&1 \
 	  && echo "S0Canary: invariant violated (expected — TLC discriminates)" \
 	  || { echo "S0Canary FAILED — TLC did not catch a broken invariant; the gate is lying"; exit 1; }
+
+# S1 model: the Standalone commit pipeline (WalCrash.tla). The vacuity canary
+# runs FIRST and must go red — a model where nothing ever promotes verifies
+# every safety property trivially, which is how a checking effort produces
+# confident, meaningless greens.
+formal/tla-model:
+	@mkdir -p $(TLC_METADIR)
+	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1 \
+	  && { echo "vacuity canary FAILED — nothing promotes; every green below is meaningless"; exit 1; } \
+	  || echo "vacuity canary: violated (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrash.cfg WalCrash.tla > /dev/null \
+	  && echo "WalCrash baseline: no error (expected)" \
+	  || { echo "WalCrash baseline FAILED"; exit 1; }
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
