@@ -7,8 +7,8 @@
 **Model:** `WalCrash.tla` + `modes/`, `mutations/`. How to run: `README.md`.
 
 **This is a scout record, not a proof.** Every verdict below is bounded — at
-`MaxCommits = 2` for 36 of the 44 configs and 3 for the other 8, two tables, at
-most one crash, and no operation after recovery. Consolidation into a `docs/tasks/` doc happens only
+`MaxCommits = 2` for 35 of the 43 configs that bind it and 3 for the other 8,
+two tables, at most one crash, and no operation after recovery. Consolidation into a `docs/tasks/` doc happens only
 when F-DB-2 completes, including the Lean phase. Nothing here should be cited
 as "the WAL is verified".
 
@@ -19,7 +19,11 @@ as "the WAL is verified".
 **CLEAN-CALIBRATED, with one honest asterisk on the calibration and two
 open conjuncts.** All seven mutations violate; all seven match their
 documented mechanism; the baseline battery is green across the mode matrix;
-the gate is 34/34 at exact expected exit codes.
+and all 34 gate entries hit their exact expected exit code — which for **24 of
+the 34 means expected to *fail*** (13 canaries and 11 mutations, each asserted
+at exit 12). Only 10 entries are clean verifications: 9 mode baselines and 1
+calibration control. "34/34" is a statement about the gate discriminating, not
+about 34 things being proved. §7 has the breakdown.
 
 **The asterisk.** "7 of 7 match" is true but not uniform, and flattening it
 to "7/7 clean" would misrepresent it:
@@ -101,9 +105,9 @@ the product; the act of writing the model precisely enough to check was.*
 Read this section before quoting any green above it.
 
 **The bounds are small, and a green at a small bound is not a proof.**
-Of the 44 configs that bind `MaxCommits` (`S0Smoke.cfg`/`S0Canary.cfg` are a
-separate spec and bind none), **36 are at 2 and 8 are at 3**. The eight, in
-full: `modes/ConsistentPrealloc3.cfg`, its three canaries
+Of the 45 `.cfg` files, 43 bind `MaxCommits` (`S0Smoke.cfg`/`S0Canary.cfg` are
+a separate spec and bind none), and of those **35 are at 2 and 8 are at 3**.
+The eight, in full: `modes/ConsistentPrealloc3.cfg`, its three canaries
 (`ConsistentPrealloc3Canary`, `ConsistentPrealloc3LiveLogCanary`,
 `ConsistentPrealloc3ChunkCanary`), `mutations/CalibrationControl3.cfg`, and the
 `M2Fork`/`M3Dup`/`M5Strand` trio. **Every other bound in this memo — including
@@ -387,7 +391,7 @@ replayed row's identity. M7 exists because `RecoverySound` clause (a) was
 checked by every config and falsified by none, and a clause with no falsifying
 mutation is a green with nothing behind it.
 
-### Re-gate result: 7 of 7 violate, 7 of 7 match their documented mechanism
+### Re-gate result: 7 of 7 violate; 7 of 7 match — see the provenance split below
 
 | Config | Baseline mutated | Result | Depth | Mechanism in one sentence |
 |---|---|---|---|---|
@@ -461,6 +465,23 @@ make formal/tla-calibrate  # standing guard: mutations still violate, controls s
 **Result: `make formal/tla-model` green — 34/34 `TLA_MODES` entries at their
 exact expected exit codes**, plus the manifest check, the baselines and the
 owed property. `make formal/tla-calibrate` green — 15/15.
+
+**What "34/34" is and is not.** It is not 34 successful verifications. The
+majority of the table is *expected to go red*:
+
+| `TLA_MODES` entries | Count | Expected exit |
+|---|---|---|
+| Vacuity/reachability canaries | 13 | **12** (violated) |
+| Mutations (M1–M7 + `M2Fork`, `M3Dup`, `M4Abort`, `M5Strand`) | 11 | **12** (violated) |
+| Mode baselines | 9 | 0 (clean) |
+| Calibration control (`CalibrationControl3`) | 1 | 0 (clean) |
+| **Total** | **34** | — |
+
+So **24 of 34 entries pass by failing**, and only 10 are clean verifications.
+A green gate here means "the model still discriminates and the baselines still
+hold", not "34 properties were proved". (`StrictScanErr.cfg`, the owed
+property, is a twelfth expected-red run but lives in `formal/tla-model`
+directly rather than in `TLA_MODES`.)
 
 Every entry carries its expected exit code **per config** rather than inferring
 it from the filename, so a rename cannot silently reclassify a config. Measured
@@ -546,7 +567,7 @@ the model or the Rust is wrong. This is the full list, classified.
 
 | # | Finding | Cites | Disposition |
 |---|---|---|---|
-| A1 | Torn tail loses durable acked commits on strict scan, on the **default** config | `src/store.rs:1017-1022`, `:1023`; `src/wal.rs:589-591` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
+| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:1017-1022`, `:1023`; `src/wal.rs:589-591` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
 | A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:536-551`, `:1023-1024`, `:1038-1044` | **F2** — code-reading finding, outside the model's state space, unadjudicated for severity |
 | A3 | Scan tolerance decided independently in two modules | `src/wal.rs:1023` vs `src/store.rs:1017-1022` | **F3** — code-reading finding, unadjudicated |
 

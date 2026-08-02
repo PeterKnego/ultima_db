@@ -222,8 +222,12 @@ promotion, `Len(parked) + Cardinality(begun) <= 1` is an invariant of it: no
 commit is ever parked while another writer proceeds, the FIFO never holds two
 tickets, `Fsync`'s batch-prefix nondeterminism never fires (at most one frame
 is ever buffered), and the version bump is dead code. All four are reachable
-only under `WalCrashMW.cfg`. Both are checked; treat 169, not 49, as the
-tripwire that the model is still exploring.
+only under `WalCrashMW.cfg`. Both are checked; MultiWriter is the config to
+watch for "is the model still exploring?", and its committed count is the
+**651** in the baseline table above (SingleWriter's is 147). An earlier
+revision of this sentence quoted 169 and 49 — Task 1/2 figures that the
+committed baselines superseded, and which contradicted the table two hundred
+lines up.
 
 ### The sink modes and the durability matrix (Task 3)
 
@@ -613,13 +617,21 @@ commit 1's belongs), not to something it once did. All of them are gated in
 **Which config carries which mechanism.** `M1.cfg` … `M5.cfg` prove each
 mutation is *caught*; the "Actual" column above is the shallowest
 counterexample, which for M2, M3 and M5 is a shallower **consequence** (or, for
-M5, the mechanism rather than the harm) of the break. The documented symptoms
-are carried entirely by the four clause-focused configs: `M2Fork.cfg` witnesses
-M2's disjoint-table erasure, `M3Dup.cfg` M3's duplicate `snapshots.insert`,
-`M4Abort.cfg` the durably-acked commit that a strict scan makes unreachable,
-and `M5Strand.cfg` the acked commit lost behind an un-synced *live-log* extend.
-Deleting one, or re-bounding it, silently removes that evidence while the gate
-stays green. Each has a same-bound, same-shape `MUTATION = "NONE"` control:
+M5, the mechanism rather than the harm) of the break. **Three** mutations
+therefore depend on a clause-focused secondary config for their documented
+symptom, and exactly three: `M2Fork.cfg` witnesses M2's disjoint-table erasure,
+`M3Dup.cfg` M3's duplicate `snapshots.insert`, and `M5Strand.cfg` the acked
+commit lost behind an un-synced *live-log* extend.
+
+**`M4Abort.cfg` is a fourth clause-focused config but not a fourth such
+dependency, and the difference matters.** `M4.cfg`'s own shallowest
+counterexample is `TailTolerance` at depth 9 — task37 §7's documented mechanism,
+on its primary config. `M4Abort.cfg` adds M4's *harm* on top of that (the
+durably-acked commit a strict scan makes unreachable); it does not rescue a
+match that would otherwise be missing. So M4 belongs with M1/M6/M7 —
+matching on its primary — not with M2/M3/M5. Deleting or re-bounding any of the
+four still silently removes evidence while the gate stays green, which is why
+all four are in the manifest. Each has a same-bound, same-shape `MUTATION = "NONE"` control:
 `CalibrationControl3.cfg`, `modes/ConsistentPreallocScanErrCheck.cfg`,
 `modes/ConsistentPrealloc3.cfg`. `M6.cfg` and `M7.cfg` need no extra config on
 either count: each one's shallowest counterexample already *is* the documented
@@ -732,7 +744,7 @@ would make the property falsifiable by the sink choice instead of by M4.
 The `M4Abort.cfg` / `ConsistentPreallocScanErrCheck.cfg` pair is where the two
 meet: the *same* invariant, the *same* bound, one constant apart. Under
 `MUTATION = "NONE"` the prealloc store is **clean** — the tolerant scan means
-`recover()` never returns `Err`, so the default config's availability gap does
+`recover()` never returns `Err`, so the strict sinks' availability gap does
 not exist on this sink. Under M4 it is **violated** at depth 10, with `cid 1`
 durable, CRC-clean and `Consistent`-acked, and unreachable because a *later*
 frame tore. Tail tolerance is what buys the immunity; remove it and the
