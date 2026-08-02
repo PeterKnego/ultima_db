@@ -139,6 +139,22 @@ formal/tla-model:
 #
 # modes/ConsistentPrealloc3.cfg is MaxCommits = 3 and is the only config that
 # reaches an extend from a non-empty log (the production shape). ~1.4 s.
+#
+# mutations/ is the CALIBRATION battery (Task 4): each config re-runs a
+# committed baseline with the MUTATION constant flipped, re-creating one of
+# the three lost-update interleavings that actually shipped
+# (docs/tasks/task15_three_phase_consistent_persistence.md, "Promotion
+# ordering"). They must go RED. A model that verifies clean but cannot
+# re-find the bugs it was built for produces confident greens that mean
+# nothing, so these are gated exactly like the canaries — exit 12, not
+# "nonzero". Mutations are constant-gated inside WalCrash.tla and never
+# forked .tla copies: a forked copy drifts from the baseline and silently
+# stops testing the real model.
+#
+# STATE COUNTS ARE NOT TRIPWIRES FOR THE RED CONFIGS. TLC halts at the first
+# counterexample, so with -workers 2 the reported counts vary run to run
+# (M1: 238 at -workers 1, 248-256 at -workers 2). The trace DEPTH is stable
+# and is what the Task 4 report records.
 TLA_MODES = \
   modes/ConsistentFsWriteCanary.cfg:12 \
   modes/ConsistentFsWrite.cfg:0 \
@@ -159,7 +175,13 @@ TLA_MODES = \
   modes/EventualFsWriteCanary.cfg:12 \
   modes/EventualFsWriteLossCanary.cfg:12 \
   modes/EventualFsWrite.cfg:0 \
-  modes/ConsistentAckKeptCheck.cfg:0
+  modes/ConsistentAckKeptCheck.cfg:0 \
+  mutations/M1.cfg:12 \
+  mutations/M2.cfg:12 \
+  mutations/M2Fork.cfg:12 \
+  mutations/M3.cfg:12 \
+  mutations/M3Dup.cfg:12 \
+  mutations/CalibrationControl3.cfg:0
 
 formal/tla-modes:
 	@mkdir -p $(TLC_METADIR)

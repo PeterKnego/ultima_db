@@ -325,17 +325,42 @@ is currently a *checked* `PreallocInvariant` clause rather than an assumption. A
 `Checkpoint` action would break that clause, on purpose — which makes it a
 useful tripwire for whoever adds one.
 
-Also pending: the remaining S3/S5 properties and the M2–M5 battery.
+Also pending: the remaining S3/S5 properties and the M4–M5 battery.
 
-M1 is already gated on `MUTATION` (one spec, never forked `.tla` copies) — it
-was needed to prove the SingleWriter path is no longer over-protected. It has
-no committed config yet; run it with:
+## Calibration: the mutations (Task 4)
 
-```bash
-cd formal/tla/wal && sed 's/MUTATION = "NONE"/MUTATION = "M1"/' WalCrash.cfg > _m1.cfg
-java -XX:+UseSerialGC -Xmx2g -cp ../../../tools/tla/tla2tools-1.7.4.jar tlc2.TLC \
-  -metadir $HOME/tlc-states -workers 2 -config _m1.cfg WalCrash.tla; rm _m1.cfg
-```
+A model that verifies clean but cannot re-find bugs that actually shipped
+produces confident greens that mean nothing. `mutations/` re-runs a committed
+baseline with the `MUTATION` constant flipped, re-creating each of the three
+lost-update interleavings task15 documents as *reproducible failure modes*
+(`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`). They are
+gated in `TLA_MODES` at exit **12** exactly like the canaries.
 
-It violates `PromotionFaithful` (exit 12). M2–M5 and the mutation configs are
-still to come.
+| Config | Baseline it mutates | Expected | Actual |
+|---|---|---|---|
+| `mutations/M1.cfg` | `WalCrash.cfg` (SingleWriter) | **violated** | `PromotionFaithful`, depth 7 |
+| `mutations/M2.cfg` | `WalCrashMW.cfg` (MultiWriter) | **violated** | `PromotionFaithful`, depth 7 |
+| `mutations/M2Fork.cfg` | — (`MaxCommits = 3`) | **violated** | `ForkFromPromotePredecessor`, depth 11 |
+| `mutations/M3.cfg` | `WalCrashMW.cfg` | **violated** | `PromotionFaithful`, depth 7 |
+| `mutations/M3Dup.cfg` | — (`MaxCommits = 3`) | **violated** | `NoDuplicateVersion`, depth 11 |
+| `mutations/CalibrationControl3.cfg` | control for the two above | no error | clean, 27843 states |
+
+- **M1** — `WriterSlotFree` drops its `parked = <<>>` conjunct: the pre-fix
+  code decremented `active_writer_count` in phase 1, so `begin_write` admitted
+  a second writer while the first was parked in the fsync wait.
+- **M2** — `GateApplies` goes false: no `PromoteGate`, so a commit promotes in
+  *completion* order rather than ticket order.
+- **M3** — the version bump reverts to the pre-fix form verbatim (`e60f8ce^`):
+  compare against `latest_version` alone **and** allocate `latest_version + 1`.
+  Both halves are the bug; see the Task 4 report for why mutating only the
+  comparison cannot produce the documented duplicate.
+
+`PromotionFaithful` is a conjunction of four *named* clauses
+(`PromoteOrderIsSubmitOrder`, `LatestStrictlyAdvances`,
+`ForkFromPromotePredecessor`, `NoDuplicateVersion`) so a mutation can be
+checked against one of them in isolation. TLC stops at the shallowest
+counterexample, and the shallowest break is not necessarily the historical
+bug's documented *symptom* — M2's disjoint-table erasure and M3's duplicate
+insert both need `MaxCommits = 3` and a deeper trace than the ordering break
+that masks them at 2. That is what `M2Fork.cfg` and `M3Dup.cfg` pin, and why
+they carry a shared control at the same bound.

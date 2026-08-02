@@ -273,7 +273,16 @@ SubIndex(c) == CHOOSE i \in 1..Len(submitted) : submitted[i].cid = c
 (* two protections the code does not have, and breaking its one real        *)
 (* protection would then change nothing observable -- M1 would be masked.   *)
 (***************************************************************************)
-GateApplies == WriterMode = "MultiWriter"
+(* M2 re-creates the pre-fix code's SECOND failure mode: there was no       *)
+(* PromoteGate at all, so a commit promoted whenever its own fsync wait     *)
+(* finished -- COMPLETION order, not ticket order. Dropping GateApplies is  *)
+(* exactly that: `Promote` may pick any parked k, not just the FIFO head.   *)
+(* Per-table locks are why this was reachable in production and why it is   *)
+(* modelled with no table reasoning at all: locks on DISJOINT tables never  *)
+(* overlap, so writer B's phase 3 ran unimpeded while A sat parked. This    *)
+(* model has no per-table locking, so every MultiWriter interleaving it     *)
+(* explores is already the disjoint-table interleaving.                     *)
+GateApplies == WriterMode = "MultiWriter" /\ MUTATION # "M2"
 BumpApplies == WriterMode = "MultiWriter"
 
 (* SingleWriter holds the writer slot (active_writer_count) from            *)
@@ -334,10 +343,33 @@ Begin(c, t) ==
 Submit(r) ==
     /\ ~crashed
     /\ r \in begun
-    /\ LET bump == BumpApplies /\ r.ver <= Max2(lastSubmitted, latestVersion)
-           v    == IF bump THEN nextVersion ELSE r.ver
+    \* M3 restores the pre-fix bump VERBATIM (e60f8ce^, src/store.rs):
+    \*     if !self.explicit_version && self.version <= inner.latest_version {
+    \*         self.version = inner.latest_version + 1;
+    \*         if self.version >= inner.next_version {
+    \*             inner.next_version = self.version + 1;
+    \*         }
+    \*     }
+    \* Both halves are the bug and both are needed to reproduce task15's
+    \* failure mode 3. The COMPARISON against a lagging `latest_version` is
+    \* what lets two writers bump at all; the ALLOCATION of `latest + 1` is
+    \* what makes them collide, because `latest` did not move between the two
+    \* submissions -- the earlier commit is parked in the fsync wait. Mutating
+    \* only the comparison keeps allocation from `next_version`, which is
+    \* unique by construction, so it breaks promotion ORDER but can never
+    \* produce the documented duplicate `snapshots.insert(v, ..)`; measured,
+    \* see the Task 4 report ("What M3-comparison-only does instead").
+    /\ LET M3   == MUTATION = "M3"
+           bump == /\ BumpApplies
+                   /\ IF M3 THEN r.ver <= latestVersion
+                            ELSE r.ver <= Max2(lastSubmitted, latestVersion)
+           v    == IF ~bump THEN r.ver
+                   ELSE IF M3 THEN latestVersion + 1
+                   ELSE nextVersion
            e    == [cid |-> r.cid, ver |-> v, tbl |-> r.tbl]
-       IN /\ nextVersion'   = IF bump THEN nextVersion + 1 ELSE nextVersion
+       IN /\ nextVersion'   = IF ~bump THEN nextVersion
+                              ELSE IF M3 THEN Max2(nextVersion, v + 1)
+                              ELSE nextVersion + 1
           \* `last_submitted_version` is maintained only by commit_multi_writer
           \* (src/store.rs:3997). Kept unconditional here because it is read
           \* only by the bump, which BumpApplies already gates off.
@@ -785,12 +817,34 @@ NoCommitEverPromotes == promoted = <<>>
 (*  (4) no snapshot is ever replaced at the same version (a duplicate       *)
 (*      `snapshots.insert(v, ..)` silently erases the earlier commit).      *)
 (***************************************************************************)
+(* The four clauses are named so a calibration mutation can be checked      *)
+(* against ONE of them in isolation. TLC reports only "PromotionFaithful    *)
+(* is violated" and stops at the SHALLOWEST counterexample, so a conjunction*)
+(* hides which clause broke -- and the shallowest break is not necessarily  *)
+(* the historical bug's documented symptom. M3 is exactly that case: it     *)
+(* breaks LatestStrictlyAdvances at depth 7 but task15 mode 3's symptom is  *)
+(* the duplicate insert, which needs a deeper trace (Task 4 report,         *)
+(* "M3 and the MaxCommits bound"). Naming the clauses is a decomposition,   *)
+(* not a change: PromotionFaithful is still their conjunction in the same   *)
+(* order, so every committed config's result is bit-identical.              *)
+PromoteOrderIsSubmitOrder ==
+    \A i \in 1..Len(promoted) : promoted[i].sub = i
+
+LatestStrictlyAdvances ==
+    \A i \in 2..Len(promoted) : promoted[i].ver > promoted[i-1].ver
+
+ForkFromPromotePredecessor ==
+    \A i \in 1..Len(promoted) :
+        promoted[i].forkedFrom = IF i = 1 THEN 0 ELSE promoted[i-1].ver
+
+NoDuplicateVersion ==
+    \A i, j \in 1..Len(promoted) : (i # j) => promoted[i].ver # promoted[j].ver
+
 PromotionFaithful ==
-    /\ \A i \in 1..Len(promoted) : promoted[i].sub = i
-    /\ \A i \in 2..Len(promoted) : promoted[i].ver > promoted[i-1].ver
-    /\ \A i \in 1..Len(promoted) :
-           promoted[i].forkedFrom = IF i = 1 THEN 0 ELSE promoted[i-1].ver
-    /\ \A i, j \in 1..Len(promoted) : (i # j) => promoted[i].ver # promoted[j].ver
+    /\ PromoteOrderIsSubmitOrder
+    /\ LatestStrictlyAdvances
+    /\ ForkFromPromotePredecessor
+    /\ NoDuplicateVersion
 
 (***************************************************************************)
 (* CRASH-REACHABILITY CANARY (Task 2). Must be VIOLATED. If it HOLDS, no    *)
