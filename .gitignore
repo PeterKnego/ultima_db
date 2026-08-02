@@ -24,3 +24,6 @@ perf.data.old
 /formal/kernel/target
 /formal/kernel/*.llbc
 /formal/kernel/BtreeKernel.lean
+/formal/key_kernel/target
+/formal/key_kernel/*.llbc
+/formal/key_kernel/KeyKernel.lean

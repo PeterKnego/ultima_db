@@ -78,7 +78,17 @@ Aeneas scope; needs hand-written protocol models).
   same by-role constants and is *not* separately instantiated; closing that
   gap properly means making the development T-parametric (`2 ≤ T ≤ 127`) —
   tracked as a follow-up in `docs/tasks/task52_btree_fixedvec_fanout.md`.
+- `key_kernel/` — a second verification kernel: the order-preserving key
+  encoding of `src/primary_key.rs` (`encode_u64`/`decode_u64`,
+  `encode_i64`/`decode_i64`, the `escape_and_terminate` framing, and the
+  variable-length-lead pair encoding), ported to the same safe-Rust subset.
+  Deltas from the real code are documented at the top of
+  `key_kernel/src/lib.rs`; equivalence is anchored by a differential test
+  against reproduced copies of the real impls
+  (`make test/formal-key-kernel`). Translated to `proofs/KeyKernel.lean`;
+  the ordering/roundtrip theorems over it are still to come.
 - `proofs/` — the lake package: `BtreeKernel.lean` (generated),
+  `KeyKernel.lean` (generated),
   `BtreeInvariant.lean` + `BalancedInvariant.lean` + `MinKeysInvariant.lean`
   (invariant definitions), helper-lemma modules (`FindPosSpec`, `EntrySpecs`,
   `ChildrenSpecs`, `ListLemmas`, `AlignedLemmas`, `TransportLemmas`,
@@ -113,6 +123,8 @@ lake build                            # first run: fetches Mathlib binary cache 
 
 ## Regenerating the translation after changing the kernel
 
+B-tree kernel:
+
 ```bash
 cd formal/kernel
 cargo test                                            # differential test must pass
@@ -121,13 +133,26 @@ PATH=$PWD/../.toolchain/charon-bin:$PATH charon cargo --preset=aeneas
 cp BtreeKernel.lean ../proofs/                        # then: cd ../proofs && lake build
 ```
 
-The generated `BtreeKernel.lean` must contain **zero `axiom`s** (an axiom
-means an unmodeled std function slipped in) — `grep -c axiom` after
-regenerating.
+Key-encoding kernel:
+
+```bash
+cd formal/key_kernel
+cargo test                                            # differential test must pass
+PATH=$PWD/../.toolchain/charon-bin:$PATH charon cargo --preset=aeneas
+../.toolchain/aeneas -backend lean key_kernel.llbc    # writes KeyKernel.lean
+cp KeyKernel.lean ../proofs/                          # then: cd ../proofs && lake build
+```
+
+The generated `BtreeKernel.lean` / `KeyKernel.lean` must contain **zero
+`axiom`s** (an axiom means an unmodeled std function slipped in) — `grep -c
+'^axiom'` after regenerating. The `.llbc` and the in-kernel-directory `.lean`
+are build intermediates and are gitignored; only the `proofs/` copy is
+committed.
 
 ## Ground rules
 
-- `proofs/BtreeKernel.lean` is generated; never hand-edit.
+- `proofs/BtreeKernel.lean` and `proofs/KeyKernel.lean` are generated; never
+  hand-edit.
 - Any change to the insert or delete path of `src/btree.rs` must be mirrored in
   `formal/kernel/src/lib.rs` (or explicitly noted as unverified drift). This is
   enforced automatically: `make formal/drift-check` (run in CI on every PR, see
