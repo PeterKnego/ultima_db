@@ -97,7 +97,7 @@ read. Retry loops must tolerate this; the granularity table is in the
 
 The store ships both sides of the anomaly as integration tests —
 `si_allows_write_skew_table_scan` and `ssi_prevents_write_skew_via_table_scan`
-in `tests/store_integration.rs`:
+in `tests/store_integration.rs`. From a checkout of the ultima_db repo:
 
 ```console
 $ cargo test --test store_integration write_skew

@@ -48,7 +48,7 @@ Each Snapshot contains:
 
 ---
 
-## Module structure
+## Where the module map lives
 
 The crate's module map — what each module is and does — lives in
 [the rustdoc](https://docs.rs/ultima-db), which documents every public
@@ -169,7 +169,7 @@ detection), a writer-id counter, and per-table commit locks.
 
 The snapshot map holds every retained version. The default `StoreConfig` keeps the 10 most recent snapshots and runs `gc()` automatically after each commit; retention, GC, writer mode, and isolation level are all knobs on `StoreConfig` — see [configuration](../reference/configuration.md). A `VersionPin` can hold one version alive across `gc()` runs independently of the retention window, which is the snapshot-handoff primitive replication needs (see [replicate with snapshot streams](../how-to/replicate-with-snapshot-streams.md)).
 
-The `intents` map and per-table `table_locks` exist so that disjoint-key MultiWriter commits don't serialize through `inner.write()`. See [Writer modes](#writer-modes) below.
+The write-intent map and the per-table commit locks exist so that disjoint-key MultiWriter commits don't serialize through the store lock. See [Writer modes](#writer-modes) below.
 
 ### Snapshots
 
@@ -205,7 +205,9 @@ The downcast to `Table<R, K>` happens at `open_table` time, returning `Error::Ty
 ### ReadTx
 
 `ReadTx` is barely a struct at all — an `Arc` to its snapshot and a metrics
-handle. It is a read-only view pinned to a specific version. It holds an `Arc<Snapshot>`, which keeps that version's data alive independently of subsequent commits. Multiple `ReadTx` instances at different versions coexist freely.
+handle. It is a read-only view pinned to a specific version; the `Arc` keeps
+that version's data alive independently of subsequent commits, and multiple
+`ReadTx` instances at different versions coexist freely.
 
 `open_table<R>` returns a `TableReader<'_, R>` (a thin wrapper that records read metrics and downcasts to `&Table<R>`). The reader borrows from the snapshot — no copying occurs.
 
@@ -258,7 +260,7 @@ UltimaDB implements **Snapshot Isolation** by default and **Serializable Snapsho
 
 Set `StoreConfig::isolation_level = IsolationLevel::Serializable` to opt in. SSI only matters under `WriterMode::MultiWriter`; under `SingleWriter` there are no concurrent writers and the level is silently equivalent to SI. v1 tracks point reads precisely; any range/scan/index read is recorded as a coarse "table touched" flag (false positives possible on read-heavy scan workloads).
 
-The full story — why SI is the default, what write skew looks like, and what SSI's coarse tracking trades away — is in [isolation](isolation.md); the exact anomaly matrices and measured overhead are in the [isolation levels reference](../reference/isolation-levels.md).
+The full story — why SI is the default, what write skew looks like, and what SSI's coarse tracking trades away — is in [isolation](isolation.md); the exact anomaly matrices and cost model are in the [isolation levels reference](../reference/isolation-levels.md).
 
 ### Writer modes
 

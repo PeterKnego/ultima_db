@@ -15,7 +15,7 @@ let store = Store::new(
 )?;
 ```
 
-## `StoreConfig` fields
+## Fields
 
 The fields are `num_snapshots_retained`, `auto_snapshot_gc`, `writer_mode`,
 `isolation_level`, `require_explicit_version`, and `persistence`. Per-field

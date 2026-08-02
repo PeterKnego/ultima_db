@@ -87,9 +87,9 @@ requires a fresh `begin_write` against the new base.
 | `ReadTx` (any configuration) | Zero. |
 
 `examples/ssi_cost.rs` measures this overhead under SmallBank-style
-contention; writer count and key hotness are configurable. No archived
-record under `docs/benchmarks/` currently covers SSI cost, so this page
-states no measured numbers.
+contention; writer count, burst count, and key hotness are compile-time
+constants in that file. No archived record under `docs/benchmarks/`
+currently covers SSI cost, so this page states no measured numbers.
 
 ## Limitations (v1)
 
