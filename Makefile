@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
 
 build:
 	cargo build
@@ -28,14 +28,315 @@ TLC_JAR ?= tools/tla/tla2tools-1.7.4.jar
 TLC_METADIR ?= $(HOME)/tlc-states
 TLC = java -XX:+UseSerialGC -Xmx2g -cp ../../../$(TLC_JAR) tlc2.TLC -metadir $(TLC_METADIR) -workers 2
 
+# A canary must be asserted on TLC's exit code 12 (invariant violated), never
+# on "nonzero". Measured on tla2tools 1.7.4 / TLC 2.19: 0 = clean,
+# 12 = invariant violated, 150 = parse error, 151 = invariant undefined.
+# A `|| echo "violated (expected)"` therefore reports success for a TYPO in
+# the invariant name — the one gate whose whole purpose is that it cannot
+# lie, quietly lying.
 formal/tla-smoke:
 	@mkdir -p $(TLC_METADIR)
-	@cd formal/tla/wal && $(TLC) S0Smoke.tla > /dev/null \
-	  && echo "S0Smoke: no error (expected)" \
-	  || { echo "S0Smoke FAILED — the gate spec should verify clean"; exit 1; }
-	@cd formal/tla/wal && ! $(TLC) S0Canary.tla > /dev/null 2>&1 \
-	  && echo "S0Canary: invariant violated (expected — TLC discriminates)" \
-	  || { echo "S0Canary FAILED — TLC did not catch a broken invariant; the gate is lying"; exit 1; }
+	@cd formal/tla/wal && $(TLC) S0Smoke.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "S0Smoke FAILED — the gate spec should verify clean (TLC exit $$rc)"; exit 1; fi; \
+	  echo "S0Smoke: no error (expected)"
+	@cd formal/tla/wal && $(TLC) S0Canary.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "S0Canary FAILED — TLC exit $$rc, expected 12 (invariant violated)."; \
+	    echo "  0 = TLC did not catch a broken invariant; 150/151 = parse error or"; \
+	    echo "  undefined invariant, i.e. the gate checked nothing. Either way it is lying."; \
+	    exit 1; \
+	  fi; \
+	  echo "S0Canary: invariant violated, TLC exit 12 (expected — TLC discriminates)"
+
+# S1 model: the Standalone commit pipeline (WalCrash.tla). Each baseline is
+# paired with a vacuity canary that runs FIRST and must go red — a model where
+# nothing ever promotes verifies every safety property trivially, which is how
+# a checking effort produces confident, meaningless greens.
+#
+# Both writer modes are checked. SingleWriter is strictly serial by
+# construction (the writer slot is held through the fsync wait), so it cannot
+# reach parking-while-another-writer-proceeds, batched fsync, or the version
+# bump — MultiWriter is the config that exercises the protocol.
+#
+# Three baselines, each preceded by a canary that MUST go red. The third
+# (CoalescedPrealloc) exists because it is the only sink for which
+# Store::recover passes tail_tolerant = true, and therefore the only config
+# that reaches the tolerant half of scan_wal.
+#
+# The last run is not a canary but an OWED PROPERTY, also expected red:
+# StrictScanErrLosesDurableAck records a known gap (a torn tail costs a
+# strict-scan store its whole log, durable acked commits included) so that
+# "we know about this" is re-checked rather than remembered.
+formal/tla-model:
+	@mkdir -p $(TLC_METADIR)
+	@$(MAKE) --no-print-directory formal/tla-manifest
+	@cd formal/tla/wal && $(TLC) -config Vacuity.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "vacuity canary (SingleWriter) FAILED — TLC exit $$rc, expected 12."; \
+	    echo "  0 = nothing promotes, the model is inert and every green below is"; \
+	    echo "  meaningless; 150/151 = the canary checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "vacuity canary (SingleWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrash.cfg WalCrash.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (SingleWriter) FAILED (TLC exit $$rc)"; exit 1; fi; \
+	  echo "WalCrash baseline (SingleWriter): no error (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityMW.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "vacuity canary (MultiWriter) FAILED — TLC exit $$rc, expected 12."; \
+	    exit 1; \
+	  fi; \
+	  echo "vacuity canary (MultiWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrashMW.cfg WalCrash.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (MultiWriter) FAILED (TLC exit $$rc)"; exit 1; fi; \
+	  echo "WalCrash baseline (MultiWriter): no error (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityCrash.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "crash canary (SingleWriter) FAILED — TLC exit $$rc, expected 12."; \
+	    echo "  0 = no behaviour crashes and recovers, so RecoverySound is checked"; \
+	    echo "  over zero crash behaviours; 150/151 = the canary checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "crash canary (SingleWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityCrashMW.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "crash canary (MultiWriter) FAILED — TLC exit $$rc, expected 12."; exit 1; \
+	  fi; \
+	  echo "crash canary (MultiWriter): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config VacuityCrashPrealloc.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "crash canary (CoalescedPrealloc) FAILED — TLC exit $$rc, expected 12."; exit 1; \
+	  fi; \
+	  echo "crash canary (CoalescedPrealloc): violated, TLC exit 12 (expected)"
+	@cd formal/tla/wal && $(TLC) -config WalCrashPrealloc.cfg WalCrash.tla > /dev/null; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then echo "WalCrash baseline (CoalescedPrealloc) FAILED (TLC exit $$rc)"; exit 1; fi; \
+	  echo "WalCrash baseline (CoalescedPrealloc): no error (expected)"
+	@cd formal/tla/wal && $(TLC) -config StrictScanErr.cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne 12 ]; then \
+	    echo "owed property StrictScanErrLosesDurableAck FAILED — TLC exit $$rc, expected 12."; \
+	    echo "  0 = either the strict-scan error path stopped being reachable (the model"; \
+	    echo "  rotted) or the behaviour changed — in which case write the real property"; \
+	    echo "  and delete this one; 150/151 = the check checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "owed property StrictScanErrLosesDurableAck: violated, TLC exit 12 (expected — known gap, still there)"
+	@$(MAKE) --no-print-directory formal/tla-modes
+
+# The Durability x WalWrite matrix (Task 3): every combination the Standalone
+# pipeline actually offers, each paired with at least one canary that must go
+# red. The expected exit code is written down PER CONFIG rather than inferred
+# from the filename — a naming convention would silently reclassify a config
+# the day someone renames it, and the whole point of these gates is that they
+# cannot quietly pass. 0 = clean, 12 = invariant violated; 150 (parse error)
+# and 151 (undefined invariant) fail either way, which is the hole this
+# discipline exists to close.
+#
+# ConsistentInline appears only with SingleWriter: Store::new rejects it under
+# MultiWriter (task38), so a MultiWriter config would model a store that
+# cannot be constructed. That restriction is now enforced by an ASSUME in
+# WalCrash.tla, not by this comment — a comment cannot stop a config from
+# quietly coming back exit 0 over an unconstructible store. A violated ASSUME
+# is TLC exit 10, which fails every entry in this table whatever it expects.
+#
+# modes/ConsistentPrealloc3.cfg is MaxCommits = 3 and is the only config that
+# reaches an extend from a non-empty log (the production shape). ~1.4 s.
+#
+# mutations/ is the CALIBRATION battery (Tasks 4-5): each config re-runs a
+# committed baseline with the MUTATION constant flipped. M1–M3 re-create the
+# three lost-update interleavings that actually shipped
+# (docs/tasks/task15_three_phase_consistent_persistence.md, "Promotion
+# ordering"); M4–M5 re-create the two preallocation subtleties task37 is
+# built around — M4 scans a preallocated WAL strictly, so a legal torn tail
+# aborts recovery (task37 §7), and M5 writes a batch into a freshly extended
+# region whose size was never sync_all'd (task37 §4 invariant 2). They must
+# go RED. A model that verifies clean but cannot re-find the bugs it was
+# built for produces confident greens that mean nothing, so these are gated
+# exactly like the canaries — exit 12, not "nonzero". Mutations are
+# constant-gated inside WalCrash.tla and never forked .tla copies: a forked
+# copy drifts from the baseline and silently stops testing the real model.
+#
+# Several mutation configs report the SHALLOWEST counterexample, which is not
+# always the documented symptom. M2Fork / M3Dup / M4Abort / M5Strand each pin
+# one symptom in isolation, and each has a same-bound MUTATION = "NONE"
+# control: mutations/CalibrationControl3.cfg for the first two,
+# modes/ConsistentPreallocScanErrCheck.cfg for M4Abort,
+# modes/ConsistentPrealloc3.cfg for M5Strand, modes/ConsistentPrealloc.cfg for
+# M6 and M7. Re-bounding or deleting one of those silently removes the
+# evidence while the gate stays green.
+#
+# STATE COUNTS ARE NOT TRIPWIRES FOR THE RED CONFIGS. TLC halts at the first
+# counterexample, so with -workers 2 the reported counts vary run to run --
+# widely, and do not treat any observed range as a band: M1 came back 221,
+# 246, 249, 251 and 256 across five runs, against a deterministic 238 at
+# -workers 1. The trace DEPTH is stable and is what the Task 4 report records.
+TLA_MODES = \
+  modes/ConsistentFsWriteCanary.cfg:12 \
+  modes/ConsistentFsWrite.cfg:0 \
+  modes/ConsistentCoalescedCanary.cfg:12 \
+  modes/ConsistentCoalesced.cfg:0 \
+  modes/ConsistentPreallocCanary.cfg:12 \
+  modes/ConsistentPreallocExtendCanary.cfg:12 \
+  modes/ConsistentPreallocTornTailCanary.cfg:12 \
+  modes/ConsistentPrealloc.cfg:0 \
+  modes/ConsistentPreallocScanErrCheck.cfg:0 \
+  modes/ConsistentPrealloc3Canary.cfg:12 \
+  modes/ConsistentPrealloc3LiveLogCanary.cfg:12 \
+  modes/ConsistentPrealloc3ChunkCanary.cfg:12 \
+  modes/ConsistentPrealloc3.cfg:0 \
+  modes/InlineFsWriteCanary.cfg:12 \
+  modes/InlineFsWrite.cfg:0 \
+  modes/InlinePreallocCanary.cfg:12 \
+  modes/InlinePreallocExtendCanary.cfg:12 \
+  modes/InlinePrealloc.cfg:0 \
+  modes/EventualFsWriteCanary.cfg:12 \
+  modes/EventualFsWriteLossCanary.cfg:12 \
+  modes/EventualFsWrite.cfg:0 \
+  modes/ConsistentAckKeptCheck.cfg:0 \
+  mutations/M1.cfg:12 \
+  mutations/M2.cfg:12 \
+  mutations/M2Fork.cfg:12 \
+  mutations/M3.cfg:12 \
+  mutations/M3Dup.cfg:12 \
+  mutations/M4.cfg:12 \
+  mutations/M4Abort.cfg:12 \
+  mutations/M5.cfg:12 \
+  mutations/M5Strand.cfg:12 \
+  mutations/M6.cfg:12 \
+  mutations/M7.cfg:12 \
+  mutations/CalibrationControl3.cfg:0
+
+formal/tla-modes:
+	@mkdir -p $(TLC_METADIR)
+	@cd formal/tla/wal && for pair in $(TLA_MODES); do \
+	  cfg=$${pair%:*}; want=$${pair##*:}; \
+	  $(TLC) -config $$cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne $$want ]; then \
+	    echo "$$cfg FAILED — TLC exit $$rc, expected $$want."; \
+	    echo "  12 expected but 0 seen = the canary's mechanism is unreachable and"; \
+	    echo "  the paired baseline is green over dead code; 0 expected but 12 seen"; \
+	    echo "  = a real property broke; 150/151 = the run checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "$$cfg: TLC exit $$rc (expected $$want)"; \
+	done
+
+# The calibration manifest (Task 6). Until now, the only thing standing
+# between M2's and M3's documented symptoms and oblivion was a PROSE COMMENT
+# above TLA_MODES saying "deleting one, or re-bounding it, silently removes
+# that evidence". M2.cfg and M3.cfg keep passing without M2Fork.cfg and
+# M3Dup.cfg -- they just stop matching the shipped bug, which is the entire
+# claim the calibration makes. A comment cannot fail a build.
+#
+# Each row pins the four things that carry a mutation's evidence:
+#
+#   cfg : invariant : MUTATION : MaxCommits : expected TLC exit code
+#
+# and the check asserts all five, plus that the config is still listed in
+# TLA_MODES at the same exit code. So deleting the file fails; renaming it
+# fails; dropping it from TLA_MODES fails; swapping its target invariant
+# fails; and re-bounding MaxCommits 3 -> 2 fails -- which is the silent one,
+# because M2Fork/M3Dup/M5Strand at MaxCommits = 2 would still be *green* while
+# checking a state space that cannot reach the symptom (see "Which config
+# carries which mechanism" in formal/tla/wal/README.md).
+#
+# The invariant named per row is the evidence-carrying one, not the whole
+# INVARIANT list: baseline-shaped configs declare five and only one is the
+# reason that row exists.
+#
+# TWO THINGS THIS DOES NOT CATCH -- see RESULTS.md §7, "What the manifest
+# still does not catch", before trusting it further than it goes:
+#   1. It checks the target invariant is DECLARED, not that it is the one TLC
+#      reported. ADDING a second INVARIANT line to a single-invariant config
+#      (M2Fork, M3Dup, M5Strand, M4Abort) keeps this green AND keeps exit 12
+#      while the red moves to the added invariant. If you are here to add an
+#      invariant to one of those four, that is the failure mode.
+#   2. M6/M7 pin RecoverySound, which most baselines also declare; their real
+#      evidence is a CLAUSE of it, which no config-level check can express.
+#
+# Controls are here too, at exit 0. A mutation row proving "violated" means
+# nothing without a same-bound MUTATION = "NONE" run proving the bound itself
+# is not what went red.
+TLA_CALIB = \
+  mutations/M1.cfg:PromotionFaithful:M1:2:12 \
+  mutations/M2.cfg:PromotionFaithful:M2:2:12 \
+  mutations/M2Fork.cfg:ForkFromPromotePredecessor:M2:3:12 \
+  mutations/M3.cfg:PromotionFaithful:M3:2:12 \
+  mutations/M3Dup.cfg:NoDupLive:M3:3:12 \
+  mutations/M4.cfg:TailTolerance:M4:2:12 \
+  mutations/M4Abort.cfg:StrictScanErrLosesDurableAck:M4:2:12 \
+  mutations/M5.cfg:PreallocInvariant:M5:2:12 \
+  mutations/M5Strand.cfg:NoAckLossAfterLiveExtend:M5:3:12 \
+  mutations/M6.cfg:RecoverySound:M6:2:12 \
+  mutations/M7.cfg:RecoverySound:M7:2:12 \
+  mutations/CalibrationControl3.cfg:ForkFromPromotePredecessor:NONE:3:0 \
+  modes/ConsistentPrealloc.cfg:RecoverySound:NONE:2:0 \
+  modes/ConsistentPrealloc3.cfg:NoAckLossAfterLiveExtend:NONE:3:0 \
+  modes/ConsistentPreallocScanErrCheck.cfg:StrictScanErrLosesDurableAck:NONE:2:0
+
+# Structural half: no TLC, runs in well under a second, and is therefore
+# wired into formal/tla-model so the guard rides on the target people already
+# run rather than on one they have to remember.
+formal/tla-manifest:
+	@cd formal/tla/wal && for spec in $(TLA_CALIB); do \
+	  cfg=`echo $$spec | cut -d: -f1`; inv=`echo $$spec | cut -d: -f2`; \
+	  mut=`echo $$spec | cut -d: -f3`; bound=`echo $$spec | cut -d: -f4`; \
+	  want=`echo $$spec | cut -d: -f5`; \
+	  if [ ! -f "$$cfg" ]; then \
+	    echo "calibration manifest FAILED — $$cfg is missing."; \
+	    echo "  It carries the MUTATION = \"$$mut\" evidence at MaxCommits = $$bound."; \
+	    echo "  If the mutation is genuinely retired, delete its manifest row too"; \
+	    echo "  and say so in formal/tla/wal/RESULTS.md — do not just delete the file."; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -qE "^INVARIANT[[:space:]]+$$inv[[:space:]]*$$" "$$cfg"; then \
+	    echo "calibration manifest FAILED — $$cfg no longer declares INVARIANT $$inv."; \
+	    echo "  That invariant is the evidence this config exists to carry."; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -qE "^[[:space:]]*MUTATION[[:space:]]*=[[:space:]]*\"$$mut\"[[:space:]]*$$" "$$cfg"; then \
+	    echo "calibration manifest FAILED — $$cfg is no longer MUTATION = \"$$mut\"."; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -qE "^[[:space:]]*MaxCommits[[:space:]]*=[[:space:]]*$$bound[[:space:]]*$$" "$$cfg"; then \
+	    echo "calibration manifest FAILED — $$cfg is no longer MaxCommits = $$bound."; \
+	    echo "  Re-bounding is the SILENT failure: the config stays green while"; \
+	    echo "  checking a state space too small to reach the symptom."; \
+	    exit 1; \
+	  fi; \
+	  case " $(TLA_MODES) " in \
+	    *" $$cfg:$$want "*) ;; \
+	    *) echo "calibration manifest FAILED — $$cfg is not in TLA_MODES at exit $$want."; \
+	       echo "  A calibration config outside TLA_MODES is never run by any gate."; \
+	       exit 1;; \
+	  esac; \
+	  echo "$$cfg: INVARIANT $$inv, MUTATION \"$$mut\", MaxCommits $$bound, TLA_MODES:$$want (ok)"; \
+	done
+
+# Behavioural half: re-run every mutation and every control and assert the
+# exit code. Same discipline as the canaries -- exact code, never "nonzero",
+# because 150 (parse error) and 151 (undefined invariant) are nonzero too and
+# mean the run checked nothing. Overlaps formal/tla-modes by design: this is
+# the standing guard for "the model is still discriminating", runnable on its
+# own without the full matrix.
+formal/tla-calibrate:
+	@mkdir -p $(TLC_METADIR)
+	@$(MAKE) --no-print-directory formal/tla-manifest
+	@cd formal/tla/wal && for spec in $(TLA_CALIB); do \
+	  cfg=`echo $$spec | cut -d: -f1`; mut=`echo $$spec | cut -d: -f3`; \
+	  want=`echo $$spec | cut -d: -f5`; \
+	  $(TLC) -config $$cfg WalCrash.tla > /dev/null 2>&1; rc=$$?; \
+	  if [ $$rc -ne $$want ]; then \
+	    echo "$$cfg FAILED — TLC exit $$rc, expected $$want (MUTATION = \"$$mut\")."; \
+	    echo "  12 expected but 0 seen = the model STOPPED BEING DISCRIMINATING:"; \
+	    echo "  it can no longer re-find a bug it was calibrated against, so every"; \
+	    echo "  green verdict elsewhere is a green with nothing behind it."; \
+	    echo "  0 expected but 12 seen = a control broke; the bound, not the"; \
+	    echo "  mutation, is what the neighbouring red was measuring."; \
+	    echo "  150/151 = the run checked nothing."; \
+	    exit 1; \
+	  fi; \
+	  echo "$$cfg: TLC exit $$rc (expected $$want)"; \
+	done
 
 # Drift guard: fail if src/btree.rs or src/primary_key.rs changed without a
 # matching formal/ update (formal/kernel/ and formal/key_kernel/ respectively).
