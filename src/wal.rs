@@ -926,6 +926,53 @@ pub enum WalSinkKind {
     IoUring,
 }
 
+impl WalSinkKind {
+    /// Whether a CRC mismatch in this sink's WAL is end-of-log rather than
+    /// corruption — i.e. the `tail_tolerant` argument to [`scan_wal`].
+    ///
+    /// **This is the single source of truth for that policy.** It is consumed
+    /// both by the sink reconstructing its own write head on open and by
+    /// `Store::recover` deciding how to read the same file; encoding it twice
+    /// let the two drift apart in principle (issue #24). The `match` is
+    /// deliberately exhaustive with no wildcard arm, so adding a sink is a
+    /// compile error until its tolerance is stated here.
+    ///
+    /// A presizing sink writes into a region of known zeros, so a torn write
+    /// there is indistinguishable from never-written space and must be treated
+    /// as end-of-log. An append-only sink has no such region: a bad CRC is real
+    /// corruption and must be loud.
+    pub(crate) fn tail_tolerant(self) -> bool {
+        match self {
+            // Append-only: no preallocated zero region, so a bad CRC is corruption.
+            WalSinkKind::FsWrite | WalSinkKind::Coalesced | WalSinkKind::BufferedFile => false,
+            // Presized: a torn write into preallocated zeros is end-of-log.
+            WalSinkKind::CoalescedPrealloc => true,
+            // Presized via `set_len` (sparse). Bench-only, and `MmapSink::open`
+            // takes its write head from `metadata().len()` without scanning at
+            // all — so this arm states the policy recovery would need, not one
+            // the sink itself currently applies.
+            #[cfg(feature = "bench-internals")]
+            WalSinkKind::Mmap => true,
+            // Append-only, like the other file sinks.
+            #[cfg(all(target_os = "linux", feature = "wal-iouring"))]
+            WalSinkKind::IoUring => false,
+        }
+    }
+}
+
+impl crate::persistence::WalWrite {
+    /// The sink this durability setting selects. Exhaustive with no wildcard so
+    /// a new `WalWrite` variant cannot silently inherit another's sink — the
+    /// other half of the #24 coupling.
+    pub(crate) fn sink_kind(self) -> WalSinkKind {
+        match self {
+            crate::persistence::WalWrite::PerEntry => WalSinkKind::FsWrite,
+            crate::persistence::WalWrite::Coalesced => WalSinkKind::Coalesced,
+            crate::persistence::WalWrite::CoalescedPrealloc => WalSinkKind::CoalescedPrealloc,
+        }
+    }
+}
+
 /// Production sink: appends framed entries to a file and fsyncs it.
 struct FileSink {
     file: File,
@@ -1114,9 +1161,11 @@ impl PreallocFileSink {
             .open(&path)
             .map_err(|e| Error::Persistence(e.to_string()))?;
         sync_dir(dir)?;
-        // Reconstruct the write head from the tolerant scan; a torn tail into
-        // preallocated zeros is end-of-log, not corruption.
-        let (_entries, write_head) = scan_wal(&path, true)?;
+        // Reconstruct the write head; a torn tail into preallocated zeros is
+        // end-of-log, not corruption. The policy comes from `tail_tolerant`
+        // rather than a literal here, so this and `Store::recover` cannot
+        // disagree about how to read the same file (issue #24).
+        let (_entries, write_head) = scan_wal(&path, WalSinkKind::CoalescedPrealloc.tail_tolerant())?;
         let capacity = file.metadata().map_err(|e| Error::Persistence(e.to_string()))?.len();
         Ok(PreallocFileSink { file, path, buf: Vec::new(), write_head, capacity, chunk })
     }
@@ -3842,6 +3891,37 @@ mod tests {
         // No-op when to <= from.
         preallocate_to(&mut f, 8192, 4096).unwrap();
         assert_eq!(f.metadata().unwrap().len(), 8192);
+    }
+
+    /// The scan-tolerance policy is one decision, and these are its values.
+    ///
+    /// Both `PreallocFileSink::open_with_chunk` and `Store::recover` route
+    /// through `tail_tolerant`, so they cannot disagree (#24) — a compile error
+    /// covers a *new* sink. What is left to regress is a flipped arm, and both
+    /// directions are bad: `CoalescedPrealloc => false` turns a benign torn
+    /// tail into a hard error that costs the caller the whole durable log,
+    /// while `FsWrite => true` silently truncates a genuinely corrupt one.
+    #[test]
+    fn scan_tolerance_is_one_decision_per_sink() {
+        use crate::persistence::WalWrite;
+
+        // Append-only sinks: a bad CRC is corruption and must be loud.
+        assert!(!WalSinkKind::FsWrite.tail_tolerant());
+        assert!(!WalSinkKind::Coalesced.tail_tolerant());
+        assert!(!WalSinkKind::BufferedFile.tail_tolerant());
+        // Presizing sink: a torn write into preallocated zeros is end-of-log.
+        assert!(WalSinkKind::CoalescedPrealloc.tail_tolerant());
+
+        // And the config surface maps onto exactly those sinks, so what
+        // `Store::recover` computes for a given `WalWrite` is what the sink
+        // for that same `WalWrite` applies.
+        assert_eq!(WalWrite::PerEntry.sink_kind(), WalSinkKind::FsWrite);
+        assert_eq!(WalWrite::Coalesced.sink_kind(), WalSinkKind::Coalesced);
+        assert_eq!(WalWrite::CoalescedPrealloc.sink_kind(), WalSinkKind::CoalescedPrealloc);
+        assert!(
+            WalWrite::CoalescedPrealloc.sink_kind().tail_tolerant(),
+            "the one production config that presizes must scan tolerantly"
+        );
     }
 
     /// A failed extend must surface its own error and leave `capacity` where it

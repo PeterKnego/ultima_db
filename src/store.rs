@@ -483,13 +483,7 @@ impl Store {
                     durability,
                     Durability::Consistent | Durability::ConsistentInline
                 );
-                let kind = match wal_write {
-                    crate::persistence::WalWrite::PerEntry => crate::wal::WalSinkKind::FsWrite,
-                    crate::persistence::WalWrite::Coalesced => crate::wal::WalSinkKind::Coalesced,
-                    crate::persistence::WalWrite::CoalescedPrealloc => {
-                        crate::wal::WalSinkKind::CoalescedPrealloc
-                    }
-                };
+                let kind = wal_write.sink_kind();
                 let inline = matches!(durability, Durability::ConsistentInline);
                 let handle = if inline {
                     crate::wal::WalHandle::with_sink_kind_inline(
@@ -1014,12 +1008,15 @@ impl Store {
             let inner = self.inner.read();
             if matches!(inner.config.persistence, Persistence::Standalone { .. }) {
                 let wal_path_buf = crate::wal::wal_path(&dir);
-                let tolerant = matches!(
-                    inner.config.persistence,
-                    Persistence::Standalone {
-                        wal_write: crate::persistence::WalWrite::CoalescedPrealloc, ..
+                // Same source of truth the sink uses to reconstruct its write
+                // head, so the two cannot apply different corruption policies
+                // to one file (issue #24).
+                let tolerant = match inner.config.persistence {
+                    Persistence::Standalone { wal_write, .. } => {
+                        wal_write.sink_kind().tail_tolerant()
                     }
-                );
+                    _ => false,
+                };
                 let entries = crate::wal::scan_wal(&wal_path_buf, tolerant)?.0;
                 let base_version = inner.latest_version;
                 drop(inner);
