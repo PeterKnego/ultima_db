@@ -209,6 +209,8 @@ Re-home the harm first.
 
 ### F2 — `preallocate_to` is not idempotent under ENOSPC interruption
 
+> Tracked as [#23](https://github.com/PeterKnego/ultima_db/issues/23). Still unadjudicated — the issue carries the finding, not a decision.
+
 `preallocate_to` (`src/wal.rs:624-639`) exists to establish one invariant:
 *the new size is durable before any record is written into the region*
 (task37 §4 invariant 2). It does that by physically zero-filling `[from, to)`
@@ -235,6 +237,8 @@ answered precisely. **Unadjudicated as to severity** — no fix is proposed
 here and none should be inferred.
 
 ### F3 — Two independent decisions about scan tolerance for the same file
+
+> Tracked as [#24](https://github.com/PeterKnego/ultima_db/issues/24). Still unadjudicated — the issue carries the finding, not a decision.
 
 `PreallocFileSink::open` scans **tolerantly, unconditionally** —
 `scan_wal(&path, true)` at `src/wal.rs:1115`, to reconstruct `write_head`.
