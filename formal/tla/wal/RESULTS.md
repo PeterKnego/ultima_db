@@ -209,7 +209,7 @@ Re-home the harm first.
 
 ### F2 — `preallocate_to` is not idempotent under ENOSPC interruption
 
-> Tracked as [#23](https://github.com/PeterKnego/ultima_db/issues/23). Still unadjudicated — the issue carries the finding, not a decision.
+> **Adjudicated 2026-08-03** ([#23](https://github.com/PeterKnego/ultima_db/issues/23)): real, **low severity** — a robustness and invariant-integrity gap, not a durability hole. In-process the post-error state is retry-safe (`capacity` not advanced, `buf` not cleared), and across a restart `capacity` is re-derived from `metadata().len()`, so it is self-correcting. What genuinely breaks is task37 §4 invariant 2, leaving safety to rest on the `fdatasync` semantics preallocation exists to be independent of, and costing the metadata-free fsync until the next clean extend. Fixed in `1e5d2b7` by rolling the size back to the last durable `capacity` on a failed extend. The analysis below stands as written — it was accurate about the mechanism.
 
 `preallocate_to` (`src/wal.rs:624-639`) exists to establish one invariant:
 *the new size is durable before any record is written into the region*

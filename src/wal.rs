@@ -621,6 +621,10 @@ fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
 /// allocation are durable before any record is written into the region. The
 /// WAL counterpart of `ultima_journal`'s `SegmentFile::preallocate_to`. No-op
 /// when `to <= from`.
+///
+/// On error the file may be left physically longer than `from` with that
+/// extension un-`sync_all`'d, so callers that care about the durability
+/// invariant must roll the size back — see `PreallocFileSink::sync`.
 fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     if to <= from {
@@ -1131,7 +1135,22 @@ impl WalSink for PreallocFileSink {
             if need > self.capacity {
                 // Extend by whole chunks to cover `need`; sync_all (size change).
                 let new_cap = need.div_ceil(self.chunk) * self.chunk;
-                preallocate_to(&mut self.file, self.capacity, new_cap)?;
+                if let Err(e) = preallocate_to(&mut self.file, self.capacity, new_cap) {
+                    // The zero-fill died partway (ENOSPC is the realistic
+                    // trigger), so the file is physically longer than
+                    // `capacity` but that extension never reached `sync_all`.
+                    // Roll it back, so the on-disk size stays one we know is
+                    // durable: otherwise a restart adopts the torn extension
+                    // via `metadata().len()` (see `open_with_chunk`) and
+                    // records land in a region whose allocation only
+                    // `sync_data` ever covers — the exact dependency
+                    // preallocation exists to remove (task37 §4 invariant 2).
+                    // Truncating frees space, so it still works under ENOSPC;
+                    // if it fails anyway, the caller needs the original error.
+                    let _ = self.file.set_len(self.capacity);
+                    let _ = self.file.sync_all();
+                    return Err(e);
+                }
                 self.capacity = new_cap;
             }
             self.file.seek(SeekFrom::Start(self.write_head)).map_err(|e| Error::Persistence(e.to_string()))?;
@@ -3823,5 +3842,49 @@ mod tests {
         // No-op when to <= from.
         preallocate_to(&mut f, 8192, 4096).unwrap();
         assert_eq!(f.metadata().unwrap().len(), 8192);
+    }
+
+    /// A failed extend must surface its own error and leave `capacity` where it
+    /// was, so the retry re-extends from a size we know is durable.
+    ///
+    /// Scope, stated plainly: this is a **regression guard, not a proof of the
+    /// rollback**. A read-only handle fails on the *first* write inside
+    /// `preallocate_to`, so nothing is written and there is no partial
+    /// extension to roll back — and both assertions below already held before
+    /// the rollback existed, when the call was a bare `?`. What it pins is that
+    /// a future edit to that error path cannot start swallowing the error or
+    /// advancing `capacity`. Covering the rollback itself needs a write that
+    /// succeeds and then fails partway (ENOSPC), which has no seam here.
+    /// See issue #23.
+    #[test]
+    fn failed_extend_propagates_and_does_not_advance_capacity() {
+        let dir = crate::test_scratch::scratch_dir();
+        let path = dir.path().join(WAL_FILENAME);
+        let mut f =
+            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        preallocate_to(&mut f, 0, 4096).unwrap();
+        drop(f);
+
+        // Read-only handle: the zero-fill cannot write, standing in for the
+        // ENOSPC failure without needing to fill a disk.
+        let ro = OpenOptions::new().read(true).open(&path).unwrap();
+        let mut sink = PreallocFileSink {
+            file: ro,
+            path: path.clone(),
+            buf: Vec::new(),
+            write_head: 0,
+            capacity: 4096,
+            chunk: 4096,
+        };
+        // Enough bytes that `need > capacity` and the extend is attempted.
+        sink.buf = vec![0xAB; 5000];
+
+        assert!(sink.sync().is_err(), "the extend failure is surfaced, not swallowed");
+        assert_eq!(sink.capacity, 4096, "capacity must not advance past a failed extend");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            4096,
+            "on-disk size still the one that was sync_all'd"
+        );
     }
 }
