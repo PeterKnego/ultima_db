@@ -120,7 +120,7 @@ frame independently lands whole, lands **torn** (present, CRC-bad), or never
 lands. Tearing is per-frame and **positional** — an absent frame is a hole at
 its own byte offset, not a removal that slides later frames forward, because
 `scan_wal` walks offsets in order and `break`s at the first record it cannot
-accept (`src/wal.rs:574-607`). `Recover` is `Store::recover`
+accept (`src/wal.rs:662-695`). `Recover` is `Store::recover`
 (`src/store.rs:984`): install the checkpoint, scan, replay entries past the
 checkpoint version. `tail_tolerant` is true for `CoalescedPrealloc` only
 (`src/store.rs:1017-1022`), and that is the whole of `SinkKind`'s influence.
@@ -236,9 +236,9 @@ covers**, because that difference is the entire preallocation bug surface.
 
 | Action | Gloss |
 |---|---|
-| `SyncData` | `fdatasync` — a barrier over frame *data* inside an already-durable file size. Reached by `PreallocFileSink` and nothing else in production (`src/wal.rs:1050-1051`), and only in steady state (`metaDurable` guard). |
-| `SyncAll` | `fsync` — data **and** metadata, so the physical file size becomes durable. Every append-mode sink uses it for every batch (`src/wal.rs:912-916`, `:966-970`) because every append changes the size; `PreallocFileSink` reaches it only as `preallocate_to`'s sync (`src/wal.rs:549`), i.e. only on an extend. |
-| `Extend` | The batch overruns `capacity`, so grow by whole chunks of physically written zeros (`src/wal.rs:1038-1044`, `:531-551`) and drop `metaDurable` until a `SyncAll` covers the new size. |
+| `SyncData` | `fdatasync` — a barrier over frame *data* inside an already-durable file size. Reached by `PreallocFileSink` and nothing else in production (`src/wal.rs:1142-1143`), and only in steady state (`metaDurable` guard). |
+| `SyncAll` | `fsync` — data **and** metadata, so the physical file size becomes durable. Every append-mode sink uses it for every batch (`src/wal.rs:1004-1008`, `:1058-1062`) because every append changes the size; `PreallocFileSink` reaches it only as `preallocate_to`'s sync (`src/wal.rs:637`), i.e. only on an extend. |
+| `Extend` | The batch overruns `capacity`, so grow by whole chunks of physically written zeros (`src/wal.rs:1130-1136`, `:619-639`) and drop `metaDurable` until a `SyncAll` covers the new size. |
 
 `sync_data` does **not** make a new file *size* durable. So bytes past the last
 `sync_all`-covered size can vanish **wholesale** on a crash — including frames a
@@ -279,8 +279,8 @@ Task 1–2 baselines, so their committed counts stay comparable across tasks.
 and at that bound there is exactly one `Extend` per behaviour, always from
 `capacity = 0` on an empty log. So the *production* shape — records already
 durable, the next batch overruns the region, `preallocate_to` zero-fills a
-**suffix** of an existing file (`src/wal.rs:536-551` with `from != 0`) and
-`need.div_ceil(chunk)*chunk` (`:1041`) crosses a chunk boundary — never happens.
+**suffix** of an existing file (`src/wal.rs:624-639` with `from != 0`) and
+`need.div_ceil(chunk)*chunk` (`:1133`) crosses a chunk boundary — never happens.
 Measured, not assumed: `NoExtendFromLiveLog` and `NoSecondChunk` are both
 **exit 0** (unreachable) at `MaxCommits = 2` and both **exit 12** at 3. That is
 also the region M5's *already-durable-and-acked* failure lives in. 14934 states,
@@ -356,7 +356,7 @@ a green as reassurance, is taking these on:
    it*. A tear that survives CRC32 is outside the state space. The CRC is 32
    bits (`crc32fast`), so that probability is small, not zero.
 3. **Rename is atomic, and `sync_dir` makes it durable.** The preallocating
-   prune (`src/wal.rs:672-707`) rebuilds the WAL through tmp+rename. S1 has no
+   prune (`src/wal.rs:760-795`) rebuilds the WAL through tmp+rename. S1 has no
    `Checkpoint` action, so this obligation is **inherited without being
    exercised** — the weakest of the five, because nothing here would notice if
    it were false.
@@ -367,7 +367,7 @@ a green as reassurance, is taking these on:
    growth the model is merely conservative; on one where `sync_all` does not,
    it is wrong, and M5's whole mechanism is mis-stated.
 5. **Commits are opaque.** A commit is a `<version, table>` pair
-   (`WalCrash.tla:45`, `:197`). Rows, keys, index maintenance and merge
+   (`WalCrash.tla:45`, `:213`). Rows, keys, index maintenance and merge
    semantics are all invisible. "The recovered state is correct" therefore
    means *the right commit identities, in the right order, into the right
    tables* — **not** the right contents. A replay that applies the correct
@@ -390,7 +390,7 @@ calibration hole that is only *half* closed.
 acked commits.** `scan_wal` treats a CRC mismatch as end-of-log only when
 `tail_tolerant`, which `Store::recover` passes for `CoalescedPrealloc` and
 nothing else (`src/store.rs:1017-1022`). Every other sink gets
-`Err(WalCorrupted)` (`src/wal.rs:589-591`), which `recover` propagates with `?`
+`Err(WalCorrupted)` (`src/wal.rs:677-679`), which `recover` propagates with `?`
 (`src/store.rs:1023`) *before applying any entry* — so frames the scan had
 already accepted, at offsets before the tear, are discarded too. This is
 reachable on **2 of the 3 `WalWrite` variants — `PerEntry` (the `#[default]`
@@ -425,18 +425,18 @@ ticket and let the rest of the FIFO proceed. That needs a per-ticket outcome on
 Checkpoint and prune — `checkpointVersion` is carried and `Recover` honours it
 as the replay floor (`src/store.rs:1027-1030`), but no action moves it off 0, so
 no committed config exercises a non-zero floor. A `Checkpoint` action also drags
-in WAL pruning (`src/wal.rs:628`), which is where checkpoint/prune/crash
+in WAL pruning (`src/wal.rs:716`), which is where checkpoint/prune/crash
 interleavings would actually bite.
 
 `write_head` **reconstruction on open** (task37 §4 invariant 3) is declared but
 inert. `PreallocFileSink::open` rebuilds the head with a *tolerant* `scan_wal`
-and takes `capacity` from `metadata().len()` (`src/wal.rs:1023-1024`); there is
+and takes `capacity` from `metadata().len()` (`src/wal.rs:1115-1116`); there is
 no persisted head pointer to corrupt. `Crash` sets `writeHead` to 0 and
 `Recover` leaves it there, because the bound is "no operation after recovery",
 so nothing would consume a reconstructed head. When S2 lifts that bound the
 reconstruction is `writeHead' = ScanLen(walAfterCrash)` in `Recover`.
 
-**WAL prune**, including the preallocating prune (`src/wal.rs:672-707`, task37
+**WAL prune**, including the preallocating prune (`src/wal.rs:760-795`, task37
 §6 strategy P2), which resets `write_head`/`capacity` from a pre-sized
 tmp+rename. It is reachable only from `Checkpoint`, which this model does not
 have, so no action moves `writeHead` backwards and `writeHead = Len(walDurable)`
@@ -500,7 +500,7 @@ Clause (c) had **none**,
 because M4 is task37 §7's *other* direction — a strict scan that refuses the
 whole log, not a tolerant one that replays past the tear — and nothing in
 M1–M5 replayed a torn frame either. M6 deletes `ScanLen`'s stop at a
-CRC-bad frame (`src/wal.rs:585-592`) and the clause goes red at depth 9,
+CRC-bad frame (`src/wal.rs:673-680`) and the clause goes red at depth 9,
 exactly as this paragraph priced it before the mutation existed. See the
 calibration table below.
 
@@ -543,7 +543,7 @@ it documents — the three lost-update interleavings task15 records as
 *reproducible failure modes*
 (`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`), the two
 preallocation subtleties task37 is built around (§4 invariant 2, §7), and the
-scan's stop-at-first-bad-frame (`src/wal.rs:585-592`). **M7 is
+scan's stop-at-first-bad-frame (`src/wal.rs:673-680`). **M7 is
 clause-targeted**, and the distinction is worth keeping. No shipped bug ever
 permuted a replayed row's identity; M7 exists because `RecoverySound` clause (a)
 was checked by every config and falsified by none, and a clause with no
@@ -587,13 +587,13 @@ commit 1's belongs), not to something it once did. All of them are gated in
   rule aborts recovery for it.
 - **M5** — `SyncData` loses its `metaDurable` guard: the batch is written into a
   freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s
-  `sync_all` (`src/wal.rs:549`) never ran before the positioned write at
-  `:1046`. task37 §4 invariant 2 — "new size must be durable before use".
+  `sync_all` (`src/wal.rs:637`) never ran before the positioned write at
+  `:1138`. task37 §4 invariant 2 — "new size must be durable before use".
 - **M6** — `ScanLen` loses the stop at a CRC-bad frame, keeping only the
-  end-of-log stop (zero len-prefix / short tail, `src/wal.rs:576-581`). Real
+  end-of-log stop (zero len-prefix / short tail, `src/wal.rs:664-669`). Real
   `scan_wal` walks offsets in order and halts at the first frame it cannot
-  accept — `break` under `tail_tolerant` (`:586-588`), `return Err` without it
-  (`:589-591`) — so a torn frame is never replayed. M6 takes it as good and
+  accept — `break` under `tail_tolerant` (`:674-676`), `return Err` without it
+  (`:677-679`) — so a torn frame is never replayed. M6 takes it as good and
   keeps going: corruption passes CRC, half a commit record lands in the store,
   and recovery reports success. That is `RecoverySound` clause (c), and M6 is
   the only mutation that touches it. Carried on a **tolerant** sink on purpose:
@@ -704,8 +704,8 @@ error. `TailTolerance` is that sentence, in two clauses that are different
 claims:
 
 1. recovery never **aborts** — `scan_wal` breaks out on an undecodable frame
-   (`src/wal.rs:586-588`) instead of returning `Err(WalCorrupted)`
-   (`:589-591`), so the store opens;
+   (`src/wal.rs:674-676`) instead of returning `Err(WalCorrupted)`
+   (`:677-679`), so the store opens;
 2. it stops at the **last good frame, not before it** — every frame in the
    maximal present-prefix of the on-disk log is replayed.
 
@@ -723,7 +723,7 @@ future-proofing, not as a check currently doing work.
 Its vacuity guard is `modes/ConsistentPreallocTornTailCanary.cfg`
 (`NoTornTailTruncation` must go **red**), which demands specifically that
 recovery truncated at a **torn** frame. An *absent* frame is a clean
-end-of-log in both scan modes (`src/wal.rs:576-581`, unconditional `break`), so
+end-of-log in both scan modes (`src/wal.rs:664-669`, unconditional `break`), so
 reaching only that case would prove nothing about tolerance. Task 2 measured
 the same fact with a scratch assertion and wrote it down in prose; prose is not
 a gate, and this is the same measurement as a committed config.
