@@ -238,7 +238,7 @@ here and none should be inferred.
 
 ### F3 — Two independent decisions about scan tolerance for the same file
 
-> Tracked as [#24](https://github.com/PeterKnego/ultima_db/issues/24). Still unadjudicated — the issue carries the finding, not a decision.
+> **Adjudicated 2026-08-03** ([#24](https://github.com/PeterKnego/ultima_db/issues/24)): real, **low severity** — a latent maintenance hazard with no reachable divergence, since both decisions derive 1:1 from the same `wal_write` field. Worth fixing because the likely future divergence is asymmetric: a new presizing sink added without touching recovery's `matches!` would make a benign torn tail a hard error costing the caller the whole durable log (F1's shape, from the other direction). Fixed in `5df6d23` — both call sites route through `WalSinkKind::tail_tolerant()`, exhaustive with no wildcard, so a new sink is a compile error until its tolerance is stated. Note the analysis below missed a *third* policy already in the tree: `MmapSink::open` presizes and takes its write head from `metadata().len()` without scanning at all (bench-only, outside the production contract).
 
 `PreallocFileSink::open` scans **tolerantly, unconditionally** —
 `scan_wal(&path, true)` at `src/wal.rs:1115`, to reconstruct `write_head`.
