@@ -39,4 +39,6 @@ how it compares with LMDB and RocksDB.
 
 Contributors: per-feature design records live in the repo's `docs/tasks/` directory, dated
 benchmark run records in [`benchmarks/`](benchmarks/), and the build/test
-workflow in the repository root's `CLAUDE.md`.
+workflow in the repository root's `CLAUDE.md`. The record of how this
+documentation set itself was written — which quadrants were covered, in which
+run, and what was approved — is [`diataxis-plan.md`](diataxis-plan.md).
