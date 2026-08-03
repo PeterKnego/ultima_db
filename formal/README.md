@@ -53,8 +53,11 @@ characterization (`RemoveFlatten.lean`): `get` equals a lookup in the flattened
 key list, and every rebalancer (rotate/merge/fix) is flatten-invariant, so
 delete's only effect on lookups is dropping the deleted key.
 
-Not yet covered: range iterators; anything concurrent (store/OCC/WAL — out of
-Aeneas scope; needs hand-written protocol models).
+Not yet covered by the Lean proofs: range iterators; anything concurrent
+(store/OCC/WAL — out of Aeneas scope; needs hand-written protocol models).
+The WAL/crash-recovery half of that gap now has such a model, in **TLA+**, not
+Lean: see [`tla/wal/README.md`](tla/wal/README.md) and
+[`tla/wal/RESULTS.md`](tla/wal/RESULTS.md).
 
 ## What is proved: primary-key encoding
 
@@ -174,6 +177,19 @@ than glossed over:
   key-encoding theorem files `KeyRoundTrip.lean` (round-trip),
   `KeyMonoFixed.lean` (fixed-width monotonicity/injectivity), and
   `KeyFraming.lean` (framing no-confusion and composite-key monotonicity).
+- `tla/wal/` — **not Lean.** A TLA+ model of the WAL / crash-recovery side,
+  which is out of Aeneas scope (concurrency + crash nondeterminism, see "Not
+  yet covered" above): the Standalone three-phase commit pipeline, the three
+  production WAL sinks and the `sync_data`/`sync_all` barrier split, checked
+  with TLC against vacuity canaries and an M1–M7 mutation re-gate. Start at
+  [`tla/wal/README.md`](tla/wal/README.md) (what is modelled, and how to run
+  it) and [`tla/wal/RESULTS.md`](tla/wal/RESULTS.md) (verdicts, state counts,
+  the three engineering findings F1–F3, and what S2 owes). Gated by
+  `make formal/tla-smoke && make formal/tla-model`; PR-gated by the `tla` job
+  in `.github/workflows/formal.yml`. Unlike the kernels, its fidelity to the
+  Rust rests on prose claims carrying `src/*.rs:LINE` cites — which is why
+  `scripts/check-drift.sh` also watches `src/wal.rs`, `src/store.rs` and
+  `src/persistence.rs`.
 - `WRITEUP.md` — the full narrative (methodology, Leanstral evaluation,
   Lean-engineering findings).
 

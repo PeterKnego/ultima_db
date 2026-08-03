@@ -188,7 +188,7 @@ two affected.
 `scan_wal` treats a CRC mismatch as end-of-log only when `tail_tolerant`,
 which `Store::recover` passes for `CoalescedPrealloc` and nothing else
 (`src/store.rs:1017-1022`). Every other sink gets `Err(WalCorrupted)`
-(`src/wal.rs:589-591`), which `recover` propagates with `?`
+(`src/wal.rs:677-679`), which `recover` propagates with `?`
 (`src/store.rs:1023`) **before applying any entry** — so frames the scan had
 already accepted, at offsets *before* the tear, are discarded with it. A
 full-length-but-CRC-bad tail is physically ordinary on an appending sink.
@@ -209,19 +209,19 @@ Re-home the harm first.
 
 ### F2 — `preallocate_to` is not idempotent under ENOSPC interruption
 
-`preallocate_to` (`src/wal.rs:536-551`) exists to establish one invariant:
+`preallocate_to` (`src/wal.rs:624-639`) exists to establish one invariant:
 *the new size is durable before any record is written into the region*
 (task37 §4 invariant 2). It does that by physically zero-filling `[from, to)`
 and then `sync_all`. **That invariant does not hold on its own error path.**
 If the zero-fill is interrupted — ENOSPC is the realistic trigger — the
 `write_all` error propagates out of `preallocate_to` *before* its `sync_all`,
 and out of `PreallocFileSink::sync` before `self.capacity = new_cap`
-(`src/wal.rs:1038-1044`). The file is now physically longer, the extension was
+(`src/wal.rs:1130-1136`). The file is now physically longer, the extension was
 never `sync_all`'d, and in-memory `capacity` still holds the old value.
 
 The consequence is on the *next open*, not on the retry:
 `PreallocFileSink::open` adopts `capacity` from `metadata().len()`
-(`src/wal.rs:1023-1024`) — i.e. it adopts the partially-extended,
+(`src/wal.rs:1115-1116`) — i.e. it adopts the partially-extended,
 never-`sync_all`'d size as though it were durable, and steady-state writes
 into it are covered by `sync_data` only. That is precisely the shape M5 was
 built to model (task37 §4 invariant 2), reached **without any mutation**.
@@ -237,7 +237,7 @@ here and none should be inferred.
 ### F3 — Two independent decisions about scan tolerance for the same file
 
 `PreallocFileSink::open` scans **tolerantly, unconditionally** —
-`scan_wal(&path, true)` at `src/wal.rs:1023`, to reconstruct `write_head`.
+`scan_wal(&path, true)` at `src/wal.rs:1115`, to reconstruct `write_head`.
 `Store::recover` decides tolerance **separately**, from the configured
 `WalWrite` (`src/store.rs:1017-1022`).
 
@@ -364,7 +364,7 @@ Three of these are doing more work than "something happens":
 
 - **`NoTornTailTruncation`** demands specifically that recovery truncated at a
   **torn** frame. An *absent* frame is a clean end-of-log in both scan modes
-  (`src/wal.rs:576-581`, unconditional `break`), so reaching only that case
+  (`src/wal.rs:664-669`, unconditional `break`), so reaching only that case
   would prove nothing about tolerance.
 - **`NoEventualAckLoss`** (red) is paired with
   `modes/ConsistentAckKeptCheck.cfg`, which runs the **same invariant** with
@@ -402,9 +402,9 @@ mutation is a green with nothing behind it.
 | **`M3Dup.cfg`** | — (`MaxCommits = 3`) | `NoDupLive` | 12 | M3's documented **symptom**: two writers bumped to the same version, the second `snapshots.insert(v, ..)` silently replacing the first. |
 | `M4.cfg` | `WalCrashPrealloc.cfg` | `TailTolerance` | 9 | `ScanIsTolerant` loses its `CoalescedPrealloc` arm (`src/store.rs:1017-1022`), so a preallocated WAL is scanned strictly and a legal torn tail aborts recovery — task37 §7. |
 | `M4Abort.cfg` | `modes/ConsistentPrealloc.cfg` | `StrictScanErrLosesDurableAck` | 10 | M4's **harm**: a durably-acked commit made unreachable because a later frame tore. |
-| `M5.cfg` | `WalCrashPrealloc.cfg` | `PreallocInvariant` | 5 | `SyncData` loses its `metaDurable` guard — a batch written into a freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s `sync_all` (`src/wal.rs:549`) never ran before the positioned write at `:1046`. task37 §4 invariant 2. |
+| `M5.cfg` | `WalCrashPrealloc.cfg` | `PreallocInvariant` | 5 | `SyncData` loses its `metaDurable` guard — a batch written into a freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s `sync_all` (`src/wal.rs:637`) never ran before the positioned write at `:1138`. task37 §4 invariant 2. |
 | **`M5Strand.cfg`** | `modes/ConsistentPrealloc3.cfg` | `NoAckLossAfterLiveExtend` | 16 | M5's **harm** rather than its mechanism: an acked commit lost behind an un-synced *live-log* extend. |
-| `M6.cfg` | `modes/ConsistentPrealloc.cfg` | `RecoverySound` clause (c) | 9 | `ScanLen` loses the stop at a CRC-bad frame (`src/wal.rs:585-592`), keeping only the end-of-log stop — corruption passes CRC, half a commit record lands in the store, and recovery reports success. |
+| `M6.cfg` | `modes/ConsistentPrealloc.cfg` | `RecoverySound` clause (c) | 9 | `ScanLen` loses the stop at a CRC-bad frame (`src/wal.rs:673-680`), keeping only the end-of-log stop — corruption passes CRC, half a commit record lands in the store, and recovery reports success. |
 | `M7.cfg` | `modes/ConsistentPrealloc.cfg` | `RecoverySound` clause (a) | 9 | `Replay` swaps the `cid`/`tbl` identity of chain positions 1 and 2, leaving `ver`, `sub`, `forkedFrom` as computed — the store restarts with the right versions, the right fork chain, and the wrong rows in them. |
 
 Controls, all clean at the same bound as the mutation they pair with —
@@ -567,9 +567,9 @@ the model or the Rust is wrong. This is the full list, classified.
 
 | # | Finding | Cites | Disposition |
 |---|---|---|---|
-| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:1017-1022`, `:1023`; `src/wal.rs:589-591` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
-| A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:536-551`, `:1023-1024`, `:1038-1044` | **F2** — code-reading finding, outside the model's state space, unadjudicated for severity |
-| A3 | Scan tolerance decided independently in two modules | `src/wal.rs:1023` vs `src/store.rs:1017-1022` | **F3** — code-reading finding, unadjudicated |
+| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:1017-1022`, `:1023`; `src/wal.rs:677-679` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
+| A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:624-639`, `:1115-1116`, `:1130-1136` | **F2** — code-reading finding, outside the model's state space, unadjudicated for severity |
+| A3 | Scan tolerance decided independently in two modules | `src/wal.rs:1115` vs `src/store.rs:1017-1022` | **F3** — code-reading finding, unadjudicated |
 
 ### Model artifacts and methodology corrections
 
@@ -596,8 +596,8 @@ the model or the Rust is wrong. This is the full list, classified.
 
 1. **The rest of the battery.** S1 covered one of the brief's property groups.
    The full S1–S5/L1/`BulkLoadGuard` set across the mode matrix is outstanding.
-2. **A `Checkpoint` action**, which drags in WAL pruning (`src/wal.rs:628`,
-   and the preallocating prune at `:672-707`). This is where
+2. **A `Checkpoint` action**, which drags in WAL pruning (`src/wal.rs:716`,
+   and the preallocating prune at `:760-795`). This is where
    checkpoint/prune/crash interleavings bite, and it is currently untouched.
    Note it will break `PreallocInvariant`'s `writeHead = Len(walDurable)`
    clause **on purpose** — a useful tripwire for whoever adds it.
@@ -616,7 +616,11 @@ the model or the Rust is wrong. This is the full list, classified.
    S3/S5 adds one, `M2`'s per-table last-writer map becomes necessary.
 7. **Adjudicate F2 and F3** and decide F1's disposition — three findings
    currently recorded, none dispositioned.
-8. **Consider wiring the gate into CI.** It is not there today.
+8. ~~**Consider wiring the gate into CI.**~~ **Done** in the S1 follow-up: the
+   `tla` job in `.github/workflows/formal.yml` runs `make formal/tla-smoke &&
+   make formal/tla-model` on any PR touching `formal/tla/**`, `tools/tla/**` or
+   the `Makefile`. What S2 still owes here is the *deep* tier — `make
+   formal/tla-calibrate` and the M1–M7 re-gate are still manual.
 9. **Close the manifest's two residual holes** (§7, "What the manifest still
    does not catch"): assert *which* invariant TLC reported, so that **adding**
    an invariant to a single-invariant calibration config cannot silently move
@@ -627,3 +631,19 @@ the model or the Rust is wrong. This is the full list, classified.
    becoming named invariants in their own right in those two configs. Neither
    is urgent; both are the difference between a guard that constrains the
    evidence and one that constrains only its container.
+10. **Replace the raw line-range cites with anchored ones.** Every fidelity
+   claim in `WalCrash.tla`, this file, `README.md` and the `.cfg` headers
+   points at `src/*.rs:LINE`. Those numbers rot on *any* commit that moves
+   lines, semantics or not: task57 (`perf(wal): frame entries at commit`)
+   landed between the S1 work starting and merging, and shifted **every**
+   `src/wal.rs` cite by 88–92 lines — 118 occurrences across 15 files, each of
+   which had to be re-checked against the source by hand. The `store.rs` and
+   `persistence.rs` cites survived only because that commit happened not to
+   touch them. S2 should consider an anchor form instead — a function or item
+   name plus one distinctive line of its body, e.g. `` src/wal.rs
+   `PreallocFileSink::sync` — "Steady-state barrier: size unchanged" `` —
+   which a grep can re-locate and a script could even verify. The drift guard
+   (`formal/scripts/check-drift.sh`, extended in the S1 follow-up to watch
+   `src/wal.rs`, `src/store.rs` and `src/persistence.rs`) now catches this at
+   PR time rather than at the next reader, which **bounds** the damage to one
+   PR's worth of rework; it does not eliminate the rework.
