@@ -2,9 +2,10 @@ name: formal
 
 # Formal-verification CI for the B-tree, the primary-key encoding and the WAL
 # crash-safety model (formal/).
-#   * drift  — gates PRs: the watched src/*.rs files may not diverge from their
-#              formal models unnoticed. Cheap (git + cargo only), so it runs on
-#              every PR.
+#   * drift  — gates PRs *and* pushes to main: the watched src/*.rs files may not
+#              diverge from their formal models unnoticed. Cheap (git + cargo
+#              only), so it runs on every PR and on any main push that touches
+#              one of them.
 #   * tla    — gates PRs that touch the TLA+ WAL model: S0 toolchain canary plus
 #              the S1 model (manifest + baselines + vacuity canaries + modes).
 #              ~90s, jar is vendored, so it is a cheap PR gate. Path-scoped
@@ -17,21 +18,23 @@ name: formal
 on:
   pull_request:
   # Also gate main directly: work merged locally and pushed (rather than via a
-  # PR) would otherwise skip this check until the next Monday cron. Path-scoped
-  # because `lean` is a ~30-minute proof build — only worth running on main when
-  # something it actually verifies changed. (`drift` stays PR-only: it diffs
-  # against the PR base, and on a main-push checkout its default base
-  # `origin/main` equals HEAD, so it would pass vacuously.)
+  # PR) would otherwise skip these checks until the next Monday cron. That is
+  # not hypothetical — task57's wal.rs refactor reached main that way and moved
+  # every cite in formal/tla/ without anything noticing.
   #
-  # The formal/ entries are the LEAN inputs specifically, not 'formal/**':
-  # `lean` is the only job this push trigger can start, and it verifies nothing
-  # under formal/tla/, so a TLA-only merge must not fire a 30-minute proof
-  # build. TLA+ is gated on the PR instead, by the `tla` job below.
+  # The path list is the union of what the jobs below need, because a workflow
+  # gets exactly one push filter. Per-job scoping is then done inside the jobs:
+  # `drift` wants all five watched sources, while `lean` is a ~30-minute proof
+  # build that verifies only the B-tree and key-encoding kernels — so it must
+  # NOT fire for a wal.rs/store.rs/persistence.rs push. See `lean-scope`.
   push:
     branches: [main]
     paths:
       - 'src/btree.rs'
       - 'src/primary_key.rs'
+      - 'src/wal.rs'
+      - 'src/store.rs'
+      - 'src/persistence.rs'
       - 'formal/kernel/**'
       - 'formal/key_kernel/**'
       - 'formal/proofs/**'
@@ -46,18 +49,31 @@ permissions:
 
 jobs:
   drift:
-    if: github.event_name == 'pull_request'
+    # PRs *and* direct-to-main pushes. Running on push is the whole point of
+    # widening the filter above: a locally-merged push never sees the PR gate,
+    # which is how task57 moved every formal/tla/ cite unnoticed.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # need the PR base commit for the range diff
-      - name: Drift guard (src/btree.rs, src/primary_key.rs <-> formal/)
+          fetch-depth: 0 # need the base commit for the range diff
+      - name: Drift guard (watched src/*.rs <-> formal/)
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          # Bypass for a watched-file change outside the verified surface
-          # by putting [skip-formal-drift] in the PR title.
-          ACK_NO_FORMAL: ${{ contains(github.event.pull_request.title, '[skip-formal-drift]') && '1' || '' }}
+          # On a PR, diff against the merge base. On a push, against the commit
+          # the branch was at before it — `origin/main` would equal HEAD here
+          # and the check would pass vacuously.
+          BASE: >-
+            ${{ github.event_name == 'pull_request'
+                && github.event.pull_request.base.sha
+                || github.event.before }}
+          # Bypass for a watched-file change outside the verified surface:
+          # [skip-formal-drift] in the PR title, or in the pushed commit message.
+          # The script tests for exactly "1", so the false branch must be empty.
+          ACK_NO_FORMAL: >-
+            ${{ (contains(github.event.pull_request.title, '[skip-formal-drift]')
+                 || contains(github.event.head_commit.message, '[skip-formal-drift]'))
+                && '1' || '' }}
         run: formal/scripts/check-drift.sh
       - name: Kernel differential tests (vs std BTreeMap / reproduced impls)
         run: |
@@ -104,8 +120,42 @@ jobs:
         # canaries + the durability-matrix modes. ~90s total.
         run: make formal/tla-smoke && make formal/tla-model
 
-  lean:
+  # The push filter above is the union of every job's inputs, so a push that
+  # only touched src/wal.rs (or store.rs/persistence.rs) reaches this workflow
+  # for `drift`'s sake — but `lean` verifies neither. Deciding that here keeps
+  # the ~30-minute build off those pushes without gating each of its steps.
+  # Schedule and workflow_dispatch always run: there is no diff to scope by.
+  lean-scope:
     if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Are the Lean inputs in scope for this run?
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" != "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "$EVENT: nothing to scope by — running the proofs."
+            exit 0
+          fi
+          if git diff --name-only "$BEFORE"...HEAD | grep -qE '^(src/btree\.rs|src/primary_key\.rs|formal/kernel/|formal/key_kernel/|formal/proofs/|formal/scripts/|\.github/workflows/formal\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Lean inputs changed — running the proofs."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No Lean inputs changed — skipping the proof build."
+          fi
+
+  lean:
+    needs: lean-scope
+    if: needs.lean-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
