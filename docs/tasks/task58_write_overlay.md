@@ -1,6 +1,6 @@
 # Task 58: Write overlay — bounded mini-memtable for SingleWriter commits
 
-**Status:** implemented (Tasks 1–5), perf-cell + docs (this task), fleet A/B ship gate outstanding (manual, out of scope for this doc).
+**Status:** implemented (Tasks 1–5), perf-cell + docs, final-review fix wave applied; fleet A/B ship gate outstanding (manual, out of scope for this doc).
 
 ## Problem
 
@@ -37,14 +37,27 @@ enum OverlayOp<R> {
 }
 ```
 
-`Table<R, K>` carries an `Overlay` plus an `overlay_disabled` flag;
-`TableSnapshot` (batch-rollback capture) mirrors both fields and restores
-them wholesale on rollback.
+`Table<R, K>` carries an `Overlay`; `TableSnapshot` (batch-rollback
+capture) mirrors it and restores it wholesale on rollback. There is no
+separate `overlay_disabled` flag (the design doc predicted one): a cap of
+`0` is the disable, and an indexed table is kept overlay-free by
+`overlay_write_ready()`'s `!indexes.is_empty()` arm rather than by a flag.
 
 Cost model: after a commit shares `entries` with the latest snapshot, the
-next write's `Arc::make_mut` copies ≤ `OVERLAY_CAP` entries (≈2 KB at cap
-128, ~100 ns) instead of cloning tree nodes. This bounded copy replacing
-the unbounded-fanout node-clone chain is the entire trick.
+next write's `Arc::make_mut` deep-copies the buffered entries instead of
+cloning tree nodes. **That copy is not a flat memcpy** — the design doc's
+inherited "≈2 KB, ~100 ns" phrasing is wrong and is corrected here.
+Cloning `Vec<(K, OverlayOp<R>)>` runs the element clone per entry: one
+atomic refcount increment on each entry's `Arc<R>`, plus a `K` clone (a
+heap allocation for `String`/`Vec<u8>` keys, a register copy for `u64`).
+So the per-write CoW cost is **linear in the number of currently buffered
+entries**, dominated by one atomic RMW each, and it *grows as the overlay
+fills* — cheapest right after a flush, most expensive at `OVERLAY_CAP − 1`.
+The trick still holds (a bounded, cap-sized cost replacing the
+unbounded-fanout node-clone chain), but the per-entry constant is an
+atomic-refcount constant, not a memcpy constant. This is the direct reason
+the cap-tuning arms in Validation below point *downward* rather than
+upward.
 
 **Write path** — `insert`/`put`/`update`/`delete` on an enabled, non-full
 table: a merged `get` (overlay-then-tree) decides existence and the exact
@@ -76,9 +89,13 @@ construction, so there is no partial-flush error path.
 of the overlay first (`Put` returns the record, `Tombstone` returns
 `None`), falling through to the tree only on a miss. All multi-row paths —
 `iter`, `range`, scans, checkpoint serialization, snapshot streaming — flow
-through `overlay::MergedIter`, a two-pointer merge of the sorted overlay
-slice and the tree iterator; overlay wins ties, tombstones swallow the
-tree's entry. `len()` = `data.len() + len_delta`. The design doc calls out
+through `Table::merged_iter`, which returns an `overlay::TableIter`: with a
+nonempty overlay, `TableIter::Merged` — a two-pointer merge of the sorted
+overlay slice and the tree iterator, overlay wins ties, tombstones swallow
+the tree's entry; with an **empty** overlay, `TableIter::Plain` — the bare
+tree iterator, one `match` per step and no peek/compare at all (the
+quiet-store fast path; see the perf sections below for why it exists).
+`len()` = `data.len() + len_delta`. The design doc calls out
 the correctness linchpin explicitly: **no direct `self.data.iter()`/range
 may exist outside this choke point** — the property test below is what
 guards it.
@@ -92,11 +109,14 @@ guards it.
   `ULTIMA_OVERLAY_CAP`, read once) for `WriterMode::SingleWriter`, `0` for
   `MultiWriter`.
 - **Non-indexed tables only.** `define_index`/`define_custom_index` flush
-  the overlay and permanently set `overlay_disabled` before touching
-  `self.data` — closing a Task-3 review finding that `get`/
-  `merged_get_arc` honor a nonempty overlay regardless of index state, so
-  buffered rows must be flushed before an indexed table's DDL and its
-  update/delete else-branches start bypassing the overlay.
+  the overlay (and zero its cap) before touching `self.data` — closing a
+  Task-3 review finding that `get`/`merged_get_arc` honor a nonempty
+  overlay regardless of index state, so buffered rows must be flushed
+  before an indexed table's DDL and its update/delete else-branches start
+  bypassing the overlay. What keeps it empty *afterwards* is
+  `overlay_write_ready()`'s `!indexes.is_empty()` arm, not the zeroed cap:
+  a later `open_table` re-applies the store's cap via `set_overlay_cap`,
+  but no write on an indexed table ever buffers again.
 - No public API, no config surface. `OVERLAY_CAP` is an internal
   `pub(crate)` const (128), env-overridable only for bench tuning
   (`ULTIMA_OVERLAY_CAP`, task57 precedent — read once at `Store::new`, `0`
@@ -152,6 +172,41 @@ guards it.
   review fix, commit `27de890`) — folded into the merged-iterator choke
   point described above rather than a special-cased tree-only path.
 
+### Final-review fix wave
+
+- **The store's `put` really buffers now.** `TableWriter::put` →
+  `TableWriter::upsert` reached the data through `Table::upsert_arc`, which
+  force-flushes and writes the tree directly — so `Table::put`'s buffering
+  branch was **dead in production**: every explicitly-keyed store write
+  bypassed the overlay and, worse, flushed it. `upsert` now calls
+  `Table::put` (which buffers when `overlay_write_ready()` and otherwise
+  falls back to `upsert_arc` verbatim). WAL emission order, write-set /
+  intent recording, counter advancement and insert-or-replace semantics are
+  unchanged — the record is still serialized and the key still encoded
+  *before* the row moves into the table, and the write set is still
+  recorded only after the write succeeds. `upsert_arc` stays reserved for
+  the MultiWriter commit-merge and replay paths, which must not route
+  through the overlay.
+- **Empty-overlay scan short-circuit.** `merged_iter` returns
+  `TableIter::Plain(tree_range)` when the overlay is empty instead of
+  building a `MergedIter` with two `Peekable`s and running a peek/compare
+  per step. The two-variant enum keeps `iter`/`range`'s public
+  `impl Iterator` signatures unchanged. Aimed squarely at the
+  `checkpoint_ms`/`snapshot_stream_ms` regression discussed below.
+- **`insert_with_id` fenced with `flush_overlay()`.** It probes and writes
+  `self.data` directly (duplicate-key check, then `insert_mut`).
+  Unreachable with a live overlay today, but the fence keeps the
+  "direct-tree access implies flushed" invariant web closed by
+  construction rather than by audit.
+- **`ULTIMA_OVERLAY_CAP` parse hardening.** A *set but unparsable* value
+  used to fall back to the default silently (`.ok().and_then(parse.ok())`),
+  which on a bench host means measuring the default while believing you
+  measured an arm. It now `eprintln!`s a warning naming the offending value
+  and the cap actually used. Deliberately not a panic: `Store::new` runs in
+  recovery contexts where aborting is worse than a default. Untested by
+  design — `std::env` is process-global and a test would race the rest of
+  the suite.
+
 ## Test inventory
 
 - **Property test (centerpiece):** `overlay_table_is_observationally_identical_to_plain_table`
@@ -159,7 +214,11 @@ guards it.
   random op sequences (insert/put/update/delete/get/range/iter/len) across
   8 seeds × caps `{1, 2, 3, 8}` (forcing flushes at every boundary
   alignment) must be observationally identical at every step. This is the
-  single test guarding the merge/tombstone/`len_delta` surface.
+  single test guarding the merge/tombstone/`len_delta` surface. The `put`
+  arm (final fix wave) draws explicit keys from `0..20`, deliberately
+  overlapping the auto-increment range so put-over-existing,
+  put-over-tombstone and `next_id` advancement are all in the net — the
+  store's `TableWriter::put` path now routes here.
 - `src/overlay.rs` unit tests: sorted-insert/replace-in-place, the full
   `len_delta` transition table, CoW-clone-doesn't-leak, cap-0-disabled,
   `take_entries` reset.
@@ -168,13 +227,23 @@ guards it.
   batch-rollback and DDL suites exercising the overlay through
   `TableSnapshot` capture/restore and `define_index`/`define_custom_index`
   flush-and-disable.
-- `src/store.rs`: SingleWriter-enable / MultiWriter-never-enables wiring,
+- `src/store.rs`: `store_put_buffers_in_the_overlay` (the regression test
+  for the dead-`put`-path bug: a store-level `put` must show
+  `overlay_len_probe() > 0` before commit, be visible to a merged read
+  pre-commit, collapse a repeated key to one buffered entry, and be visible
+  to a reader after commit), SingleWriter-enable / MultiWriter-never-enables wiring,
   DDL flush+disable at the store level, MVCC visibility (old `ReadTx` sees
   its frozen overlay; new sees new state), recovery and checkpoint
   round-trips with a nonempty overlay at the cut point, and the
   `bulk_load` Delta-path fix above.
 
 ## Local direction numbers (sandbox, direction-only — do not draw a perf conclusion from these)
+
+> These `perf_decomp` numbers predate the final review and predate the
+> store-`put` fix (before which explicitly-keyed store writes never reached
+> the overlay at all). The **method of record for local measurement** is the
+> same-binary interleaved `ULTIMA_OVERLAY_CAP=0` A/B described two sections
+> down; this cell is kept as the earlier direction-only artifact.
 
 `cargo run --release --features persistence --example perf_decomp`, cell
 (7) added: same `store_eventual_update` loop with `ULTIMA_OVERLAY_CAP=0`
@@ -240,74 +309,133 @@ No tuning was attempted per the task brief's direction-only instruction.
 This result is recorded as-is for the review gate; it does not by itself
 support or refute the ship criterion below — only the fleet run does.
 
-## `make perf/check` findings (sandbox, direction-only, non-gating)
+## `make perf/check` output — cross-host, NOT an A/B (no conclusions drawn)
 
-`autobench/CLAUDE.md` documents that this gate's committed baselines
-(`autobench/baselines/*.json`) are NVMe-host medians and states plainly:
-*"`make perf/check` fails on the noisy virtualized sandbox by design —
-different host shape, not a regression."* Per the task brief, these results
-are recorded for the review gate rather than tuned against.
+`make perf/check` compares *this sandbox run* against
+`autobench/baselines/*.json`, which are **NVMe-host medians recorded on a
+different machine**. `autobench/CLAUDE.md` says so plainly: *"`make
+perf/check` fails on the noisy virtualized sandbox by design — different
+host shape, not a regression."* Every number below is therefore
+**cross-host and non-comparable**: it says nothing about the overlay,
+because the two sides differ in host *and* in build. It is recorded only
+as run evidence that the gate was executed.
 
 `smr-apply-microbench` (SMR mode, explicit-version `SingleWriter` — the
-overlay engages on every apply, since the `state` table carries no index):
-seven consecutive runs on the loaded local sandbox.
+overlay engages on every apply, since the `state` table carries no index),
+seven consecutive runs on the loaded local sandbox:
 
-| metric | baseline (NVMe) | observed range (7 runs) | direction |
-|---|--:|--:|---|
-| `apply_sw_batch_throughput` | 233,340 | 515,707 – 556,680 | **+121% to +139%** (large, stable win) |
-| `apply_p99_ns` | 19,099 | 12,428 – 14,370 | **−25% to −35%** (stable win) |
-| `checkpoint_ms` | 22.7 | 31.1 – 40.0 | **+37% to +76%** (stable regression) |
-| `apply_throughput` (whole-pipeline, includes in-loop checkpoint) | 24,659 | 16,515 – 22,380 | −9% to −33% (noisy, tracks checkpoint_ms) |
-| `snapshot_stream_ms` (in-memory, no disk I/O) | 44.5 | 42.1 – 52.5 | mostly flat, one noisy outlier |
-| `read_p99_under_load_ns` | 547 | 570 – 851 | noisy (already a 39%-tolerance tail metric) |
+| metric | baseline (**NVMe host**) | observed (**sandbox**, 7 runs) |
+|---|--:|--:|
+| `apply_sw_batch_throughput` | 233,340 | 515,707 – 556,680 |
+| `apply_p99_ns` | 19,099 | 12,428 – 14,370 |
+| `checkpoint_ms` | 22.7 | 31.1 – 40.0 |
+| `apply_throughput` (whole-pipeline, includes in-loop checkpoint) | 24,659 | 16,515 – 22,380 |
+| `snapshot_stream_ms` (in-memory, no disk I/O) | 44.5 | 42.1 – 52.5 |
+| `read_p99_under_load_ns` | 547 | 570 – 851 |
 
-Two findings pull in opposite directions, and both are worth recording:
+**Struck.** Earlier revisions of this doc read the table above as an A/B and
+drew two conclusions from it — a "+121% to +139% large, stable win" on
+`apply_sw_batch_throughput` and a "**−25% to −35%** stable win" on
+`apply_p99_ns`, plus a "+37% to +76% stable regression" on
+`checkpoint_ms`. **All three conclusions are withdrawn**: a sandbox number
+against an NVMe-recorded baseline measures the host difference, not the
+change. The overlay's real local signal is the same-binary A/B in the next
+section — which, notably, finds `apply_p99_ns` moving in the *opposite*
+direction from what this cross-host table appeared to show.
 
-1. **`apply_sw_batch_throughput` — a large, consistent win exactly where
-   the design predicted one.** This cell is T=8 sequential auto-versioned
-   commits on the main `SingleWriter` store — precisely the regime the
-   overlay targets (bounded memcpy replacing a per-commit node-clone
-   chain). `apply_p99_ns` (the pinned-apply latency tail) improves in the
-   same direction. Both are stable across all 7 runs — this is a real
-   signal, not sandbox noise flipping sign.
-2. **`checkpoint_ms` — a consistent regression, but not attributable to
-   the overlay's design (double-buffering).** Per the brief's instruction
-   to check whether "the apply workload's batched cells now double-buffer"
-   before flagging: `checkpoint()` does **not** flush the overlay — it
-   serializes the merged view (`Table::merged_iter`, the same choke point
-   `collect_serialized_rows` uses for `snapshot_stream`) without touching
-   `data`. If the overlay's per-row merge branch were the cause,
-   `snapshot_stream_ms` — which serializes the *identical* merged view,
-   in memory, via the same code path — would show the same consistent
-   regression. It does not (44.5 → 42–52, no consistent direction). What
-   *does* differ: `checkpoint()` uniquely does real disk I/O on this path
-   (`write_checkpoint`'s fsync, a WAL-prune round-trip through the
-   background thread, `cleanup_old_checkpoints`'s directory scan+unlink) —
-   none of which `snapshot_stream`'s in-memory `Read` impl touches. On a
-   loaded/virtualized sandbox disk, that is exactly the kind of cost this
-   gate's own baseline doc warns is not sandbox-comparable. `mw-commit-microbench`
-   (`MultiWriter`, which never enables the overlay by construction) shows
-   two "regressions" — `mw_scaling_8x` and `mw_scaling_efficiency` — that
-   are pre-documented false positives (`infer_direction` gates those two
-   the wrong way; both values actually *improved*), reinforcing that this
-   host's gate output needs the documented caveats applied rather than
-   read at face value.
+(For completeness on gate-reading hygiene: `mw-commit-microbench`
+— `MultiWriter`, which never enables the overlay by construction — also
+reports `mw_scaling_8x` and `mw_scaling_efficiency` "regressions" that are
+pre-documented false positives: `infer_direction` gates those two the
+wrong way and both values actually improved.)
 
-**Flagged for the review gate, not resolved here:** whether `checkpoint_ms`'s
-regression reproduces on the NVMe bench host (Step 6, out of this task's
-scope) is the deciding question. If it does reproduce there, the most
-likely structural cause given the above is disk-I/O-path contention from
-the overlay-enabled `SingleWriter` apply loop generating a different write
-pattern to the same disk `checkpoint()` fsyncs against (e.g. more, smaller
-WAL/tree writes between checkpoints instead of fewer, larger ones) rather
-than the checkpoint serialization path itself. No tuning was attempted
-per the brief's direction-only instruction for this sandbox.
+## Local method of record: same-binary interleaved A/B (`ULTIMA_OVERLAY_CAP=0`)
+
+The only trustworthy local comparison is **one binary, one host, arms
+interleaved**: run `smr-apply-microbench` with the overlay at its default
+cap, then again with `ULTIMA_OVERLAY_CAP=0` (which disables the overlay at
+`Store::new` and reproduces main's write path exactly), alternating arms
+and repeating, so host drift lands on both arms equally. Same build, same
+process shape, no cross-host baseline anywhere in the comparison. Sandbox
+magnitudes are still not publishable — but *sign* and *rank* are usable
+when the arms don't overlap.
+
+Result of the final review's interleaved run:
+
+| metric | overlay vs `CAP=0`, same binary | reading |
+|---|--:|---|
+| `apply_sw_batch_throughput` | **+35% to +78%** | win; 8/8 repeats non-overlapping between arms |
+| `apply_p99_ns` | **+31% to +124% (WORSE)** | regression; the flush spike |
+| `read_p99_under_load_ns` | **−25% to −60% (better)** | win |
+| `checkpoint_ms` | **+19% median (worse)** | regression |
+| `snapshot_stream_ms` | **+6% median (worse)** | regression, same direction as checkpoint |
+
+Three things follow:
+
+1. **Throughput up, write tail down — and that trade was predicted.** The
+   overlay converts a per-commit node-clone chain into a bounded per-write
+   copy plus one batched tree pass every `OVERLAY_CAP` writes. The batched
+   pass is *cheaper per row* but it is **not free and it is not amortized
+   within a transaction**: one commit in every `OVERLAY_CAP` pays the whole
+   flush inline. That spike is exactly what a p99 metric samples, so
+   `apply_sw_batch_throughput` improving while `apply_p99_ns` worsens is
+   the design's own trade showing up, not a contradiction. The spec
+   anticipated it ("worst-case flush latency … rides inside one commit;
+   `OVERLAY_CAP` bounds it"). What was *not* anticipated is the magnitude:
+   +31–124% on the tail is large enough that it must be an explicit ship
+   consideration, not a footnote — see Validation.
+2. **`checkpoint_ms` and `snapshot_stream_ms` regress together, and the
+   old WAL/disk-I/O attribution was wrong.** The prior revision blamed
+   `checkpoint()`'s "fsync, a WAL-prune round-trip, `cleanup_old_checkpoints`"
+   and argued `snapshot_stream_ms` was flat. Both halves fail: the
+   `smr-apply-microbench` store runs in **SMR (checkpoint-only) mode,
+   which has no WAL at all**, so there is no WAL-prune round-trip to
+   blame; and the same-binary A/B shows `snapshot_stream_ms` *not* flat but
+   regressing +6% in the same direction. The surviving hypothesis is the
+   shared one: both paths serialize through `Table::merged_iter`
+   (`collect_serialized_rows`), and with a nonempty overlay every step of
+   that scan paid a peek/compare merge instead of a bare tree step. The
+   evidence is a **sign test, not a magnitude match** (+19% vs +6% on two
+   cells with different absolute costs and different noise), so this stays
+   a hypothesis rather than a measurement — hedged, and to be re-tested on
+   the fleet host.
+3. **The empty-overlay short-circuit in the final fix wave targets exactly
+   this.** `merged_iter` now returns `TableIter::Plain` — the bare tree
+   iterator — whenever the overlay is empty, so every quiet-table scan
+   (every `ReadTx`, every MultiWriter store, every table between flushes)
+   costs one `match` per step rather than the merge. It does **not** help
+   the case where the checkpoint cut lands on a *nonempty* overlay, which
+   is the regime this cell measures; whether the remaining gap survives is
+   a fleet-run question.
 
 ## Validation
 
-Ship iff eventual A beats Fjall same-host glibc, with C/E unchanged; A/B
-recipe: bench-oneshot competitor plus a branch-vs-main A/F run,
-OVERLAY_CAP arms 64/128/256 if marginal.
+Ship iff eventual A beats Fjall same-host glibc, with C/E unchanged.
+A/B recipe: `bench-oneshot competitor` plus a branch-vs-main A/F run.
+
+**Fleet metric set** — throughput alone is no longer sufficient given the
+same-binary result above. Each arm must report, at minimum:
+
+- eventual A / F throughput (the ship criterion),
+- C / E quiet-store read guardrails,
+- **write-tail latency (p99/p99.9) and `apply_p99_ns`** — first-class
+  ship-blockers now, not diagnostics: the local A/B found +31–124% on the
+  apply tail, and a throughput win bought with a tail that large is not
+  automatically a good trade,
+- `checkpoint_ms` / `snapshot_stream_ms` (to settle the serialize-scan
+  hypothesis above).
+
+**`OVERLAY_CAP` tuning arms: 16 / 32 / 128** (was 64/128/256 — reversed
+direction). Rationale: the corrected cost model says per-write CoW cost is
+**linear in the number of buffered entries** (one `Arc` refcount atomic
+plus a `K` clone each), not a flat memcpy, so it grows with cap; flush
+frequency meanwhile scales as 1/cap, and each flush is a bounded batched
+pass whose *per-row* cost is already the cheap part. Raising the cap
+therefore makes the common-path write more expensive to buy fewer flushes,
+and it makes each flush spike bigger — the wrong direction on both the
+mean and the tail. Smaller caps are the promising region: they shrink both
+the per-write copy and the flush spike, at the cost of more (individually
+cheaper) flushes. 128 is retained as the incumbent control arm.
 
 This fleet A/B (one c6id.2xlarge, real AWS spend) is **out of scope for
 this task** — it is Step 6 of the task brief and requires explicit user
