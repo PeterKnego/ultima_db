@@ -4067,4 +4067,71 @@ mod tests {
         assert_eq!(id, 6);
         assert_eq!(t.len(), 2);
     }
+
+    /// Drive an overlay table and a plain table with the same op sequence;
+    /// they must be observationally identical. Deterministic seeds; caps 1,
+    /// 2, 3, 8 force flushes at every boundary alignment.
+    #[test]
+    fn overlay_table_is_observationally_identical_to_plain_table() {
+        use rand::RngExt;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        for seed in 0..8u64 {
+            for cap in [1usize, 2, 3, 8] {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut plain: Table<String> = Table::new();
+                let mut with_ov: Table<String> = Table::new();
+                with_ov.overlay_mut_for_test(cap);
+                let mut live_keys: Vec<u64> = Vec::new();
+                for step in 0..400 {
+                    match rng.random_range(0..6) {
+                        0 | 1 => {
+                            let v = format!("v{step}");
+                            let a = plain.insert(v.clone()).unwrap();
+                            let b = with_ov.insert(v).unwrap();
+                            assert_eq!(a, b, "auto ids must stay in lockstep");
+                            live_keys.push(a);
+                        }
+                        2 if !live_keys.is_empty() => {
+                            let k = live_keys[rng.random_range(0..live_keys.len())];
+                            let v = format!("u{step}");
+                            assert_eq!(
+                                plain.update(&k, v.clone()).is_ok(),
+                                with_ov.update(&k, v).is_ok()
+                            );
+                        }
+                        3 if !live_keys.is_empty() => {
+                            let i = rng.random_range(0..live_keys.len());
+                            let k = live_keys.swap_remove(i);
+                            let a = plain.delete(&k);
+                            let b = with_ov.delete(&k);
+                            assert_eq!(a.is_ok(), b.is_ok());
+                            if let (Ok(x), Ok(y)) = (a, b) {
+                                assert_eq!(x, y);
+                            }
+                        }
+                        4 => {
+                            let k = rng.random_range(0..(live_keys.len() as u64 + 4));
+                            assert_eq!(plain.get(&k), with_ov.get(&k), "seed {seed} cap {cap} step {step}");
+                        }
+                        _ => {
+                            let lo = rng.random_range(0..12u64);
+                            let hi = lo + rng.random_range(0..12u64);
+                            let a: Vec<(u64, String)> =
+                                plain.range(lo..hi).map(|(k, v)| (*k, v.clone())).collect();
+                            let b: Vec<(u64, String)> =
+                                with_ov.range(lo..hi).map(|(k, v)| (*k, v.clone())).collect();
+                            assert_eq!(a, b, "seed {seed} cap {cap} step {step}");
+                        }
+                    }
+                    assert_eq!(plain.len(), with_ov.len());
+                }
+                // Full-iteration equivalence at the end, overlay still nonempty.
+                let a: Vec<(u64, String)> = plain.iter().map(|(k, v)| (*k, v.clone())).collect();
+                let b: Vec<(u64, String)> = with_ov.iter().map(|(k, v)| (*k, v.clone())).collect();
+                assert_eq!(a, b);
+            }
+        }
+    }
 }
