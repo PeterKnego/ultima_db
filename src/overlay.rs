@@ -135,6 +135,51 @@ impl<R, K: Ord + Clone> Overlay<R, K> {
 	}
 }
 
+/// Two-pointer merge of the sorted overlay slice and the tree's range
+/// iterator. Overlay wins key ties; tombstones swallow the tree's entry.
+/// With an empty overlay this is the tree iterator plus one dead branch.
+pub(crate) struct MergedIter<'a, R, K, T>
+where
+	T: Iterator<Item = (&'a K, &'a R)>,
+{
+	pub(crate) overlay: std::iter::Peekable<std::slice::Iter<'a, (K, OverlayOp<R>)>>,
+	pub(crate) tree: std::iter::Peekable<T>,
+}
+
+impl<'a, R: 'a, K: Ord + 'a, T> Iterator for MergedIter<'a, R, K, T>
+where
+	T: Iterator<Item = (&'a K, &'a R)>,
+{
+	type Item = (&'a K, &'a R);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			let take_overlay = match (self.overlay.peek(), self.tree.peek()) {
+				(Some((ok, _)), Some((tk, _))) => match ok.cmp(tk) {
+					std::cmp::Ordering::Less => true,
+					std::cmp::Ordering::Greater => false,
+					std::cmp::Ordering::Equal => {
+						self.tree.next(); // shadowed by the overlay entry
+						true
+					}
+				},
+				(Some(_), None) => true,
+				(None, Some(_)) => false,
+				(None, None) => return None,
+			};
+			if take_overlay {
+				let (k, op) = self.overlay.next().unwrap();
+				match op {
+					OverlayOp::Put { rec, .. } => return Some((k, rec.as_ref())),
+					OverlayOp::Tombstone => continue, // tree twin already skipped
+				}
+			} else {
+				return self.tree.next();
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

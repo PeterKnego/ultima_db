@@ -6,15 +6,15 @@ use std::any::Any;
 use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use crate::btree::BTree;
+use crate::btree::{BTree, BTreeRange};
 use crate::index::{
     CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage,
     UniqueStorage,
 };
-use crate::overlay::Overlay;
+use crate::overlay::{MergedIter, Overlay, OverlayOp};
 use crate::persistence::Record;
 use crate::primary_key::{AutoKey, PrimaryKey};
 use crate::{Error, Result};
@@ -148,6 +148,17 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
             .downcast_ref::<Table<R, K>>()
             .ok_or_else(|| Error::TypeMismatch("merge source".to_string()))?;
 
+        // The write overlay (task58) is a SingleWriter-only optimization.
+        // This per-key merge is MultiWriter's commit-time reconciliation
+        // path, and it reads/writes `self`/`source` through the tree
+        // directly (`data.get_arc`, `upsert_arc`, `delete`) rather than
+        // through `merged_get`/`merged_iter` — an overlay-resident write on
+        // either side here would silently be missed.
+        debug_assert!(
+            self.overlay_is_empty() && source.overlay_is_empty(),
+            "merge_keys_from: overlay must be empty on the MultiWriter merge path"
+        );
+
         // BUG(task47): under the `drop-merge-key` mutation, silently skip the
         // writer's edit to the first key of this merge — a lost update the
         // commit merge is supposed to preserve. OCC/SSI validation already
@@ -206,8 +217,8 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         &self,
         serialize_record: &(dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync),
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut out = Vec::with_capacity(self.data.len());
-        for (key, record) in self.data.range(..) {
+        let mut out = Vec::with_capacity(self.len());
+        for (key, record) in self.merged_iter(..) {
             let bytes = serialize_record(record as &dyn Any)?;
             out.push((key.encode(), bytes));
         }
@@ -354,8 +365,21 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
 
     /// Borrow the underlying data B-tree. Used by bulk-load Delta to walk
     /// the captured base in key order while materializing the merged rows.
+    ///
+    /// Callers see the tree *without* the overlay — only valid where the
+    /// overlay is empty by construction (bulk paths never enable it).
     pub(crate) fn data_ref(&self) -> &BTree<K, R> {
+        debug_assert!(self.overlay_is_empty(), "data_ref: overlay must be empty");
         &self.data
+    }
+
+    /// Whether the write overlay currently holds no entries. Trivially true
+    /// today (the overlay is inert, built with `Overlay::new(0)` everywhere)
+    /// — becomes load-bearing once writes route through it (task58 T3), at
+    /// which point every debug_assert here fences a real invariant instead
+    /// of a tautology.
+    fn overlay_is_empty(&self) -> bool {
+        self.overlay.is_empty()
     }
 
     /// The auto-increment counter, or `None` for an explicitly-keyed table.
@@ -397,8 +421,16 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         self.upsert_arc(key, Arc::new(record))
     }
 
-    /// Look up a record by its key.
+    /// Look up a record by its key. Overlay-then-tree: a live overlay entry
+    /// (if any) wins, a tombstone means "not found" regardless of the tree.
     pub fn get(&self, key: &K) -> Option<&R> {
+        if !self.overlay.is_empty() {
+            match self.overlay.get(key) {
+                Some(OverlayOp::Put { rec, .. }) => return Some(rec.as_ref()),
+                Some(OverlayOp::Tombstone) => return None,
+                None => {}
+            }
+        }
         self.data.get(key)
     }
 
@@ -621,49 +653,100 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         Ok(())
     }
 
+    /// Merge the write overlay with the backing tree over `range` — the
+    /// choke point every multi-row read (`iter`, `range`, `first`, `last`,
+    /// `collect_serialized_rows`) flows through. The overlay slice is
+    /// pre-narrowed to `range` via two `partition_point` calls, so this
+    /// stays O(log cap + items) rather than O(cap) per call. With an empty
+    /// overlay, `MergedIter` degenerates to the tree iterator plus one dead
+    /// branch per `next()`.
+    fn merged_iter<'a, Rb>(&'a self, range: Rb) -> MergedIter<'a, R, K, BTreeRange<'a, K, R>>
+    where
+        Rb: RangeBounds<K> + 'a,
+    {
+        let e = self.overlay.entries();
+        let lo = match range.start_bound() {
+            Bound::Included(k) => e.partition_point(|(ek, _)| ek < k),
+            Bound::Excluded(k) => e.partition_point(|(ek, _)| ek <= k),
+            Bound::Unbounded => 0,
+        };
+        let hi = match range.end_bound() {
+            Bound::Included(k) => e.partition_point(|(ek, _)| ek <= k),
+            Bound::Excluded(k) => e.partition_point(|(ek, _)| ek < k),
+            Bound::Unbounded => e.len(),
+        };
+        MergedIter {
+            overlay: e[lo..hi].iter().peekable(),
+            tree: self.data.range(range).peekable(),
+        }
+    }
+
+    /// Overlay-then-tree point lookup returning an owned `Arc`. Internal
+    /// counterpart to `get` for call sites that need to hold the value past
+    /// the table's borrow (e.g. a future write path layering onto the
+    /// overlay); not yet called from this task's read paths.
+    #[allow(dead_code)]
+    fn merged_get_arc(&self, key: &K) -> Option<Arc<R>> {
+        if !self.overlay.is_empty() {
+            match self.overlay.get(key) {
+                Some(OverlayOp::Put { rec, .. }) => return Some(Arc::clone(rec)),
+                Some(OverlayOp::Tombstone) => return None,
+                None => {}
+            }
+        }
+        self.data.get_arc(key)
+    }
+
     /// Returns an iterator over records within the specified key range.
     pub fn range<'a>(
         &'a self,
         range: impl RangeBounds<K> + 'a,
     ) -> impl Iterator<Item = (&'a K, &'a R)> + 'a {
-        self.data.range(range)
+        self.merged_iter(range)
     }
 
     /// Returns the number of records in the table.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.data.len()
+        (self.data.len() as i64 + self.overlay.len_delta()) as usize
     }
 
     /// Returns true if the table contains no records.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len() == 0
     }
 
     /// Returns true if the table contains a record with the given key.
     pub fn contains(&self, key: &K) -> bool {
-        self.data.get(key).is_some()
+        self.get(key).is_some()
     }
 
     /// Returns the first (lowest key) record, or `None` if empty.
     pub fn first(&self) -> Option<(&K, &R)> {
-        self.data.range(..).next()
+        self.merged_iter(..).next()
     }
 
     /// Returns the last (highest key) record, or `None` if empty.
     pub fn last(&self) -> Option<(&K, &R)> {
-        self.data.range(..).next_back()
+        if self.overlay.is_empty() {
+            self.data.range(..).next_back()
+        } else {
+            // `MergedIter` isn't double-ended; the overlay is bounded
+            // (`OVERLAY_CAP`), so draining it for the tail entry is cheap
+            // and correct rather than clever.
+            self.merged_iter(..).last()
+        }
     }
 
     /// Iterate over all records in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &R)> + '_ {
-        self.range(..)
+        self.merged_iter(..)
     }
 
     /// Look up multiple records by key.
     pub fn get_many(&self, keys: &[K]) -> Vec<Option<&R>> {
-        keys.iter().map(|key| self.data.get(key)).collect()
+        keys.iter().map(|key| self.get(key)).collect()
     }
 
     // -----------------------------------------------------------------------
@@ -724,6 +807,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             }
         };
         // Backfill via fast bulk-build primitive (falls back to per-row for custom indexes).
+        // Reads `self.data` directly: indexed tables carry an always-empty,
+        // disabled overlay, so this is exactly today's tree-only picture.
         index.rebuild_from_sorted_data(&self.data)?;
         self.indexes.insert(name.to_string(), index);
         Ok(())
@@ -743,6 +828,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
+        // Not routed through `get`/`merged_iter`: indexed tables carry an
+        // always-empty, disabled overlay (define_index/define_custom_index
+        // backfill straight off `self.data`), so a direct tree read is safe.
         match managed.storage().get(key) {
             Some(row_key) => Ok(self.data.get(&row_key).map(|r| (row_key, r))),
             None => Ok(None),
@@ -763,6 +851,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, NonUniqueStorage<IK, K>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
+        // Indexed tables have an always-empty, disabled overlay — see the
+        // comment in `get_unique`. Direct tree reads are safe here too.
         Ok(managed
             .storage()
             .get_ids(key)
@@ -781,7 +871,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        // Try unique first, then non-unique.
+        // Try unique first, then non-unique. Indexed tables have an
+        // always-empty, disabled overlay (see `get_unique`); direct tree
+        // reads below are safe.
         if let Some(managed) = idx
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>()
@@ -815,7 +907,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        // Try unique first, then non-unique.
+        // Try unique first, then non-unique. Indexed tables have an
+        // always-empty, disabled overlay (see `get_unique`); direct tree
+        // reads below are safe.
         if let Some(managed) = idx
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>()
@@ -856,6 +950,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         if self.indexes.contains_key(name) {
             return Err(Error::IndexAlreadyExists(name.to_string()));
         }
+        // Reads `self.data` directly: indexed tables carry an always-empty,
+        // disabled overlay, so this is exactly today's tree-only picture.
         index.rebuild(self.data.range(..).map(|(id, r)| (id.clone(), r)))?;
         let adapter = CustomIndexAdapter::new(name.to_string(), index);
         self.indexes.insert(name.to_string(), Box::new(adapter));
@@ -1098,6 +1194,20 @@ impl<R, K: PrimaryKey> Clone for Table<R, K> {
 impl<R: Record, K: AutoKey> Default for Table<R, K> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl<R, K: PrimaryKey> Table<R, K> {
+    /// Test-only escape hatch: enable the overlay at `cap` (a no-op if it's
+    /// already enabled) and hand back a mutable handle so tests can drive
+    /// overlay state directly instead of pushing OVERLAY_CAP-many writes
+    /// through the not-yet-built flush path.
+    pub(crate) fn overlay_mut_for_test(&mut self, cap: usize) -> &mut Overlay<R, K> {
+        if !self.overlay.enabled() {
+            self.overlay = Overlay::new(cap);
+        }
+        &mut self.overlay
     }
 }
 
@@ -3669,5 +3779,42 @@ mod tests {
                 .total,
             0
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Merged reads through the write overlay (task58 T2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merged_get_prefers_overlay_and_respects_tombstones() {
+        let mut t: Table<String> = Table::new();
+        let id = t.insert("tree".to_string()).unwrap();
+        let ov = t.overlay_mut_for_test(8);
+        ov.set_put(id, std::sync::Arc::new("overlay".to_string()), true);
+        assert_eq!(t.get(&id).map(String::as_str), Some("overlay"));
+        t.overlay_mut_for_test(8).set_tombstone(id);
+        assert_eq!(t.get(&id), None);
+        assert!(!t.contains(&id));
+    }
+
+    #[test]
+    fn merged_len_and_iter_and_range_merge_both_sources() {
+        let mut t: Table<String> = Table::new();
+        let a = t.insert("a".to_string()).unwrap(); // key 1
+        let b = t.insert("b".to_string()).unwrap(); // key 2
+        let _c = t.insert("c".to_string()).unwrap(); // key 3
+        {
+            let ov = t.overlay_mut_for_test(8);
+            ov.set_put(b, std::sync::Arc::new("b2".to_string()), true); // update via overlay
+            ov.set_tombstone(a); // delete via overlay
+            ov.set_put(10, std::sync::Arc::new("j".to_string()), false); // new row
+        }
+        assert_eq!(t.len(), 3); // 3 - 1 + 1
+        let got: Vec<(u64, String)> = t.iter().map(|(k, v)| (*k, v.clone())).collect();
+        assert_eq!(got, vec![(2, "b2".into()), (3, "c".into()), (10, "j".into())]);
+        let ranged: Vec<u64> = t.range(2..=3).map(|(k, _)| *k).collect();
+        assert_eq!(ranged, vec![2, 3]);
+        assert_eq!(t.first().map(|(k, _)| *k), Some(2));
+        assert_eq!(t.last().map(|(k, _)| *k), Some(10));
     }
 }
