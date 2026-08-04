@@ -135,9 +135,44 @@ impl<R, K: Ord + Clone> Overlay<R, K> {
 	}
 }
 
+/// The table's multi-row read iterator: the merge when there is something
+/// to merge, the bare tree iterator when there isn't.
+///
+/// The quiet-store fast path is the whole point of the split. `MergedIter`
+/// costs a `Peekable` wrapper on the tree side plus a two-way peek/compare
+/// per step even with zero overlay entries; a table with an empty overlay
+/// (every read-only snapshot, every non-`SingleWriter` store, every table
+/// between flushes) should pay a single `match` instead. Keeping both
+/// behind one enum also keeps `Table::iter`/`range`'s public
+/// `impl Iterator` signatures unchanged.
+pub(crate) enum TableIter<'a, R, K, T>
+where
+	T: Iterator<Item = (&'a K, &'a R)>,
+{
+	/// Empty overlay — the tree iterator, unwrapped.
+	Plain(T),
+	/// Nonempty overlay — the two-pointer merge below.
+	Merged(MergedIter<'a, R, K, T>),
+}
+
+impl<'a, R: 'a, K: Ord + 'a, T> Iterator for TableIter<'a, R, K, T>
+where
+	T: Iterator<Item = (&'a K, &'a R)>,
+{
+	type Item = (&'a K, &'a R);
+
+	#[inline]
+	fn next(&mut self) -> Option<Self::Item> {
+		match self {
+			TableIter::Plain(tree) => tree.next(),
+			TableIter::Merged(merged) => merged.next(),
+		}
+	}
+}
+
 /// Two-pointer merge of the sorted overlay slice and the tree's range
 /// iterator. Overlay wins key ties; tombstones swallow the tree's entry.
-/// With an empty overlay this is the tree iterator plus one dead branch.
+/// Only constructed for a nonempty overlay — see [`TableIter`].
 pub(crate) struct MergedIter<'a, R, K, T>
 where
 	T: Iterator<Item = (&'a K, &'a R)>,

@@ -14,7 +14,7 @@ use crate::index::{
     CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage,
     UniqueStorage,
 };
-use crate::overlay::{MergedIter, Overlay, OverlayOp};
+use crate::overlay::{MergedIter, Overlay, OverlayOp, TableIter};
 use crate::persistence::Record;
 use crate::primary_key::{AutoKey, PrimaryKey};
 use crate::{Error, Result};
@@ -296,10 +296,10 @@ pub struct Table<R, K = u64> {
     /// `new_keyed` does support `insert` once it has been written to.
     next_id: Option<K>,
     indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, K>>>,
-    /// Bounded write-front absorbing recent mutations. Disabled (`cap == 0`)
-    /// everywhere in this task — every construction site below builds it
-    /// with `Overlay::new(0)`, which makes every read a single dead branch
-    /// away from today's tree-only path. See `src/overlay.rs`.
+    /// Bounded write-front absorbing recent mutations. Every construction
+    /// site below builds it disabled (`cap == 0`); `Store`'s writer path
+    /// enables it per table via [`Table::set_overlay_cap`] (SingleWriter
+    /// only). See `src/overlay.rs`.
     overlay: Overlay<R, K>,
 }
 
@@ -373,11 +373,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         &self.data
     }
 
-    /// Whether the write overlay currently holds no entries. Trivially true
-    /// today (the overlay is inert, built with `Overlay::new(0)` everywhere)
-    /// — becomes load-bearing once writes route through it (task58 T3), at
-    /// which point every debug_assert here fences a real invariant instead
-    /// of a tautology.
+    /// Whether the write overlay currently holds no entries. Load-bearing:
+    /// the `debug_assert!`s that call it fence real invariants (the
+    /// MultiWriter merge path and `data_ref()`'s tree-only view).
     fn overlay_is_empty(&self) -> bool {
         self.overlay.is_empty()
     }
@@ -754,13 +752,20 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// choke point every multi-row read (`iter`, `range`, `first`, `last`,
     /// `collect_serialized_rows`) flows through. The overlay slice is
     /// pre-narrowed to `range` via two `partition_point` calls, so this
-    /// stays O(log cap + items) rather than O(cap) per call. With an empty
-    /// overlay, `MergedIter` degenerates to the tree iterator plus one dead
-    /// branch per `next()`.
-    fn merged_iter<'a, Rb>(&'a self, range: Rb) -> MergedIter<'a, R, K, BTreeRange<'a, K, R>>
+    /// stays O(log cap + items) rather than O(cap) per call.
+    ///
+    /// An empty overlay short-circuits to the bare tree iterator
+    /// (`TableIter::Plain`): scans on a quiet table — every `ReadTx`, every
+    /// MultiWriter store, every table between flushes — pay one `match` per
+    /// step instead of the merge's peek/compare, which is what keeps
+    /// checkpoint/snapshot-stream scan cost off the overlay's bill.
+    fn merged_iter<'a, Rb>(&'a self, range: Rb) -> TableIter<'a, R, K, BTreeRange<'a, K, R>>
     where
         Rb: RangeBounds<K> + 'a,
     {
+        if self.overlay.is_empty() {
+            return TableIter::Plain(self.data.range(range));
+        }
         let e = self.overlay.entries();
         let lo = match range.start_bound() {
             Bound::Included(k) => e.partition_point(|(ek, _)| ek < k),
@@ -772,10 +777,10 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             Bound::Excluded(k) => e.partition_point(|(ek, _)| ek < k),
             Bound::Unbounded => e.len(),
         };
-        MergedIter {
+        TableIter::Merged(MergedIter {
             overlay: e[lo..hi].iter().peekable(),
             tree: self.data.range(range).peekable(),
-        }
+        })
     }
 
     /// Overlay-then-tree point lookup returning an owned `Arc`. Internal
@@ -912,14 +917,19 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         kind: IndexKind,
         extractor: impl Fn(&R) -> IK + Send + Sync + 'static,
     ) -> Result<()> {
-        // Indexed tables use the direct path: index reads at 735–824
-        // (get_unique/get_by_index/index_range) read `self.data` straight
-        // off the tree and rely on the overlay staying empty and disabled
-        // from here on (task58 T5) — `get`/`merged_get_arc` consult the
-        // overlay whenever it's nonempty regardless of index state, so any
-        // entries buffered before this call must be flushed now or they'd
-        // wrongly keep shadowing the tree once `update`/`delete` stop
-        // routing through the overlay.
+        // Indexed tables use the direct path: the index reads below
+        // (get_unique/get_by_index/get_by_key/index_range) read `self.data`
+        // straight off the tree, so an indexed table's overlay must stay
+        // *empty* from here on. What guarantees that is
+        // `overlay_write_ready()`'s `!self.indexes.is_empty()` arm — once
+        // this index is registered no write buffers again. (The cap itself
+        // is zeroed here for clarity, but a later `open_table` re-applies
+        // the store's cap via `set_overlay_cap`; the emptiness invariant is
+        // the load-bearing one, not the cap.) Entries buffered *before* this
+        // call still have to be flushed now: `get`/`merged_get_arc` consult
+        // a nonempty overlay regardless of index state, so leaving them
+        // would let them shadow the tree forever while `update`/`delete`
+        // wrote around them.
         self.flush_overlay();
         self.overlay = Overlay::new(0);
         if let Some(existing) = self.indexes.get(name) {
@@ -949,8 +959,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             }
         };
         // Backfill via fast bulk-build primitive (falls back to per-row for custom indexes).
-        // Reads `self.data` directly: indexed tables carry an always-empty,
-        // disabled overlay, so this is exactly today's tree-only picture.
+        // Reads `self.data` directly: the overlay was just flushed and no
+        // further write will buffer into it, so this is exactly today's
+        // tree-only picture.
         index.rebuild_from_sorted_data(&self.data)?;
         self.indexes.insert(name.to_string(), index);
         Ok(())
@@ -970,9 +981,10 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
-        // Not routed through `get`/`merged_iter`: indexed tables carry an
-        // always-empty, disabled overlay (define_index/define_custom_index
-        // backfill straight off `self.data`), so a direct tree read is safe.
+        // Not routed through `get`/`merged_iter`: an indexed table's overlay
+        // is always empty — `overlay_write_ready()` refuses to buffer while
+        // `!self.indexes.is_empty()`, and the DDL that created this index
+        // flushed whatever predated it — so a direct tree read is safe.
         match managed.storage().get(key) {
             Some(row_key) => Ok(self.data.get(&row_key).map(|r| (row_key, r))),
             None => Ok(None),
@@ -993,8 +1005,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, NonUniqueStorage<IK, K>>>()
             .ok_or_else(|| Error::IndexTypeMismatch(index_name.to_string()))?;
-        // Indexed tables have an always-empty, disabled overlay — see the
-        // comment in `get_unique`. Direct tree reads are safe here too.
+        // An indexed table's overlay is always empty — see the comment in
+        // `get_unique`. Direct tree reads are safe here too.
         Ok(managed
             .storage()
             .get_ids(key)
@@ -1013,9 +1025,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        // Try unique first, then non-unique. Indexed tables have an
-        // always-empty, disabled overlay (see `get_unique`); direct tree
-        // reads below are safe.
+        // Try unique first, then non-unique. An indexed table's overlay is
+        // always empty (see `get_unique`); direct tree reads below are safe.
         if let Some(managed) = idx
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>()
@@ -1049,9 +1060,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        // Try unique first, then non-unique. Indexed tables have an
-        // always-empty, disabled overlay (see `get_unique`); direct tree
-        // reads below are safe.
+        // Try unique first, then non-unique. An indexed table's overlay is
+        // always empty (see `get_unique`); direct tree reads below are safe.
         if let Some(managed) = idx
             .as_any()
             .downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>()
@@ -1089,16 +1099,18 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         name: &str,
         mut index: I,
     ) -> Result<()> {
-        // Indexed tables use the direct path; index reads at 735–824 rely
-        // on the overlay staying empty and disabled from here on — see the
-        // comment in `define_index` (task58 T5).
+        // Indexed tables use the direct path; the index reads rely on the
+        // overlay staying empty from here on, which
+        // `overlay_write_ready()`'s `!self.indexes.is_empty()` arm enforces
+        // — see the fuller comment in `define_index` (task58 T5).
         self.flush_overlay();
         self.overlay = Overlay::new(0);
         if self.indexes.contains_key(name) {
             return Err(Error::IndexAlreadyExists(name.to_string()));
         }
-        // Reads `self.data` directly: indexed tables carry an always-empty,
-        // disabled overlay, so this is exactly today's tree-only picture.
+        // Reads `self.data` directly: the overlay was just flushed and no
+        // further write will buffer into it, so this is exactly today's
+        // tree-only picture.
         index.rebuild(self.data.range(..).map(|(id, r)| (id.clone(), r)))?;
         let adapter = CustomIndexAdapter::new(name.to_string(), index);
         self.indexes.insert(name.to_string(), Box::new(adapter));
@@ -1290,6 +1302,9 @@ impl<R: Record, K: AutoKey> Table<R, K> {
     /// Returns an error if the ID already exists or if a unique index
     /// constraint is violated.
     pub fn insert_with_id(&mut self, id: K, record: R) -> Result<K> {
+        // Reads and writes `self.data` directly (duplicate probe below, then
+        // `insert_mut`) — flush first so the tree is the whole truth.
+        self.flush_overlay();
         if self.data.get(&id).is_some() {
             // `K` carries no `Display`/`Debug` bound; the order-preserving
             // encoding is the one printable form every key type has.
@@ -4165,7 +4180,7 @@ mod tests {
                 with_ov.overlay_mut_for_test(cap);
                 let mut live_keys: Vec<u64> = Vec::new();
                 for step in 0..400 {
-                    match rng.random_range(0..6) {
+                    match rng.random_range(0..7) {
                         0 | 1 => {
                             let v = format!("v{step}");
                             let a = plain.insert(v.clone()).unwrap();
@@ -4194,6 +4209,25 @@ mod tests {
                         4 => {
                             let k = rng.random_range(0..(live_keys.len() as u64 + 4));
                             assert_eq!(plain.get(&k), with_ov.get(&k), "seed {seed} cap {cap} step {step}");
+                        }
+                        5 => {
+                            // Explicit-key `put` — the path the store's
+                            // `TableWriter::put`/`upsert` drives. Keys
+                            // deliberately overlap the auto-increment range
+                            // so put-over-existing, put-over-tombstone and
+                            // counter advancement all get exercised.
+                            let k = rng.random_range(0..20u64);
+                            let v = format!("p{step}");
+                            plain.put(k, v.clone()).unwrap();
+                            with_ov.put(k, v).unwrap();
+                            assert_eq!(
+                                plain.next_id(),
+                                with_ov.next_id(),
+                                "put must advance both counters alike"
+                            );
+                            if !live_keys.contains(&k) {
+                                live_keys.push(k);
+                            }
                         }
                         _ => {
                             let lo = rng.random_range(0..12u64);

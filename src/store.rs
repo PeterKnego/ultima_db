@@ -533,10 +533,22 @@ impl Store {
         // `merge_keys_from` debug_asserts the overlay is empty).
         let overlay_cap: usize = match config.writer_mode {
             WriterMode::MultiWriter => 0,
-            WriterMode::SingleWriter => std::env::var("ULTIMA_OVERLAY_CAP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(crate::overlay::OVERLAY_CAP),
+            // A *set but unparsable* value is a misconfiguration, not an
+            // absent override: warn loudly (naming the bad value and the cap
+            // actually used) instead of silently behaving like the var was
+            // never set. Deliberately not a panic — `Store::new` runs in
+            // recovery contexts where aborting is worse than a default.
+            WriterMode::SingleWriter => match std::env::var("ULTIMA_OVERLAY_CAP") {
+                Ok(raw) => raw.parse::<usize>().unwrap_or_else(|e| {
+                    eprintln!(
+                        "ultima_db: ULTIMA_OVERLAY_CAP={raw:?} is not a valid \
+                         usize ({e}); using the default write-overlay cap of {}",
+                        crate::overlay::OVERLAY_CAP
+                    );
+                    crate::overlay::OVERLAY_CAP
+                }),
+                Err(_) => crate::overlay::OVERLAY_CAP,
+            },
         };
 
         let metrics = Arc::new(StoreMetrics::new());
@@ -2940,11 +2952,18 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         } else {
             None
         };
-        // `upsert_arc` consumes the key, so keep a copy to record *after* it
+        // `Table::put` consumes the key, so keep a copy to record *after* it
         // succeeds — a failed write must not leave the key in the write set
         // (that would make a later commit conflict on a row it never wrote).
         let recorded = self.write_set.is_some().then(|| key.clone());
-        self.table.upsert_arc(key, Arc::new(record))?;
+        // `Table::put`, not `upsert_arc`: `put` is the overlay-aware
+        // insert-or-replace (it buffers when `overlay_write_ready()` and
+        // otherwise falls back to `upsert_arc` verbatim, same semantics and
+        // same counter advancement). `upsert_arc` force-flushes and writes
+        // the tree directly — it stays reserved for the MultiWriter
+        // commit-merge / replay path (`merge_keys_from`), which must not
+        // route through the overlay.
+        self.table.put(key, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.record(recorded.as_ref().expect("cloned when write_set is Some"));
         }
@@ -7531,6 +7550,34 @@ mod tests {
         let t = rtx.open_table::<String>("t").unwrap();
         assert_eq!(t.get(1).map(String::as_str), Some("a"));
         assert!(t.overlay_len_probe() > 0, "SingleWriter write should be buffered");
+    }
+
+    /// `TableWriter::put`/`upsert` must buffer like `insert` does. It used to
+    /// call `Table::upsert_arc`, which force-flushes and writes the tree
+    /// directly — making `Table::put`'s buffering branch dead in production.
+    #[test]
+    fn store_put_buffers_in_the_overlay() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table_keyed::<String, u64>("t").unwrap();
+            t.put(7u64, "seven".to_string()).unwrap();
+            assert!(
+                t.overlay_len_probe() > 0,
+                "store put must land in the write overlay, not the tree"
+            );
+            // Merged reads see it before any flush.
+            assert_eq!(t.get(7u64).map(String::as_str), Some("seven"));
+            // Replacing the same key stays a single buffered entry.
+            t.put(7u64, "seven-b".to_string()).unwrap();
+            assert_eq!(t.overlay_len_probe(), 1);
+            assert_eq!(t.len(), 1);
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, u64>("t").unwrap();
+        assert_eq!(t.get(7u64).map(String::as_str), Some("seven-b"));
+        assert_eq!(t.len(), 1);
     }
 
     #[test]
