@@ -419,6 +419,24 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         true
     }
 
+    /// Enable, resize, or disable the write overlay for this table.
+    ///
+    /// Flushes first when the new `cap` can't hold what's already buffered
+    /// (including the `cap == 0` disable case) — an overlay is never
+    /// replaced out from under entries it can no longer fit. A no-op when
+    /// the cap is unchanged, so re-opening a write transaction against the
+    /// same table preserves whatever is already buffered instead of
+    /// discarding it on every `open_table`.
+    pub(crate) fn set_overlay_cap(&mut self, cap: usize) {
+        if cap < self.overlay.entries().len() {
+            self.flush_overlay();
+        }
+        if self.overlay.cap() == cap {
+            return;
+        }
+        self.overlay = Overlay::new(cap);
+    }
+
     /// Replay the buffered ops into the tree in one batched, sorted pass —
     /// the root and inner nodes CoW once for the whole batch instead of once
     /// per transaction. Infallible: Puts use `insert_arc_mut`, and every
@@ -893,6 +911,16 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         kind: IndexKind,
         extractor: impl Fn(&R) -> IK + Send + Sync + 'static,
     ) -> Result<()> {
+        // Indexed tables use the direct path: index reads at 735–824
+        // (get_unique/get_by_index/index_range) read `self.data` straight
+        // off the tree and rely on the overlay staying empty and disabled
+        // from here on (task58 T5) — `get`/`merged_get_arc` consult the
+        // overlay whenever it's nonempty regardless of index state, so any
+        // entries buffered before this call must be flushed now or they'd
+        // wrongly keep shadowing the tree once `update`/`delete` stop
+        // routing through the overlay.
+        self.flush_overlay();
+        self.overlay = Overlay::new(0);
         if let Some(existing) = self.indexes.get(name) {
             if existing.kind() == IndexKind::Custom || existing.kind() != kind {
                 return Err(Error::IndexTypeMismatch(name.to_string()));
@@ -1060,6 +1088,11 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         name: &str,
         mut index: I,
     ) -> Result<()> {
+        // Indexed tables use the direct path; index reads at 735–824 rely
+        // on the overlay staying empty and disabled from here on — see the
+        // comment in `define_index` (task58 T5).
+        self.flush_overlay();
+        self.overlay = Overlay::new(0);
         if self.indexes.contains_key(name) {
             return Err(Error::IndexAlreadyExists(name.to_string()));
         }
@@ -1322,6 +1355,21 @@ impl<R: Record, K: AutoKey> Default for Table<R, K> {
 
 #[cfg(test)]
 impl<R, K: PrimaryKey> Table<R, K> {
+    /// The number of buffered overlay entries. A `pub(crate)` fn (rather
+    /// than inlining this into `overlay_len_for_test` below) so the
+    /// `TableWriter`/`TableReader` pass-throughs in `store.rs` can call it
+    /// by name instead of reaching into their private `table` field.
+    /// Deliberately in this unconstrained-`R` impl block (no `Record`
+    /// bound) rather than alongside `flush_overlay`, so it (and
+    /// `overlay_len_for_test`, which delegates to it) compile regardless of
+    /// whether `R` happens to satisfy `Record` in a given test.
+    pub(crate) fn overlay_len_probe(&self) -> usize {
+        self.overlay.entries().len()
+    }
+}
+
+#[cfg(test)]
+impl<R, K: PrimaryKey> Table<R, K> {
     /// Test-only escape hatch: enable the overlay at `cap` (a no-op if it's
     /// already enabled) and hand back a mutable handle so tests can drive
     /// overlay state directly instead of pushing OVERLAY_CAP-many writes
@@ -1335,7 +1383,7 @@ impl<R, K: PrimaryKey> Table<R, K> {
 
     /// Test-only probe: the number of buffered overlay entries.
     pub(crate) fn overlay_len_for_test(&self) -> usize {
-        self.overlay.entries().len()
+        self.overlay_len_probe()
     }
 }
 

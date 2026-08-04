@@ -376,6 +376,16 @@ pub(crate) struct StoreInner {
     /// durability — the only configuration whose commits park in a WAL
     /// fsync wait. See [`StoreInner::commit_may_park`].
     wal_consistent: bool,
+    /// Write-overlay capacity applied to every table a writer opens.
+    /// Computed once here at [`Store::new`]: `0` for
+    /// [`WriterMode::MultiWriter`] (the overlay is a SingleWriter-only
+    /// optimization — MultiWriter's commit-time merge reads/writes tables
+    /// through the tree directly, see `merge_keys_from`), else
+    /// [`crate::overlay::OVERLAY_CAP`] unless overridden by the
+    /// `ULTIMA_OVERLAY_CAP` env var (bench escape hatch, not a public knob —
+    /// task57 precedent). `WriteTx::open_table` applies this to each dirty
+    /// table via `Table::set_overlay_cap`.
+    overlay_cap: usize,
     /// WAL writer handle (persistence feature, Standalone mode only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_handle: Option<crate::wal::WalHandle>,
@@ -517,6 +527,18 @@ impl Store {
         #[cfg(not(feature = "persistence"))]
         let wal_consistent = false;
 
+        // Read once per store, not per open_table: the overlay is a
+        // SingleWriter-only optimization (MultiWriter always gets 0 — its
+        // commit-time merge reads/writes the tree directly and
+        // `merge_keys_from` debug_asserts the overlay is empty).
+        let overlay_cap: usize = match config.writer_mode {
+            WriterMode::MultiWriter => 0,
+            WriterMode::SingleWriter => std::env::var("ULTIMA_OVERLAY_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::overlay::OVERLAY_CAP),
+        };
+
         let metrics = Arc::new(StoreMetrics::new());
         let empty = Arc::new(Snapshot {
             version: 0,
@@ -537,6 +559,7 @@ impl Store {
                 next_ticket: 0,
                 promote_gate: Arc::new(PromoteGate::new()),
                 wal_consistent,
+                overlay_cap,
                 #[cfg(feature = "persistence")]
                 wal_handle,
                 #[cfg(feature = "persistence")]
@@ -688,6 +711,7 @@ impl Store {
         let base_version = base.version;
         let writer_mode = inner.config.writer_mode;
         let isolation_level = inner.config.isolation_level;
+        let overlay_cap = inner.overlay_cap;
         let metrics = Arc::clone(&inner.metrics);
 
         // Track active writer.
@@ -716,6 +740,7 @@ impl Store {
             ddl_tables: std::cell::RefCell::new(BTreeSet::new()),
             ever_deleted_tables: BTreeSet::new(),
             writer_mode,
+            overlay_cap,
             needs_cleanup: true,
             metrics,
             intents,
@@ -1389,8 +1414,15 @@ impl Store {
                     .downcast_ref::<crate::table::Table<R>>()
                     .ok_or_else(|| Error::TypeMismatch(table_name.to_string()))?;
 
-                // 2. Validate + materialize off-lock.
-                let mat = materialize_delta(delta, base_typed.data_ref())?;
+                // 2. Validate + materialize off-lock. `data_ref` needs the
+                // overlay empty (task58 T5: a SingleWriter table's latest
+                // committed snapshot can have buffered-but-unflushed rows),
+                // so flush an O(1) clone rather than the live snapshot table
+                // — cheap (BTree root + overlay Arc bumps) and leaves the
+                // installed snapshot untouched.
+                let mut base_for_delta = base_typed.clone();
+                base_for_delta.flush_overlay();
+                let mat = materialize_delta(delta, base_for_delta.data_ref())?;
                 // Keep the table's existing counter and push it past the
                 // highest key the delta leaves behind, so an id the delta
                 // used can never be handed out again.
@@ -2302,6 +2334,11 @@ pub struct WriteTx {
     ever_deleted_tables: BTreeSet<String>,
     /// Writer mode at the time this transaction was created.
     writer_mode: WriterMode,
+    /// Write-overlay cap at the time this transaction was created — copied
+    /// from [`StoreInner::overlay_cap`] so the open-table path doesn't
+    /// re-take the store lock on every call. Applied to each table's dirty
+    /// clone via `Table::set_overlay_cap` in `ensure_dirty_entry`.
+    overlay_cap: usize,
     /// Set to `true` on successful commit so `Drop` skips cleanup.
     needs_cleanup: bool,
     /// Shared metrics for the store this transaction belongs to.
@@ -2736,6 +2773,13 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         self.table.len()
     }
 
+    /// The number of entries currently buffered in the write overlay.
+    /// `pub(crate)` test-only probe — see `Table::overlay_len_probe`.
+    #[cfg(test)]
+    pub(crate) fn overlay_len_probe(&self) -> usize {
+        self.table.overlay_len_probe()
+    }
+
     /// Returns true if the table contains no records.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -3132,6 +3176,13 @@ impl<'tx, R: Record, K: PrimaryKey> TableReader<'tx, R, K> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
+    }
+
+    /// The number of entries currently buffered in the write overlay.
+    /// `pub(crate)` test-only probe — see `Table::overlay_len_probe`.
+    #[cfg(test)]
+    pub(crate) fn overlay_len_probe(&self) -> usize {
+        self.table.overlay_len_probe()
     }
 
     /// Returns true if the table contains a record with the given key.
@@ -3608,7 +3659,7 @@ impl WriteTx {
             } else {
                 self.base.tables.get(name)
             };
-            let table: Table<R, K> = match existing {
+            let mut table: Table<R, K> = match existing {
                 Some(arc_mt) => arc_mt
                     .as_any()
                     .downcast_ref::<Table<R, K>>()
@@ -3636,6 +3687,13 @@ impl WriteTx {
                     Table::<R, K>::empty_with_counter(auto_counter_seed::<K>())
                 }
             };
+            // Every path a writer gets a table — fresh clone from the base
+            // snapshot or a brand-new empty table — goes through here, so
+            // this is the single site that enables/sizes the write overlay
+            // (task58 T5). SingleWriter gets `overlay_cap` (from
+            // `ULTIMA_OVERLAY_CAP` or the `OVERLAY_CAP` default);
+            // MultiWriter always gets 0.
+            table.set_overlay_cap(self.overlay_cap);
             self.deleted_tables.remove(name);
             let entry = DirtyEntry {
                 table: Box::new(table),
@@ -7454,5 +7512,181 @@ mod tests {
                 .expect("table opened")
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-overlay store wiring (task58 T5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn single_writer_store_buffers_writes_in_the_overlay() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(1).map(String::as_str), Some("a"));
+        assert!(t.overlay_len_probe() > 0, "SingleWriter write should be buffered");
+    }
+
+    #[test]
+    fn multi_writer_store_never_engages_the_overlay() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.overlay_len_probe(), 0);
+        assert_eq!(t.get(1).map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn old_snapshot_keeps_its_frozen_overlay() {
+        let store = Store::default();
+        let mut w1 = store.begin_write(None).unwrap();
+        w1.open_table::<String>("t")
+            .unwrap()
+            .insert("v1".to_string())
+            .unwrap();
+        w1.commit().unwrap();
+        let old = store.begin_read(None).unwrap(); // pins version with v1 only
+        let mut w2 = store.begin_write(None).unwrap();
+        w2.open_table::<String>("t")
+            .unwrap()
+            .update(1, "v2".to_string())
+            .unwrap();
+        w2.commit().unwrap();
+        let old_t = old.open_table::<String>("t").unwrap();
+        assert_eq!(old_t.get(1).map(String::as_str), Some("v1"));
+        let new_t = store.begin_read(None).unwrap();
+        assert_eq!(
+            new_t
+                .open_table::<String>("t")
+                .unwrap()
+                .get(1)
+                .map(String::as_str),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn define_index_flushes_and_disables_the_overlay() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("row".to_string()).unwrap();
+            t.define_index("len", IndexKind::NonUnique, |r: &String| r.len() as u64)
+                .unwrap();
+            assert_eq!(t.overlay_len_probe(), 0, "DDL must flush");
+            t.insert("row2".to_string()).unwrap();
+            assert_eq!(
+                t.overlay_len_probe(),
+                0,
+                "indexed table writes bypass the overlay"
+            );
+            assert_eq!(t.get_by_index("len", &3u64).unwrap().len(), 1);
+            assert_eq!(t.get_by_index("len", &4u64).unwrap().len(), 1);
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn recovery_replays_into_an_equivalent_table_with_overlay_pending() {
+        use crate::{Durability, Persistence, WalWrite};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let mk = || {
+            Store::new(
+                StoreConfig::builder()
+                    .persistence(Persistence::standalone(
+                        dir.path().to_path_buf(),
+                        Durability::Consistent,
+                        WalWrite::Coalesced,
+                    ))
+                    .build(),
+            )
+            .unwrap()
+        };
+        {
+            let store = mk();
+            store.register_table::<String>("t").unwrap();
+            let mut wtx = store.begin_write(None).unwrap();
+            {
+                let mut t = wtx.open_table::<String>("t").unwrap();
+                t.insert("a".to_string()).unwrap();
+                t.insert("b".to_string()).unwrap();
+                t.delete(1).unwrap();
+            }
+            wtx.commit().unwrap(); // overlay entries never flushed — "crash" here
+        }
+        let store = mk();
+        store.register_table::<String>("t").unwrap();
+        store.recover().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(1), None);
+        assert_eq!(t.get(2).map(String::as_str), Some("b"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn checkpoint_serializes_the_merged_view() {
+        use crate::{Durability, Persistence, WalWrite};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let store = Store::new(
+            StoreConfig::builder()
+                .persistence(Persistence::standalone(
+                    dir.path().to_path_buf(),
+                    Durability::Consistent,
+                    WalWrite::Coalesced,
+                ))
+                .build(),
+        )
+        .unwrap();
+        store.register_table::<String>("t").unwrap();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+            t.insert("b".to_string()).unwrap();
+            t.delete(1).unwrap();
+        }
+        wtx.commit().unwrap();
+        store.checkpoint().unwrap(); // serializes with the overlay nonempty
+
+        let store2 = Store::new(
+            StoreConfig::builder()
+                .persistence(Persistence::standalone(
+                    dir.path().to_path_buf(),
+                    Durability::Consistent,
+                    WalWrite::Coalesced,
+                ))
+                .build(),
+        )
+        .unwrap();
+        store2.register_table::<String>("t").unwrap();
+        store2.recover().unwrap();
+        let rtx = store2.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(2).map(String::as_str), Some("b"));
+        assert_eq!(t.get(1), None);
+        assert_eq!(t.len(), 1);
     }
 }

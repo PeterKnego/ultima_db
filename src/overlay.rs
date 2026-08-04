@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 /// Default capacity. Bench-tunable via `ULTIMA_OVERLAY_CAP` at table-enable
 /// time (bench escape hatch, not a public knob — task57 precedent).
-#[allow(dead_code)]
 pub(crate) const OVERLAY_CAP: usize = 128;
 
 #[allow(dead_code)]
@@ -62,6 +61,7 @@ impl<R, K: Ord + Clone> Overlay<R, K> {
 	}
 
 	pub(crate) fn enabled(&self) -> bool { self.cap > 0 }
+	pub(crate) fn cap(&self) -> usize { self.cap }
 	pub(crate) fn is_empty(&self) -> bool { self.entries.is_empty() }
 	pub(crate) fn is_full(&self) -> bool { self.cap > 0 && self.entries.len() >= self.cap }
 	pub(crate) fn len_delta(&self) -> i64 { self.len_delta }
