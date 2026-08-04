@@ -176,15 +176,17 @@ use std::sync::Arc;
 /// flush latency (~100-200 us for 128 warm inserts), which rides inside one
 /// commit. Env-overridable for bench tuning only — never a public config knob
 /// (task57 precedent).
+///
+/// Deliberately NOT memoized in a `OnceLock`: the cap-independence test varies
+/// this within one process, and an integration test cannot reach a `cfg(test)`
+/// escape hatch. This is one `env::var` per write on a bounded path, not per
+/// row — Task 7 measures it and memoizes only if it shows.
 pub(crate) fn overlay_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("ULTIMA_OVERLAY_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|c| *c > 0)
-            .unwrap_or(128)
-    })
+    std::env::var("ULTIMA_OVERLAY_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(128)
 }
 
 /// What the overlay records for a key.
@@ -900,43 +902,18 @@ fn behaviour_is_independent_of_overlay_cap() {
 }
 ```
 
-**Note:** `overlay_cap()` memoizes in a `OnceLock`, so `behaviour_is_independent_of_overlay_cap` cannot vary the cap in-process. Change `overlay_cap()` to read the env var on each call in `#[cfg(test)]` builds:
+**Note:** `overlay_cap()` reads the env var on every call (Task 1 already implements it that way, deliberately un-memoized) so this test can vary the cap in-process. Do not add a `OnceLock` — it would make this test silently vacuous, since only the first cap would ever take effect and all five arms would trivially agree.
+
+Integration tests compile the crate without `cfg(test)`, so `tests/overlay_equivalence.rs` cannot call the private `flush_overlay`. Add a hidden hook on `Table`, following the codebase's existing `#[doc(hidden)] pub` precedent (`src/wal.rs:908`, `src/store.rs:1297`):
 
 ```rust
-pub(crate) fn overlay_cap() -> usize {
-    #[cfg(test)]
-    {
-        return std::env::var("ULTIMA_OVERLAY_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|c| *c > 0)
-            .unwrap_or(128);
-    }
-    #[cfg(not(test))]
-    {
-        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CAP.get_or_init(|| {
-            std::env::var("ULTIMA_OVERLAY_CAP")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|c| *c > 0)
-                .unwrap_or(128)
-        })
-    }
-}
-```
-
-Integration tests compile the crate without `cfg(test)`, so also add a test-only public hook on `Table` for the two things `tests/overlay_equivalence.rs` needs:
-
-```rust
-    /// Test-only: force a flush. Not part of the public API contract.
+    /// Test-only: force a flush. Hidden from the docs and not part of the
+    /// public API contract — see the task58 global constraint.
     #[doc(hidden)]
     pub fn flush_overlay_for_test(&mut self) {
         self.flush_overlay();
     }
 ```
-
-and make the integration test set the cap via the env var before building tables — which requires `overlay_cap()` to not memoize in normal builds either. Simplest resolution, and the one to implement: **drop the `OnceLock` entirely** and read the env var on every call. It is one `std::env::var` per flush check, not per row, and the flush check happens once per write on a bounded path. Measure it in Task 7 and memoize only if it shows.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
