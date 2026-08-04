@@ -453,6 +453,17 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// [`Table::insert_with_id`], `put` replaces an existing row instead of
     /// returning [`Error::DuplicateKey`].
     pub fn put(&mut self, key: K, record: R) -> Result<()> {
+        if self.overlay_write_ready() {
+            let resident = self.data.get(&key).is_some();
+            // Keep the auto-increment counter (if this key type has one)
+            // past any explicitly written key, exactly as `upsert_arc`'s
+            // direct path does — just applied before the row lands in the
+            // overlay instead of the tree. No-op for every non-`AutoKey`
+            // key.
+            key.advance_auto_counter(&mut self.next_id);
+            self.overlay.set_put(key, Arc::new(record), resident);
+            return Ok(());
+        }
         self.upsert_arc(key, Arc::new(record))
     }
 
@@ -512,14 +523,15 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// the auto-increment counter past the key on `AutoKey` tables so a later
     /// `insert` cannot reissue it. Used at commit by the per-key merge path.
     pub(crate) fn upsert_arc(&mut self, key: K, arc: Arc<R>) -> Result<()> {
-        // `upsert_arc` is both the MultiWriter commit-merge helper
+        // `upsert_arc` is the MultiWriter commit-merge helper
         // (`merge_keys_from`, which already debug_asserts the overlay is
-        // empty before calling in) and the engine behind `put`/`TableWriter`
-        // explicit-key writes — unlike `insert`/`update`/`delete`, it does
-        // not buffer into the overlay itself. Flushing first keeps this
-        // write correct (and visible to the direct tree write below)
-        // whenever an overlay-carrying table reaches this path; with no
-        // production caller enabling the overlay yet, this is a no-op today.
+        // empty before calling in) and `put`'s fallback for when the
+        // overlay isn't write-ready (disabled, or an indexed table) — `put`
+        // itself buffers into the overlay directly when it can (see `put`).
+        // Flushing first keeps this direct tree write correct if either
+        // caller ever reaches here with a non-empty overlay; today both
+        // already guarantee that by construction, so this is a defensive
+        // no-op.
         self.flush_overlay();
 
         let prior = self.data.get_arc(&key);
@@ -4040,5 +4052,19 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(t.get(&id).map(String::as_str), Some("keep"));
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn put_lands_in_overlay_and_advances_the_counter() {
+        let mut t: Table<String> = Table::new();
+        t.overlay_mut_for_test(8);
+        t.put(5, "five".to_string()).unwrap();
+        assert_eq!(t.overlay_len_for_test(), 1, "put buffered, not flushed to the tree");
+        assert_eq!(t.get(&5).map(String::as_str), Some("five"));
+        // The auto-increment counter must advance past an explicitly
+        // written key even though the row only landed in the overlay.
+        let id = t.insert("six".to_string()).unwrap();
+        assert_eq!(id, 6);
+        assert_eq!(t.len(), 2);
     }
 }
