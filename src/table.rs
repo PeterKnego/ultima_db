@@ -421,14 +421,15 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
 
     /// Enable, resize, or disable the write overlay for this table.
     ///
-    /// Flushes first when the new `cap` can't hold what's already buffered
-    /// (including the `cap == 0` disable case) — an overlay is never
-    /// replaced out from under entries it can no longer fit. A no-op when
-    /// the cap is unchanged, so re-opening a write transaction against the
-    /// same table preserves whatever is already buffered instead of
-    /// discarding it on every `open_table`.
+    /// Contract: same cap → buffered entries are preserved (a no-op), so
+    /// re-opening a write transaction against the same table doesn't
+    /// discard anything on every `open_table`. Any cap *change* — including
+    /// the `cap == 0` disable case, and including a cap the buffered
+    /// entries would still fit under — flushes first: entries are never
+    /// dropped, only ever flushed to the tree before the overlay is
+    /// replaced.
     pub(crate) fn set_overlay_cap(&mut self, cap: usize) {
-        if cap < self.overlay.entries().len() {
+        if !self.overlay.is_empty() && cap != self.overlay.cap() {
             self.flush_overlay();
         }
         if self.overlay.cap() == cap {
@@ -4057,6 +4058,37 @@ mod tests {
             assert_eq!(t.get(id).map(String::as_str), Some(format!("v{i}").as_str()));
         }
         assert_eq!(t.get(&id5).map(String::as_str), Some("v4"));
+    }
+
+    /// A cap change must never drop buffered entries, even when they'd
+    /// still fit under the new cap — `set_overlay_cap`'s contract is flush
+    /// on any change, preserve only on an unchanged cap (task58 T5 review
+    /// finding: the original guard only flushed when shrinking below the
+    /// current entry count, silently dropping entries on e.g. 128 -> 64
+    /// with 10 buffered).
+    #[test]
+    fn set_overlay_cap_change_flushes_instead_of_dropping() {
+        let mut t: Table<String> = Table::new();
+        t.overlay_mut_for_test(8);
+        let a = t.insert("a".to_string()).unwrap();
+        let b = t.insert("b".to_string()).unwrap();
+        assert_eq!(t.overlay_len_probe(), 2, "buffered, not yet flushed");
+
+        t.set_overlay_cap(4); // cap change; both entries still fit under 4
+        assert_eq!(t.overlay_len_probe(), 0, "cap change must flush, not drop");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.get(&a).map(String::as_str), Some("a"));
+        assert_eq!(t.get(&b).map(String::as_str), Some("b"));
+
+        let c = t.insert("c".to_string()).unwrap();
+        assert_eq!(t.overlay_len_probe(), 1, "buffered under the new cap-4 overlay");
+        t.set_overlay_cap(4); // same cap: must preserve, not flush
+        assert_eq!(
+            t.overlay_len_probe(),
+            1,
+            "same-cap re-open preserves buffered entries"
+        );
+        assert_eq!(t.get(&c).map(String::as_str), Some("c"));
     }
 
     #[test]
