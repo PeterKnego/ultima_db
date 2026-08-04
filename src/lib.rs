@@ -51,6 +51,7 @@ pub(crate) mod intents;
 pub mod metrics;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
+mod overlay;
 pub mod persistence;
 pub mod primary_key;
 #[cfg(feature = "persistence")]
