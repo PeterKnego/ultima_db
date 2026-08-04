@@ -406,6 +406,41 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         }
     }
 
+    /// True when this mutation should go through the overlay. Also the flush
+    /// trigger: a full overlay is drained into the tree before the caller
+    /// proceeds, so the subsequent buffer insert always has room.
+    fn overlay_write_ready(&mut self) -> bool {
+        if !self.overlay.enabled() || !self.indexes.is_empty() {
+            return false;
+        }
+        if self.overlay.is_full() {
+            self.flush_overlay();
+        }
+        true
+    }
+
+    /// Replay the buffered ops into the tree in one batched, sorted pass —
+    /// the root and inner nodes CoW once for the whole batch instead of once
+    /// per transaction. Infallible: Puts use `insert_arc_mut`, and every
+    /// Tombstone shadows a tree-resident key by the overlay invariant.
+    pub(crate) fn flush_overlay(&mut self) {
+        if self.overlay.is_empty() {
+            return;
+        }
+        let entries = self.overlay.take_entries();
+        for (key, op) in entries.iter() {
+            match op {
+                OverlayOp::Put { rec, .. } => {
+                    self.data.insert_arc_mut(key.clone(), Arc::clone(rec));
+                }
+                OverlayOp::Tombstone => {
+                    let removed = self.data.remove_mut(key);
+                    debug_assert!(removed, "tombstone shadowed a non-resident key");
+                }
+            }
+        }
+    }
+
     /// Insert-or-replace a record at an explicit key. Available for every key
     /// type — this is how explicitly-keyed tables are written.
     ///
@@ -437,7 +472,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// Update a record by its key. Returns an error if the key does not exist
     /// or if a unique index constraint is violated.
     pub fn update(&mut self, key: &K, record: R) -> Result<()> {
-        let old = self.data.get_arc(key).ok_or(Error::KeyNotFound)?;
+        let old = self.merged_get_arc(key).ok_or(Error::KeyNotFound)?;
 
         // Update all indexes; rollback on failure.
         // SAFETY: Same invariants as `insert` — see comment there.
@@ -462,7 +497,12 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             }
         }
 
-        self.data.insert_mut(key.clone(), record);
+        if self.overlay_write_ready() {
+            let resident = self.data.get(key).is_some();
+            self.overlay.set_put(key.clone(), Arc::new(record), resident);
+        } else {
+            self.data.insert_mut(key.clone(), record);
+        }
         Ok(())
     }
 
@@ -472,6 +512,16 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// the auto-increment counter past the key on `AutoKey` tables so a later
     /// `insert` cannot reissue it. Used at commit by the per-key merge path.
     pub(crate) fn upsert_arc(&mut self, key: K, arc: Arc<R>) -> Result<()> {
+        // `upsert_arc` is both the MultiWriter commit-merge helper
+        // (`merge_keys_from`, which already debug_asserts the overlay is
+        // empty before calling in) and the engine behind `put`/`TableWriter`
+        // explicit-key writes — unlike `insert`/`update`/`delete`, it does
+        // not buffer into the overlay itself. Flushing first keeps this
+        // write correct (and visible to the direct tree write below)
+        // whenever an overlay-carrying table reaches this path; with no
+        // production caller enabling the overlay yet, this is a no-op today.
+        self.flush_overlay();
+
         let prior = self.data.get_arc(&key);
         let new_ref: &R = &arc;
         // SAFETY: same invariants as `insert` — see comment there.
@@ -520,13 +570,23 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// Delete a record by its key. Returns the deleted record, or an error if
     /// the key does not exist.
     pub fn delete(&mut self, key: &K) -> Result<Arc<R>> {
-        let old = self.data.get_arc(key).ok_or(Error::KeyNotFound)?;
+        let old = self.merged_get_arc(key).ok_or(Error::KeyNotFound)?;
         // Remove from all indexes before removing from data tree.
         for idx in self.indexes.values_mut() {
             idx.on_delete(key.clone(), &old);
         }
-        let removed = self.data.remove_mut(key);
-        debug_assert!(removed, "delete: presence checked above");
+        if self.overlay_write_ready() {
+            match self.overlay.get(key) {
+                Some(OverlayOp::Put {
+                    tree_resident: false,
+                    ..
+                }) => self.overlay.remove_entry(key),
+                _ => self.overlay.set_tombstone(key.clone()),
+            }
+        } else {
+            let removed = self.data.remove_mut(key);
+            debug_assert!(removed, "delete: presence checked above");
+        }
         Ok(old)
     }
 
@@ -566,6 +626,10 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         if updates.is_empty() {
             return Ok(());
         }
+        // Flush first: the snapshot/restore rollback below and the phase-0
+        // existence probe (`self.data.get_arc`) then operate on a
+        // merged-empty table, unchanged from today.
+        self.flush_overlay();
 
         // Deduplicate: keep only the last value for each key.
         let mut seen = BTreeMap::new();
@@ -620,6 +684,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         if keys.is_empty() {
             return Ok(());
         }
+        // Flush first — see the comment in `update_batch`.
+        self.flush_overlay();
 
         // Deduplicate keys.
         let mut keys = keys.to_vec();
@@ -683,9 +749,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
 
     /// Overlay-then-tree point lookup returning an owned `Arc`. Internal
     /// counterpart to `get` for call sites that need to hold the value past
-    /// the table's borrow (e.g. a future write path layering onto the
-    /// overlay); not yet called from this task's read paths.
-    #[allow(dead_code)]
+    /// the table's borrow — `update`/`delete` use it as the merged existence
+    /// probe so a row buffered in the overlay is found without a tree read.
     fn merged_get_arc(&self, key: &K) -> Option<Arc<R>> {
         if !self.overlay.is_empty() {
             match self.overlay.get(key) {
@@ -1063,7 +1128,12 @@ impl<R: Record, K: AutoKey> Table<R, K> {
         }
 
         self.next_id = next;
-        self.data.insert_mut(id.clone(), record);
+        if self.overlay_write_ready() {
+            // A fresh auto-assigned id is never already in the tree.
+            self.overlay.set_put(id.clone(), Arc::new(record), false);
+        } else {
+            self.data.insert_mut(id.clone(), record);
+        }
         Ok(id)
     }
 
@@ -1092,6 +1162,11 @@ impl<R: Record, K: AutoKey> Table<R, K> {
         if records.is_empty() {
             return Ok(vec![]);
         }
+        // Flush first: the `max_key` fast-path guard below reads the tree
+        // directly, and the snapshot/restore rollback then captures a
+        // merged-empty table — both unchanged from today once the overlay
+        // is drained.
+        self.flush_overlay();
 
         // Assign the whole id run up front, before touching any state, so an
         // overflow panics with the table untouched (as the old
@@ -1244,6 +1319,11 @@ impl<R, K: PrimaryKey> Table<R, K> {
             self.overlay = Overlay::new(cap);
         }
         &mut self.overlay
+    }
+
+    /// Test-only probe: the number of buffered overlay entries.
+    pub(crate) fn overlay_len_for_test(&self) -> usize {
+        self.overlay.entries().len()
     }
 }
 
@@ -3895,5 +3975,70 @@ mod tests {
             ov.set_tombstone(c);
         }
         assert_eq!(t.last(), Some((&b, &"b".to_string())));
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-path overlay routing (task58 T3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn writes_land_in_overlay_and_flush_at_cap() {
+        let mut t: Table<String> = Table::new();
+        t.overlay_mut_for_test(4); // enable with tiny cap
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(t.insert(format!("v{i}")).unwrap());
+        }
+        assert_eq!(t.overlay_len_for_test(), 4, "all four writes buffered");
+        let id5 = t.insert("v4".to_string()).unwrap(); // fifth write: flush, then buffer
+        assert_eq!(t.overlay_len_for_test(), 1);
+        assert_eq!(t.len(), 5);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(t.get(id).map(String::as_str), Some(format!("v{i}").as_str()));
+        }
+        assert_eq!(t.get(&id5).map(String::as_str), Some("v4"));
+    }
+
+    #[test]
+    fn overlay_delete_semantics_match_the_spec() {
+        let mut t: Table<String> = Table::new();
+        let resident = t.insert("old".to_string()).unwrap();
+        t.overlay_mut_for_test(8);
+        let born = t.insert("young".to_string()).unwrap(); // overlay-born
+        // overlay-born delete: entry removed, no tombstone
+        let removed = t.delete(&born).unwrap();
+        assert_eq!(removed.as_str(), "young");
+        assert_eq!(t.overlay_len_for_test(), 0);
+        // tree-resident delete through the overlay: tombstone
+        let removed = t.delete(&resident).unwrap();
+        assert_eq!(removed.as_str(), "old");
+        assert_eq!(t.overlay_len_for_test(), 1);
+        assert_eq!(t.len(), 0);
+        assert!(matches!(t.delete(&resident), Err(Error::KeyNotFound)));
+        assert!(matches!(t.update(&resident, "x".into()), Err(Error::KeyNotFound)));
+    }
+
+    #[test]
+    fn batch_ops_flush_first_and_stay_correct() {
+        let mut t: Table<String> = Table::new();
+        t.overlay_mut_for_test(8);
+        let id = t.insert("solo".to_string()).unwrap();
+        let ids = t.insert_batch((0..10).map(|i| format!("b{i}")).collect()).unwrap();
+        assert_eq!(t.overlay_len_for_test(), 0, "insert_batch flushed the overlay");
+        assert_eq!(t.len(), 11);
+        assert_eq!(t.get(&id).map(String::as_str), Some("solo"));
+        assert_eq!(ids.len(), 10);
+    }
+
+    #[test]
+    fn rollback_restores_the_overlay() {
+        let mut t: Table<String> = Table::new();
+        t.overlay_mut_for_test(8);
+        let id = t.insert("keep".to_string()).unwrap();
+        // update_batch with a failing key rolls back wholesale
+        let res = t.update_batch(vec![(id, "changed".into()), (9999, "nope".into())]);
+        assert!(res.is_err());
+        assert_eq!(t.get(&id).map(String::as_str), Some("keep"));
+        assert_eq!(t.len(), 1);
     }
 }
