@@ -182,8 +182,15 @@ set before the second store is constructed (the cap is read once at
 `Store::new`), isolating the overlay's effect as
 `store_eventual_no_overlay − store_eventual_update`.
 
-Five back-to-back runs on the loaded local sandbox (4-core, ±35% swings
-observed per the task brief):
+Five back-to-back runs on the loaded local sandbox. `examples/perf_decomp.rs`'s
+own header comment states the applicable noise band for this cell type:
+*"Direction-only on the sandbox; single-threaded cells resolve to ±3–17%"*
+(consistent with `docs/benchmarks/ycsb-eventual-write-decomposition-2026-08-02.md`,
+which validated the same sandbox-vs-NVMe relationship for this harness).
+The ±35% figure elsewhere in this task's verification (see the
+`make perf/check` section below) belongs to a different measurement
+domain — autobench SMR-apply gate tolerances — and does not apply to
+`perf_decomp` cells; it is not cited here.
 
 | run | store_eventual_update (ov) | store_eventual_no_overlay | overlay effect (no_ov − ov) |
 |---|--:|--:|--:|
@@ -200,14 +207,16 @@ is a small, consistently **negative** gap (overlay-enabled ~120–430 ns
 
 1. The sign is stable across five repeats — this is not simple noise
    flipping sign run to run.
-2. The magnitude (~120–430 ns) is well inside the ±35% same-machine noise
-   band this sandbox exhibits on ~4.5–4.8 µs single-threaded cells (≈
-   ±1600 ns), and is also small next to the MVCC-tax term this cell is
-   meant to isolate (1975 ns measured on the NVMe host in the prior
-   decomposition doc). A ~150–400 ns swing is exactly the kind of
-   measurement this loaded sandbox is not trusted to resolve per
-   `CLAUDE.md`'s benchmarking policy ("never draw a perf conclusion... from
-   a local run").
+2. The magnitude (~120–430 ns) is well inside the ±3–17% noise band this
+   harness documents for single-threaded cells: applied to the ~4.5–4.8 µs
+   cell median, that's roughly **±135–800 ns** — a range that comfortably
+   covers the observed −115..−427 ns swing on its own. It is also small
+   next to the MVCC-tax term this cell is meant to isolate (1975 ns
+   measured on the NVMe host in the prior decomposition doc). A swing this
+   size, within the harness's own documented band, is exactly the kind of
+   measurement this loaded sandbox is not trusted to resolve directionally
+   per `CLAUDE.md`'s benchmarking policy ("never draw a perf conclusion...
+   from a local run").
 3. Falls out of the earlier "conclusions" section of the decomposition
    doc: this cell only ever isolates the CoW-clone-vs-bounded-copy delta.
    With a single-record-per-txn workload against a 10k-row table, the
@@ -217,6 +226,15 @@ is a small, consistently **negative** gap (overlay-enabled ~120–430 ns
    be close enough that sandbox noise dominates. This is exactly the kind
    of gap the fleet A/B (Step 6, out of this task's scope) is designed to
    resolve, not something to chase further on this host.
+
+**Honest wrinkle, left unresolved for the fleet run:** even granting that
+the magnitude sits inside the noise band, the *sign* came out the opposite
+of the design doc's prediction — small negative (overlay-enabled slightly
+slower) instead of the predicted positive 1–2 µs win — and the observed
+magnitude is far below that 1–2 µs prediction in either direction. Nothing
+here contradicts the design (the band covers zero), but nothing here
+confirms it either. This is recorded as unresolved for the fleet A/B to
+settle, the same posture taken with the `checkpoint_ms` finding below.
 
 No tuning was attempted per the task brief's direction-only instruction.
 This result is recorded as-is for the review gate; it does not by itself
