@@ -730,12 +730,48 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// Returns the last (highest key) record, or `None` if empty.
     pub fn last(&self) -> Option<(&K, &R)> {
         if self.overlay.is_empty() {
-            self.data.range(..).next_back()
-        } else {
-            // `MergedIter` isn't double-ended; the overlay is bounded
-            // (`OVERLAY_CAP`), so draining it for the tail entry is cheap
-            // and correct rather than clever.
-            self.merged_iter(..).last()
+            return self.data.range(..).next_back();
+        }
+        // `MergedIter` isn't `DoubleEndedIterator`, and its default
+        // `.last()` drains the *tree* side (`self.data.range(..)`) to
+        // exhaustion — an O(table size) scan, not O(cap). Instead, walk a
+        // bounded reverse merge: the mirror of `MergedIter::next()`, using
+        // the overlay's own tail (at most `OVERLAY_CAP` entries) and the
+        // tree's `next_back()`. Cost is O(log n) for tree descent plus at
+        // most `OVERLAY_CAP` steps on the overlay side.
+        let entries = self.overlay.entries();
+        let mut ov_idx = entries.len();
+        let mut tree = self.data.range(..);
+        let mut tree_tail: Option<(&K, &R)> = tree.next_back();
+        loop {
+            let take_overlay = match (ov_idx, &tree_tail) {
+                (0, None) => return None,
+                (0, Some(_)) => false,
+                (_, None) => true,
+                (_, Some((tk, _))) => {
+                    let ok = &entries[ov_idx - 1].0;
+                    match ok.cmp(tk) {
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Equal => {
+                            // Overlay shadows this tree entry; consume it
+                            // and step the tree side back one further.
+                            tree_tail = tree.next_back();
+                            true
+                        }
+                    }
+                }
+            };
+            if take_overlay {
+                ov_idx -= 1;
+                let (k, op) = &entries[ov_idx];
+                match op {
+                    OverlayOp::Put { rec, .. } => return Some((k, rec.as_ref())),
+                    OverlayOp::Tombstone => continue, // its tree twin (if any) already skipped
+                }
+            } else {
+                return tree_tail;
+            }
         }
     }
 
@@ -3816,5 +3852,48 @@ mod tests {
         assert_eq!(ranged, vec![2, 3]);
         assert_eq!(t.first().map(|(k, _)| *k), Some(2));
         assert_eq!(t.last().map(|(k, _)| *k), Some(10));
+    }
+
+    #[test]
+    fn merged_last_falls_back_past_a_tombstoned_tree_max() {
+        // Overlay tail is a tombstone shadowing the tree's max key; the true
+        // last is an earlier, untouched tree key.
+        let mut t: Table<String> = Table::new();
+        let _a = t.insert("a".to_string()).unwrap(); // key 1
+        let b = t.insert("b".to_string()).unwrap(); // key 2
+        let c = t.insert("c".to_string()).unwrap(); // key 3 (tree max)
+        t.overlay_mut_for_test(8).set_tombstone(c);
+        assert_eq!(t.last(), Some((&b, &"b".to_string())));
+    }
+
+    #[test]
+    fn merged_last_prefers_an_overlay_put_beyond_the_tree_max() {
+        // Overlay tail is a Put for a key beyond anything in the tree.
+        let mut t: Table<String> = Table::new();
+        let _a = t.insert("a".to_string()).unwrap(); // key 1
+        let _b = t.insert("b".to_string()).unwrap(); // key 2
+        let ov = t.overlay_mut_for_test(8);
+        ov.set_put(99, std::sync::Arc::new("z".to_string()), false);
+        assert_eq!(t.last(), Some((&99, &"z".to_string())));
+    }
+
+    #[test]
+    fn merged_last_walks_back_through_a_run_of_tombstones() {
+        // Overlay tombstones kill every tree-resident key above 2, so the
+        // backward walk must skip several shadowed entries before landing
+        // on the first survivor.
+        let mut t: Table<String> = Table::new();
+        let _a = t.insert("a".to_string()).unwrap(); // key 1
+        let b = t.insert("b".to_string()).unwrap(); // key 2 — survives
+        let c = t.insert("c".to_string()).unwrap(); // key 3
+        let d = t.insert("d".to_string()).unwrap(); // key 4
+        let e = t.insert("e".to_string()).unwrap(); // key 5 (tree max)
+        {
+            let ov = t.overlay_mut_for_test(8);
+            ov.set_tombstone(e);
+            ov.set_tombstone(d);
+            ov.set_tombstone(c);
+        }
+        assert_eq!(t.last(), Some((&b, &"b".to_string())));
     }
 }
