@@ -408,6 +408,17 @@ Three things follow:
    is the regime this cell measures; whether the remaining gap survives is
    a fleet-run question.
 
+## Validation — GATE PASSED 2026-08-04
+
+The fleet ship gate ran on 2026-08-04 and **passed at cap 32**:
+eventual YCSB A 2.41 ms vs Fjall 2.71 ms same-host glibc (1.12x ahead;
+F 1.35x ahead), C guardrail +3.2% (within the <=5% under-writes budget),
+E improved -6%. At the spec's original cap 128 the A cell only tied Fjall
+(2.76 vs 2.71); the cap sweep confirmed the corrected cost model (per-entry
+Arc-clone, linear in cap) and the default is now **32**. Full numbers and
+the write-tail p99 side-signal: `docs/benchmarks/write-overlay-gate-nvme-2026-08-04.md`
+(results `dist/20260804T185027Z-overlay-gate/`).
+
 ## Validation
 
 Ship iff eventual A beats Fjall same-host glibc, with C/E unchanged.

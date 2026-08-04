@@ -10,7 +10,13 @@ use std::sync::Arc;
 
 /// Default capacity. Bench-tunable via `ULTIMA_OVERLAY_CAP` at table-enable
 /// time (bench escape hatch, not a public knob — task57 precedent).
-pub(crate) const OVERLAY_CAP: usize = 128;
+///
+/// 32, not the spec's original 128: per-write CoW cost is linear in buffered
+/// entries (an `Arc` bump + `K` clone per entry) while flush frequency is
+/// 1/cap, and the 2026-08-04 NVMe gate measured cap 32 fastest end-to-end
+/// (eventual YCSB A 2.41 ms vs 2.76 at cap 128 — the difference between
+/// beating Fjall and tying it). See docs/tasks/task58_write_overlay.md.
+pub(crate) const OVERLAY_CAP: usize = 32;
 
 #[allow(dead_code)]
 pub(crate) enum OverlayOp<R> {
