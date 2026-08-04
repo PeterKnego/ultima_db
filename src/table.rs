@@ -14,6 +14,7 @@ use crate::index::{
     CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage,
     UniqueStorage,
 };
+use crate::overlay::Overlay;
 use crate::persistence::Record;
 use crate::primary_key::{AutoKey, PrimaryKey};
 use crate::{Error, Result};
@@ -284,6 +285,11 @@ pub struct Table<R, K = u64> {
     /// `new_keyed` does support `insert` once it has been written to.
     next_id: Option<K>,
     indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, K>>>,
+    /// Bounded write-front absorbing recent mutations. Disabled (`cap == 0`)
+    /// everywhere in this task — every construction site below builds it
+    /// with `Overlay::new(0)`, which makes every read a single dead branch
+    /// away from today's tree-only path. See `src/overlay.rs`.
+    overlay: Overlay<R, K>,
 }
 
 /// Captured table state for atomic batch rollback.
@@ -291,6 +297,7 @@ struct TableSnapshot<R, K = u64> {
     data: BTree<K, R>,
     next_id: Option<K>,
     indexes: BTreeMap<String, Box<dyn IndexMaintainer<R, K>>>,
+    overlay: Overlay<R, K>,
 }
 
 impl<R: Record, K: PrimaryKey> Table<R, K> {
@@ -302,6 +309,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             data: BTree::new(),
             next_id: None,
             indexes: BTreeMap::new(),
+            overlay: Overlay::new(0),
         }
     }
 
@@ -334,6 +342,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             data,
             next_id,
             indexes,
+            overlay: Overlay::new(0),
         })
     }
 
@@ -369,6 +378,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             data: BTree::new(),
             next_id,
             indexes: BTreeMap::new(),
+            overlay: Overlay::new(0),
         }
     }
 
@@ -503,6 +513,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone_box()))
                 .collect(),
+            overlay: self.overlay.clone(),
         }
     }
 
@@ -511,6 +522,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         self.data = snap.data;
         self.next_id = snap.next_id;
         self.indexes = snap.indexes;
+        self.overlay = snap.overlay;
     }
 
     /// Update multiple records by key. Returns an error if any key does not
@@ -877,6 +889,7 @@ impl<R: Record, K: AutoKey> Table<R, K> {
             data: BTree::new(),
             next_id: Some(K::first()),
             indexes: BTreeMap::new(),
+            overlay: Overlay::new(0),
         }
     }
 
@@ -1077,6 +1090,7 @@ impl<R, K: PrimaryKey> Clone for Table<R, K> {
             data: self.data.clone(),
             next_id: self.next_id.clone(),
             indexes,
+            overlay: self.overlay.clone(),
         }
     }
 }
