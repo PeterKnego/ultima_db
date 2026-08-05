@@ -30,12 +30,25 @@ the prose from drifting apart:
   * a manifest row no cite references -- so a DELETED cite cannot leave a
     rotting row behind.
 
+Two more guard the checker's own preconditions rather than a single anchor:
+
+  * a BARE cite whose range is also an anchor under a different src_file. Such
+    a cite is correct only by document position: a later prose edit that adds
+    an earlier prefix for the other file re-targets it to a different, equally
+    valid anchor, and every existing check stays green. Prefixed form is the
+    only form inheritance cannot mis-attribute, so bare form is refused there.
+  * a manifest src_file the formal.yml push filter does not watch. The cite
+    guard runs in a job that a direct-to-main push only reaches when the push
+    touched a listed path; a cite into a fourth source file would otherwise
+    lose push-time coverage silently.
+
 Usage:
   formal/scripts/check-cites.py [-v]
     -v / --verbose   also list every anchor and where it is cited
 """
 
 import bisect
+import fnmatch
 import os
 import re
 import subprocess
@@ -43,6 +56,7 @@ import sys
 
 CORPUS_DIR = "formal/tla/wal"
 MANIFEST = "formal/tla/wal/cite-anchors.tsv"
+WORKFLOW = ".github/workflows/formal.yml"
 
 # ---------------------------------------------------------------------------
 # The scanner.
@@ -214,6 +228,115 @@ def read_manifest(root):
 
 
 # ---------------------------------------------------------------------------
+# The workflow push filter.
+#
+# This checker runs in formal.yml's `drift` job, and on a push that job only
+# runs when the push touched one of `on.push.paths`. The coverage is complete
+# today only by coincidence: every src_file in the manifest (wal.rs, store.rs,
+# persistence.rs) happens to be listed. A cite into a fourth source file would
+# silently lose push-time coverage -- the workflow would not fire at all for a
+# change to that file, so nothing would notice the cite going stale until the
+# next PR that happens to touch formal/.
+#
+# Parsed with a targeted scan rather than PyYAML: the repo installs nothing,
+# and python3 has no YAML in the stdlib. The scan is deliberately narrow --
+# `on:` -> `push:` -> `paths:` -> a block sequence of scalars -- and every way
+# of not finding exactly that is an error, so a reshaped workflow fails the
+# check instead of quietly passing it.
+# ---------------------------------------------------------------------------
+
+# `on` is a YAML 1.1 boolean, so a formatter may render the key as `on`, `"on"`
+# or even `true`. Accept all three rather than hard-coding the current spelling.
+_ON_RE = re.compile(r"""^(?:on|["']on["']|true):\s*(?:#.*)?$""")
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def _block_lines(lines, start, outer_indent):
+    """Yield (lineno, line) for the block indented under lines[start]."""
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if _indent(line) <= outer_indent:
+            return
+        yield i, line
+
+
+def _find_key(lines, start, outer_indent, key):
+    """-> index of `key:` directly inside the block under lines[start]."""
+    inner = None
+    for i, line in _block_lines(lines, start, outer_indent):
+        ind = _indent(line)
+        if inner is None:
+            inner = ind
+        if ind != inner:
+            continue  # deeper: belongs to some other key in this block
+        if re.match(r"^" + re.escape(key) + r":\s*(?:#.*)?$", line.strip()):
+            return i, ind
+    return None, None
+
+
+def read_push_paths(root):
+    """-> (paths, errors). Fails closed: an unparseable filter is an error."""
+    full = os.path.join(root, WORKFLOW)
+    if not os.path.exists(full):
+        return [], [f"{WORKFLOW}: missing -- cannot verify push-path coverage"]
+    with open(full, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+
+    on_idx = None
+    for i, line in enumerate(lines):
+        if _ON_RE.match(line):
+            on_idx = i
+            break
+    if on_idx is None:
+        return [], [f"{WORKFLOW}: no top-level `on:` block found -- cannot verify "
+                    "push-path coverage"]
+
+    push_idx, push_ind = _find_key(lines, on_idx, _indent(lines[on_idx]), "push")
+    if push_idx is None:
+        return [], [f"{WORKFLOW}: `on:` has no `push:` block -- this workflow no "
+                    "longer gates pushes, so the cite guard has no push-time "
+                    "coverage at all"]
+
+    paths_idx, paths_ind = _find_key(lines, push_idx, push_ind, "paths")
+    if paths_idx is None:
+        return [], [f"{WORKFLOW}:{push_idx + 1}: `on.push` has no `paths:` list "
+                    "-- cannot verify push-path coverage"]
+
+    paths = []
+    for i, line in _block_lines(lines, paths_idx, paths_ind):
+        item = line.strip()
+        if not item.startswith("- "):
+            return [], [f"{WORKFLOW}:{i + 1}: expected a `- <path>` item under "
+                        f"`on.push.paths`, got {item!r}"]
+        val = item[2:].split(" #")[0].strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if val:
+            paths.append(val)
+    if not paths:
+        return [], [f"{WORKFLOW}:{paths_idx + 1}: `on.push.paths` is empty -- "
+                    "cannot verify push-path coverage"]
+    return paths, []
+
+
+def path_is_watched(src, paths):
+    """Does any push-filter pattern select `src`?"""
+    for p in paths:
+        if p == src:
+            return True
+        if p.endswith("/**") and src.startswith(p[:-2]):
+            return True
+        if fnmatch.fnmatchcase(src, p):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Resolving a source file, at the working tree or at a frozen revision.
 # ---------------------------------------------------------------------------
 
@@ -316,12 +439,25 @@ def main(argv):
 
     cites = scan_corpus(root)
     rows, errors = read_manifest(root)
+    push_paths, push_errors = read_push_paths(root)
+    errors.extend(push_errors)
 
     # Census, for the CI log: a scan that silently stops finding the bare forms
     # is the exact failure this whole checker exists to prevent.
+    #
+    # `bare-nonsrc` is its own bucket rather than part of `non-src`. It is the
+    # one thing the checker SKIPS: a bare cite that inherits a non-src file
+    # (`WalCrash.tla:45` ... `:213`) has no anchor to verify, and folding it in
+    # beside genuine prefixed `.tla` cites made the skip invisible -- in a
+    # census billed as a tripwire, the silent skip is exactly what has to show.
     census = {}
     for c in cites:
-        kind = c.form if (c.is_src or c.form == "orphan") else "non-src"
+        if c.is_src or c.form == "orphan":
+            kind = c.form
+        elif c.form.startswith("bare"):
+            kind = "bare-nonsrc"
+        else:
+            kind = "non-src"
         census[kind] = census.get(kind, 0) + 1
 
     anchors = {}
@@ -336,6 +472,53 @@ def main(argv):
         failures.append(
             (f"{c.where()}: bare cite `{c.text.strip()}` has no preceding "
              f"`file:LINE` cite to inherit a file from", []))
+
+    # 0. A bare cite may not resolve to a range that is ALSO an anchor under a
+    #    different src_file. `:720` is a valid anchor in both src/store.rs and
+    #    src/wal.rs; which one a bare `:720` means is decided purely by which
+    #    prefix happens to sit above it, so prose churn that introduces an
+    #    earlier `src/wal.rs:` prefix re-targets it to a different, equally
+    #    valid anchor -- and every other check here stays green, because both
+    #    anchors hold. (Today the only thing that would catch it is incidental:
+    #    the abandoned anchor would trip STALE MANIFEST ROW, and only because
+    #    it happens to have exactly one citer.) Prefixed form is the only form
+    #    inheritance cannot mis-attribute, so bare form is refused there.
+    #
+    #    Collisions are collected by range alone, ignoring rev: inheritance
+    #    carries the revision along with the path, so a frozen prefix re-targets
+    #    a bare cite just as effectively as a working-tree one.
+    by_range = {}
+    for (rev, path, rng) in list(rows) + list(anchors):
+        if path and path.startswith("src/") and path.endswith(".rs"):
+            by_range.setdefault(rng, {}).setdefault(path, set()).add(rev)
+    for c in cites:
+        if not (c.is_src and c.form.startswith("bare")):
+            continue
+        others = by_range.get(c.range, {})
+        if len(others) < 2:
+            continue
+        def _at(p):
+            revs = sorted(others[p])
+            return f"{p}:{c.range}" + ("" if revs == ["-"] else f" ({'/'.join(revs)})")
+        width = max(len(_at(p)) for p in others)
+
+        def _describe(p):
+            tok = next((rows[(r, p, c.range)][0] for r in sorted(others[p])
+                        if (r, p, c.range) in rows), None)
+            return f"      {_at(p):<{width}}" + (f"   {tok!r}" if tok else "")
+        failures.append((
+            f"AMBIGUOUS BARE CITE {c.where()} `{c.text.strip()}`",
+            [f"    it inherits {c.path} from an earlier prefix cite, but the",
+             f"    range {c.range} is an anchor under more than one source file:"]
+            + [_describe(p) for p in sorted(others)]
+            + ["    Both resolve, so nothing below would fail if this cite meant",
+               "    the other one -- and which it means is decided only by which",
+               "    prefix happens to sit above it in the document. Write it in",
+               f"    prefixed form, `{c.path}:{c.range}`, where inheritance",
+               "    cannot mis-attribute it. (Do not 'fix' this by deleting the",
+               "    colliding manifest row: the collision is a fact about the",
+               "    two source files, not a defect in the manifest.)"],
+        ))
 
     # 1. Every anchor must have a manifest row, and the row must hold.
     for anchor in sorted(anchors, key=lambda a: (a[1], int(a[2].split("-")[0]), a[0])):
@@ -375,11 +558,42 @@ def main(argv):
                  "    more. Delete the row, or restore the cite it belonged to."],
             ))
 
+    # 3. Every source file the manifest cites must be watched by the workflow's
+    #    push filter, or this checker never runs for a direct-to-main push that
+    #    changes it. Coverage is currently complete by coincidence -- wal.rs,
+    #    store.rs and persistence.rs are all listed for other reasons.
+    cited_sources = sorted({path for (_rev, path, _rng) in rows})
+    unwatched = set()
+    if push_paths:
+        for src in cited_sources:
+            if path_is_watched(src, push_paths):
+                continue
+            unwatched.add(src)
+            failures.append((
+                f"UNWATCHED SOURCE {src}",
+                [f"    {MANIFEST} pins cites into {src}, but",
+                 f"    {WORKFLOW}'s on.push.paths does not select it. This",
+                 "    checker runs in that workflow's `drift` job, so a push to",
+                 f"    main that changes only {src} starts no job at all and the",
+                 "    cites into it go stale unnoticed until some later PR happens",
+                 "    to touch formal/. Add it to the push filter:",
+                 f"      - '{src}'",
+                 "    (keep it beside the other watched sources), and check",
+                 "    `lean-scope` too if the new file belongs to the Lean side."],
+            ))
+
     print("cite-check: scanned " + CORPUS_DIR)
     print("  cite occurrences: "
           + ", ".join(f"{k}={v}" for k, v in sorted(census.items())))
     print(f"  distinct src/*.rs anchors: {len(anchors)}"
           f"   manifest rows: {len(rows)}")
+    if not push_paths:
+        note = "  (push filter unreadable -- see below)"
+    elif unwatched:
+        note = "  (UNWATCHED: " + ", ".join(sorted(unwatched)) + ")"
+    else:
+        note = f"  (all watched by {WORKFLOW}'s push filter)"
+    print("  cited sources: " + ", ".join(cited_sources) + note)
 
     if verbose:
         for anchor in sorted(anchors, key=lambda a: (a[1], int(a[2].split("-")[0]), a[0])):
