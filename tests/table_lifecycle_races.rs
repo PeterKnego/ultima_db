@@ -102,7 +102,11 @@ fn seed(store: &Store) {
 fn b_rows(b: BOp) -> Vec<(u64, String)> {
     match b {
         BOp::BulkReplace => (1u64..=3).map(|i| (i, format!("bulk{i}"))).collect(),
-        // Delta over the seed {1: seed1, 2: seed2}: update 1, delete 2, insert 4.
+        // Hand-derived, unlike the Replace arm, because a delta's result
+        // depends on the fixture: this is `seed()`'s {1: seed1, 2: seed2} with
+        // `bulk_delta_input()` applied — update 1, delete 2, insert 4. **Change
+        // `seed()` or `bulk_delta_input()` and this must change with them**, or
+        // the failure will point at the store instead of at the fixture.
         BOp::BulkDelta => vec![(1, "delta1".to_string()), (4, "delta4".to_string())],
     }
 }
@@ -203,10 +207,9 @@ fn run_cell(a: AState, b: BOp) -> CellOutcome {
 /// commit returned `Ok`, since a conflicting A must leave B's effect entirely
 /// intact.
 ///
-/// `None` means "A replaced the whole table": it deleted `T`, so if that
-/// commit stood, no per-key claim about B's rows survives it. (Every such cell
-/// is expected to conflict, so `None` is in practice never reached; it is here
-/// so the check states its own limits rather than silently over-asserting.)
+/// `None` means "A replaced the whole table": it deleted `T`, so per-key claims
+/// about B's rows do not survive it. Those states are checked against
+/// [`a_whole_table`] instead — `None` is *not* a licence to assert nothing.
 fn a_touched(a: AState) -> Option<&'static [u64]> {
     match a {
         // Contributed nothing to `T`: no row write, and DDL touches no row.
@@ -220,7 +223,51 @@ fn a_touched(a: AState) -> Option<&'static [u64]> {
     }
 }
 
-/// **Rule (ii)**: B committed `Ok`, so B's full effect is visible afterwards.
+/// A's **complete** post-state, for the states that replace the table wholesale
+/// (the ones [`a_touched`] reports `None` for).
+///
+/// Outer `None` means the table is absent; `Some(rows)` means present with
+/// exactly those rows and no others. Every one of these is fully determined by
+/// what A did, which is what lets rule (ii) be enforced on A rather than
+/// abandoned when A's commit stands.
+fn a_whole_table(a: AState) -> Option<Vec<(u64, String)>> {
+    match a {
+        AState::Delete => None,
+        // The reopen does not retract the delete; the table comes back fresh
+        // and empty, and A wrote nothing into it.
+        AState::DeleteRecreate | AState::WriteDeleteRecreate => Some(Vec::new()),
+        // Fresh table, so auto-increment restarts at 1.
+        AState::DeleteRecreateWrite => Some(vec![(1, "recreated".to_string())]),
+        AState::OpenOnly | AState::OpenWrite | AState::OpenDdl => {
+            unreachable!("{a:?} does not replace the table wholesale")
+        }
+    }
+}
+
+/// **Rule (ii)** applied to A: A committed `Ok`, so A's full effect is visible.
+///
+/// Only meaningful for the wholesale-replacement states, where A's commit
+/// determines the table's entire contents.
+fn a_effect_intact(a: AState, out: &CellOutcome) -> Result<(), String> {
+    match (a_whole_table(a), out.table_present) {
+        (None, false) => Ok(()),
+        (None, true) => Err(format!(
+            "A deleted the table and committed Ok; it is still present as {:?}",
+            out.rows_after
+        )),
+        (Some(_), false) => {
+            Err("A recreated the table and committed Ok; it is absent".to_string())
+        }
+        (Some(want), true) if out.rows_after == want => Ok(()),
+        (Some(want), true) => Err(format!(
+            "A recreated the table as {want:?} and committed Ok; found {:?}",
+            out.rows_after
+        )),
+    }
+}
+
+/// **Rule (ii)**: whatever committed `Ok` has its full effect visible
+/// afterwards, and is never silently reverted.
 ///
 /// Checked on every cell, conflicts included. Task 1 checked only the negative
 /// half — "no `seed`-prefixed row is present" — which a partial-merge
@@ -233,11 +280,22 @@ fn a_touched(a: AState) -> Option<&'static [u64]> {
 ///
 /// Both are relaxed only on the keys A was entitled to change, and only if A
 /// actually committed.
-fn b_effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
+///
+/// When A committed *and* replaced the table wholesale, B's rows are
+/// legitimately gone and no claim about them survives — but that is not licence
+/// to assert nothing, because A is now the party that committed `Ok`. The check
+/// switches to [`a_effect_intact`] rather than returning early. (Reverting the
+/// `installed_tables` term makes `DeleteRecreate x Bulk*` commit with A's
+/// delete silently discarded, leaving B's rows in place: that is a rule (ii)
+/// violation against **A**, and it is this arm that catches it.)
+///
+/// The one thing rule (ii) genuinely cannot adjudicate is A committing a delete
+/// over B's install — both committed `Ok`, and one of them must lose. Rule 4
+/// exists precisely so that never happens, and enforcing it is the
+/// *expectation* half's job, not this one.
+fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
     let exempt: &[u64] = match (out.commit.is_ok(), a_touched(a)) {
-        // A replaced the table wholesale and that commit stood — nothing can
-        // be claimed about B's individual rows.
-        (true, None) => return Ok(()),
+        (true, None) => return a_effect_intact(a, out),
         (true, Some(keys)) => keys,
         // A did not commit: it gets no exemption at all.
         (false, _) => &[],
@@ -299,12 +357,12 @@ fn check_cell(a: AState, b: BOp, expect: Expect) {
         ),
     }
 
-    // (ii) THE UMBRELLA PROPERTY: B committed Ok, so B's effect is never
-    // silently reverted.
-    if let Err(why) = b_effect_intact(a, b, &out) {
+    // (ii) THE UMBRELLA PROPERTY: whatever committed Ok is never silently
+    // reverted.
+    if let Err(why) = effect_intact(a, b, &out) {
         panic!(
-            "{label}: {why} — B committed Ok and was silently reverted. \
-             rows={:?} commit={:?}",
+            "{label}: {why} — something that committed Ok was silently \
+             reverted. rows={:?} commit={:?}",
             out.rows_after, out.commit
         );
     }
@@ -348,6 +406,13 @@ fn delete_recreate_over_a_bulk_replace_conflicts() {
     check_cell(AState::DeleteRecreate, BOp::BulkReplace, Expect::Conflicts);
 }
 
+/// Rule 4 — but **never rely on this cell alone as the canary for the
+/// `installed_tables` term.** Unlike its four delete-flavoured siblings it has
+/// a second, independent path to the same conflict: the recreate's `insert`
+/// leaves a non-empty `write_set[T]`, and the install put `T` in
+/// `deleted_tables`, so `validate_write_set`'s *first* loop conflicts it too.
+/// Verified — dropping `|| cws.installed_tables.contains(deleted)` turns the
+/// other five red and leaves this one green.
 #[test]
 fn delete_recreate_write_over_a_bulk_replace_conflicts() {
     check_cell(
@@ -357,8 +422,22 @@ fn delete_recreate_write_over_a_bulk_replace_conflicts() {
     );
 }
 
-/// Rule 4, and bug 5 (fixed in 68cd794): stale write-set digests made this
-/// behave differently from `DeleteRecreate` purely because A wrote first.
+/// Rule 4. **This is not a bug-5 calibrator, despite the shape** — an earlier
+/// draft of this suite claimed it was, and a reverted `68cd794` will not turn
+/// it red.
+///
+/// Bug 5 was `delete_table` leaving stale write-set digests behind. Reverting
+/// it cannot flip this cell, because the *second* loop conflicts
+/// `ever_deleted_tables` against the install's `installed_tables` whether or
+/// not the digests were cleared; pre-fix, the stale digests merely give the
+/// first loop a redundant second path to the same answer. `delete_table`'s own
+/// comment says as much: "It adds no defence against a delete-and-recreate
+/// being overwritten by latest — the second loop is the only thing preventing
+/// that, before and after."
+///
+/// Bug 5's observable effect is on delete-vs-**delete**, where the stale
+/// digests raised a spurious conflict against a concurrent commit that merely
+/// *removed* the table. Calibrating it needs the `delete_table` column.
 #[test]
 fn write_delete_recreate_over_a_bulk_replace_conflicts() {
     check_cell(
@@ -406,6 +485,9 @@ fn delete_recreate_over_a_bulk_delta_conflicts() {
     check_cell(AState::DeleteRecreate, BOp::BulkDelta, Expect::Conflicts);
 }
 
+/// Rule 4. Carries the same caveat as its Replace twin: the recreate's write
+/// gives it a second path to the conflict, so it is not a canary for the
+/// `installed_tables` term.
 #[test]
 fn delete_recreate_write_over_a_bulk_delta_conflicts() {
     check_cell(
@@ -415,6 +497,8 @@ fn delete_recreate_write_over_a_bulk_delta_conflicts() {
     );
 }
 
+/// Rule 4. Not a bug-5 calibrator — see the Replace twin for why a reverted
+/// `68cd794` leaves this green.
 #[test]
 fn write_delete_recreate_over_a_bulk_delta_conflicts() {
     check_cell(
