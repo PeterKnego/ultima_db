@@ -13,16 +13,32 @@
 //! *sequential* — A begins, B commits, A commits. So is every cell here. No
 //! threads, no scheduler, no timing.
 //!
+//! The matrix is complete as of Task 4: 7 [`AState`]s × 6 [`BOp`]s = 42 cells,
+//! 38 of them live (two tests pack two cells each) and 4 carried `#[ignore]`d
+//! as questions awaiting a ruling. Run those with `-- --ignored`.
+//!
 //! See `docs/superpowers/specs/2026-08-05-table-lifecycle-races-design.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use ultima_db::{
-    BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store, StoreConfig,
-    WriterMode,
+    AddOptions, BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store,
+    StoreConfig, WriterMode,
 };
 
+/// The table under test. Every [`AState`] acts on this one and no other.
 const T: &str = "t";
+
+/// A second table, touched only by the multi-table [`BOp`]s and never by A.
+///
+/// It is what makes the two new columns distinguishable from the single-table
+/// ones. [`BOp::BulkBatch`] installs `T` and `U` in one atomic snapshot, and
+/// [`BOp::StreamInstallDrop`] acts on `T` *by omitting it* — the wire stream
+/// declares `U` alone, so `T` is dropped as an extra.
+const U: &str = "u";
+
+/// Every table [`run_cell`] observes after the race.
+const WATCHED: &[&str] = &[T, U];
 
 /// What the in-flight transaction A did before B committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +74,30 @@ enum BOp {
     /// leaves `T` absent, which is why the oracle has to ask
     /// [`b_leaves_table`] before it can say what "B's effect intact" means.
     TxDelete,
+    /// `Store::bulk_load_batch` — a **multi-table atomic** install of `T` *and*
+    /// `U` in one snapshot.
+    ///
+    /// The second table is not decoration. `Store::bulk_load` with a `Replace`
+    /// input *is* `bulk_load_batch` with a single `add` (`src/store.rs:1420`),
+    /// so a one-table batch column would run the same code as
+    /// [`BOp::BulkReplace`] through a different spelling and assert nothing new.
+    /// What only a batch can get wrong is atomicity across tables — A's commit
+    /// rebasing onto `latest` and taking `T` back while dropping `U`, or the
+    /// reverse — and that is a claim no single-table observation can make.
+    BulkBatch,
+    /// `install_snapshot_stream` with `InstallOptions::on_extra_tables =
+    /// OnExtra::Drop`, from a source store holding only `U`.
+    ///
+    /// The odd one out in two ways. First, B's act on `T` is an *omission*: the
+    /// stream never mentions `T`, and `T` disappears because the keep-set does
+    /// not contain it. Second, that removal reaches `CommittedWriteSet` by a
+    /// different route than every other delete here — `install_batch_inner`
+    /// puts keep-set drops in `deleted_tables` but deliberately **not** in
+    /// `installed_tables` ("The drops are removals, not installs",
+    /// `src/store.rs:1867`), so this column is the only one where those two
+    /// fields disagree about a table.
+    #[cfg(feature = "persistence")]
+    StreamInstallDrop,
 }
 
 /// The expected commit outcome for a cell.
@@ -71,19 +111,71 @@ enum Expect {
     DdlConflicts,
 }
 
+/// Post-race observation of **every** table in [`WATCHED`], not just `T`.
+///
+/// Task 1 recorded `rows_after`/`table_present` for `T` alone, which was
+/// sufficient while every `BOp` was single-table. Both of Task 4's break that,
+/// in opposite directions:
+///
+/// - [`BOp::BulkBatch`] installs two tables in one snapshot, so "B's effect
+///   survived" is a claim about both of them and a single-table check would
+///   miss a commit that took `T` back correctly while losing `U`. Measured: a
+///   batch that stages `T` only turns **all seven** cells of that column red,
+///   committed and conflicted alike, every one of them through
+///   [`side_tables_intact`].
+/// - [`BOp::StreamInstallDrop`] acts on `T` by *not* streaming it, so `U` is
+///   the only positive evidence the install happened at all. Measured against
+///   an install made into a silent no-op (`U` left unregistered on the
+///   destination, which is the `pending.is_empty()` early return in
+///   `install_snapshot_stream`): four of the six cells in that column are
+///   caught by outcome (i) or by `T`'s own disposition anyway, but
+///   [`delete_over_a_stream_install_drop_commits`] is not. With the side clause
+///   disabled it passes a do-nothing install outright — A deletes `T`, commits
+///   `Ok`, and `T` ends absent, which is exactly what the cell demands.
+///   Observing `U` is the whole of what that cell asserts about B.
+///
+/// [`rows_after`](Self::rows_after) and [`table_present`](Self::table_present)
+/// are kept as accessors so every cell Tasks 1–3 wrote reads unchanged.
 struct CellOutcome {
     commit: Result<u64, Error>,
-    rows_after: Vec<(u64, String)>,
-    table_present: bool,
+    /// Rows of each watched table that exists; an absent table has no entry.
+    tables: BTreeMap<&'static str, Vec<(u64, String)>>,
+}
+
+impl CellOutcome {
+    /// `T`'s rows, or empty when `T` is absent — indistinguishable on their
+    /// own, which is why [`table_present`](Self::table_present) exists.
+    fn rows_after(&self) -> &[(u64, String)] {
+        self.tables.get(T).map_or(&[], Vec::as_slice)
+    }
+
+    fn table_present(&self) -> bool {
+        self.tables.contains_key(T)
+    }
 }
 
 fn mw_store() -> Store {
-    Store::new(
+    let store = Store::new(
         StoreConfig::builder()
             .writer_mode(WriterMode::MultiWriter)
             .build(),
     )
-    .unwrap()
+    .unwrap();
+    // `install_snapshot_stream` reconstructs each incoming table through the
+    // registry, and `OnUnknown::Drop` (the default) silently discards anything
+    // unregistered — leaving `pending` empty, which makes the whole install a
+    // no-op that returns `base_version` without touching the store. So `U` must
+    // be registered on *both* ends of the stream for `StreamInstallDrop` to act
+    // at all, and `b_side_tables`' demand that `U` be present afterwards is what
+    // holds it to that.
+    //
+    // `T` is deliberately left unregistered: `TableRegistry::validate_type`
+    // passes on unknown names ("If not registered, we don't enforce — allows
+    // non-persistent tables", `src/registry.rs:326`), so nothing needs it, and
+    // leaving it out keeps every Tasks 1–3 cell running exactly as it did.
+    #[cfg(feature = "persistence")]
+    store.register_table::<String>(U).unwrap();
+    store
 }
 
 /// Seeds `T` with two rows, ids 1 and 2.
@@ -119,9 +211,51 @@ fn b_rows(b: BOp) -> Vec<(u64, String)> {
         // at its seed value is deliberate — it is the row `AState::OpenWrite`
         // claims, so the disjoint-key merge has something to get wrong.
         BOp::TxWrite => vec![(1, "seed1".to_string()), (2, "from_b".to_string())],
+        // Distinct from the Replace arm on purpose. The two install paths are
+        // the same code, so identical values would make a column mix-up
+        // invisible; `batch{i}` vs `bulk{i}` makes it a failure.
+        BOp::BulkBatch => (1u64..=3).map(|i| (i, format!("batch{i}"))).collect(),
         // Nothing left to enumerate; presence is the whole of B's effect here.
         BOp::TxDelete => Vec::new(),
+        // Likewise — but for the opposite reason. `TxDelete` removes `T`
+        // explicitly; this removes it by never streaming it.
+        #[cfg(feature = "persistence")]
+        BOp::StreamInstallDrop => Vec::new(),
     }
+}
+
+/// B's effect on the watched tables **other than `T`**: the complete list of
+/// those it leaves present, with their complete contents. Any watched table not
+/// listed here must be absent afterwards.
+///
+/// Kept apart from [`b_rows`] because these need none of its exemption
+/// machinery. No `AState` opens, writes, or deletes a table other than `T`, so
+/// A can never hold a legitimate claim on one — the check is exact in both
+/// directions and unconditional on A's outcome, which is a strictly stronger
+/// assertion than anything `T` can carry.
+///
+/// [`side_rows`] feeds the *fixture* from this same list, so the rows B is told
+/// to install and the rows the oracle demands cannot drift apart.
+fn b_side_tables(b: BOp) -> &'static [(&'static str, &'static [(u64, &'static str)])] {
+    match b {
+        BOp::BulkBatch => &[(U, &[(1, "batch_u1"), (2, "batch_u2")])],
+        #[cfg(feature = "persistence")]
+        BOp::StreamInstallDrop => &[(U, &[(1, "streamed_u1"), (2, "streamed_u2")])],
+        BOp::BulkReplace | BOp::BulkDelta | BOp::TxWrite | BOp::TxDelete => &[],
+    }
+}
+
+/// The owned form of one [`b_side_tables`] entry, for handing to an installer.
+///
+/// Panics rather than returning empty when `name` is not declared: an
+/// undeclared side table would make B install rows the oracle then demands be
+/// absent, and the resulting failure would name the wrong party.
+fn side_rows(b: BOp, name: &str) -> Vec<(u64, String)> {
+    b_side_tables(b)
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, rows)| rows.iter().map(|(k, v)| (*k, v.to_string())).collect())
+        .unwrap_or_else(|| panic!("{b:?} declares no side table {name:?}"))
 }
 
 /// Whether B left `T` in existence.
@@ -133,8 +267,12 @@ fn b_rows(b: BOp) -> Vec<(u64, String)> {
 /// but emptied — which is within one row of the shape of bug 3.
 fn b_leaves_table(b: BOp) -> bool {
     match b {
-        BOp::BulkReplace | BOp::BulkDelta | BOp::TxWrite => true,
+        BOp::BulkReplace | BOp::BulkDelta | BOp::TxWrite | BOp::BulkBatch => true,
         BOp::TxDelete => false,
+        // A keep-set drop is a removal, exactly like `delete_table` — the
+        // difference is only in how it reaches `CommittedWriteSet`.
+        #[cfg(feature = "persistence")]
+        BOp::StreamInstallDrop => false,
     }
 }
 
@@ -227,20 +365,76 @@ fn run_cell(a: AState, b: BOp) -> CellOutcome {
             assert!(b.delete_table(T));
             b.commit().unwrap();
         }
+        BOp::BulkBatch => {
+            let mut batch = store.bulk_load_batch();
+            for (name, rows) in [
+                (T, b_rows(BOp::BulkBatch)),
+                (U, side_rows(BOp::BulkBatch, U)),
+            ] {
+                batch
+                    .add::<String>(
+                        name,
+                        BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+                        AddOptions::default(),
+                    )
+                    .unwrap();
+            }
+            // One `commit`, so both tables land in one snapshot version — the
+            // atomicity the column exists to test.
+            batch.commit(BulkLoadOptions::default()).unwrap();
+        }
+        #[cfg(feature = "persistence")]
+        BOp::StreamInstallDrop => {
+            use std::io::Read as _;
+
+            use ultima_db::{InstallOptions, OnExtra};
+
+            // The source holds `U` and nothing else, so the stream declares
+            // `U` alone and `T` is an extra at the destination.
+            let src = mw_store();
+            {
+                let mut w = src.begin_write(None).unwrap();
+                let mut t = w.open_table::<String>(U).unwrap();
+                // `put`, not `insert`: the keys are asserted by
+                // `b_side_tables`, so they are stated here rather than left to
+                // whatever the auto-increment counter happens to hand out.
+                for (k, v) in side_rows(BOp::StreamInstallDrop, U) {
+                    t.put(k, v).unwrap();
+                }
+                w.commit().unwrap();
+            }
+            let mut bytes = Vec::new();
+            src.snapshot_stream(None)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+
+            store
+                .install_snapshot_stream(
+                    std::io::Cursor::new(&bytes),
+                    InstallOptions {
+                        on_extra_tables: OnExtra::Drop,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
     }
 
     // ── A commits; observe ──────────────────────────────────────────────
     let commit = wtx.commit();
 
     let rtx = store.begin_read(None).unwrap();
-    let (rows_after, table_present) = match rtx.open_table::<String>(T) {
-        Ok(t) => (
-            t.iter().map(|(k, v)| (k, v.clone())).collect::<Vec<_>>(),
-            true,
-        ),
-        Err(_) => (Vec::new(), false),
-    };
-    CellOutcome { commit, rows_after, table_present }
+    let mut tables = BTreeMap::new();
+    for name in WATCHED {
+        if let Ok(t) = rtx.open_table::<String>(*name) {
+            tables.insert(
+                *name,
+                t.iter().map(|(k, v)| (k, v.clone())).collect::<Vec<_>>(),
+            );
+        }
+    }
+    CellOutcome { commit, tables }
 }
 
 /// The rows A is *entitled* to have changed on top of B, **and the values it
@@ -315,21 +509,62 @@ fn a_whole_table(a: AState, b: BOp) -> Option<Vec<(u64, String)>> {
 /// Only meaningful for the wholesale-replacement states, where A's commit
 /// determines the table's entire contents.
 fn a_effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
-    match (a_whole_table(a, b), out.table_present) {
+    match (a_whole_table(a, b), out.table_present()) {
         (None, false) => Ok(()),
         (None, true) => Err(format!(
             "A deleted the table and committed Ok; it is still present as {:?}",
-            out.rows_after
+            out.rows_after()
         )),
         (Some(_), false) => {
             Err("A recreated the table and committed Ok; it is absent".to_string())
         }
-        (Some(want), true) if out.rows_after == want => Ok(()),
+        (Some(want), true) if out.rows_after() == want => Ok(()),
         (Some(want), true) => Err(format!(
             "A recreated the table as {want:?} and committed Ok; found {:?}",
-            out.rows_after
+            out.rows_after()
         )),
     }
+}
+
+/// **Rule (ii)** on the watched tables other than `T`.
+///
+/// Unconditional in both directions and independent of A's outcome, because no
+/// `AState` touches these: a table B installed must be present with exactly B's
+/// rows, and one B did not install must be absent. Nothing here is ever
+/// exempted, so this is the strictest clause in the oracle — and the only one
+/// that can see a multi-table install come apart.
+///
+/// Run first in [`effect_intact`], ahead of anything about `T`. A `BulkBatch`
+/// that lost `U` while getting `T` right is a broken atomic install, and
+/// reporting it as such names the defect; letting a later `T` clause fire first
+/// would not.
+fn side_tables_intact(b: BOp, out: &CellOutcome) -> Result<(), String> {
+    let declared: BTreeMap<&str, &[(u64, &str)]> = b_side_tables(b).iter().copied().collect();
+    for name in WATCHED.iter().filter(|n| **n != T) {
+        match (declared.get(name), out.tables.get(*name)) {
+            (None, None) => {}
+            (None, Some(got)) => {
+                return Err(format!(
+                    "table {name:?} exists as {got:?}; B installed no such table"
+                ));
+            }
+            (Some(want), None) => {
+                return Err(format!(
+                    "B installed table {name:?} as {want:?}; it is now absent"
+                ));
+            }
+            (Some(want), Some(got)) => {
+                let want: Vec<(u64, String)> =
+                    want.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+                if *got != want {
+                    return Err(format!(
+                        "table {name:?}: B installed {want:?}, found {got:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// **Rule (ii)**: whatever committed `Ok` has its full effect visible
@@ -364,6 +599,8 @@ fn a_effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
 /// exists precisely so that never happens, and enforcing it is the
 /// *expectation* half's job, not this one.
 fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
+    side_tables_intact(b, out)?;
+
     let exempt: &[(u64, &str)] = match (out.commit.is_ok(), a_touched(a)) {
         (true, None) => return a_effect_intact(a, b, out),
         (true, Some(rows)) => rows,
@@ -373,7 +610,7 @@ fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
     let is_exempt = |k: u64| exempt.iter().any(|(ek, _)| *ek == k);
 
     let after: BTreeMap<u64, &str> = out
-        .rows_after
+        .rows_after()
         .iter()
         .map(|(k, v)| (*k, v.as_str()))
         .collect();
@@ -401,17 +638,17 @@ fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
     // A left `T`'s existence alone — every [`a_touched`]-`Some` state only opens
     // the table — so B's disposition of it is the whole answer, in both
     // directions. The second arm is the one that catches a resurrection.
-    match (b_leaves_table(b), out.table_present) {
+    match (b_leaves_table(b), out.table_present()) {
         (true, false) => return Err("B installed the table; it is now absent".to_string()),
         (false, true) => {
             return Err(format!(
                 "B deleted the table; it is present as {:?}",
-                out.rows_after
+                out.rows_after()
             ));
         }
         _ => {}
     }
-    if !out.table_present {
+    if !out.table_present() {
         // B removed it and it is gone: `b_rows` is empty and so is `rows_after`,
         // so both loops below would be vacuous.
         return Ok(());
@@ -429,7 +666,7 @@ fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
     }
 
     let installed: BTreeSet<u64> = b_rows(b).into_iter().map(|(k, _)| k).collect();
-    for (k, v) in &out.rows_after {
+    for (k, v) in out.rows_after() {
         if !installed.contains(k) && !is_exempt(*k) {
             return Err(format!(
                 "row ({k}, {v:?}) is not one B installed — pre-B state resurrected"
@@ -461,6 +698,15 @@ fn expected_presence(a: AState, b: BOp) -> Option<bool> {
         // Bug 5 (fixed in 68cd794): same shape, but A wrote before deleting.
         // Must match the line above — that it did not was the bug.
         (AState::WriteDeleteRecreate, BOp::TxDelete) => Some(false),
+        // The same pinned choice, reached through a keep-set drop instead of a
+        // `delete_table`. Cited separately because the ruling was made about
+        // Phase 2's `(None, _)` arm, and that arm is indifferent to *how* the
+        // table left latest — these two cells are what say so.
+        #[cfg(feature = "persistence")]
+        (
+            AState::DeleteRecreate | AState::WriteDeleteRecreate,
+            BOp::StreamInstallDrop,
+        ) => Some(false),
         _ => None,
     }
 }
@@ -495,16 +741,16 @@ fn check_cell(a: AState, b: BOp, expect: Expect) {
         panic!(
             "{label}: {why} — something that committed Ok was silently \
              reverted. rows={:?} commit={:?}",
-            out.rows_after, out.commit
+            out.rows_after(), out.commit
         );
     }
 
     // (iii) the table's existence, where a specific ruling pinned it
     if let Some(want) = expected_presence(a, b) {
         assert_eq!(
-            out.table_present, want,
+            out.table_present(), want,
             "{label}: expected table_present={want}, rows={:?} commit={:?}",
-            out.rows_after, out.commit
+            out.rows_after(), out.commit
         );
     }
 }
@@ -553,10 +799,17 @@ fn delete_recreate_over_a_bulk_replace_conflicts() {
 /// leaves a non-empty `write_set[T]`, and the install put `T` in
 /// `deleted_tables`, so `validate_write_set`'s *first* loop conflicts it too.
 /// Verified — dropping `|| cws.installed_tables.contains(deleted)` turns its
-/// **six** delete-flavoured siblings in the two bulk columns red (`Delete`,
-/// `DeleteRecreate` and `WriteDeleteRecreate`, each against Replace and Delta)
-/// and leaves this one green. The count is six, not the five an earlier
-/// revision of this comment claimed.
+/// **nine** delete-flavoured siblings in the three bulk columns red (`Delete`,
+/// `DeleteRecreate` and `WriteDeleteRecreate`, each against Replace, Delta and
+/// Batch) and leaves this one green. The count was six before Task 4 added the
+/// `BulkBatch` column, and five in a still earlier revision of this comment; it
+/// tracks the number of *installing* columns, so re-measure it rather than
+/// trusting it if another is added.
+///
+/// The `StreamInstallDrop` column is untouched by that revert, which is not a
+/// gap: a keep-set drop deliberately never puts `T` in `installed_tables`, so
+/// the term has nothing to bite on there. That column's delete-flavoured cells
+/// are decided by the term's *absence*, and they stay green.
 #[test]
 fn delete_recreate_write_over_a_bulk_replace_conflicts() {
     check_cell(
@@ -793,6 +1046,165 @@ fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
     check_cell(AState::DeleteRecreate, BOp::TxDelete, Expect::Commits);
 }
 
+// ── Axis A × B3 (`bulk_load_batch`, multi-table atomic install) ─────────────
+//
+// `Store::bulk_load` with a `Replace` input **is** a one-element
+// `bulk_load_batch` (`src/store.rs:1420`), so on `T` alone this column is the
+// Replace column re-spelled, and its outcomes are the same by construction
+// rather than by coincidence.
+//
+// What is new is `U`. Both tables go in through one `add` each and one
+// `commit`, landing in a single snapshot version, so every cell below carries
+// an atomicity claim that no single-table column can state: whatever A's commit
+// does to `T`, `U` must be present with B's exact rows. `side_tables_intact`
+// asserts it unconditionally — A never touches `U`, so it gets no exemption
+// there in any cell, committed or conflicted.
+
+/// Rules 1 and 5 together: A contributed nothing to `T`, so B's install of `T`
+/// stands — and A never touched `U`, so B's install of `U` stands with it.
+///
+/// The one cell in this column where A commits, which makes it the only one
+/// where a Phase 2 arm runs against a multi-table install. It takes the
+/// `(Some(_), _)` skip — `T` is in latest and A's write set for it is empty —
+/// and Phase 3 then re-forks from the current latest, which is what carries `U`
+/// through. A promotion that rebuilt the snapshot from A's *base* instead would
+/// leave `U` absent, and `side_tables_intact` is what says so.
+#[test]
+fn open_only_does_not_revert_a_bulk_batch() {
+    check_cell(AState::OpenOnly, BOp::BulkBatch, Expect::Commits);
+}
+
+/// Rule 3: A holds DDL on `T` and B replaced `T`.
+#[test]
+fn ddl_only_over_a_bulk_batch_fails_loudly() {
+    check_cell(AState::OpenDdl, BOp::BulkBatch, Expect::DdlConflicts);
+}
+
+/// Rule 2: A wrote id 1 and B replaced the whole table under it.
+#[test]
+fn write_over_a_bulk_batch_conflicts() {
+    check_cell(AState::OpenWrite, BOp::BulkBatch, Expect::Conflicts);
+}
+
+/// Rule 4: `T` is in the batch's `installed_tables`, so A's delete was decided
+/// against contents that no longer exist.
+#[test]
+fn delete_over_a_bulk_batch_conflicts() {
+    check_cell(AState::Delete, BOp::BulkBatch, Expect::Conflicts);
+}
+
+/// Rule 4: the reopen does not retract the delete.
+#[test]
+fn delete_recreate_over_a_bulk_batch_conflicts() {
+    check_cell(AState::DeleteRecreate, BOp::BulkBatch, Expect::Conflicts);
+}
+
+/// Rule 4. Same caveat as its Replace and Delta twins: the recreate's `insert`
+/// gives `validate_write_set`'s first loop an independent path to the same
+/// conflict, so this is not a canary for the `installed_tables` term.
+#[test]
+fn delete_recreate_write_over_a_bulk_batch_conflicts() {
+    check_cell(AState::DeleteRecreateWrite, BOp::BulkBatch, Expect::Conflicts);
+}
+
+/// Rule 4. Not a bug-5 calibrator — see the Replace twin for why a reverted
+/// `68cd794` leaves this green.
+#[test]
+fn write_delete_recreate_over_a_bulk_batch_conflicts() {
+    check_cell(AState::WriteDeleteRecreate, BOp::BulkBatch, Expect::Conflicts);
+}
+
+// ── Axis A × B6 (`install_snapshot_stream`, `OnExtra::Drop`) ────────────────
+//
+// The column where B's `CommittedWriteSet` has `deleted_tables` and
+// `installed_tables` naming **different** tables: `install_batch_inner` records
+// the streamed `U` in both, and the keep-set-dropped `T` in `deleted_tables`
+// only, on the stated grounds that "The drops are removals, not installs"
+// (`src/store.rs:1867`). Nowhere else in the matrix do those two fields
+// disagree, and the disagreement is exactly what decides this column: rule 4's
+// antecedent is "B *installed* `T`", and here it is false, so every one of A's
+// delete-flavoured states is a delete-vs-delete rather than a delete-vs-install.
+//
+// That makes this column the `TxDelete` column's twin, reached by a different
+// route — and it inherits both of that column's unresolved cells along with its
+// answers. Two of the four corners of the delete/recreate square are carried
+// below as `#[ignore]`d questions for the same reason their `TxDelete`
+// counterparts are.
+
+/// Rule 2: A wrote id 1 to `T` and B's keep-set dropped `T`.
+/// `validate_write_set`'s first loop — A's write set for `T` is non-empty and
+/// `T` is in B's `deleted_tables`, which a keep-set drop populates exactly as
+/// `delete_table` does.
+#[cfg(feature = "persistence")]
+#[test]
+fn write_over_a_stream_install_drop_conflicts() {
+    check_cell(AState::OpenWrite, BOp::StreamInstallDrop, Expect::Conflicts);
+}
+
+/// Rule 3: A holds DDL on `T` and B removed `T`. The `flags` map ors
+/// `deleted_tables` in, so a keep-set drop reaches the DDL check on the same
+/// terms a `delete_table` does.
+#[cfg(feature = "persistence")]
+#[test]
+fn ddl_only_over_a_stream_install_drop_fails_loudly() {
+    check_cell(AState::OpenDdl, BOp::StreamInstallDrop, Expect::DdlConflicts);
+}
+
+/// Rule 4, taken at its word: A deleted `T`, and B did **not** install `T` — it
+/// installed `U` and dropped `T` as an extra. `validate_write_set`'s second loop
+/// asks `cws.tables.contains_key(T) || cws.installed_tables.contains(T)`, and a
+/// keep-set drop puts `T` in neither, so this is delete-vs-delete and commits.
+///
+/// The residual question is the one
+/// [`delete_vs_concurrent_delete_outcome_is_unruled`] carries: whether SI
+/// *should* conflict when both parties remove the same table. This cell is
+/// pinned anyway, and the two are not the same question. There the outcome turns
+/// on nothing but that unruled preference; here there is an independent,
+/// documented ruling to appeal to — the `installed_tables` split was decided
+/// deliberately, with the reason written at the site, and the SMR use case it
+/// exists for wants an `InstallSnapshot` to leave the follower mirroring the
+/// leader whatever a local writer was doing. Both parties want `T` gone and
+/// nothing either committed is lost either way. Should delete-vs-delete ever be
+/// ruled a conflict, this cell moves with it.
+#[cfg(feature = "persistence")]
+#[test]
+fn delete_over_a_stream_install_drop_commits() {
+    check_cell(AState::Delete, BOp::StreamInstallDrop, Expect::Commits);
+}
+
+/// Bug 5 (fixed in 68cd794) again, and the **second** cell able to calibrate it
+/// — reached through the keep-set-drop route rather than `delete_table`.
+///
+/// Packed as an equality for the same reason
+/// [`write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete`]
+/// is: bug 5 was not a wrong answer in isolation but the *difference* between
+/// these two lines. `delete_table` left `write_set[T]` describing rows of an
+/// incarnation that no longer exists, so the first loop conflicted the state
+/// that happened to write before deleting and let the one that did not through.
+///
+/// That this reproduces against a keep-set drop is the point of running it here.
+/// Bug 5's mechanism is on A's side entirely — stale digests meeting *any*
+/// `deleted_tables` entry — so it must be independent of how B's removal was
+/// spelled, and the `TxDelete` twin alone cannot say that.
+///
+/// Both halves also assert, through [`a_whole_table`], that the write-free
+/// recreate does **not** bring `T` back: `b_leaves_table` is false here, so the
+/// pinned 2026-08-05 choice applies by the same Phase 2 `(None, _)` arm.
+#[cfg(feature = "persistence")]
+#[test]
+fn write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop() {
+    check_cell(
+        AState::WriteDeleteRecreate,
+        BOp::StreamInstallDrop,
+        Expect::Commits,
+    );
+    check_cell(
+        AState::DeleteRecreate,
+        BOp::StreamInstallDrop,
+        Expect::Commits,
+    );
+}
+
 // ── Cells awaiting a ruling ────────────────────────────────────────────────
 //
 // Carried as `#[ignore]`d tests rather than omitted, so the question is visible
@@ -823,17 +1235,25 @@ fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
 /// under `IsolationLevel::Serializable`: still `Ok`. Anyone extending this suite
 /// to SSI should not start here.
 ///
-/// Where SSI *does* diverge, measured 2026-08-05 across all 28 cells — six of
-/// them, every one `Ok` under SI and `SerializationFailure` under SSI:
+/// Where SSI *does* diverge, re-measured 2026-08-05 across all 42 cells after
+/// Task 4 — ten of them, every one `Ok` under SI and `SerializationFailure`
+/// under SSI:
 ///
-/// - `OpenOnly x BulkReplace`, `OpenOnly x BulkDelta`,
-///   `OpenOnly x TxWrite`, `OpenOnly x TxDelete`
-/// - `DeleteRecreate x TxDelete`, `WriteDeleteRecreate x TxDelete`
+/// - `OpenOnly` against **every** `BOp`: `BulkReplace`, `BulkDelta`, `TxWrite`,
+///   `TxDelete`, `BulkBatch`, `StreamInstallDrop`.
+/// - `DeleteRecreate` and `WriteDeleteRecreate` against each of the two
+///   table-removing columns, `TxDelete` and `StreamInstallDrop`.
 ///
 /// That is the real scope of an SSI pass: `OpenOnly`'s `t.len()` records a read
-/// that every B invalidates, and the two recreate cells read the table they
-/// recreated. Note the second pair is the bug-5 cell, so an SSI pass must decide
-/// whether that equality is asserted per isolation level or only under SI.
+/// that every B invalidates without exception, and the recreate cells read the
+/// table they recreated. Note the second group is the bug-5 pair in both of its
+/// spellings, so an SSI pass must decide whether that equality is asserted per
+/// isolation level or only under SI.
+///
+/// The count was six before Task 4 and is stated per *cell*, not per test: both
+/// bug-5 tests pack two `check_cell`s and abort on the first, so a naive run
+/// shows eight failures and hides the two `DeleteRecreate` halves. Those were
+/// unmasked by swapping the lines and confirmed to diverge too.
 ///
 /// **Current behaviour, measured 2026-08-05 under SI:** commits `Ok`; `T` is
 /// absent afterwards. Absence is asserted, not merely observed — `a_whole_table`
@@ -872,4 +1292,80 @@ fn delete_vs_concurrent_delete_outcome_is_unruled() {
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn delete_recreate_write_vs_concurrent_delete_outcome_is_unruled() {
     check_cell(AState::DeleteRecreateWrite, BOp::TxDelete, Expect::Conflicts);
+}
+
+/// UNRESOLVED — needs a ruling before it is pinned. **This is the cell the
+/// design spec names**: "`A1` × `B6` — whether a write-free open should
+/// resurrect a keep-set-dropped table."
+///
+/// A opened `T`, wrote nothing, and committed; B's snapshot install dropped `T`
+/// as an extra. Two mechanisms decide the outcome and they were decided
+/// independently, which is the whole of the question:
+///
+/// - `validate_write_set` does not conflict A. Its first loop needs a non-empty
+///   `write_set[T]` (A has only the eager empty entry `open_table` leaves) and
+///   its second needs `T` in `cws.tables` or `cws.installed_tables` — and the
+///   `installed_tables` fix deliberately keeps keep-set drops out of the latter
+///   ("The drops are removals, not installs", `src/store.rs:1867`). So A
+///   commits.
+/// - Phase 2 then finds `T` gone from latest with an empty write set and takes
+///   the `(None, _)` skip arm, so A's clone is not reinstalled and `T` stays
+///   dropped.
+///
+/// Neither was chosen with the other in view. Together they give "commits, and
+/// the table stays gone", which is the same answer bug 3's fix pinned for
+/// `OpenOnly × TxDelete` — but there the two halves were decided together, in
+/// one commit, about one mechanism. Here the agreement is a coincidence of two
+/// rulings, and it is worth an explicit decision that it is the intended one.
+/// The alternative — conflicting A, on the grounds that a snapshot install is a
+/// wholesale state replacement and an SMR follower should refuse a local
+/// transaction that spans it — would mean putting keep-set drops back into
+/// `installed_tables`, which is precisely what the fix declined to do.
+///
+/// **Current behaviour, measured 2026-08-05:** commits `Ok`; `T` is absent
+/// afterwards and `U` is present with the streamed rows.
+#[cfg(feature = "persistence")]
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn open_only_vs_stream_install_drop_outcome_is_unruled() {
+    check_cell(AState::OpenOnly, BOp::StreamInstallDrop, Expect::Commits);
+}
+
+/// UNRESOLVED — needs a ruling before it is pinned. The keep-set-drop twin of
+/// [`delete_recreate_write_vs_concurrent_delete_outcome_is_unruled`], and open
+/// for exactly the same reason rather than a new one.
+///
+/// A deleted `T`, recreated it, and wrote a row into the new incarnation; B's
+/// keep-set dropped `T`. `validate_write_set`'s first loop sees a non-empty
+/// `write_set[T]` against `T` in `deleted_tables` and conflicts — but the
+/// digests describe the *recreated* table, not the one B removed, and
+/// `write_set` cannot tell the two incarnations apart. That is bug 5's
+/// conflation arrived at from the other side: stale digests there, live digests
+/// from a new table here.
+///
+/// It is the fourth corner of a square whose other three
+/// (`Delete`, `DeleteRecreate`, `WriteDeleteRecreate`, all against
+/// `StreamInstallDrop`) commit, and the odd one out only because A happened to
+/// write after recreating. Committing would take Phase 2's
+/// `(None, Some(digests))` arm and install A's recreated table wholesale over a
+/// snapshot install that had just dropped it — which for the SMR case this
+/// column models is arguably *worse* than the conflict, and is the reason this
+/// is a ruling and not a fix.
+///
+/// Carried separately from its `TxDelete` twin rather than folded into it: the
+/// two reach the same loop through different `CommittedWriteSet` encodings, so a
+/// ruling that changed one without the other would be a real divergence, and
+/// only two cells can show it.
+///
+/// **Current behaviour, measured 2026-08-05:** `Err(WriteConflict)`; `T` is
+/// absent afterwards and `U` is present with the streamed rows.
+#[cfg(feature = "persistence")]
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn delete_recreate_write_vs_stream_install_drop_outcome_is_unruled() {
+    check_cell(
+        AState::DeleteRecreateWrite,
+        BOp::StreamInstallDrop,
+        Expect::Conflicts,
+    );
 }
