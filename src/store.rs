@@ -4332,6 +4332,36 @@ impl WriteTx {
         if existed_in_base {
             self.deleted_tables.insert(name.to_string());
         }
+        // These digests are the other half of a pair whose exact keys
+        // (`DirtyEntry::modified_keys`) just went out with the dirty entry;
+        // the two are maintained in lockstep. Rows written before the delete
+        // no longer exist here, so digests naming them describe nothing — and
+        // left behind they make `validate_write_set`'s first loop conflict
+        // against a concurrent commit that merely *removed* the same table:
+        // the delete-vs-delete that
+        // `delete_then_reopen_without_writing_leaves_a_concurrently_deleted_table_absent`
+        // pins as non-conflicting.
+        //
+        // That spurious conflict is all this fixes. It adds no defence
+        // against a delete-and-recreate being overwritten by latest — the
+        // second loop is the only thing preventing that, before and after.
+        // Verified with that loop disabled in both configurations: the
+        // recreate is lost either way, via Phase 2's merge arm on non-empty
+        // digests and via the `(Some(_), _)` skip arm on empty ones.
+        //
+        // Emptied, not removed. Every counterparty path tests `contains_key`
+        // (the second loop, `has_concurrent`, `validate_read_set`), so an
+        // empty entry is observationally identical to the digests it
+        // replaces, and `ensure_write_set` already leaves one on every
+        // `open_table` — write-then-delete now publishes exactly what
+        // open-then-delete does. `remove` would publish less.
+        //
+        // The delete stays visible to OCC regardless: `ever_deleted_tables`
+        // below keeps it, and the second loop conflicts it against a
+        // concurrent commit that wrote to or installed `name`.
+        if let Some(digests) = self.write_set.get_mut(name) {
+            digests.clear();
+        }
         let existed = existed_in_dirty || existed_in_base;
         if existed && matches!(self.writer_mode, WriterMode::MultiWriter) {
             self.ever_deleted_tables.insert(name.to_string());
@@ -6283,6 +6313,151 @@ mod tests {
         assert!(
             rtx.open_table::<String>("t").is_err(),
             "a write-free recreate must not survive a concurrent delete"
+        );
+    }
+
+    /// `delete_table` drops the dirty entry, and with it the `modified_keys`
+    /// half of the write-tracking pair — so it must empty the digest half too.
+    ///
+    /// The two are documented as maintained in lockstep (see
+    /// `DirtyEntry::modified_keys`), and Phase 2 reads emptiness off the
+    /// digests while merging from `modified_keys`. Leaving digests behind
+    /// makes the pair disagree: digests non-empty, exact keys empty.
+    ///
+    /// The entry itself is expected to survive as an *empty* set, not to
+    /// vanish: it is what the published `CommittedWriteSet::tables` uses to
+    /// say this transaction touched the table.
+    #[test]
+    fn delete_table_clears_the_write_set_digests() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t")
+            .unwrap()
+            .insert("x".into())
+            .unwrap();
+        assert_eq!(wtx.write_set_digests("t").len(), 1, "the write is recorded");
+
+        assert!(wtx.delete_table("t"));
+        assert!(
+            wtx.write_set_digests("t").is_empty(),
+            "digests for rows the delete destroyed must not survive it"
+        );
+
+        // Reopening yields a fresh empty table; both halves stay empty until
+        // something is written to it.
+        assert!(wtx.open_table::<String>("t").unwrap().is_empty());
+        assert!(wtx.write_set_digests("t").is_empty());
+        assert_eq!(wtx.modified_keys_of::<u64>("t"), Some(BTreeSet::new()));
+    }
+
+    /// The write-then-delete form of
+    /// `delete_then_reopen_without_writing_leaves_a_concurrently_deleted_table_absent`:
+    /// writing a row *before* deleting the table must not change the outcome
+    /// of racing a concurrent delete of that same table.
+    ///
+    /// The rows were destroyed by our own `delete_table`, and the concurrent
+    /// commit only *removed* the table, which agrees with our delete. So this
+    /// is a delete-vs-delete: no conflict, and the write-free recreate does
+    /// not survive.
+    ///
+    /// Without the fix the stale digests left in `write_set` make
+    /// `validate_write_set`'s first loop fire — commit returns
+    /// `WriteConflict` on "t" — so whether that pinned semantic held depended
+    /// on whether the transaction happened to write before deleting.
+    #[test]
+    fn write_then_delete_and_recreate_does_not_conflict_with_a_concurrent_delete() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // B writes a row, then deletes the table and recreates it empty.
+        wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .insert("y".into())
+            .unwrap();
+        assert!(wtx_b.delete_table("t"));
+        assert!(wtx_b.open_table::<String>("t").unwrap().is_empty());
+
+        // A deletes the same table and nothing else.
+        wtx_a.delete_table("t");
+        wtx_a.commit().unwrap();
+
+        wtx_b
+            .commit()
+            .expect("rows destroyed by our own delete_table must not conflict with a delete");
+
+        let rtx = store.begin_read(None).unwrap();
+        assert!(
+            rtx.open_table::<String>("t").is_err(),
+            "a write-free recreate must not survive a concurrent delete"
+        );
+    }
+
+    /// The counterpart guard: clearing the digests must not lose the fact that
+    /// this transaction deleted the table.
+    ///
+    /// `ever_deleted_tables` still carries it, and `validate_write_set`'s
+    /// second loop still conflicts our delete against a concurrent commit that
+    /// *wrote to* the table — the case a removal-only concurrent commit is
+    /// distinguished from. This is the same assertion as
+    /// `concurrent_write_conflicts_with_delete_table`, with a row written
+    /// before the delete, which is the shape that used to conflict on the
+    /// first loop instead.
+    #[test]
+    fn write_then_delete_still_conflicts_with_a_concurrent_write() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // B writes a row, then deletes the table.
+        wtx_b
+            .open_table::<String>("t")
+            .unwrap()
+            .insert("y".into())
+            .unwrap();
+        assert!(wtx_b.delete_table("t"));
+
+        // A writes to the table B deleted.
+        wtx_a
+            .open_table::<String>("t")
+            .unwrap()
+            .insert("z".into())
+            .unwrap();
+        wtx_a.commit().unwrap();
+
+        let err = wtx_b.commit().unwrap_err();
+        assert!(
+            matches!(err, Error::WriteConflict { ref table, .. } if table == "t"),
+            "delete over a concurrently written table must still conflict, got {err:?}"
         );
     }
 

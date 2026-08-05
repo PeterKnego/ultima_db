@@ -1030,6 +1030,43 @@ mod bulk_load_occ {
         assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
     }
 
+    /// The same, with a row written *before* the delete.
+    ///
+    /// This shape used to conflict on `validate_write_set`'s **first** loop:
+    /// `delete_table` left the pre-delete row digests in `write_set`, and a
+    /// bulk install lists the table in `deleted_tables`. Now that the delete
+    /// clears those digests, only the second loop is left to catch it, via
+    /// `installed_tables` — so this pins that the conflict survived moving
+    /// between loops rather than merely appearing to.
+    #[test]
+    fn write_then_delete_conflicts_with_a_concurrent_bulk_replace() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t")
+            .unwrap()
+            .update(1, "from_writer".into())
+            .unwrap();
+        assert!(wtx.delete_table("t"));
+
+        let bulk_v = store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::WriteConflict { ref table, .. }) if table == "t"),
+            "delete over a bulk-replaced table must conflict, got {res:?}"
+        );
+
+        assert_eq!(store.latest_version(), bulk_v);
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+    }
+
     /// The delete must still not conflict with a *different* table's load —
     /// `installed_tables` is per-table like every other OCC check.
     #[test]
