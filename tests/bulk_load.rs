@@ -825,8 +825,8 @@ fn bulk_load_replace_preserves_unique_index_definition() {
 
 mod bulk_load_occ {
     use ultima_db::{
-        BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IsolationLevel, Store,
-        StoreConfig, WriterMode,
+        BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, IsolationLevel,
+        Store, StoreConfig, WriterMode,
     };
 
     fn replace_input(n: u64) -> BulkLoadInput<String> {
@@ -874,6 +874,121 @@ mod bulk_load_occ {
 
         // The bulk-loaded data must be intact at latest.
         assert_eq!(store.latest_version(), bulk_v);
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+    }
+
+    /// The sibling of the test above, for a transaction that **opened** the
+    /// replaced table but never wrote to it.
+    ///
+    /// `WriteTx::open_table` eagerly clones the table into `self.dirty`, so a
+    /// write-free transaction still carries a full pre-replace snapshot of it.
+    /// At commit:
+    ///
+    /// * `validate_write_set` walks `cws.deleted_tables` but only conflicts
+    ///   when `self.write_set[deleted]` is **non-empty**, and deliberately so —
+    ///   the comment there says "opened but nothing written must not count",
+    ///   because a snapshot read of a since-replaced table is fine under SI.
+    /// * `install_batch_inner` records its `CommittedWriteSet` with
+    ///   `tables: BTreeMap::new()`, so `has_concurrent` — computed only from
+    ///   `cws.tables.contains_key(n)` — is `false` for the replaced table.
+    /// * Phase 2 therefore takes the fast path and installs `my_dirty`
+    ///   wholesale.
+    ///
+    /// The read-safety argument justifies skipping the *conflict*; it does not
+    /// address the transaction then writing that stale snapshot back. If the
+    /// assertions below fail, the bulk load was silently reverted by a
+    /// transaction that wrote nothing.
+    #[test]
+    fn write_free_txn_that_opened_a_replaced_table_must_not_revert_the_bulk_load() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        // Opens the table — and nothing else. No insert, update or delete.
+        let mut wtx = store.begin_write(None).unwrap();
+        let t = wtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 2, "the txn holds a pre-replace clone");
+        drop(t);
+
+        let bulk_v = store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        // The transaction must still see its own snapshot: not conflicting a
+        // write-free opener is justified on the grounds that a snapshot read of
+        // a since-replaced table is fine under SI, so that read has to keep
+        // working. This is the guarantee the fix must not have traded away.
+        let t = wtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 2, "the txn must still read its own pre-replace snapshot");
+        assert_eq!(t.get(1).map(String::as_str), Some("seed1"));
+        drop(t);
+
+        // Whether this conflicts is not the point — either outcome is
+        // defensible for a write-free transaction, and pinning one here would
+        // freeze `validate_write_set`'s opened-but-unwritten policy inside a
+        // bulk-load test. Bound it to the defensible set so an unrelated error
+        // cannot pass silently, and let the data assertions carry the contract.
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Ok(_) | Err(Error::WriteConflict { .. })),
+            "unexpected commit outcome: {res:?}"
+        );
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(
+            t.len(),
+            3,
+            "bulk-loaded table was reverted by a write-free txn (commit -> {res:?})"
+        );
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+        assert_eq!(t.get(3).map(String::as_str), Some("bulk3"));
+        assert!(
+            t.get(2).map(String::as_str) != Some("seed2"),
+            "pre-replace row resurrected (commit -> {res:?})"
+        );
+        assert!(store.latest_version() >= bulk_v);
+    }
+
+    /// The one behaviour this fix intentionally changed.
+    ///
+    /// `define_index` records into `ddl_tables`, never into `write_set`, so a
+    /// DDL-only transaction slips past `validate_write_set` exactly like a
+    /// write-free one. Before the fix it took the fast path and reinstated its
+    /// pre-replace clone — destroying the bulk load. Of the three available
+    /// outcomes (install wholesale and lose the load; take the merge slow path
+    /// and silently drop the DDL, which task41 forbids; or fail loudly) only
+    /// the third is defensible, so it now raises `IndexDdlConflict` — the same
+    /// contract task41 already established for DDL racing an ordinary commit.
+    ///
+    /// The existing `mw_index_ddl_with_concurrent_commit_errors` drives that
+    /// conflict through `cws.tables`; this drives it through `deleted_tables`,
+    /// which nothing else covers.
+    #[test]
+    fn ddl_only_txn_on_a_bulk_replaced_table_fails_loudly() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<String>("t")
+            .unwrap()
+            .define_index("by_val", IndexKind::Unique, |s: &String| s.clone())
+            .unwrap();
+
+        store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::IndexDdlConflict { .. })),
+            "DDL over a bulk-replaced table must fail loudly, got {res:?}"
+        );
+
+        // And the load survives, which is the point of failing rather than
+        // installing.
         let rtx = store.begin_read(None).unwrap();
         let t = rtx.open_table::<String>("t").unwrap();
         assert_eq!(t.len(), 3);
