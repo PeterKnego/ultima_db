@@ -495,7 +495,12 @@ shift smaller than a wide anchor's own width leaves that row green: insert one
 line near the top of `src/wal.rs` and the 50-line `scan_wal` row still contains
 its token. It is the narrow anchors that fire — 14 of them, on that one-line
 insertion — and a re-anchor pass then re-reads all of them. Prefer a token from
-the first line of the range so an anchor's *start* is what is pinned. And note
+the first line of the range so an anchor's *start* is what is pinned — but note
+that protects **asymmetrically**: 28 of the 37 multi-line tokens sit on their
+first line, so a *deletion* above pushes the token out of range and is caught,
+while an *insertion* pushes it further in and is not. Measured on one line
+changed near the top of `src/wal.rs`: deletion fires 35 of 40 rows, insertion
+only 14. Do not read a green run as proof nothing moved. And note
 the checker verifies where a claim points, never that the claim is *true*: only
 reading the code does that.
 

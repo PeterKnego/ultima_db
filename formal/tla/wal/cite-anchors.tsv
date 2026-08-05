@@ -23,9 +23,9 @@
 # Rows are sorted by file then first line. See formal/tla/wal/README.md,
 # 'Source-line cites', for how to add a cite or record a frozen one.
 
-src/persistence.rs	44-46	-	pub enum Durability {
-src/persistence.rs	70-75	-	pub enum WalWrite {
-src/persistence.rs	147-151	-	pub fn standalone(
+src/persistence.rs	44-46	-	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+src/persistence.rs	70-75	-	#[default]
+src/persistence.rs	147-151	-	wal_write: WalWrite,
 src/store.rs	437	-	fn commit_may_park(&self) -> bool {
 src/store.rs	707	-	pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
 src/store.rs	720	-	if inner.active_writer_count > 0 {
@@ -64,7 +64,7 @@ src/wal.rs	720	-	pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Res
 src/wal.rs	764-799	-	fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Option<(u64, u64)>> {
 src/wal.rs	977	-	struct FileSink {
 src/wal.rs	977-980	-	struct FileSink {
-src/wal.rs	1050-1054	-	fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+src/wal.rs	1050-1054	-	.write_all(&entry.bytes)
 src/wal.rs	1055-1059	-	fn sync(&mut self) -> Result<()> {
 src/wal.rs	1074	-	struct BufferedFileSink {
 src/wal.rs	1074-1081	-	struct BufferedFileSink {
