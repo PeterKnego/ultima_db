@@ -243,19 +243,27 @@ fn run_cell(a: AState, b: BOp) -> CellOutcome {
     CellOutcome { commit, rows_after, table_present }
 }
 
-/// The keys A is *entitled* to have changed on top of B — and only when A's
-/// commit returned `Ok`, since a conflicting A must leave B's effect entirely
-/// intact.
+/// The rows A is *entitled* to have changed on top of B, **and the values it
+/// must have left there** — and only when A's commit returned `Ok`, since a
+/// conflicting A must leave B's effect entirely intact.
+///
+/// Keys and values are one list on purpose. An earlier revision returned keys
+/// alone, and [`effect_intact`] used them only to *exclude* those rows from B's
+/// check — so on exactly the keys A claimed, nothing was asserted by anybody.
+/// Replacing Phase 2's `merge_keys_from` call with a no-op (a textbook silent
+/// lost update: `commit=Ok`, A's `update(1, "from_a")` reverted to `seed1`) left
+/// the whole suite green. Splitting these into two functions would let that hole
+/// reopen the moment one drifted from the other; as one list it cannot.
 ///
 /// `None` means "A replaced the whole table": it deleted `T`, so per-key claims
 /// about B's rows do not survive it. Those states are checked against
 /// [`a_whole_table`] instead — `None` is *not* a licence to assert nothing.
-fn a_touched(a: AState) -> Option<&'static [u64]> {
+fn a_touched(a: AState) -> Option<&'static [(u64, &'static str)]> {
     match a {
         // Contributed nothing to `T`: no row write, and DDL touches no row.
         AState::OpenOnly | AState::OpenDdl => Some(&[]),
         // `update(1, "from_a")`.
-        AState::OpenWrite => Some(&[1]),
+        AState::OpenWrite => Some(&[(1, "from_a")]),
         AState::Delete
         | AState::DeleteRecreate
         | AState::DeleteRecreateWrite
@@ -337,7 +345,11 @@ fn a_effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
 /// - no row B did not install is present.
 ///
 /// Both are relaxed only on the keys A was entitled to change, and only if A
-/// actually committed.
+/// actually committed — and on exactly those keys A's *own* value is asserted
+/// instead, so the relaxation transfers the obligation rather than dropping it.
+/// Without that transfer the exempt keys would be checked by nobody, and a
+/// Phase 2 merge that silently discarded A's write would pass. See
+/// [`a_touched`].
 ///
 /// When A committed *and* replaced the table wholesale, B's rows are
 /// legitimately gone and no claim about them survives — but that is not licence
@@ -352,12 +364,39 @@ fn a_effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
 /// exists precisely so that never happens, and enforcing it is the
 /// *expectation* half's job, not this one.
 fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
-    let exempt: &[u64] = match (out.commit.is_ok(), a_touched(a)) {
+    let exempt: &[(u64, &str)] = match (out.commit.is_ok(), a_touched(a)) {
         (true, None) => return a_effect_intact(a, b, out),
-        (true, Some(keys)) => keys,
+        (true, Some(rows)) => rows,
         // A did not commit: it gets no exemption at all.
         (false, _) => &[],
     };
+    let is_exempt = |k: u64| exempt.iter().any(|(ek, _)| *ek == k);
+
+    let after: BTreeMap<u64, &str> = out
+        .rows_after
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+
+    // **Rule (ii) applied to A**, on exactly the keys the exemption above takes
+    // out of B's check. This runs before the presence match deliberately: a
+    // committed row of A's that vanished with the table is still a lost update,
+    // and reporting it as "B deleted the table" would name the wrong party.
+    for (k, want) in exempt {
+        match after.get(k) {
+            Some(got) if got == want => {}
+            Some(got) => {
+                return Err(format!(
+                    "row {k}: A committed {want:?}, found {got:?} — A's write was reverted"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "row {k}: A committed {want:?}, now absent — A's write was reverted"
+                ));
+            }
+        }
+    }
 
     // A left `T`'s existence alone — every [`a_touched`]-`Some` state only opens
     // the table — so B's disposition of it is the whole answer, in both
@@ -378,14 +417,8 @@ fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
         return Ok(());
     }
 
-    let after: BTreeMap<u64, &str> = out
-        .rows_after
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .collect();
-
     for (k, want) in b_rows(b) {
-        if exempt.contains(&k) {
+        if is_exempt(k) {
             continue;
         }
         match after.get(&k) {
@@ -397,7 +430,7 @@ fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
 
     let installed: BTreeSet<u64> = b_rows(b).into_iter().map(|(k, _)| k).collect();
     for (k, v) in &out.rows_after {
-        if !installed.contains(k) && !exempt.contains(k) {
+        if !installed.contains(k) && !is_exempt(*k) {
             return Err(format!(
                 "row ({k}, {v:?}) is not one B installed — pre-B state resurrected"
             ));
@@ -638,11 +671,17 @@ fn open_only_does_not_revert_a_concurrent_write() {
 
 /// Key-level OCC: A updates id 1, B updates id 2 — disjoint, so both land.
 ///
-/// This is the only cell in the matrix that reaches Phase 2's *merge* arm;
-/// every other `Commits` cell takes a skip arm. It is therefore the one that
-/// proves the umbrella check's `exempt` relaxation is a relaxation and not a
-/// hole: id 2 is not exempt, so B's `from_b` must still be there afterwards even
-/// though A committed on top.
+/// This is the only cell in the matrix that reaches Phase 2's *merge* arm; every
+/// other `Commits` cell takes a skip arm. So it is the sole guard on
+/// `merge_keys_from`, in both directions: id 2 is not exempt, so B's `from_b`
+/// must survive A committing on top, and id 1 *is* exempt, so [`a_touched`]'s
+/// value check is what proves A's `from_a` was not quietly dropped.
+///
+/// An earlier revision of this comment claimed the exemption was "a relaxation
+/// and not a hole" while `a_touched` still returned bare keys — at which point it
+/// was precisely a hole, and stubbing `merge_keys_from` to a no-op left the
+/// suite green. Both halves are asserted now; the claim is true as of the commit
+/// that fixed `a_touched`, and not before.
 #[test]
 fn write_over_a_concurrent_write_to_a_different_row_commits() {
     check_cell(AState::OpenWrite, BOp::TxWrite, Expect::Commits);
@@ -739,6 +778,15 @@ fn ddl_only_over_a_concurrent_delete_fails_loudly() {
 /// Calibrated 2026-08-05: reverting `68cd794`'s digest-clearing block turns the
 /// first line red (`WriteConflict` where `Ok` is required) and leaves the second
 /// green.
+///
+/// One property of packing them: the halves run in order, so an abort in the
+/// first masks the second. Under the bug-5 revert the reported failure is
+/// `WriteDeleteRecreate` only, and whether `DeleteRecreate` also moved is not
+/// visible from the output — swap the two lines to see the other side.
+/// Confirmed by doing so: swapped, the *`DeleteRecreate`* line passes and
+/// `WriteDeleteRecreate` still fails, which is the asymmetry. Packing is still
+/// right, because the property under test is the equality of the two, not either
+/// outcome alone.
 #[test]
 fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
     check_cell(AState::WriteDeleteRecreate, BOp::TxDelete, Expect::Commits);
@@ -762,18 +810,35 @@ fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
 /// `installed_tables` (B's commit puts it in neither). Both parties want the
 /// table gone, so nothing is lost.
 ///
-/// The question is `Serializable`, where `validate_read_set` aborts the same
-/// race. That divergence is pre-existing, undocumented, and not obviously wrong
-/// — an SSI abort here is conservative, not unsound. Whether SI should conflict
-/// too, or SSI should stop aborting, is a design question and not a bug report.
-/// The same question covers `DeleteRecreate x TxDelete`, whose *SI* outcome is
-/// separately pinned by dbd56d4 (see
-/// `write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete`)
-/// but whose SSI behaviour is equally unruled.
+/// So what is left unruled is narrow: whether SI *should* conflict when both
+/// parties delete the same table, given that neither can observe the other's
+/// rows afterwards. Rule (ii) holds either way, so this is a question about
+/// outcome (i) alone.
+///
+/// **`Serializable` is not the reason, contrary to the design spec** (`…
+/// races-design.md:119-121`, which lists this cell as one where "SSI's
+/// `validate_read_set` aborts it"). It does not. `AState::Delete` calls only
+/// `delete_table`, which never reads, so there is no read-set entry for `T` and
+/// `validate_read_set`'s delete arm (`src/store.rs:4541`) cannot fire. Measured
+/// under `IsolationLevel::Serializable`: still `Ok`. Anyone extending this suite
+/// to SSI should not start here.
+///
+/// Where SSI *does* diverge, measured 2026-08-05 across all 28 cells — six of
+/// them, every one `Ok` under SI and `SerializationFailure` under SSI:
+///
+/// - `OpenOnly x BulkReplace`, `OpenOnly x BulkDelta`,
+///   `OpenOnly x TxWrite`, `OpenOnly x TxDelete`
+/// - `DeleteRecreate x TxDelete`, `WriteDeleteRecreate x TxDelete`
+///
+/// That is the real scope of an SSI pass: `OpenOnly`'s `t.len()` records a read
+/// that every B invalidates, and the two recreate cells read the table they
+/// recreated. Note the second pair is the bug-5 cell, so an SSI pass must decide
+/// whether that equality is asserted per isolation level or only under SI.
 ///
 /// **Current behaviour, measured 2026-08-05 under SI:** commits `Ok`; `T` is
-/// absent afterwards. Rule (ii) holds either way, so what is unruled here is
-/// outcome (i) alone.
+/// absent afterwards. Absence is asserted, not merely observed — `a_whole_table`
+/// returns `None` for `Delete`, so `a_effect_intact`'s `(None, true)` arm fails
+/// this cell if `T` survives.
 #[test]
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn delete_vs_concurrent_delete_outcome_is_unruled() {
