@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
+.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
 
 build:
 	cargo build
@@ -343,6 +343,14 @@ formal/tla-calibrate:
 # Override for changes outside the verified surface: ACK_NO_FORMAL=1.
 formal/drift-check:
 	formal/scripts/check-drift.sh
+
+# Cite guard: verify that every src/*.rs:LINE cite in formal/tla/wal/ still
+# points at what it claims, via the expectation tokens in
+# formal/tla/wal/cite-anchors.tsv. Complements formal/drift-check, which only
+# knows that *something* under formal/ changed. Needs nothing but python3 and
+# git; runs in well under a second.
+formal/cite-check:
+	formal/scripts/check-cites.py
 
 lint:
 	cargo clippy -- -D warnings

@@ -15,6 +15,10 @@
 #     into src/wal.rs, src/store.rs and src/persistence.rs. Those cites rot on
 #     any edit that moves lines — including a pure perf refactor that changes
 #     no semantics at all (task57 shifted every wal.rs cite by 88-92 lines).
+#     Whether they ROTTED is a different question from whether formal/ changed,
+#     and this guard cannot answer it: check-cites.py does, by verifying each
+#     cite's expectation token against the source. Both run in CI; neither
+#     replaces the other (see formal/tla/wal/README.md, "Source-line cites").
 #
 # Nothing forces the Rust and the models to stay in step — this does: if a
 # watched file changed in a diff but nothing under formal/ did, it fails and
@@ -161,6 +165,13 @@ $recheck_block
   NOTE for src/wal.rs / src/store.rs / src/persistence.rs: "no semantic change"
   is NOT enough on its own. formal/tla/wal/ carries raw src/*.rs:LINE cites, so
   an edit that only shifts lines still invalidates them. Check the cites before
-  acknowledging.
+  acknowledging:
+
+    formal/scripts/check-cites.py     (or: make formal/cite-check)
+
+  That verifies every cite's expectation token against the source it names, so
+  it — not this guard — is what tells you whether the lines actually moved.
+  It runs in CI alongside this check, and passing it is NOT satisfied by
+  ACK_NO_FORMAL.
 MSG
 exit 1

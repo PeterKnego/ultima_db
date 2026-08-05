@@ -412,16 +412,114 @@ Four lessons, and they generalise:
    fires on any watched-file edit, which is the right trigger, but the work it
    demands is proportional to the number of raw line numbers.
 
-**Proposed, not yet done:** replace raw ranges with *anchors* — a function or
-`struct` name plus a distinctive line of its body — e.g. "`commit_multi_writer`,
-at the `if !self.explicit_version` bump" instead of "`src/store.rs:4130`". An
-anchor survives every edit that does not touch the cited construct, which is
-almost all of them, and when it *does* break it breaks by not being found,
-which is checkable mechanically instead of by eye. Deliberately deferred out of
-this pass: converting ~180 cites is a prose rewrite that would bury the
-line-by-line verification this commit is for, and several `.cfg` headers are
-column-constrained. Do it as its own commit, with a script that resolves every
-anchor against the tree and fails if one is missing or ambiguous.
+### Source-line cites: the anchor manifest
+
+The fix for lesson 4 is `formal/scripts/check-cites.py` (`make formal/cite-check`),
+run in CI in the `drift` job. It answers the question the drift guard cannot:
+*do the cites still point at what they claim?* The drift guard's predicate is
+"a watched source changed and nothing under `formal/` did", which has no
+relation to whether any cite was re-checked — `c8c1f0a` broke all 99
+`src/wal.rs` cites and **satisfied the drift guard in the same commit**, because
+it also touched one unrelated line in `RESULTS.md`.
+
+Each distinct anchor carries an **expectation token** in a sidecar manifest,
+`cite-anchors.tsv`. The anchor holds when that token occurs *exactly once*
+inside the range it names. This is the anchoring idea from lesson 4 — a
+function signature or a distinctive expression instead of a bare number — but
+kept *out* of the prose: `WalCrash.tla`'s comment blocks are column-boxed to a
+fixed right margin and the `.cfg` headers are line-length constrained, so an
+inline `{token}` syntax would wreck the two largest files. A sidecar is also
+the smaller thing to maintain: ~193 cite occurrences, 65 anchors.
+
+```
+# src_file          range      rev         expectation token
+src/wal.rs          653-702    -           pub(crate) fn scan_wal
+src/wal.rs          1119       5df6d23^    scan_wal(&path, true)
+```
+
+Tab-separated, four fields, `#` comments, sorted by file then first line.
+
+- **range** — one line (`1206`) or an inclusive span (`653-702`).
+- **rev** — `-` for the working tree, or a git revision for a **frozen** cite
+  that deliberately names historical code. Frozen rows are resolved with
+  `git show <rev>:<file>` and checked like any other — *not* exempted. Lesson 3
+  said a sweep must skip them; that was half right. Skipping is what let the
+  `5df6d23^` cite of `scan_wal(&path, true)` ship wrong at creation, naming
+  line 1115 (correct at an earlier revision) where that call is at 1119, and a
+  frozen cite is the worst place for an error because nothing will ever move it
+  again, so nothing will ever prompt a re-check. Frozen means *verified against
+  a different revision*, not *unverified*.
+- **token** — a plain substring, no regex. Both **zero** matches and **more
+  than one** are failures: an ambiguous token like `sync_all`, which matches
+  three times inside `preallocate_to` alone, is exactly as useless as a missing
+  one.
+
+**Adding a cite.** Write it in the prose as usual, then run the checker. It
+fails with `UNKNOWN ANCHOR` and the row skeleton to add — that failure is the
+point: a new cite cannot enter without an expectation. Open the source at the
+range, pick a token that is *stable under reformatting but specific* (a
+signature, a distinctive expression, a struct field — never `?`, `let mut`, or
+a bare `sync_all`), and add the row. Deleting the last cite of an anchor is
+symmetric: the now-unreferenced row fails as `STALE MANIFEST ROW`, so the
+manifest and the prose cannot drift apart in either direction.
+
+**Recording a frozen cite.** Write it as `<sha>^ src/file.rs:LINE` and add a row
+whose `rev` is that same `<sha>^`. Verify it *at that revision* —
+`git show 5df6d23^:src/wal.rs | sed -n '1119p'` — never by carrying a line
+number across a revision boundary, which is precisely how the 1115 error was
+made.
+
+**What the scanner has to handle.** Cites come in three shapes, and a per-token
+regex finds only the first:
+
+| shape | example | share at round 3 |
+|---|---|---|
+| prefixed | `` `src/store.rs:1073-1078` ``, `(src/wal.rs:653-702)` | 147 |
+| frozen | `1e5d2b7^ src/wal.rs:1130-1136` | 8 |
+| bare continuation | `` (`src/store.rs:4130`, `:4193`/`:4247`) ``, `(src/wal.rs:1101, 1105-1108)` | 38 |
+
+The bare forms carry no file of their own; they inherit the nearest *preceding*
+prefix cite in the document, and its revision with it: in
+`e60f8ce^ src/store.rs:2361-2366, inside commit_multi_writer (:2253)` the
+`:2253` means 2253 at `e60f8ce^`, not 2253 today. The scanner therefore also
+tracks prefixes it does **not** check, such as `WalCrash.tla:45` — otherwise
+the `` `:213` `` beside it would inherit whatever `src/*.rs` was named further
+up and invent an anchor from nothing. Two consequences when *writing* a cite:
+keep a frozen cite's `<sha>^` on the same line as its path (the scanner binds
+them on one line only), and remember that quoting a cite shape in prose creates
+a real anchor — this section's own examples are all live cites, and the
+checker holds them to the manifest like any other.
+
+**What it does not catch.** The rule is *exactly once within the range*, so a
+shift smaller than a wide anchor's own width leaves that row green: insert one
+line near the top of `src/wal.rs` and the 50-line `scan_wal` row still contains
+its token. It is the narrow anchors that fire — 14 of them, on that one-line
+insertion — and a re-anchor pass then re-reads all of them. Prefer a token from
+the first line of the range so an anchor's *start* is what is pinned — but note
+that protects **asymmetrically**: 28 of the 37 multi-line tokens sit on their
+first line, so a *deletion* above pushes the token out of range and is caught,
+while an *insertion* pushes it further in and is not. Measured on one line
+changed near the top of `src/wal.rs`: deletion fires 35 of 40 rows, insertion
+only 14. Do not read a green run as proof nothing moved. And note
+the checker verifies where a claim points, never that the claim is *true*: only
+reading the code does that.
+
+**Census.** The checker prints one on every run — a scanner that quietly stops
+finding the bare forms is the exact failure it exists to prevent, and the
+occurrence counts are how you see that happen. Read them as a tripwire, not as
+a constant: they move whenever prose is added, including this section's own
+examples.
+
+At the round-3 corpus the scanner measured 147 prefixed + 8 frozen + 34
+bare-colon + 4 bare-comma = 193 occurrences over 17 files. The per-shape counts
+reproduce that pass's two independent hand sweeps; its **59 distinct anchors**
+does not reproduce — no grouping of this corpus yields 59. Counting distinct
+`(rev, file, range)` triples gives **65**; 53 of them are reachable from a
+prefixed cite and 12 only from a bare one, which is the most likely source of
+the gap, and several ranges share a start line (`src/wal.rs:1074` and
+`src/wal.rs:1074-1081` are different claims about the same struct). 65 is the
+number that matters here: each triple is a separate assertion about the source
+and needs its own expectation.
 
 ## Not yet done
 
