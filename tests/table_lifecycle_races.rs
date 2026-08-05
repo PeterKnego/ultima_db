@@ -51,6 +51,13 @@ enum BOp {
     /// `Store::bulk_load` Delta — inserts id 4, updates id 1, deletes id 2,
     /// so it touches rows A may also have touched.
     BulkDelta,
+    /// Another transaction updates id 2 — a row `AState::OpenWrite` does *not*
+    /// touch, so the disjoint-key case is the one under test.
+    TxWrite,
+    /// Another transaction deletes the table. Unlike every other `BOp` this one
+    /// leaves `T` absent, which is why the oracle has to ask
+    /// [`b_leaves_table`] before it can say what "B's effect intact" means.
+    TxDelete,
 }
 
 /// The expected commit outcome for a cell.
@@ -108,6 +115,26 @@ fn b_rows(b: BOp) -> Vec<(u64, String)> {
         // `seed()` or `bulk_delta_input()` and this must change with them**, or
         // the failure will point at the store instead of at the fixture.
         BOp::BulkDelta => vec![(1, "delta1".to_string()), (4, "delta4".to_string())],
+        // Also hand-derived: `seed()` with id 2 updated in place. Keeping id 1
+        // at its seed value is deliberate — it is the row `AState::OpenWrite`
+        // claims, so the disjoint-key merge has something to get wrong.
+        BOp::TxWrite => vec![(1, "seed1".to_string()), (2, "from_b".to_string())],
+        // Nothing left to enumerate; presence is the whole of B's effect here.
+        BOp::TxDelete => Vec::new(),
+    }
+}
+
+/// Whether B left `T` in existence.
+///
+/// Split out from [`b_rows`] because "B installed no rows" and "B removed the
+/// table" are the same empty vector and opposite post-conditions: the first
+/// demands the table be present and empty, the second demands it be absent.
+/// Collapsing them would let `TxDelete` cells pass with the table resurrected
+/// but emptied — which is within one row of the shape of bug 3.
+fn b_leaves_table(b: BOp) -> bool {
+    match b {
+        BOp::BulkReplace | BOp::BulkDelta | BOp::TxWrite => true,
+        BOp::TxDelete => false,
     }
 }
 
@@ -187,6 +214,19 @@ fn run_cell(a: AState, b: BOp) -> CellOutcome {
                 .bulk_load::<String>(T, bulk_delta_input(), BulkLoadOptions::default())
                 .unwrap();
         }
+        BOp::TxWrite => {
+            let mut b = store.begin_write(None).unwrap();
+            b.open_table::<String>(T)
+                .unwrap()
+                .update(2, "from_b".to_string())
+                .unwrap();
+            b.commit().unwrap();
+        }
+        BOp::TxDelete => {
+            let mut b = store.begin_write(None).unwrap();
+            assert!(b.delete_table(T));
+            b.commit().unwrap();
+        }
     }
 
     // ── A commits; observe ──────────────────────────────────────────────
@@ -230,13 +270,31 @@ fn a_touched(a: AState) -> Option<&'static [u64]> {
 /// exactly those rows and no others. Every one of these is fully determined by
 /// what A did, which is what lets rule (ii) be enforced on A rather than
 /// abandoned when A's commit stands.
-fn a_whole_table(a: AState) -> Option<Vec<(u64, String)>> {
+///
+/// It takes `b` for one reason: a write-free *recreate* is not an unconditional
+/// promise that the table comes back. When a concurrent commit removed `T` from
+/// latest and A contributed no row to it, Phase 2's `(None, _)` arm skips the
+/// install and A's recreate is dropped — the pinned choice of 2026-08-05, see
+/// [`expected_presence`]. Only `BOp::TxDelete` removes `T` from latest, so only
+/// that arm differs; a bulk install leaves `T` present, and Phase 2 then takes
+/// the `(Some(_), _)` arm — which is moot in practice, since every recreate
+/// cell against a bulk install conflicts before reaching Phase 2 at all.
+fn a_whole_table(a: AState, b: BOp) -> Option<Vec<(u64, String)>> {
     match a {
         AState::Delete => None,
         // The reopen does not retract the delete; the table comes back fresh
-        // and empty, and A wrote nothing into it.
-        AState::DeleteRecreate | AState::WriteDeleteRecreate => Some(Vec::new()),
-        // Fresh table, so auto-increment restarts at 1.
+        // and empty, and A wrote nothing into it — or, against a concurrent
+        // delete, does not come back at all.
+        AState::DeleteRecreate | AState::WriteDeleteRecreate => {
+            if b_leaves_table(b) {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }
+        // Fresh table, so auto-increment restarts at 1. Unconditional, unlike
+        // the arm above: A wrote a row, so Phase 2's `(None, Some(digests))`
+        // arm installs it wholesale even when a concurrent commit removed `T`.
         AState::DeleteRecreateWrite => Some(vec![(1, "recreated".to_string())]),
         AState::OpenOnly | AState::OpenWrite | AState::OpenDdl => {
             unreachable!("{a:?} does not replace the table wholesale")
@@ -248,8 +306,8 @@ fn a_whole_table(a: AState) -> Option<Vec<(u64, String)>> {
 ///
 /// Only meaningful for the wholesale-replacement states, where A's commit
 /// determines the table's entire contents.
-fn a_effect_intact(a: AState, out: &CellOutcome) -> Result<(), String> {
-    match (a_whole_table(a), out.table_present) {
+fn a_effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
+    match (a_whole_table(a, b), out.table_present) {
         (None, false) => Ok(()),
         (None, true) => Err(format!(
             "A deleted the table and committed Ok; it is still present as {:?}",
@@ -295,14 +353,29 @@ fn a_effect_intact(a: AState, out: &CellOutcome) -> Result<(), String> {
 /// *expectation* half's job, not this one.
 fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
     let exempt: &[u64] = match (out.commit.is_ok(), a_touched(a)) {
-        (true, None) => return a_effect_intact(a, out),
+        (true, None) => return a_effect_intact(a, b, out),
         (true, Some(keys)) => keys,
         // A did not commit: it gets no exemption at all.
         (false, _) => &[],
     };
 
+    // A left `T`'s existence alone — every [`a_touched`]-`Some` state only opens
+    // the table — so B's disposition of it is the whole answer, in both
+    // directions. The second arm is the one that catches a resurrection.
+    match (b_leaves_table(b), out.table_present) {
+        (true, false) => return Err("B installed the table; it is now absent".to_string()),
+        (false, true) => {
+            return Err(format!(
+                "B deleted the table; it is present as {:?}",
+                out.rows_after
+            ));
+        }
+        _ => {}
+    }
     if !out.table_present {
-        return Err("B installed the table; it is now absent".to_string());
+        // B removed it and it is gone: `b_rows` is empty and so is `rows_after`,
+        // so both loops below would be vacuous.
+        return Ok(());
     }
 
     let after: BTreeMap<u64, &str> = out
@@ -333,7 +406,33 @@ fn effect_intact(a: AState, b: BOp, out: &CellOutcome) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs a cell and asserts both halves of the oracle.
+/// Whether the table must exist after the race, for the cells where that — and
+/// not the row contents — is the property under test. `None` = not asserted.
+///
+/// [`effect_intact`] already enforces every one of these structurally, and the
+/// two must agree. This exists anyway because a generic oracle cannot carry a
+/// citation: each arm below names the commit that decided the outcome, so a
+/// future reader who wants to change one knows whose ruling they are
+/// overturning. If these ever disagree, the bug is in the test, not the store.
+fn expected_presence(a: AState, b: BOp) -> Option<bool> {
+    match (a, b) {
+        // Bug 3 (fixed in dbd56d4): a write-free open must not resurrect a
+        // table a concurrent delete removed. Pre-fix it came back carrying A's
+        // pre-delete clone, `seed1`/`seed2` and all.
+        (AState::OpenOnly, BOp::TxDelete) => Some(false),
+        // Pinned choice, 2026-08-05 (dbd56d4): a write-free recreate does not
+        // survive a concurrent delete. See
+        // `delete_then_reopen_without_writing_leaves_a_concurrently_deleted_table_absent`
+        // in `src/store.rs`.
+        (AState::DeleteRecreate, BOp::TxDelete) => Some(false),
+        // Bug 5 (fixed in 68cd794): same shape, but A wrote before deleting.
+        // Must match the line above — that it did not was the bug.
+        (AState::WriteDeleteRecreate, BOp::TxDelete) => Some(false),
+        _ => None,
+    }
+}
+
+/// Runs a cell and asserts all three parts of the oracle.
 fn check_cell(a: AState, b: BOp, expect: Expect) {
     let out = run_cell(a, b);
     let label = format!("{a:?} x {b:?}");
@@ -363,6 +462,15 @@ fn check_cell(a: AState, b: BOp, expect: Expect) {
         panic!(
             "{label}: {why} — something that committed Ok was silently \
              reverted. rows={:?} commit={:?}",
+            out.rows_after, out.commit
+        );
+    }
+
+    // (iii) the table's existence, where a specific ruling pinned it
+    if let Some(want) = expected_presence(a, b) {
+        assert_eq!(
+            out.table_present, want,
+            "{label}: expected table_present={want}, rows={:?} commit={:?}",
             out.rows_after, out.commit
         );
     }
@@ -411,8 +519,11 @@ fn delete_recreate_over_a_bulk_replace_conflicts() {
 /// a second, independent path to the same conflict: the recreate's `insert`
 /// leaves a non-empty `write_set[T]`, and the install put `T` in
 /// `deleted_tables`, so `validate_write_set`'s *first* loop conflicts it too.
-/// Verified — dropping `|| cws.installed_tables.contains(deleted)` turns the
-/// other five red and leaves this one green.
+/// Verified — dropping `|| cws.installed_tables.contains(deleted)` turns its
+/// **six** delete-flavoured siblings in the two bulk columns red (`Delete`,
+/// `DeleteRecreate` and `WriteDeleteRecreate`, each against Replace and Delta)
+/// and leaves this one green. The count is six, not the five an earlier
+/// revision of this comment claimed.
 #[test]
 fn delete_recreate_write_over_a_bulk_replace_conflicts() {
     check_cell(
@@ -506,4 +617,194 @@ fn write_delete_recreate_over_a_bulk_delta_conflicts() {
         BOp::BulkDelta,
         Expect::Conflicts,
     );
+}
+
+// ── Axis A × B4 (a concurrent transaction's row write) ──────────────────────
+//
+// B here is an ordinary commit: its `CommittedWriteSet` names `T` in `tables`,
+// and leaves both `deleted_tables` and `installed_tables` empty. That is the
+// *opposite* field pattern from the bulk columns above, where `tables` is empty
+// and only `deleted_tables` names `T`. Reading the wrong one of the two was the
+// root of all five bugs, so what this column buys is that the validator and the
+// Phase 2 installer have to be right about a table under both encodings.
+
+/// Rule 1: A contributed nothing to `T`, so B's write stands. Phase 2 reaches
+/// the `(Some(_), _)` skip arm — `T` is still in latest, and A's empty write set
+/// means there is nothing of A's to merge onto it.
+#[test]
+fn open_only_does_not_revert_a_concurrent_write() {
+    check_cell(AState::OpenOnly, BOp::TxWrite, Expect::Commits);
+}
+
+/// Key-level OCC: A updates id 1, B updates id 2 — disjoint, so both land.
+///
+/// This is the only cell in the matrix that reaches Phase 2's *merge* arm;
+/// every other `Commits` cell takes a skip arm. It is therefore the one that
+/// proves the umbrella check's `exempt` relaxation is a relaxation and not a
+/// hole: id 2 is not exempt, so B's `from_b` must still be there afterwards even
+/// though A committed on top.
+#[test]
+fn write_over_a_concurrent_write_to_a_different_row_commits() {
+    check_cell(AState::OpenWrite, BOp::TxWrite, Expect::Commits);
+}
+
+/// Rule 3: A holds DDL on `T` and B wrote to `T`.
+#[test]
+fn ddl_only_over_a_concurrent_write_fails_loudly() {
+    check_cell(AState::OpenDdl, BOp::TxWrite, Expect::DdlConflicts);
+}
+
+/// Rule 4: A deleted `T` and B modified it, so A's delete was decided against
+/// contents that no longer exist. `validate_write_set`'s second loop, reached
+/// through its `cws.tables.contains_key` half rather than the `installed_tables`
+/// half the bulk column exercises.
+#[test]
+fn delete_over_a_concurrent_write_conflicts() {
+    check_cell(AState::Delete, BOp::TxWrite, Expect::Conflicts);
+}
+
+/// Rule 4: the reopen does not retract the delete — `ever_deleted_tables` still
+/// carries `T`.
+#[test]
+fn delete_recreate_over_a_concurrent_write_conflicts() {
+    check_cell(AState::DeleteRecreate, BOp::TxWrite, Expect::Conflicts);
+}
+
+/// Rule 4. Unlike its bulk twins this one has no second path to the conflict:
+/// A's write set for `T` is `{digest(1)}` (the recreate's `insert`) and B's is
+/// `{digest(2)}`, which are disjoint, and B's `deleted_tables` is empty so the
+/// first loop is vacuous. Only the second loop conflicts it.
+#[test]
+fn delete_recreate_write_over_a_concurrent_write_conflicts() {
+    check_cell(AState::DeleteRecreateWrite, BOp::TxWrite, Expect::Conflicts);
+}
+
+/// Rule 4.
+#[test]
+fn write_delete_recreate_over_a_concurrent_write_conflicts() {
+    check_cell(AState::WriteDeleteRecreate, BOp::TxWrite, Expect::Conflicts);
+}
+
+// ── Axis A × B5 (a concurrent transaction's `delete_table`) ─────────────────
+//
+// The column bugs 3 and 5 live in, and the only one that can calibrate them.
+// B's `CommittedWriteSet` here names `T` in `deleted_tables` **and nowhere
+// else** — `tables` is empty because `delete_table` never opens the table, and
+// `installed_tables` is empty because an ordinary commit installs nothing. So
+// this is the one column where "B removed `T`" is the entire post-condition,
+// and `table_present` carries the assertion that row contents cannot.
+
+/// Bug 3 (fixed in dbd56d4): a write-free `open_table` resurrected a table a
+/// concurrent `delete_table` removed — commit returned `Ok` and `T` came back
+/// carrying A's pre-delete clone, `seed1`/`seed2` and all. Phase 2's `(None, _)`
+/// arm installed A's dirty table despite its own comment saying "but I wrote to
+/// it"; it now installs only when the transaction contributed something.
+///
+/// Calibrated 2026-08-05: restoring that arm to an unconditional install turns
+/// this red on both the presence assertion and the umbrella check.
+#[test]
+fn open_only_does_not_resurrect_a_concurrently_deleted_table() {
+    check_cell(AState::OpenOnly, BOp::TxDelete, Expect::Commits);
+}
+
+/// Rule 2: A wrote rows to `T` and B deleted `T`. `validate_write_set`'s first
+/// loop — A's write set for `T` is non-empty and `T` is in B's `deleted_tables`.
+#[test]
+fn write_over_a_concurrent_delete_conflicts() {
+    check_cell(AState::OpenWrite, BOp::TxDelete, Expect::Conflicts);
+}
+
+/// Rule 3: A holds DDL on `T` and B touched `T` — deleting it counts. The DDL
+/// check reads the same `flags` map Phase 2 does, and that map ors
+/// `deleted_tables` in, so a delete reaches it. Failing loudly is the right
+/// answer for the same reason task41 gave: A's index definition cannot survive
+/// the merge, and Phase 2 would otherwise drop it in silence.
+#[test]
+fn ddl_only_over_a_concurrent_delete_fails_loudly() {
+    check_cell(AState::OpenDdl, BOp::TxDelete, Expect::DdlConflicts);
+}
+
+/// Bug 5 (fixed in 68cd794), and **the only cell that can calibrate it** — the
+/// bulk columns cannot, see `write_delete_recreate_over_a_bulk_replace_conflicts`.
+///
+/// The two halves are deliberately in one test, because bug 5 was not a wrong
+/// answer in isolation: it was the *difference* between them. `delete_table`
+/// left `write_set[T]` describing rows that no longer existed, in a table about
+/// to be recreated empty, so `validate_write_set`'s first loop conflicted
+/// `WriteDeleteRecreate` against B's `deleted_tables` while `DeleteRecreate`,
+/// which never wrote, sailed through. The outcome depended on whether the
+/// transaction happened to write before deleting. Asserting the two together is
+/// what states that it must not.
+///
+/// Calibrated 2026-08-05: reverting `68cd794`'s digest-clearing block turns the
+/// first line red (`WriteConflict` where `Ok` is required) and leaves the second
+/// green.
+#[test]
+fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
+    check_cell(AState::WriteDeleteRecreate, BOp::TxDelete, Expect::Commits);
+    check_cell(AState::DeleteRecreate, BOp::TxDelete, Expect::Commits);
+}
+
+// ── Cells awaiting a ruling ────────────────────────────────────────────────
+//
+// Carried as `#[ignore]`d tests rather than omitted, so the question is visible
+// in the matrix instead of being a hole nobody can see. Per the design spec:
+// "The implementer must surface these rather than choose, and no such cell is
+// pinned until a ruling exists." Run them with `-- --ignored`; the doc comments
+// record what they do *today*, which is not the same as what they should do.
+
+/// UNRESOLVED — needs a ruling before it is pinned.
+///
+/// Delete vs delete. Non-conflicting under `SnapshotIsolation`, which is what
+/// this suite runs: `validate_write_set`'s first loop needs a non-empty write
+/// set for `T` (A has none — `delete_table` alone never opens the table, so no
+/// entry is ever created) and its second loop needs `T` in B's `tables` or
+/// `installed_tables` (B's commit puts it in neither). Both parties want the
+/// table gone, so nothing is lost.
+///
+/// The question is `Serializable`, where `validate_read_set` aborts the same
+/// race. That divergence is pre-existing, undocumented, and not obviously wrong
+/// — an SSI abort here is conservative, not unsound. Whether SI should conflict
+/// too, or SSI should stop aborting, is a design question and not a bug report.
+/// The same question covers `DeleteRecreate x TxDelete`, whose *SI* outcome is
+/// separately pinned by dbd56d4 (see
+/// `write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete`)
+/// but whose SSI behaviour is equally unruled.
+///
+/// **Current behaviour, measured 2026-08-05 under SI:** commits `Ok`; `T` is
+/// absent afterwards. Rule (ii) holds either way, so what is unruled here is
+/// outcome (i) alone.
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn delete_vs_concurrent_delete_outcome_is_unruled() {
+    check_cell(AState::Delete, BOp::TxDelete, Expect::Commits);
+}
+
+/// UNRESOLVED — needs a ruling before it is pinned.
+///
+/// Delete-then-recreate-*with-a-write* vs a concurrent delete. This is the
+/// fourth corner of a square whose other three — `Delete`, `DeleteRecreate` and
+/// `WriteDeleteRecreate`, all against `TxDelete` — commit `Ok`. It is the only
+/// one that conflicts, and the reason is the same conflation `68cd794` fixed for
+/// bug 5, arrived at from the other side: `write_set[T]` does not distinguish
+/// the deleted table from the recreated one, so `validate_write_set`'s first
+/// loop reads "A wrote rows to a table B deleted" when what A did was write rows
+/// to a *new* table that happens to share the name. Bug 5 was stale digests from
+/// the old incarnation; this is live digests from the new one, hitting the same
+/// loop.
+///
+/// It is not obviously wrong. Committing would take Phase 2's
+/// `(None, Some(digests))` arm and install A's recreated table wholesale, which
+/// is a defensible outcome — but so is refusing a delete-and-recreate that raced
+/// a delete. `68cd794` deliberately went no further than clearing the stale
+/// digests, and its commit message is explicit that it adds no new defence;
+/// extending it to this cell would change a real outcome, not remove a spurious
+/// one. That is a ruling, not a fix.
+///
+/// **Current behaviour, measured 2026-08-05:** `Err(WriteConflict)`; `T` is
+/// absent afterwards.
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn delete_recreate_write_vs_concurrent_delete_outcome_is_unruled() {
+    check_cell(AState::DeleteRecreateWrite, BOp::TxDelete, Expect::Conflicts);
 }
