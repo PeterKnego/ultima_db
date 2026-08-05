@@ -14,7 +14,7 @@
 //! threads, no scheduler, no timing.
 //!
 //! The matrix is complete as of Task 4: 7 [`AState`]s × 6 [`BOp`]s = 42 cells,
-//! 38 of them live (two tests pack two cells each) and 4 carried `#[ignore]`d
+//! 37 of them live (two tests pack two cells each) and 5 carried `#[ignore]`d
 //! as questions awaiting a ruling. Run those with `-- --ignored`.
 //!
 //! See `docs/superpowers/specs/2026-08-05-table-lifecycle-races-design.md`.
@@ -78,7 +78,7 @@ enum BOp {
     /// `U` in one snapshot.
     ///
     /// The second table is not decoration. `Store::bulk_load` with a `Replace`
-    /// input *is* `bulk_load_batch` with a single `add` (`src/store.rs:1420`),
+    /// input *is* `bulk_load_batch` with a single `add` (`src/store.rs:1425-1426`),
     /// so a one-table batch column would run the same code as
     /// [`BOp::BulkReplace`] through a different spelling and assert nothing new.
     /// What only a batch can get wrong is atomicity across tables — A's commit
@@ -127,12 +127,25 @@ enum Expect {
 ///   the only positive evidence the install happened at all. Measured against
 ///   an install made into a silent no-op (`U` left unregistered on the
 ///   destination, which is the `pending.is_empty()` early return in
-///   `install_snapshot_stream`): four of the six cells in that column are
-///   caught by outcome (i) or by `T`'s own disposition anyway, but
-///   [`delete_over_a_stream_install_drop_commits`] is not. With the side clause
-///   disabled it passes a do-nothing install outright — A deletes `T`, commits
-///   `Ok`, and `T` ends absent, which is exactly what the cell demands.
-///   Observing `U` is the whole of what that cell asserts about B.
+///   `install_snapshot_stream`): all **six** tests of that column fail with the
+///   side clause on; with it disabled, **five** still fail — caught by outcome
+///   (i) or by `T`'s own disposition — and
+///   [`delete_vs_stream_install_drop_outcome_is_unruled`] passes a do-nothing install
+///   outright. A deletes `T`, commits `Ok`, and `T` ends absent, which is
+///   exactly what that cell demands; observing `U` is the whole of what it
+///   asserts about B.
+///
+/// Counted in *tests*, not cells: the stream column is seven cells in six
+/// tests, because
+/// [`write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop`]
+/// packs two. An earlier revision of this comment said "four of the six cells"
+/// and was wrong twice over — wrong number, wrong unit.
+///
+/// Note the sole side-clause-only cell is now `#[ignore]`d (see
+/// [`delete_vs_stream_install_drop_outcome_is_unruled`]), so within the stream
+/// column the clause catches nothing extra on a default CI run. It stays
+/// load-bearing in CI through [`BOp::BulkBatch`], whose seven cells are all
+/// live and all depend on it.
 ///
 /// [`rows_after`](Self::rows_after) and [`table_present`](Self::table_present)
 /// are kept as accessors so every cell Tasks 1–3 wrote reads unchanged.
@@ -1049,7 +1062,7 @@ fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
 // ── Axis A × B3 (`bulk_load_batch`, multi-table atomic install) ─────────────
 //
 // `Store::bulk_load` with a `Replace` input **is** a one-element
-// `bulk_load_batch` (`src/store.rs:1420`), so on `T` alone this column is the
+// `bulk_load_batch` (`src/store.rs:1425-1426`), so on `T` alone this column is the
 // Replace column re-spelled, and its outcomes are the same by construction
 // rather than by coincidence.
 //
@@ -1126,10 +1139,22 @@ fn write_delete_recreate_over_a_bulk_batch_conflicts() {
 // delete-flavoured states is a delete-vs-delete rather than a delete-vs-install.
 //
 // That makes this column the `TxDelete` column's twin, reached by a different
-// route — and it inherits both of that column's unresolved cells along with its
-// answers. Two of the four corners of the delete/recreate square are carried
-// below as `#[ignore]`d questions for the same reason their `TxDelete`
-// counterparts are.
+// route — and it inherits that column's unresolved cells along with its
+// answers. **Every question open against `TxDelete` is open here too**, and by
+// the same authority rather than an analogous one: the ruling comment on
+// `CommittedWriteSet::installed_tables` (`src/store.rs:283-288`) names both
+// spellings in one breath — "a table this commit merely removed (`delete_table`,
+// or a snapshot-stream keep-set drop) agrees with that transaction's delete and
+// must not [conflict]". So whatever is ruled covers both and whatever is unruled
+// is unruled for both, and no cell here can be pinned by appealing to a
+// distinction that sentence does not draw.
+//
+// Three of this column's seven cells are therefore carried below as `#[ignore]`d
+// questions: `OpenOnly`, and two of the four corners of the delete/recreate
+// square (`Delete` and `DeleteRecreateWrite`). The other two corners,
+// `DeleteRecreate` and `WriteDeleteRecreate`, are live — pinned not by a
+// preference about delete-vs-delete but by the bug-5 equality between them,
+// which holds whichever way that preference is eventually ruled.
 
 /// Rule 2: A wrote id 1 to `T` and B's keep-set dropped `T`.
 /// `validate_write_set`'s first loop — A's write set for `T` is non-empty and
@@ -1148,28 +1173,6 @@ fn write_over_a_stream_install_drop_conflicts() {
 #[test]
 fn ddl_only_over_a_stream_install_drop_fails_loudly() {
     check_cell(AState::OpenDdl, BOp::StreamInstallDrop, Expect::DdlConflicts);
-}
-
-/// Rule 4, taken at its word: A deleted `T`, and B did **not** install `T` — it
-/// installed `U` and dropped `T` as an extra. `validate_write_set`'s second loop
-/// asks `cws.tables.contains_key(T) || cws.installed_tables.contains(T)`, and a
-/// keep-set drop puts `T` in neither, so this is delete-vs-delete and commits.
-///
-/// The residual question is the one
-/// [`delete_vs_concurrent_delete_outcome_is_unruled`] carries: whether SI
-/// *should* conflict when both parties remove the same table. This cell is
-/// pinned anyway, and the two are not the same question. There the outcome turns
-/// on nothing but that unruled preference; here there is an independent,
-/// documented ruling to appeal to — the `installed_tables` split was decided
-/// deliberately, with the reason written at the site, and the SMR use case it
-/// exists for wants an `InstallSnapshot` to leave the follower mirroring the
-/// leader whatever a local writer was doing. Both parties want `T` gone and
-/// nothing either committed is lost either way. Should delete-vs-delete ever be
-/// ruled a conflict, this cell moves with it.
-#[cfg(feature = "persistence")]
-#[test]
-fn delete_over_a_stream_install_drop_commits() {
-    check_cell(AState::Delete, BOp::StreamInstallDrop, Expect::Commits);
 }
 
 /// Bug 5 (fixed in 68cd794) again, and the **second** cell able to calibrate it
@@ -1263,6 +1266,62 @@ fn write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop()
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn delete_vs_concurrent_delete_outcome_is_unruled() {
     check_cell(AState::Delete, BOp::TxDelete, Expect::Commits);
+}
+
+/// UNRESOLVED — needs a ruling before it is pinned. The keep-set-drop spelling
+/// of [`delete_vs_concurrent_delete_outcome_is_unruled`], and **the same
+/// question**, not an analogous one.
+///
+/// A deleted `T`; B installed `U` from a wire stream and dropped `T` as an
+/// extra. `validate_write_set`'s second loop asks
+/// `cws.tables.contains_key(T) || cws.installed_tables.contains(T)`, and a
+/// keep-set drop puts `T` in neither, so this is delete-vs-delete and commits —
+/// exactly as its twin does.
+///
+/// This cell was **pinned as `Commits` when Task 4 landed, and un-pinned on
+/// review**. The pinning argued that the twin's outcome turns on nothing but an
+/// unruled preference whereas this one had an independent documented ruling to
+/// appeal to: the `installed_tables` split, decided deliberately with its reason
+/// written at the site. That argument does not survive reading the site. The
+/// classification comment at `src/store.rs:1867` ("The drops are removals, not
+/// installs") establishes only *which set* a keep-set drop lands in; the place
+/// where classification becomes a semantic ruling is `src/store.rs:283-288`, and
+/// it names both spellings in one breath:
+///
+/// > a table this commit merely removed (`delete_table`, **or a snapshot-stream
+/// > keep-set drop**) agrees with that transaction's delete and must not
+/// > [conflict].
+///
+/// One sentence, both routes, one rule. So the citation cannot separate the two
+/// cells: whatever it rules, it rules for both, and the open question — whether
+/// SI *should* conflict when both parties remove the same table — is open for
+/// both. Confirmed behaviourally indistinguishable from the twin under both
+/// isolation levels. Pinning one while ignoring the other would have given two
+/// identical questions opposite treatments, which is the accident this section
+/// exists to prevent.
+///
+/// A live argument does exist for pinning — the SMR use case this column models
+/// wants an `InstallSnapshot` to leave the follower mirroring the leader
+/// whatever a local writer was doing, and nothing either party committed is lost
+/// either way. It is an argument for pinning **both** cells against
+/// `src/store.rs:283-288`, which would retire two unresolved cells rather than
+/// add one. That is a ruling to make deliberately, not a side effect of one
+/// task's cell-by-cell reasoning.
+///
+/// **Current behaviour, measured 2026-08-05:** commits `Ok`; `T` is absent
+/// afterwards and `U` is present with the streamed rows. Both are asserted, not
+/// merely observed — `a_whole_table` returns `None` for `Delete`, and
+/// [`side_tables_intact`] holds `U` unconditionally.
+///
+/// Note this is the one cell in the column that [`side_tables_intact`] catches
+/// *alone* (see [`CellOutcome`]), so ignoring it moves that evidence off the
+/// default CI path. The clause stays load-bearing in CI through
+/// [`BOp::BulkBatch`]; here it is now demonstrated only under `-- --ignored`.
+#[cfg(feature = "persistence")]
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn delete_vs_stream_install_drop_outcome_is_unruled() {
+    check_cell(AState::Delete, BOp::StreamInstallDrop, Expect::Commits);
 }
 
 /// UNRESOLVED — needs a ruling before it is pinned.
