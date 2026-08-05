@@ -39,6 +39,11 @@ on:
       - 'formal/key_kernel/**'
       - 'formal/proofs/**'
       - 'formal/scripts/**'
+      # The TLA+ corpus itself, for `drift`'s cite check: a push that only adds
+      # a cite (or drops the last one referencing a manifest row) touches no
+      # watched source, and would otherwise reach no job at all. `lean` scopes
+      # itself out of these — see `lean-scope`.
+      - 'formal/tla/**'
       - '.github/workflows/formal.yml'
   schedule:
     - cron: '17 4 * * 1' # Mondays 04:17 UTC
@@ -75,6 +80,17 @@ jobs:
                  || contains(github.event.head_commit.message, '[skip-formal-drift]'))
                 && '1' || '' }}
         run: formal/scripts/check-drift.sh
+      # The drift guard cannot see this class of rot: its predicate is "did
+      # anything under formal/ change", which has no relation to whether the
+      # cites were re-checked. c8c1f0a broke all 99 src/wal.rs cites and
+      # satisfied the drift guard in the same commit, because it also touched
+      # one unrelated line in RESULTS.md. This checks the cites themselves,
+      # against the expectation tokens in formal/tla/wal/cite-anchors.tsv.
+      # python3 + git only, well under a second — no reason not to run it on
+      # every event the drift guard runs on. Needs the fetch-depth: 0 above,
+      # because the frozen `<sha>^` rows are resolved with `git show`.
+      - name: Cite guard (formal/tla/wal/ src/*.rs:LINE cites still point at what they claim)
+        run: formal/scripts/check-cites.py
       - name: Kernel differential tests (vs std BTreeMap / reproduced impls)
         run: |
           make test/formal-kernel

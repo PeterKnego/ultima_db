@@ -1,0 +1,90 @@
+# Expectation manifest for the src/*.rs:LINE cites in formal/tla/wal/.
+#
+# One row per DISTINCT ANCHOR, not per cite occurrence: ~193 occurrences across
+# 17 files resolve to the 65 anchors below. Checked by
+# formal/scripts/check-cites.py, which fails if a cite has no row here, if a row
+# here is cited by nothing, or if a row's token is missing from / ambiguous in
+# the range it names.
+#
+# Columns, tab-separated:
+#   src_file  range  rev  expectation-token
+#
+#   range   a single line (1206) or an inclusive span (653-702)
+#   rev     '-' for the working tree, or a git revision for a FROZEN cite that
+#           deliberately names historical code (the '<sha>^' idiom). Frozen rows
+#           are verified via `git show <rev>:<file>` -- never exempted. One of
+#           them was wrong at creation precisely because nothing checked it.
+#   token   plain substring (no regex). Must occur EXACTLY ONCE inside the
+#           range. Pick something stable under reformatting but specific: a
+#           signature, a distinctive expression, a struct field. Never a token
+#           that recurs (`sync_all`, `?`, `let mut`) -- an ambiguous
+#           expectation proves nothing and the checker rejects it.
+#
+# Rows are sorted by file then first line. See formal/tla/wal/README.md,
+# 'Source-line cites', for how to add a cite or record a frozen one.
+
+src/persistence.rs	44-46	-	pub enum Durability {
+src/persistence.rs	70-75	-	pub enum WalWrite {
+src/persistence.rs	147-151	-	pub fn standalone(
+src/store.rs	437	-	fn commit_may_park(&self) -> bool {
+src/store.rs	707	-	pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
+src/store.rs	720	-	if inner.active_writer_count > 0 {
+src/store.rs	1037	-	pub fn recover(&self) -> Result<()> {
+src/store.rs	1037-1219	-	pub fn recover(&self) -> Result<()> {
+src/store.rs	1058-1062	-	inner.snapshots.insert(v, Arc::new(snapshot));
+src/store.rs	1073-1078	-	let tolerant = match inner.config.persistence {
+src/store.rs	1079	-	scan_wal(&wal_path_buf, tolerant)?
+src/store.rs	1083-1086	-	.filter(|e| e.version > base_version)
+src/store.rs	1202-1213	-	latest_version = entry.version;
+src/store.rs	1206-1212	-	version: latest_version,
+src/store.rs	2253	e60f8ce^	fn commit_multi_writer(mut self) -> Result<u64> {
+src/store.rs	2361-2366	e60f8ce^	self.version = inner.latest_version + 1;
+src/store.rs	3838-3940	-	fn commit_single_writer(mut self) -> Result<u64> {
+src/store.rs	3889-3905	-	let mut inner = if needs_wal_wait {
+src/store.rs	3945	-	fn commit_multi_writer(mut self) -> Result<u64> {
+src/store.rs	4116	-	Phase 3: WAL submission + bookkeeping under brief write lock
+src/store.rs	4130	-	if !self.explicit_version
+src/store.rs	4136	-	if self.version > inner.last_submitted_version {
+src/store.rs	4193	-	let gate = if inner.commit_may_park() {
+src/store.rs	4247	-	gate.wait_turn(*ticket);
+src/store.rs	4264	-	gate.wait_turn(*ticket);
+src/wal.rs	619-623	-	Physically zero-fill
+src/wal.rs	619-643	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
+src/wal.rs	628-643	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
+src/wal.rs	633-640	-	let zeros = [0u8; 64 * 1024];
+src/wal.rs	641	-	file.sync_all().map_err(
+src/wal.rs	653-702	-	pub(crate) fn scan_wal(path: &Path, tail_tolerant: bool) -> Result<(Vec<WalEntry>, u64)> {
+src/wal.rs	666-699	-	while offset + 4 <= all_bytes.len() {
+src/wal.rs	668-673	-	if len == 0 {
+src/wal.rs	677	-	if crc32(data) != stored_crc {
+src/wal.rs	677-684	-	if crc32(data) != stored_crc {
+src/wal.rs	678-680	-	break; // torn write into preallocated space
+src/wal.rs	681-683	-	return Err(Error::WalCorrupted(format!(
+src/wal.rs	720	-	pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<bool> {
+src/wal.rs	764-799	-	fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Option<(u64, u64)>> {
+src/wal.rs	977	-	struct FileSink {
+src/wal.rs	977-980	-	struct FileSink {
+src/wal.rs	1050-1054	-	fn append(&mut self, entry: &FramedEntry) -> Result<()> {
+src/wal.rs	1055-1059	-	fn sync(&mut self) -> Result<()> {
+src/wal.rs	1074	-	struct BufferedFileSink {
+src/wal.rs	1074-1081	-	struct BufferedFileSink {
+src/wal.rs	1101	-	self.buf.extend_from_slice(&entry.bytes);
+src/wal.rs	1105-1108	-	if !self.buf.is_empty() {
+src/wal.rs	1109-1113	-	if self.datasync {
+src/wal.rs	1119	5df6d23^	scan_wal(&path, true)
+src/wal.rs	1130-1136	1e5d2b7^	preallocate_to(&mut self.file, self.capacity, new_cap)?;
+src/wal.rs	1139-1146	-	struct PreallocFileSink {
+src/wal.rs	1168	-	WalSinkKind::CoalescedPrealloc.tail_tolerant()
+src/wal.rs	1168-1169	-	WalSinkKind::CoalescedPrealloc.tail_tolerant()
+src/wal.rs	1176	-	self.buf.extend_from_slice(&entry.bytes);
+src/wal.rs	1183-1204	-	let need = self.write_head + self.buf.len() as u64;
+src/wal.rs	1186	-	let new_cap = need.div_ceil(self.chunk) * self.chunk;
+src/wal.rs	1187	-	if let Err(e) = preallocate_to(&mut self.file, self.capacity, new_cap) {
+src/wal.rs	1205	-	self.file.seek(SeekFrom::Start(self.write_head))
+src/wal.rs	1205-1207	-	self.file.seek(SeekFrom::Start(self.write_head))
+src/wal.rs	1206	-	self.file.write_all(&self.buf).map_err(
+src/wal.rs	1207	-	self.write_head += self.buf.len() as u64;
+src/wal.rs	1210-1211	-	// Steady-state barrier: size unchanged, so fdatasync suffices.
+src/wal.rs	1211	-	self.file.sync_data().map_err(
+src/wal.rs	1813-1824	-	pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
+src/wal.rs	1838-1842	-	.send(WalMsg::Entry(framed))
