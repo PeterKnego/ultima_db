@@ -4052,10 +4052,34 @@ impl WriteTx {
                     // Read-only open or failed batch rolled back write set.
                     // Don't substitute at install — keep latest as-is.
                 }
-                (None, _) => {
-                    // Table doesn't exist in the base but I wrote to it
-                    // (concurrent writer deleted it). Install wholesale.
+                (None, Some(digests)) if !digests.is_empty() => {
+                    // Table is gone from latest (a concurrent commit deleted
+                    // or keep-set-dropped it) and I wrote rows to it. Install
+                    // wholesale — there is nothing to merge onto.
                     merged_tables.insert(name, Arc::from(my_dirty));
+                }
+                (None, _) => {
+                    // Table is gone from latest and my write set for it is
+                    // empty. Three ways to get here: a read-only `open_table`
+                    // (which clones the table eagerly), a batch that rolled
+                    // its write set back, or a table this transaction created
+                    // — or deleted and recreated — and never wrote to.
+                    // Installing would put back a table a concurrent commit
+                    // removed, in the first case with its pre-delete rows.
+                    // Skip.
+                    //
+                    // What that costs is bounded by the arm's own guard: the
+                    // write set is empty, so no row any caller wrote is
+                    // dropped here. The table is left out only when this
+                    // transaction contributed nothing to it *and* a concurrent
+                    // commit removed it from latest — never when the
+                    // transaction wrote rows, which is the arm above.
+                    //
+                    // This does not spare a brand-new table: a concurrent
+                    // commit can create and then remove the same name, and
+                    // then a write-free open of it lands here too and the
+                    // table stays absent. That outcome is the same rule, not
+                    // an exception to it.
                 }
             }
         }
@@ -6077,6 +6101,152 @@ mod tests {
         wtx_a.commit().unwrap();
         let err = wtx_b.commit().unwrap_err();
         assert!(matches!(err, Error::WriteConflict { ref table, .. } if table == "t"));
+    }
+
+    /// A transaction that only *opened* a table a concurrent commit deleted
+    /// must not put it back.
+    ///
+    /// `open_table` clones the table into `dirty` eagerly, so a write-free
+    /// transaction still carries the pre-delete contents. `validate_write_set`
+    /// deliberately lets it through (an empty write set is not a write), and
+    /// `has_concurrent` is true because the deletion is in `cws.deleted_tables`
+    /// — so Phase 2 reaches the `(None, _)` install arm with the table absent
+    /// from latest. Installing there would resurrect it with its pre-delete
+    /// rows.
+    #[test]
+    fn write_free_open_does_not_resurrect_a_concurrently_deleted_table() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // B opens the table and writes nothing at all.
+        let t = wtx_b.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 1, "B holds a pre-delete clone");
+        drop(t);
+
+        wtx_a.delete_table("t");
+        wtx_a.commit().unwrap();
+
+        // Whether B conflicts is not the point — a write-free transaction may
+        // legitimately commit. What must not happen is the table coming back.
+        let res = wtx_b.commit();
+
+        let rtx = store.begin_read(None).unwrap();
+        assert!(
+            rtx.open_table::<String>("t").is_err(),
+            "deleted table resurrected by a write-free txn (commit -> {res:?})"
+        );
+    }
+
+    /// The counterpart to the test above: creating a table by opening it and
+    /// committing still works in MultiWriter mode, including when another
+    /// table saw a concurrent commit.
+    ///
+    /// Here "fresh" is named in no concurrent write set, so it takes the fast
+    /// path — but that is this scenario's route, not a general guarantee for
+    /// new tables: a concurrent commit that creates and then removes the same
+    /// name does reach the skipping arm. What holds generally is the arm's own
+    /// guard — it only ever discards an *empty* write set, so a table the
+    /// caller actually wrote to is never dropped.
+    #[test]
+    fn open_table_with_no_writes_still_creates_the_table() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("other")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // B creates "fresh" by opening it, and writes nothing.
+        assert!(wtx_b.open_table::<String>("fresh").unwrap().is_empty());
+        // A commits on an unrelated table in the meantime.
+        wtx_a
+            .open_table::<String>("other")
+            .unwrap()
+            .insert("y".into())
+            .unwrap();
+        wtx_a.commit().unwrap();
+        wtx_b.commit().unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let fresh = rtx
+            .open_table::<String>("fresh")
+            .expect("open_table + commit must create the table");
+        assert!(fresh.is_empty());
+    }
+
+    /// Pins the third route into the skipping install arm: a table this
+    /// transaction deleted and then reopened (which yields a *fresh empty*
+    /// table, not the pre-delete clone) and never wrote to, while a concurrent
+    /// commit deleted the same table.
+    ///
+    /// The commit succeeds — neither validation loop fires, and correctly so:
+    /// an empty write set is not a write, and the concurrent commit only
+    /// removed the table, which agrees with our own delete. The table is then
+    /// left absent rather than recreated empty.
+    ///
+    /// Nothing can be lost either way — the dirty table is empty on both sides
+    /// of the fix — so this is pinning a choice, not a correctness property.
+    /// It is here because the arm has no other test that would notice a
+    /// refactor flipping it.
+    #[test]
+    fn delete_then_reopen_without_writing_leaves_a_concurrently_deleted_table_absent() {
+        let store = Store::new(StoreConfig {
+            writer_mode: WriterMode::MultiWriter,
+            ..StoreConfig::default()
+        })
+        .unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            wtx.open_table::<String>("t")
+                .unwrap()
+                .insert("x".into())
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut wtx_a = store.begin_write(None).unwrap();
+        let mut wtx_b = store.begin_write(None).unwrap();
+
+        // B deletes and recreates the table, then writes nothing to it.
+        assert!(wtx_b.delete_table("t"));
+        assert!(
+            wtx_b.open_table::<String>("t").unwrap().is_empty(),
+            "reopen after delete must yield a fresh empty table"
+        );
+
+        wtx_a.delete_table("t");
+        wtx_a.commit().unwrap();
+
+        wtx_b
+            .commit()
+            .expect("delete-vs-delete must not conflict, and an empty write set is not a write");
+
+        let rtx = store.begin_read(None).unwrap();
+        assert!(
+            rtx.open_table::<String>("t").is_err(),
+            "a write-free recreate must not survive a concurrent delete"
+        );
     }
 
     #[test]
