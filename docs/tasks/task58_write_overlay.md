@@ -237,6 +237,64 @@ guards it.
   round-trips with a nonempty overlay at the cut point, and the
   `bulk_load` Delta-path fix above.
 
+### Ported from the parallel implementation
+
+A second, independently-written overlay implementation existed on
+`feat/task58-write-overlay` (overlay on by default, cap 128, an
+`ULTIMA_OVERLAY_CAP` read per write, a public `flush_overlay_for_test`
+hook). Its *tests* were reviewed against this branch's and the gaps
+closed; the implementation itself was not merged. All sizing below is
+against this branch's `OVERLAY_CAP = 32`, and no public API was added.
+
+- `src/store.rs` `bulk_load_delta_sees_rows_a_commit_left_in_the_write_overlay`
+  and `bulk_load_delta_sees_a_base_split_between_tree_and_overlay` — the
+  Delta path's `base_typed.clone() + flush_overlay() + data_ref()` had no
+  test at all. The second seeds 100 rows so the base straddles the cap
+  boundary (96 flushed, 4 buffered) and asserts the straddle rather than
+  assuming it. Dropping the `flush_overlay()` makes them fail with
+  `KeyNotFound` and `len 97 != 101`.
+- `src/store.rs` `snapshot_stream_serializes_the_merged_view` — the
+  snapshot-stream serialization walk (`Table::collect_serialized_rows`) is a
+  *different* walk from the checkpoint's (`registry::serialize_table` via
+  `Table::len`/`Table::iter`) and was unpinned. Pointing it at the raw tree
+  loses the buffered tail, resurrects tombstoned rows and drops an overlaid
+  overwrite.
+- `src/store.rs` `checkpoint_serializes_the_merged_view` re-based from
+  `Persistence::standalone` onto `Persistence::smr`, so the assertions bind
+  the checkpoint's own content with no WAL beside it.
+- `src/store.rs` `old_snapshot_keeps_its_frozen_overlay` resized: version 1
+  is 20 rows (entirely overlay-resident, asserted), version 2 is ~390 ops
+  with the overwrites and deletes placed mid-stream so a flush runs *over*
+  them. The previous two-write form could not observe a flush at all — it
+  passes unchanged against a `flush_overlay` that discards tombstones,
+  where the resized form fails with `len 400 != 393`.
+- `tests/overlay_equivalence.rs` (new binary) — the MultiWriter-vs-
+  SingleWriter differential and the two MultiWriter OCC guards. MultiWriter
+  hard-zeroes the cap, so the two writer modes are a free differential
+  oracle over the public API with no test hook. Teeth: a `Table::len` that
+  ignores `len_delta` diverges the two modes; removing the MultiWriter
+  cap-zero trips `merge_keys_from`'s overlay assertion in the disjoint-key
+  merge guard; and the task47 mutation harness
+  (`--features mutation-testing`, `ULTIMA_MUTATION=drop-merge-key` /
+  `skip-writeset-validation`) fails the disjoint-key and overlapping-key
+  guards respectively.
+- **Not ported.** The parallel branch's bare-`Table` equivalence and batch-
+  rollback drivers need its public `flush_overlay_for_test`; this branch
+  covers the same ground internally via
+  `table::tests::overlay_table_is_observationally_identical_to_plain_table`
+  and `rollback_restores_the_overlay`, where the hooks are `pub(crate)`.
+  Its `overlay_cap_independence` binary tests a per-write env-var read this
+  branch resolves once in `Store::new`. Its store-level `define_index`
+  mid-transaction test duplicates
+  `store::tests::define_index_flushes_and_disables_the_overlay`. Its WAL-
+  replay-with-a-live-overlay test is unreachable here: recovery builds
+  tables through `Table::empty_with_counter` and replays via the registry
+  closures, never through `WriteTx::ensure_dirty_entry`, so a replayed
+  table's overlay cap stays 0 and the test would assert nothing about the
+  overlay. `store::tests::recovery_replays_into_an_equivalent_table_with_overlay_pending`
+  already covers the reachable half — a WAL written by a store whose
+  overlay was live at the cut point replays correctly.
+
 ## Local direction numbers (sandbox, direction-only — do not draw a perf conclusion from these)
 
 > These `perf_decomp` numbers predate the final review and predate the
