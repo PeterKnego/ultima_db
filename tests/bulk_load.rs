@@ -995,6 +995,102 @@ mod bulk_load_occ {
         assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
     }
 
+    /// The mirror image of `inflight_writer_on_replaced_table_conflicts_at_commit`:
+    /// a transaction that **deletes** a table a concurrent `bulk_load` replaced
+    /// must conflict, not silently drop the freshly loaded data.
+    ///
+    /// `validate_write_set`'s second loop conflicts when a concurrent commit
+    /// *modified* a table this transaction deleted — but a bulk install's
+    /// `CommittedWriteSet` has an empty `tables` map, so a check against
+    /// `cws.tables` alone never fires and the delete wins. The delete was
+    /// decided against contents the load has since replaced, so it must lose.
+    #[test]
+    fn delete_table_conflicts_with_a_concurrent_bulk_replace() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.delete_table("t");
+
+        let bulk_v = store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::WriteConflict { ref table, .. }) if table == "t"),
+            "delete over a bulk-replaced table must conflict, got {res:?}"
+        );
+
+        // The load must still be there — the point of conflicting.
+        assert_eq!(store.latest_version(), bulk_v);
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+    }
+
+    /// The delete must still not conflict with a *different* table's load —
+    /// `installed_tables` is per-table like every other OCC check.
+    #[test]
+    fn delete_table_does_not_conflict_with_a_bulk_replace_of_another_table() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1"]);
+        seed(&store, "other", &["o1"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.delete_table("t");
+
+        store
+            .bulk_load::<String>("other", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        wtx.commit().expect("unrelated table load must not conflict");
+
+        let rtx = store.begin_read(None).unwrap();
+        assert!(rtx.open_table::<String>("t").is_err());
+        assert_eq!(rtx.open_table::<String>("other").unwrap().len(), 3);
+    }
+
+    /// The same fix also closes a *lost `delete_table`*: a transaction that
+    /// deleted a table and reopened it (write-free) racing a bulk replace used
+    /// to commit `Ok` with its `delete_table` silently discarded.
+    ///
+    /// Pre-fix trace: the write set for "t" is empty, so
+    /// `validate_write_set`'s first loop does not fire; the second loop found
+    /// nothing because a bulk install's `tables` map is empty; and Phase 2
+    /// took the `(Some(_), _)` arm, keeping the bulk-loaded table as-is. The
+    /// reopen had already cleared "t" from `deleted_tables`, so nothing
+    /// removed it at install — commit succeeded and the table survived with
+    /// the loaded contents, the delete having simply evaporated.
+    ///
+    /// Note this needs the write-free form. The same shape *with* a row write
+    /// has always conflicted, on the first loop, which neither fix touches.
+    #[test]
+    fn write_free_delete_and_recreate_over_a_bulk_replace_conflicts() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        let mut wtx = store.begin_write(None).unwrap();
+        assert!(wtx.delete_table("t"));
+        assert!(wtx.open_table::<String>("t").unwrap().is_empty());
+
+        store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        let res = wtx.commit();
+        assert!(
+            matches!(res, Err(Error::WriteConflict { ref table, .. }) if table == "t"),
+            "a delete racing a bulk replace must conflict, not be dropped, got {res:?}"
+        );
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+    }
+
     /// Same as above through the Delta path.
     #[test]
     fn inflight_writer_on_delta_loaded_table_conflicts_at_commit() {

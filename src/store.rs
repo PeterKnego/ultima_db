@@ -263,7 +263,29 @@ struct CommittedWriteSet {
     /// Tables that were deleted during this transaction.
     /// Used to detect cross-table conflicts (e.g., writer A deletes a table
     /// that writer B modified).
+    ///
+    /// A bulk install also lists here every table it *installed*: swapping the
+    /// table invalidates writers of the old one exactly like a
+    /// delete+recreate, and the first loop of `validate_write_set`,
+    /// `validate_read_set` and the `has_concurrent` flag all want both events.
+    /// The subset that is an install rather than a removal is in
+    /// [`Self::installed_tables`].
     deleted_tables: BTreeSet<String>,
+    /// The subset of [`Self::deleted_tables`] this commit *installed* — the
+    /// tables a bulk load or snapshot-stream install swapped in — as opposed
+    /// to the ones it removed.
+    ///
+    /// "Installed", not "replaced", because a `BulkDelta` belongs here too: it
+    /// reaches `install_batch_inner` as a wholly rebuilt `Table`, so at this
+    /// layer the entire `Arc<dyn MergeableTable>` is substituted and a delta
+    /// is no less of a swap than a `Replace`.
+    ///
+    /// Only the second loop of `validate_write_set` needs the distinction: a
+    /// transaction that deleted a table decided that against contents this
+    /// commit has since swapped out, so it must conflict; a table this commit
+    /// merely removed (`delete_table`, or a snapshot-stream keep-set drop)
+    /// agrees with that transaction's delete and must not.
+    installed_tables: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,11 +1859,15 @@ impl Store {
                 .collect(),
         };
 
-        // Tables replaced by this install, plus any dropped by `keep_set` —
-        // recorded as a committed write set below so in-flight MultiWriter
-        // transactions based on the pre-install snapshot conflict at commit
-        // instead of silently overwriting the loaded data.
-        let mut replaced: BTreeSet<String> = pending.iter().map(|p| p.name.clone()).collect();
+        // Tables this install swaps in. Recorded as a committed write set
+        // below so in-flight MultiWriter transactions based on the pre-install
+        // snapshot conflict at commit instead of silently overwriting the
+        // loaded data.
+        let installed_tables: BTreeSet<String> = pending.iter().map(|p| p.name.clone()).collect();
+        // Those, plus any table `keep_set` drops. The drops are removals, not
+        // installs, so they stay out of `installed_tables` — see
+        // `CommittedWriteSet::installed_tables`.
+        let mut replaced: BTreeSet<String> = installed_tables.clone();
         if keep_set.is_some() {
             for name in prev.tables.keys() {
                 if !tables.contains_key(name) {
@@ -1900,6 +1926,7 @@ impl Store {
                 version: new_version,
                 tables: BTreeMap::new(),
                 deleted_tables: replaced,
+                installed_tables,
             });
         }
 
@@ -4145,6 +4172,10 @@ impl WriteTx {
             version: v,
             tables: std::mem::take(&mut self.write_set),
             deleted_tables: std::mem::take(&mut self.ever_deleted_tables),
+            // An ordinary commit never installs a table wholesale; its row
+            // writes are in `tables` and its `delete_table` calls are
+            // removals.
+            installed_tables: BTreeSet::new(),
         });
         remove_active_writer(&mut inner, self.base.version);
         prune_write_sets(&mut inner);
@@ -4367,7 +4398,9 @@ impl WriteTx {
     /// (transactions that committed after this one started). Checks three
     /// conflict conditions:
     /// 1. A concurrent commit deleted a table this transaction wrote to.
-    /// 2. This transaction deleted a table a concurrent commit wrote to.
+    /// 2. This transaction deleted a table a concurrent commit wrote to or
+    ///    installed (bulk load / snapshot stream). A table the concurrent
+    ///    commit only removed does not conflict.
     /// 3. Key-level overlap: both transactions modified the same key in the same table.
     ///
     /// Returns `Some(WriteConflict)` on the first conflict found, `None` if clean.
@@ -4403,9 +4436,13 @@ impl WriteTx {
                     });
                 }
             }
-            // Did we delete a table that a concurrent commit modified?
+            // Did we delete a table that a concurrent commit modified or
+            // installed? Both mean our delete was decided against contents
+            // that no longer exist. A table the concurrent commit merely
+            // *removed* is in neither set, so delete-vs-delete stays
+            // non-conflicting.
             for deleted in &self.ever_deleted_tables {
-                if cws.tables.contains_key(deleted) {
+                if cws.tables.contains_key(deleted) || cws.installed_tables.contains(deleted) {
                     return Some(Error::WriteConflict {
                         table: deleted.clone(),
                         key_digests: vec![],
