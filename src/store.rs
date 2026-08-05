@@ -7802,7 +7802,15 @@ mod tests {
     /// The snapshot stream is the *other* serialization walk of a table:
     /// `Table::collect_serialized_rows`, separate code from the checkpoint's
     /// `Table::len`/`Table::iter` (see `registry::serialize_table`). It has to
-    /// merge the overlay too, and nothing pinned that.
+    /// merge the overlay too.
+    ///
+    /// It is not unpinned — pointing it at the raw tree already fails 11 of the
+    /// 32 tests in `tests/snapshot_stream.rs`, because those seed through a
+    /// `WriteTx` under the cap, so a tree-only walk emits nothing at all. What
+    /// they do not cover is a base *split* between tree and overlay: they are
+    /// all-overlay, so a walk that read only the overlay would also satisfy
+    /// them. This test adds the straddle, tombstones over tree-resident rows,
+    /// and an overlaid overwrite.
     ///
     /// The base straddles the boundary on purpose: 100 rows at
     /// [`crate::overlay::OVERLAY_CAP`] (32) leaves 96 flushed into the tree and

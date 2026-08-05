@@ -256,9 +256,12 @@ against this branch's `OVERLAY_CAP = 32`, and no public API was added.
 - `src/store.rs` `snapshot_stream_serializes_the_merged_view` — the
   snapshot-stream serialization walk (`Table::collect_serialized_rows`) is a
   *different* walk from the checkpoint's (`registry::serialize_table` via
-  `Table::len`/`Table::iter`) and was unpinned. Pointing it at the raw tree
-  loses the buffered tail, resurrects tombstoned rows and drops an overlaid
-  overwrite.
+  `Table::len`/`Table::iter`). It was **not** unpinned — a raw-tree walk
+  already fails 11 of the 32 tests in `tests/snapshot_stream.rs` — but that
+  existing coverage is entirely all-overlay, so a walk reading *only* the
+  overlay would satisfy it too. This adds the case that separates them: a base
+  straddling the cap boundary, tombstones over tree-resident rows, and an
+  overlaid overwrite.
 - `src/store.rs` `checkpoint_serializes_the_merged_view` re-based from
   `Persistence::standalone` onto `Persistence::smr`, so the assertions bind
   the checkpoint's own content with no WAL beside it.

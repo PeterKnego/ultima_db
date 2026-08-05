@@ -4042,7 +4042,11 @@ mod tests {
         // Bounds come through variables: these ranges are inverted, which is
         // exactly what a caller can pass at runtime, but written as literals
         // clippy's `reversed_empty_ranges` rejects them at compile time.
-        for (lo, hi) in [(5u64, 2u64), (5, 5), (99, 30), (2, 1)] {
+        // Only pairs that straddle an overlay key produce `lo > hi` and can
+        // actually panic: with the overlay at {3, 20}, `(5,2)` gives lo=1,hi=0
+        // and `(25,5)` gives lo=2,hi=1. The rest yield `lo == hi` and are here
+        // to pin that ordinary empty ranges stay empty.
+        for (lo, hi) in [(5u64, 2u64), (25, 5), (5, 5), (99, 30), (2, 1)] {
             let got: Vec<u64> = t.range(lo..hi).map(|(k, _)| *k).collect();
             assert!(got.is_empty(), "range({lo}..{hi}) must be empty, not panic");
             let got_incl: Vec<u64> = t.range(lo..=hi).map(|(k, _)| *k).collect();
