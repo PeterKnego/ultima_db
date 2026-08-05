@@ -151,6 +151,26 @@ fn main() {
     });
     drop(store_ev);
 
+    // (7) Same as (6) with the overlay disabled — isolates the overlay's effect.
+    unsafe { std::env::set_var("ULTIMA_OVERLAY_CAP", "0") };
+    let dir2 = tempfile::tempdir_in(bench_disk_dir()).unwrap();
+    let store_no_ov = make_store(Persistence::standalone(
+        dir2.path().to_path_buf(),
+        Durability::Eventual,
+        WalWrite::Coalesced,
+    ));
+    let c_no_ov = measure("store_eventual_no_overlay", &keys, |ks| {
+        for &k in ks {
+            let mut wtx = store_no_ov.begin_write(None).unwrap();
+            let mut table = wtx.open_table::<YcsbRecord>("ycsb").unwrap();
+            let _ = table.update(k, YcsbRecord::new(k.wrapping_add(1)));
+            wtx.commit().unwrap();
+        }
+    });
+    unsafe { std::env::remove_var("ULTIMA_OVERLAY_CAP") };
+    drop(store_no_ov);
+    println!("  overlay effect (no_ov - ov) {:8.0}", c_no_ov - c_ev);
+
     // Sub-decompose the WAL bucket: serialize vs channel-send-to-parked-thread.
     let c_ser = measure("wal_serialize_only", &keys, |ks| {
         for &k in ks {

@@ -106,8 +106,8 @@ promote time* — as `PromotionFaithful`.
 
 The version bump and the `PromoteGate` FIFO are gated on
 `WriterMode = "MultiWriter"`, because in the Rust they exist only in
-`commit_multi_writer` (`src/store.rs:3992`, `:4050`/`:4104`).
-`commit_single_writer` (`:3737-3843`) has neither — holding the writer slot
+`commit_multi_writer` (`src/store.rs:4069`, `:4127`/`:4181`).
+`commit_single_writer` (`:3814-3920`) has neither — holding the writer slot
 through the fsync wait is its *only* protection. Modelling them
 unconditionally would hand SingleWriter protections the code lacks, and would
 mask M1.
@@ -121,9 +121,9 @@ lands. Tearing is per-frame and **positional** — an absent frame is a hole at
 its own byte offset, not a removal that slides later frames forward, because
 `scan_wal` walks offsets in order and `break`s at the first record it cannot
 accept (`src/wal.rs:662-695`). `Recover` is `Store::recover`
-(`src/store.rs:984`): install the checkpoint, scan, replay entries past the
+(`src/store.rs:1021`): install the checkpoint, scan, replay entries past the
 checkpoint version. `tail_tolerant` is true for `CoalescedPrealloc` only
-(`src/store.rs:1017-1022`), and that is the whole of `SinkKind`'s influence.
+(`src/store.rs:1054-1059`), and that is the whole of `SinkKind`'s influence.
 
 `RecoverySound` is S1: after a successful crash+recover, the recovered state is
 the replay of a **prefix of submission order** (matching on cid, version *and
@@ -164,7 +164,7 @@ which of the two these are. Do not read the table above as conjunct coverage.
 
 Two things to know before building on this. The post-`Recover` value of
 `promoted` is the **replay sequence, not the Rust's snapshot chain**: recovery
-installs exactly one snapshot, at `latest_version` (`src/store.rs:1150-1156`),
+installs exactly one snapshot, at `latest_version` (`src/store.rs:1187-1193`),
 so a property like "every acked version is *readable* after recovery" must not
 be built on it. And the bound is **≤1 crash *and no operation after
 recovery*** — every steady-state action requires `~crashed` and `Recover`
@@ -389,9 +389,9 @@ calibration hole that is only *half* closed.
 **A torn tail costs a strict-scan store its whole log — including durable,
 acked commits.** `scan_wal` treats a CRC mismatch as end-of-log only when
 `tail_tolerant`, which `Store::recover` passes for `CoalescedPrealloc` and
-nothing else (`src/store.rs:1017-1022`). Every other sink gets
+nothing else (`src/store.rs:1054-1059`). Every other sink gets
 `Err(WalCorrupted)` (`src/wal.rs:677-679`), which `recover` propagates with `?`
-(`src/store.rs:1023`) *before applying any entry* — so frames the scan had
+(`src/store.rs:1060`) *before applying any entry* — so frames the scan had
 already accepted, at offsets before the tear, are discarded too. This is
 reachable on **2 of the 3 `WalWrite` variants — `PerEntry` (the `#[default]`
 one) and `Coalesced` — under either durable tier**, not an exotic corner.
@@ -423,7 +423,7 @@ ticket and let the rest of the FIFO proceed. That needs a per-ticket outcome on
 `Fsync`. L1 (liveness) stays inexpressible until then.
 
 Checkpoint and prune — `checkpointVersion` is carried and `Recover` honours it
-as the replay floor (`src/store.rs:1027-1030`), but no action moves it off 0, so
+as the replay floor (`src/store.rs:1064-1067`), but no action moves it off 0, so
 no committed config exercises a non-zero floor. A `Checkpoint` action also drags
 in WAL pruning (`src/wal.rs:716`), which is where checkpoint/prune/crash
 interleavings would actually bite.
@@ -580,7 +580,7 @@ commit 1's belongs), not to something it once did. All of them are gated in
   Both halves are the bug; see the Task 4 report for why mutating only the
   comparison cannot produce the documented duplicate.
 - **M4** — `ScanIsTolerant` loses its `CoalescedPrealloc` arm: the tolerance
-  selection at `src/store.rs:1017-1022` goes away and a preallocated WAL is
+  selection at `src/store.rs:1054-1059` goes away and a preallocated WAL is
   scanned *strictly*. task37 §7 is the whole reason that arm exists —
   preallocation puts a partially-written record in front of durable zeros, so a
   torn tail *looks* like a complete frame whose CRC fails, and the pre-task37
@@ -604,7 +604,7 @@ commit 1's belongs), not to something it once did. All of them are gated in
   leaving `ver`, `sub` and `forkedFrom` exactly as it computed them. Real
   recovery takes identity from the frame itself: `scan_wal` returns records in
   offset order and `Store::recover` applies each to the table its own entry
-  names (`src/store.rs:1027-1030`), so position *i* carries submission *i*'s
+  names (`src/store.rs:1064-1067`), so position *i* carries submission *i*'s
   row. M7 applies commit 2's row where commit 1's belongs — the store restarts
   with the right versions, the right fork chain and the wrong rows in them.
   That is `RecoverySound` clause (a), and M7 is the only mutation that touches

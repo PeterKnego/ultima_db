@@ -376,6 +376,16 @@ pub(crate) struct StoreInner {
     /// durability — the only configuration whose commits park in a WAL
     /// fsync wait. See [`StoreInner::commit_may_park`].
     wal_consistent: bool,
+    /// Write-overlay capacity applied to every table a writer opens.
+    /// Computed once here at [`Store::new`]: `0` for
+    /// [`WriterMode::MultiWriter`] (the overlay is a SingleWriter-only
+    /// optimization — MultiWriter's commit-time merge reads/writes tables
+    /// through the tree directly, see `merge_keys_from`), else
+    /// [`crate::overlay::OVERLAY_CAP`] unless overridden by the
+    /// `ULTIMA_OVERLAY_CAP` env var (bench escape hatch, not a public knob —
+    /// task57 precedent). `WriteTx::open_table` applies this to each dirty
+    /// table via `Table::set_overlay_cap`.
+    overlay_cap: usize,
     /// WAL writer handle (persistence feature, Standalone mode only).
     #[cfg(feature = "persistence")]
     pub(crate) wal_handle: Option<crate::wal::WalHandle>,
@@ -517,6 +527,30 @@ impl Store {
         #[cfg(not(feature = "persistence"))]
         let wal_consistent = false;
 
+        // Read once per store, not per open_table: the overlay is a
+        // SingleWriter-only optimization (MultiWriter always gets 0 — its
+        // commit-time merge reads/writes the tree directly and
+        // `merge_keys_from` debug_asserts the overlay is empty).
+        let overlay_cap: usize = match config.writer_mode {
+            WriterMode::MultiWriter => 0,
+            // A *set but unparsable* value is a misconfiguration, not an
+            // absent override: warn loudly (naming the bad value and the cap
+            // actually used) instead of silently behaving like the var was
+            // never set. Deliberately not a panic — `Store::new` runs in
+            // recovery contexts where aborting is worse than a default.
+            WriterMode::SingleWriter => match std::env::var("ULTIMA_OVERLAY_CAP") {
+                Ok(raw) => raw.parse::<usize>().unwrap_or_else(|e| {
+                    eprintln!(
+                        "ultima_db: ULTIMA_OVERLAY_CAP={raw:?} is not a valid \
+                         usize ({e}); using the default write-overlay cap of {}",
+                        crate::overlay::OVERLAY_CAP
+                    );
+                    crate::overlay::OVERLAY_CAP
+                }),
+                Err(_) => crate::overlay::OVERLAY_CAP,
+            },
+        };
+
         let metrics = Arc::new(StoreMetrics::new());
         let empty = Arc::new(Snapshot {
             version: 0,
@@ -537,6 +571,7 @@ impl Store {
                 next_ticket: 0,
                 promote_gate: Arc::new(PromoteGate::new()),
                 wal_consistent,
+                overlay_cap,
                 #[cfg(feature = "persistence")]
                 wal_handle,
                 #[cfg(feature = "persistence")]
@@ -688,6 +723,7 @@ impl Store {
         let base_version = base.version;
         let writer_mode = inner.config.writer_mode;
         let isolation_level = inner.config.isolation_level;
+        let overlay_cap = inner.overlay_cap;
         let metrics = Arc::clone(&inner.metrics);
 
         // Track active writer.
@@ -716,6 +752,7 @@ impl Store {
             ddl_tables: std::cell::RefCell::new(BTreeSet::new()),
             ever_deleted_tables: BTreeSet::new(),
             writer_mode,
+            overlay_cap,
             needs_cleanup: true,
             metrics,
             intents,
@@ -1389,8 +1426,15 @@ impl Store {
                     .downcast_ref::<crate::table::Table<R>>()
                     .ok_or_else(|| Error::TypeMismatch(table_name.to_string()))?;
 
-                // 2. Validate + materialize off-lock.
-                let mat = materialize_delta(delta, base_typed.data_ref())?;
+                // 2. Validate + materialize off-lock. `data_ref` needs the
+                // overlay empty (task58 T5: a SingleWriter table's latest
+                // committed snapshot can have buffered-but-unflushed rows),
+                // so flush an O(1) clone rather than the live snapshot table
+                // — cheap (BTree root + overlay Arc bumps) and leaves the
+                // installed snapshot untouched.
+                let mut base_for_delta = base_typed.clone();
+                base_for_delta.flush_overlay();
+                let mat = materialize_delta(delta, base_for_delta.data_ref())?;
                 // Keep the table's existing counter and push it past the
                 // highest key the delta leaves behind, so an id the delta
                 // used can never be handed out again.
@@ -2302,6 +2346,11 @@ pub struct WriteTx {
     ever_deleted_tables: BTreeSet<String>,
     /// Writer mode at the time this transaction was created.
     writer_mode: WriterMode,
+    /// Write-overlay cap at the time this transaction was created — copied
+    /// from [`StoreInner::overlay_cap`] so the open-table path doesn't
+    /// re-take the store lock on every call. Applied to each table's dirty
+    /// clone via `Table::set_overlay_cap` in `ensure_dirty_entry`.
+    overlay_cap: usize,
     /// Set to `true` on successful commit so `Drop` skips cleanup.
     needs_cleanup: bool,
     /// Shared metrics for the store this transaction belongs to.
@@ -2736,6 +2785,13 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         self.table.len()
     }
 
+    /// The number of entries currently buffered in the write overlay.
+    /// `pub(crate)` test-only probe — see `Table::overlay_len_probe`.
+    #[cfg(test)]
+    pub(crate) fn overlay_len_probe(&self) -> usize {
+        self.table.overlay_len_probe()
+    }
+
     /// Returns true if the table contains no records.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -2896,11 +2952,18 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         } else {
             None
         };
-        // `upsert_arc` consumes the key, so keep a copy to record *after* it
+        // `Table::put` consumes the key, so keep a copy to record *after* it
         // succeeds — a failed write must not leave the key in the write set
         // (that would make a later commit conflict on a row it never wrote).
         let recorded = self.write_set.is_some().then(|| key.clone());
-        self.table.upsert_arc(key, Arc::new(record))?;
+        // `Table::put`, not `upsert_arc`: `put` is the overlay-aware
+        // insert-or-replace (it buffers when `overlay_write_ready()` and
+        // otherwise falls back to `upsert_arc` verbatim, same semantics and
+        // same counter advancement). `upsert_arc` force-flushes and writes
+        // the tree directly — it stays reserved for the MultiWriter
+        // commit-merge / replay path (`merge_keys_from`), which must not
+        // route through the overlay.
+        self.table.put(key, record)?;
         if let Some(ws) = &mut self.write_set {
             ws.record(recorded.as_ref().expect("cloned when write_set is Some"));
         }
@@ -3132,6 +3195,13 @@ impl<'tx, R: Record, K: PrimaryKey> TableReader<'tx, R, K> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
+    }
+
+    /// The number of entries currently buffered in the write overlay.
+    /// `pub(crate)` test-only probe — see `Table::overlay_len_probe`.
+    #[cfg(test)]
+    pub(crate) fn overlay_len_probe(&self) -> usize {
+        self.table.overlay_len_probe()
     }
 
     /// Returns true if the table contains a record with the given key.
@@ -3608,7 +3678,7 @@ impl WriteTx {
             } else {
                 self.base.tables.get(name)
             };
-            let table: Table<R, K> = match existing {
+            let mut table: Table<R, K> = match existing {
                 Some(arc_mt) => arc_mt
                     .as_any()
                     .downcast_ref::<Table<R, K>>()
@@ -3636,6 +3706,13 @@ impl WriteTx {
                     Table::<R, K>::empty_with_counter(auto_counter_seed::<K>())
                 }
             };
+            // Every path a writer gets a table — fresh clone from the base
+            // snapshot or a brand-new empty table — goes through here, so
+            // this is the single site that enables/sizes the write overlay
+            // (task58 T5). SingleWriter gets `overlay_cap` (from
+            // `ULTIMA_OVERLAY_CAP` or the `OVERLAY_CAP` default);
+            // MultiWriter always gets 0.
+            table.set_overlay_cap(self.overlay_cap);
             self.deleted_tables.remove(name);
             let entry = DirtyEntry {
                 table: Box::new(table),
@@ -7454,5 +7531,484 @@ mod tests {
                 .expect("table opened")
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-overlay store wiring (task58 T5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn single_writer_store_buffers_writes_in_the_overlay() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(1).map(String::as_str), Some("a"));
+        assert!(t.overlay_len_probe() > 0, "SingleWriter write should be buffered");
+    }
+
+    /// `TableWriter::put`/`upsert` must buffer like `insert` does. It used to
+    /// call `Table::upsert_arc`, which force-flushes and writes the tree
+    /// directly — making `Table::put`'s buffering branch dead in production.
+    #[test]
+    fn store_put_buffers_in_the_overlay() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table_keyed::<String, u64>("t").unwrap();
+            t.put(7u64, "seven".to_string()).unwrap();
+            assert!(
+                t.overlay_len_probe() > 0,
+                "store put must land in the write overlay, not the tree"
+            );
+            // Merged reads see it before any flush.
+            assert_eq!(t.get(7u64).map(String::as_str), Some("seven"));
+            // Replacing the same key stays a single buffered entry.
+            t.put(7u64, "seven-b".to_string()).unwrap();
+            assert_eq!(t.overlay_len_probe(), 1);
+            assert_eq!(t.len(), 1);
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, u64>("t").unwrap();
+        assert_eq!(t.get(7u64).map(String::as_str), Some("seven-b"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn multi_writer_store_never_engages_the_overlay() {
+        let store = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+        }
+        wtx.commit().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.overlay_len_probe(), 0);
+        assert_eq!(t.get(1).map(String::as_str), Some("a"));
+    }
+
+    /// An old `ReadTx` sees its own frozen overlay; a later writer that
+    /// flushes past the cap sees the new state and cannot disturb the old one.
+    ///
+    /// The overlay's entry vec is an `Arc<Vec<_>>` shared between the snapshot
+    /// and every table cloned off it, so the writer's buffered writes *and* its
+    /// flushes all run against storage the old `ReadTx` is still reading.
+    ///
+    /// Sizing is against [`crate::overlay::OVERLAY_CAP`] (32): version 1 writes
+    /// 20 rows, so its entire visible state is overlay-resident (asserted
+    /// below, not assumed) rather than a tree that would answer correctly
+    /// either way; version 2 writes ~390 ops, so the clone flushes a dozen
+    /// times underneath it. The deletes and overwrites matter — a flush that
+    /// mishandles tombstones or `len_delta` shows up only once a flush has
+    /// actually run, which is what this sizing buys over a two-write test.
+    #[test]
+    fn old_snapshot_keeps_its_frozen_overlay() {
+        let store = Store::default();
+        {
+            let mut w1 = store.begin_write(None).unwrap();
+            let mut t = w1.open_table_keyed::<String, u64>("t").unwrap();
+            for i in 1..=20u64 {
+                t.put(i, format!("v1_{i}")).unwrap();
+            }
+            drop(t);
+            w1.commit().unwrap();
+        }
+
+        // Pinned at version 1, where every row is still buffered.
+        let old = store.begin_read(None).unwrap();
+        let before: Vec<(u64, String)> = {
+            let t = old.open_table_keyed::<String, u64>("t").unwrap();
+            assert_eq!(t.len(), 20, "buffered rows are invisible to their own read");
+            assert_eq!(
+                t.overlay_len_probe(),
+                20,
+                "the base must be entirely overlay-resident for this to bite"
+            );
+            t.iter().map(|(k, v)| (k, v.clone())).collect()
+        };
+
+        // Version 2: enough writes to drive several flushes through the clone.
+        {
+            let mut w2 = store.begin_write(None).unwrap();
+            let mut t = w2.open_table_keyed::<String, u64>("t").unwrap();
+            for i in 21..=200u64 {
+                t.put(i, format!("v2_{i}")).unwrap();
+            }
+            // Overwrites and deletes of rows the earlier puts already flushed
+            // into the tree, placed mid-stream so the 200 puts that follow
+            // drive them *through* a flush rather than leaving them buffered
+            // where a broken flush would never touch them.
+            for i in 1..=5u64 {
+                t.update(i, format!("v2_over_{i}")).unwrap();
+            }
+            for i in 6..=12u64 {
+                t.delete(i).unwrap();
+            }
+            for i in 201..=400u64 {
+                t.put(i, format!("v2_{i}")).unwrap();
+            }
+            drop(t);
+            w2.commit().unwrap();
+        }
+
+        // The old transaction is untouched: same length, same rows, same
+        // values — including the five the writer overwrote and the seven it
+        // deleted, both of which the writer flushed to its own tree.
+        {
+            let t = old.open_table_keyed::<String, u64>("t").unwrap();
+            assert_eq!(t.len(), 20, "the old snapshot's length moved");
+            let now: Vec<(u64, String)> = t.iter().map(|(k, v)| (k, v.clone())).collect();
+            assert_eq!(now, before, "the old snapshot's rows moved");
+            assert_eq!(t.get(3u64).map(String::as_str), Some("v1_3"));
+            assert_eq!(t.get(9u64).map(String::as_str), Some("v1_9"));
+            assert_eq!(t.get(100u64), None, "a later version's row leaked backwards");
+        }
+
+        // ...and the new one sees exactly the new state.
+        let new = store.begin_read(None).unwrap();
+        let t = new.open_table_keyed::<String, u64>("t").unwrap();
+        assert_eq!(t.len(), 20 + 380 - 7);
+        assert_eq!(t.get(3u64).map(String::as_str), Some("v2_over_3"));
+        assert_eq!(t.get(9u64), None, "a flushed tombstone did not take");
+        assert_eq!(t.get(400u64).map(String::as_str), Some("v2_400"));
+        let keys: Vec<u64> = t.iter().map(|(k, _)| k).collect();
+        let expected: Vec<u64> = (1..=5u64).chain(13..=400u64).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn define_index_flushes_and_disables_the_overlay() {
+        let store = Store::default();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("row".to_string()).unwrap();
+            t.define_index("len", IndexKind::NonUnique, |r: &String| r.len() as u64)
+                .unwrap();
+            assert_eq!(t.overlay_len_probe(), 0, "DDL must flush");
+            t.insert("row2".to_string()).unwrap();
+            assert_eq!(
+                t.overlay_len_probe(),
+                0,
+                "indexed table writes bypass the overlay"
+            );
+            assert_eq!(t.get_by_index("len", &3u64).unwrap().len(), 1);
+            assert_eq!(t.get_by_index("len", &4u64).unwrap().len(), 1);
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn recovery_replays_into_an_equivalent_table_with_overlay_pending() {
+        use crate::{Durability, Persistence, WalWrite};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let mk = || {
+            Store::new(
+                StoreConfig::builder()
+                    .persistence(Persistence::standalone(
+                        dir.path().to_path_buf(),
+                        Durability::Consistent,
+                        WalWrite::Coalesced,
+                    ))
+                    .build(),
+            )
+            .unwrap()
+        };
+        {
+            let store = mk();
+            store.register_table::<String>("t").unwrap();
+            let mut wtx = store.begin_write(None).unwrap();
+            {
+                let mut t = wtx.open_table::<String>("t").unwrap();
+                t.insert("a".to_string()).unwrap();
+                t.insert("b".to_string()).unwrap();
+                t.delete(1).unwrap();
+            }
+            wtx.commit().unwrap(); // overlay entries never flushed — "crash" here
+        }
+        let store = mk();
+        store.register_table::<String>("t").unwrap();
+        store.recover().unwrap();
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(1), None);
+        assert_eq!(t.get(2).map(String::as_str), Some("b"));
+        assert_eq!(t.len(), 1);
+    }
+
+    /// A checkpoint taken while rows are still buffered must contain them.
+    ///
+    /// **SMR persistence deliberately**: SMR is checkpoint-only, so the
+    /// assertions below can only be satisfied by the checkpoint's own content.
+    /// This used `Persistence::standalone`, where a WAL sits next to the
+    /// checkpoint and could in principle replay the dropped rows back in and
+    /// mask a lossy checkpoint. It does not today — `recover` replays only
+    /// entries with `version > base_version`, and a checkpoint of the latest
+    /// version leaves none — but that is a property of the replay filter, not
+    /// of this test. SMR removes the dependency entirely.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn checkpoint_serializes_the_merged_view() {
+        use crate::Persistence;
+
+        let dir = crate::test_scratch::scratch_dir();
+        let store = Store::new(
+            StoreConfig::builder()
+                .persistence(Persistence::smr(dir.path().to_path_buf()))
+                .build(),
+        )
+        .unwrap();
+        store.register_table::<String>("t").unwrap();
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<String>("t").unwrap();
+            t.insert("a".to_string()).unwrap();
+            t.insert("b".to_string()).unwrap();
+            t.delete(1).unwrap();
+        }
+        wtx.commit().unwrap();
+        store.checkpoint().unwrap(); // serializes with the overlay nonempty
+
+        let store2 = Store::new(
+            StoreConfig::builder()
+                .persistence(Persistence::smr(dir.path().to_path_buf()))
+                .build(),
+        )
+        .unwrap();
+        store2.register_table::<String>("t").unwrap();
+        store2.recover().unwrap();
+        let rtx = store2.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.get(2).map(String::as_str), Some("b"));
+        assert_eq!(t.get(1), None);
+        assert_eq!(t.len(), 1);
+    }
+
+    /// The snapshot stream is the *other* serialization walk of a table:
+    /// `Table::collect_serialized_rows`, separate code from the checkpoint's
+    /// `Table::len`/`Table::iter` (see `registry::serialize_table`). It has to
+    /// merge the overlay too.
+    ///
+    /// It is not unpinned — pointing it at the raw tree already fails 11 of the
+    /// 32 tests in `tests/snapshot_stream.rs`, because those seed through a
+    /// `WriteTx` under the cap, so a tree-only walk emits nothing at all. What
+    /// they do not cover is a base *split* between tree and overlay: they are
+    /// all-overlay, so a walk that read only the overlay would also satisfy
+    /// them. This test adds the straddle, tombstones over tree-resident rows,
+    /// and an overlaid overwrite.
+    ///
+    /// The base straddles the boundary on purpose: 100 rows at
+    /// [`crate::overlay::OVERLAY_CAP`] (32) leaves 96 flushed into the tree and
+    /// 4 buffered, plus a second transaction whose puts, tombstones and
+    /// overwrite over *tree-resident* rows are all still buffered when the
+    /// stream is built. A tree-only walk keeps the flushed prefix and drops the
+    /// tail, which is the failure mode a coarse assertion survives.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn snapshot_stream_serializes_the_merged_view() {
+        use std::io::Read;
+
+        let store = Store::default();
+        store.register_table::<String>("t").unwrap();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<String, u64>("t").unwrap();
+            for i in 1..=100u64 {
+                t.put(i, format!("v{i}")).unwrap();
+            }
+            drop(t);
+            wtx.commit().unwrap();
+        }
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<String, u64>("t").unwrap();
+            for i in 101..=108u64 {
+                t.put(i, format!("late{i}")).unwrap();
+            }
+            // Keys 10..=14 and 20 were flushed to the tree by the 100-row
+            // transaction, so these are tombstones and an overlaid put over
+            // real tree rows rather than overlay-only edits.
+            for i in 10..=14u64 {
+                t.delete(i).unwrap();
+            }
+            t.update(20u64, "overwritten".to_string()).unwrap();
+            drop(t);
+            wtx.commit().unwrap();
+        }
+
+        let expected: Vec<(u64, String)> = (1..=9u64)
+            .chain(15..=100u64)
+            .map(|i| {
+                let v = if i == 20 {
+                    "overwritten".to_string()
+                } else {
+                    format!("v{i}")
+                };
+                (i, v)
+            })
+            .chain((101..=108u64).map(|i| (i, format!("late{i}"))))
+            .collect();
+
+        // 18 buffered entries: the 4 the first transaction left behind (its
+        // overlay is carried over intact by `set_overlay_cap`, same cap) plus
+        // the 14 keys the second one touched — under the cap, so the committed
+        // snapshot's table provably still holds all of them buffered.
+        {
+            let rtx = store.begin_read(None).unwrap();
+            let t = rtx.open_table_keyed::<String, u64>("t").unwrap();
+            assert_eq!(t.overlay_len_probe(), 18, "the source must still be overlaid");
+            let rows: Vec<(u64, String)> = t.iter().map(|(k, v)| (k, v.clone())).collect();
+            assert_eq!(rows, expected, "the source store is wrong");
+        }
+
+        let mut bytes = Vec::new();
+        store
+            .snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let dst = Store::default();
+        dst.register_table::<String>("t").unwrap();
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+        let rtx = dst.begin_read(None).unwrap();
+        let t = rtx.open_table_keyed::<String, u64>("t").unwrap();
+        let rows: Vec<(u64, String)> = t.iter().map(|(k, v)| (k, v.clone())).collect();
+        assert_eq!(
+            rows, expected,
+            "rows buffered at stream time were omitted from the snapshot stream"
+        );
+        assert_eq!(t.len(), expected.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // bulk_load Delta over a base whose rows are still in the write overlay
+    // -----------------------------------------------------------------------
+
+    /// Every other Delta test seeds through `bulk_load(Replace)`, which builds
+    /// the table with `Table::from_bulk` and therefore leaves the overlay
+    /// empty. That makes the whole suite blind to the base the Delta path
+    /// actually reads: a `WriteTx` commit installs its table with the overlay
+    /// still live (task58 never flushes at commit), so materializing against
+    /// the raw tree would see an *empty* base and silently drop every
+    /// committed row.
+    ///
+    /// Updating and deleting overlay-only rows is asserted too, because
+    /// `materialize_delta`'s existence check (`Error::KeyNotFound`) is
+    /// answered by the same base — a raw-tree base rejects the delta outright.
+    #[test]
+    fn bulk_load_delta_sees_rows_a_commit_left_in_the_write_overlay() {
+        use crate::{BulkDelta, BulkLoadInput, BulkLoadOptions};
+
+        let store = Store::default();
+
+        // Seed through a WriteTx, not bulk_load: these rows stay in the overlay.
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<String, u64>("t").unwrap();
+            for i in 1..=5u64 {
+                t.put(i, format!("seed{i}")).unwrap();
+            }
+            drop(t);
+            wtx.commit().unwrap();
+        }
+        {
+            let rtx = store.begin_read(None).unwrap();
+            let t = rtx.open_table_keyed::<String, u64>("t").unwrap();
+            assert_eq!(t.overlay_len_probe(), 5, "the base must be overlay-resident");
+        }
+
+        let delta = BulkDelta {
+            inserts: vec![(6, "d6".to_string())],
+            updates: vec![(2, "seed2_new".to_string())],
+            deletes: vec![4],
+        };
+        store
+            .bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default())
+            .expect("delta over an overlay-backed base");
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(
+            t.get(1).map(String::as_str),
+            Some("seed1"),
+            "committed overlay row LOST — the delta base did not see the overlay"
+        );
+        assert_eq!(t.get(3).map(String::as_str), Some("seed3"));
+        assert_eq!(t.get(5).map(String::as_str), Some("seed5"));
+        assert_eq!(t.get(2).map(String::as_str), Some("seed2_new"));
+        assert_eq!(t.get(4), None, "the delta's delete must apply");
+        assert_eq!(t.get(6).map(String::as_str), Some("d6"));
+        assert_eq!(t.len(), 5, "5 seeded - 1 deleted + 1 inserted");
+    }
+
+    /// The same hazard for a base that is *half* overlay: rows written before
+    /// the cap forced a flush live in the tree, rows written after live in the
+    /// overlay. A raw-tree base keeps the flushed prefix and drops the tail,
+    /// which is the failure mode most likely to survive a coarse assertion.
+    ///
+    /// 100 rows at [`crate::overlay::OVERLAY_CAP`] (32) leaves 96 in the tree
+    /// and 4 buffered. The split is asserted, not assumed, so a future cap
+    /// change that degenerates this back into the all-overlay case above fails
+    /// here instead of quietly testing less.
+    #[test]
+    fn bulk_load_delta_sees_a_base_split_between_tree_and_overlay() {
+        use crate::{BulkDelta, BulkLoadInput, BulkLoadOptions};
+
+        let store = Store::default();
+        {
+            let mut wtx = store.begin_write(None).unwrap();
+            let mut t = wtx.open_table_keyed::<String, u64>("t").unwrap();
+            for i in 1..=100u64 {
+                t.put(i, format!("seed{i}")).unwrap();
+            }
+            drop(t);
+            wtx.commit().unwrap();
+        }
+        {
+            let rtx = store.begin_read(None).unwrap();
+            let t = rtx.open_table_keyed::<String, u64>("t").unwrap();
+            let buffered = t.overlay_len_probe();
+            assert!(
+                buffered > 0 && buffered < 100,
+                "the base must straddle tree and overlay; buffered={buffered}"
+            );
+        }
+
+        let delta = BulkDelta {
+            inserts: vec![(101, "d101".to_string())],
+            ..Default::default()
+        };
+        store
+            .bulk_load::<String>("t", BulkLoadInput::Delta(delta), BulkLoadOptions::default())
+            .unwrap();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 101, "the overlaid tail of the base was dropped");
+        for i in 1..=100u64 {
+            assert_eq!(
+                t.get(i).map(String::as_str),
+                Some(format!("seed{i}").as_str()),
+                "row {i} missing from the delta's output"
+            );
+        }
+        assert_eq!(t.get(101).map(String::as_str), Some("d101"));
     }
 }
