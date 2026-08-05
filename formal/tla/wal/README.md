@@ -405,7 +405,7 @@ Four lessons, and they generalise:
 2. **Sweep for the bare shapes too.** Roughly a fifth of the cites here have no
    `src/*.rs:` prefix.
 3. **A `<sha>^`-prefixed cite is frozen, not stale.** `e60f8ce^ src/store.rs:2361-2366`,
-   `1e5d2b7^ src/wal.rs:1130-1136` and `5df6d23^ src/wal.rs:1115` name code that
+   `1e5d2b7^ src/wal.rs:1130-1136` and `5df6d23^ src/wal.rs:1119` name code that
    was deliberately *removed*; re-anchoring them to the current tree destroys
    the claim. Any sweep must skip a cite carrying a revision prefix.
 4. **The drift guard bounds the damage; it does not remove the rework.** It

@@ -236,15 +236,20 @@ distinction matters.** The model has no partial-extend action and no ENOSPC:
 `Extend` either happens or does not. TLC neither found this nor could have.
 It surfaced because writing `SlotSafe` and `syncedCapacity` forced the
 question "what exactly makes a size durable, and when is it not?" to be
-answered precisely. **Unadjudicated as to severity** — no fix is proposed
-here and none should be inferred.
+answered precisely.
+
+*This paragraph read "**Unadjudicated as to severity** — no fix is proposed
+here and none should be inferred" when written, which was true then. It was
+adjudicated low severity and fixed on 2026-08-03; see the banner above. The
+analysis is preserved because it was accurate about the mechanism, but the
+disposition it states is not.*
 
 ### F3 — Two independent decisions about scan tolerance for the same file
 
 > **Adjudicated 2026-08-03** ([#24](https://github.com/PeterKnego/ultima_db/issues/24)): real, **low severity** — a latent maintenance hazard with no reachable divergence, since both decisions derive 1:1 from the same `wal_write` field. Worth fixing because the likely future divergence is asymmetric: a new presizing sink added without touching recovery's `matches!` would make a benign torn tail a hard error costing the caller the whole durable log (F1's shape, from the other direction). Fixed in `5df6d23` — both call sites route through `WalSinkKind::tail_tolerant()`, exhaustive with no wildcard, so a new sink is a compile error until its tolerance is stated. Note the analysis below missed a *third* policy already in the tree: `MmapSink::open` presizes and takes its write head from `metadata().len()` without scanning at all (bench-only, outside the production contract).
 
 `PreallocFileSink::open` scans **tolerantly, unconditionally** —
-`scan_wal(&path, true)` at `5df6d23^ src/wal.rs:1115`, to reconstruct
+`scan_wal(&path, true)` at `5df6d23^ src/wal.rs:1119`, to reconstruct
 `write_head`. Cited at the pre-fix revision: the hardcoded `true` is gone, and
 that call is `src/wal.rs:1168` today, routed through
 `WalSinkKind::CoalescedPrealloc.tail_tolerant()`.
@@ -581,7 +586,7 @@ the model or the Rust is wrong. This is the full list, classified.
 |---|---|---|---|
 | A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:1073-1078`, `:1079`; `src/wal.rs:681-683` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
 | A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:628-643`, `:1168-1169`, `:1183-1204`; the error path as described is `1e5d2b7^ src/wal.rs:1130-1136` | **F2** — code-reading finding, outside the model's state space; adjudicated low severity and **fixed in `1e5d2b7`** (see F2) |
-| A3 | Scan tolerance decided independently in two modules | `5df6d23^ src/wal.rs:1115` vs `src/store.rs:1073-1078` (both route through `WalSinkKind::tail_tolerant()` today) | **F3** — code-reading finding; adjudicated low severity and **fixed in `5df6d23`** (see F3) |
+| A3 | Scan tolerance decided independently in two modules | `5df6d23^ src/wal.rs:1119` vs `src/store.rs:1073-1078` (both route through `WalSinkKind::tail_tolerant()` today) | **F3** — code-reading finding; adjudicated low severity and **fixed in `5df6d23`** (see F3) |
 
 ### Model artifacts and methodology corrections
 
