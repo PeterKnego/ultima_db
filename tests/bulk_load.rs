@@ -880,6 +880,63 @@ mod bulk_load_occ {
         assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
     }
 
+    /// The sibling of the test above, for a transaction that **opened** the
+    /// replaced table but never wrote to it.
+    ///
+    /// `WriteTx::open_table` eagerly clones the table into `self.dirty`, so a
+    /// write-free transaction still carries a full pre-replace snapshot of it.
+    /// At commit:
+    ///
+    /// * `validate_write_set` walks `cws.deleted_tables` but only conflicts
+    ///   when `self.write_set[deleted]` is **non-empty**, and deliberately so —
+    ///   the comment there says "opened but nothing written must not count",
+    ///   because a snapshot read of a since-replaced table is fine under SI.
+    /// * `install_batch_inner` records its `CommittedWriteSet` with
+    ///   `tables: BTreeMap::new()`, so `has_concurrent` — computed only from
+    ///   `cws.tables.contains_key(n)` — is `false` for the replaced table.
+    /// * Phase 2 therefore takes the fast path and installs `my_dirty`
+    ///   wholesale.
+    ///
+    /// The read-safety argument justifies skipping the *conflict*; it does not
+    /// address the transaction then writing that stale snapshot back. If the
+    /// assertions below fail, the bulk load was silently reverted by a
+    /// transaction that wrote nothing.
+    #[test]
+    fn write_free_txn_that_opened_a_replaced_table_must_not_revert_the_bulk_load() {
+        let store = multi_writer_store();
+        seed(&store, "t", &["seed1", "seed2"]);
+
+        // Opens the table — and nothing else. No insert, update or delete.
+        let mut wtx = store.begin_write(None).unwrap();
+        let t = wtx.open_table::<String>("t").unwrap();
+        assert_eq!(t.len(), 2, "the txn holds a pre-replace clone");
+        drop(t);
+
+        let bulk_v = store
+            .bulk_load::<String>("t", replace_input(3), BulkLoadOptions::default())
+            .unwrap();
+
+        // Whether this conflicts is not the point — either outcome is
+        // defensible for a write-free transaction. What must not happen is a
+        // successful commit that reinstates the pre-replace table.
+        let res = wtx.commit();
+
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("t").unwrap();
+        assert_eq!(
+            t.len(),
+            3,
+            "bulk-loaded table was reverted by a write-free txn (commit -> {res:?})"
+        );
+        assert_eq!(t.get(1).map(String::as_str), Some("bulk1"));
+        assert_eq!(t.get(3).map(String::as_str), Some("bulk3"));
+        assert!(
+            t.get(2).map(String::as_str) != Some("seed2"),
+            "pre-replace row resurrected (commit -> {res:?})"
+        );
+        assert!(store.latest_version() >= bulk_v);
+    }
+
     /// Same as above through the Delta path.
     #[test]
     fn inflight_writer_on_delta_loaded_table_conflicts_at_commit() {

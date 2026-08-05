@@ -3963,7 +3963,21 @@ impl WriteTx {
                     .keys()
                     .map(|n| {
                         let has = inner.committed_write_sets.iter().any(|cws| {
-                            cws.version > self.base.version && cws.tables.contains_key(n)
+                            cws.version > self.base.version
+                                // `deleted_tables` matters as much as `tables`
+                                // here. A `bulk_load` install records a
+                                // *wholesale* replacement — `tables` is empty
+                                // and only `deleted_tables` names the table —
+                                // so a flag computed from `tables` alone stays
+                                // false, and Phase 2 takes the fast path and
+                                // reinstates this transaction's pre-replace
+                                // clone over the bulk-loaded data. A writer
+                                // that actually wrote is stopped earlier by
+                                // `validate_write_set`; one that merely opened
+                                // the table is not, and used to silently
+                                // revert the load on a successful commit.
+                                && (cws.tables.contains_key(n)
+                                    || cws.deleted_tables.contains(n))
                         });
                         (n.clone(), has)
                     })
