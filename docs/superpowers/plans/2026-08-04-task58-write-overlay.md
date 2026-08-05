@@ -1,5 +1,18 @@
 # Write Overlay (task58) Implementation Plan
 
+> **SUPERSEDED — this plan was executed but is NOT what shipped.** task58 was
+> built twice in parallel. The implementation that shipped is the one planned in
+> [`2026-08-03-write-overlay.md`](2026-08-03-write-overlay.md): it passed the
+> NVMe fleet A/B and its cap is **32**, not the 128 assumed below, and its
+> overlay is **opt-in and off by default** rather than on-by-default with gates.
+> Read `docs/tasks/task58_write_overlay.md` for what actually exists.
+>
+> This plan is retained as design history, and because its execution produced
+> two things that did ship: the inverted-range slice-clamp fix (`Table::range`
+> could panic in release), and the test gaps it found — notably that the
+> `bulk_load` Delta path had been changed with zero coverage. Do not follow its
+> steps against the current tree; the file names and mechanisms differ.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the per-transaction O(height×T) B-tree copy-on-write clone chain with a bounded flat overlay, so an eventual-tier commit costs a ~100 ns memcpy instead of ~2 µs of node cloning.
