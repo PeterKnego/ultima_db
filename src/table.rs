@@ -777,6 +777,13 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             Bound::Excluded(k) => e.partition_point(|(ek, _)| ek < k),
             Bound::Unbounded => e.len(),
         };
+        // An empty or inverted range (`5..2`, `5..5`) leaves `lo > hi`, and
+        // `e[lo..hi]` would panic — in release too, since a slice-index panic
+        // is not debug-gated. `BTree::range` is total on such bounds (it
+        // filters rather than descends), so before the overlay this returned an
+        // empty iterator; clamping keeps that. A committed snapshot normally
+        // carries a live overlay, so this is the ordinary path, not a corner.
+        let hi = hi.max(lo);
         TableIter::Merged(MergedIter {
             overlay: e[lo..hi].iter().peekable(),
             tree: self.data.range(range).peekable(),
@@ -4008,6 +4015,45 @@ mod tests {
         assert_eq!(ranged, vec![2, 3]);
         assert_eq!(t.first().map(|(k, _)| *k), Some(2));
         assert_eq!(t.last().map(|(k, _)| *k), Some(10));
+    }
+
+    /// An empty or inverted range must stay empty, not panic.
+    ///
+    /// The overlay narrows `entries()` with two independent `partition_point`
+    /// calls; for `5..2` the start bound lands above the end bound and the
+    /// resulting `e[lo..hi]` is an out-of-order slice index — which panics in
+    /// **release** as well, since that is not a `debug_assert`. `BTree::range`
+    /// is total on these bounds, so before the overlay every one of these
+    /// returned an empty iterator, and a committed snapshot normally carries a
+    /// live overlay, so this is the ordinary read path.
+    #[test]
+    fn inverted_and_empty_ranges_stay_empty_with_a_live_overlay() {
+        let mut t: Table<String> = Table::new();
+        for i in 0..8 {
+            t.insert(format!("v{i}")).unwrap();
+        }
+        {
+            let ov = t.overlay_mut_for_test(8);
+            ov.set_put(3, std::sync::Arc::new("three".to_string()), true);
+            ov.set_put(20, std::sync::Arc::new("twenty".to_string()), false);
+        }
+        assert_eq!(t.overlay_len_for_test(), 2, "the overlay must be live for this to bite");
+
+        // Bounds come through variables: these ranges are inverted, which is
+        // exactly what a caller can pass at runtime, but written as literals
+        // clippy's `reversed_empty_ranges` rejects them at compile time.
+        for (lo, hi) in [(5u64, 2u64), (5, 5), (99, 30), (2, 1)] {
+            let got: Vec<u64> = t.range(lo..hi).map(|(k, _)| *k).collect();
+            assert!(got.is_empty(), "range({lo}..{hi}) must be empty, not panic");
+            let got_incl: Vec<u64> = t.range(lo..=hi).map(|(k, _)| *k).collect();
+            assert!(
+                got_incl.iter().all(|k| *k >= lo && *k <= hi),
+                "range({lo}..={hi}) leaked a key outside its bounds: {got_incl:?}"
+            );
+        }
+        // A valid range still works after the clamp.
+        let valid: Vec<u64> = t.range(2u64..=4u64).map(|(k, _)| *k).collect();
+        assert_eq!(valid, vec![2, 3, 4]);
     }
 
     #[test]
