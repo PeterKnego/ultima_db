@@ -926,6 +926,84 @@ mod tests {
         assert!(tb.is_err(), "extra table 'b' must be dropped");
     }
 
+    /// A keep-set *drop* is a removal, not an install: a concurrent
+    /// MultiWriter transaction that deleted the same table agrees with it and
+    /// must not conflict.
+    ///
+    /// This pins how `CommittedWriteSet::installed_tables` is populated —
+    /// `install_batch_inner` records both the tables it installs and the ones
+    /// the keep set drops in `deleted_tables`, and only the former belongs in
+    /// `installed_tables`. Widening it to the whole set would turn this
+    /// delete-vs-delete into a spurious `WriteConflict`.
+    #[test]
+    fn keep_set_drop_does_not_conflict_with_a_concurrent_delete_table() {
+        use ultima_db::snapshot_stream::install::{InstallOptions, OnExtra};
+        use ultima_db::WriterMode;
+
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct A {
+            v: u64,
+        }
+        #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+        struct B {
+            v: u64,
+        }
+
+        // Source has only table "a".
+        let src = Store::new(StoreConfig::default()).unwrap();
+        src.register_table::<A>("a").unwrap();
+        {
+            let mut tx = src.begin_write(None).unwrap();
+            tx.open_table::<A>("a").unwrap().insert(A { v: 1 }).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.snapshot_stream(None)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        // Destination is MultiWriter and has both "a" and a stray "b".
+        let dst = Store::new(
+            StoreConfig::builder()
+                .writer_mode(WriterMode::MultiWriter)
+                .build(),
+        )
+        .unwrap();
+        dst.register_table::<A>("a").unwrap();
+        dst.register_table::<B>("b").unwrap();
+        {
+            let mut tx = dst.begin_write(None).unwrap();
+            tx.open_table::<A>("a").unwrap().insert(A { v: 99 }).unwrap();
+            tx.open_table::<B>("b").unwrap().insert(B { v: 7 }).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // In-flight writer deletes "b" — the very table the keep set drops.
+        let mut wtx = dst.begin_write(None).unwrap();
+        assert!(wtx.delete_table("b"));
+
+        dst.install_snapshot_stream(
+            std::io::Cursor::new(&bytes),
+            InstallOptions {
+                on_extra_tables: OnExtra::Drop,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        wtx.commit()
+            .expect("delete of a keep-set-dropped table must not conflict");
+
+        let read = dst.begin_read(None).unwrap();
+        assert!(read.open_table::<B>("b").is_err(), "'b' must stay dropped");
+        assert_eq!(
+            read.open_table::<A>("a").unwrap().get(1),
+            Some(&A { v: 1 }),
+            "the installed 'a' must survive the concurrent commit"
+        );
+    }
+
     /// Default `OnExtra::Keep` preserves dst-only tables (backwards-compat
     /// with pre-fix behaviour).
     #[test]
