@@ -490,6 +490,44 @@ them on one line only), and remember that quoting a cite shape in prose creates
 a real anchor — this section's own examples are all live cites, and the
 checker holds them to the manifest like any other.
 
+**A bare cite may not name a range that two source files both anchor.**
+Inheritance picks a bare cite's file by document position alone, and no other
+check here can tell a right answer from a lucky one. `720` is a valid anchor in
+*both* `src/store.rs:720` (`begin_write`'s `active_writer_count` check) and
+`src/wal.rs:720` (`prune_wal`). A bare one written under a `src/store.rs`
+prefix is therefore correct only until prose churn puts a `src/wal.rs:` prefix
+earlier in the same comment block — at which point it silently re-targets to a
+*different, also-valid* anchor, and every check above stays green because both
+anchors hold. The only thing that catches that today is incidental: the
+abandoned anchor trips `STALE MANIFEST ROW`, and only because it happens to
+have exactly one citer. So the checker refuses the bare form there —
+`AMBIGUOUS BARE CITE`, naming both candidate anchors and their tokens. **To fix
+it, write that cite in prefixed form**: a cite carrying its own file cannot be
+mis-attributed by inheritance. `WalCrash.tla`'s M1 block is the live example —
+its `active_writer_count` cite spells `src/store.rs` out, and the surrounding
+lines were re-wrapped to keep the column box square. Do *not* fix it by
+deleting the colliding manifest row; the collision is a fact about the two
+source files, not a defect in the manifest. The rule ignores `rev`, because
+inheritance carries the revision along with the path — a frozen prefix
+re-targets a bare cite just as effectively as a working-tree one.
+
+**Every cited source must be in the workflow's push filter.** This checker runs
+in `formal.yml`'s `drift` job, and on a direct-to-main push that job runs only
+when the push touched one of `on.push.paths`. Coverage is complete today by
+coincidence: all three `src_file`s in the manifest are listed there for other
+reasons. A cite into a fourth source file would silently lose push-time
+coverage — a push changing only that file would start no job of this workflow
+at all, so its cites could rot until some later PR happened to touch `formal/`,
+which is the exact hole the push filter was widened to close. The checker
+therefore asserts it and fails with `UNWATCHED SOURCE <file>`. **To fix it, add
+the `- '<file>'` line** to `on.push.paths` beside the other watched sources —
+and look at `lean-scope` while you are there, so the ~30-minute proof build does
+not start firing on pushes that do not concern it. The workflow is read by a
+targeted scan of the `on:` → `push:` → `paths:` block (no PyYAML: the repo
+installs nothing and python3 ships no YAML parser), and *every* way of not
+finding exactly that block is itself a failure — a reshaped workflow fails the
+check rather than passing it vacuously.
+
 **What it does not catch.** The rule is *exactly once within the range*, so a
 shift smaller than a wide anchor's own width leaves that row green: insert one
 line near the top of `src/wal.rs` and the 50-line `scan_wal` row still contains
@@ -508,7 +546,17 @@ reading the code does that.
 finding the bare forms is the exact failure it exists to prevent, and the
 occurrence counts are how you see that happen. Read them as a tripwire, not as
 a constant: they move whenever prose is added, including this section's own
-examples.
+examples. It also names the cited source files and whether the push filter
+covers all of them.
+
+One bucket exists purely to make a *skip* visible. `bare-nonsrc` counts bare
+cites that inherit a **non-src** prefix — a `.tla` or `.cfg` file — and so have
+no anchor to check. Skipping them is right: they are illustrative prose whose
+real targets are cited elsewhere. But the first version of the census folded
+them in with genuine prefixed `.tla` cites under `non-src`, which made the one
+thing a tripwire census cannot otherwise surface invisible: a bare cite dropped
+with no diagnostic. They are their own bucket now, and a jump in it means a new
+bare cite is inheriting the wrong kind of prefix.
 
 At the round-3 corpus the scanner measured 147 prefixed + 8 frozen + 34
 bare-colon + 4 bare-comma = 193 occurrences over 17 files. The per-shape counts
