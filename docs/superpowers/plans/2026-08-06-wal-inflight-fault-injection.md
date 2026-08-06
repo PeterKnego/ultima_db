@@ -10,6 +10,13 @@
 
 **Design spec:** `docs/superpowers/specs/2026-08-06-wal-inflight-fault-injection-design.md` — read it before Task 1.
 
+> **Cites re-anchored 2026-08-06 (task60).** Every `src/*.rs:LINE` below names
+> the **current** tree, not the tree this document was written against. The
+> implementation's own `#[cfg]`-gated insertions in `src/wal.rs` moved the
+> lines it cites — e.g. the F2 rollback moved from line 1199 to `:1223-1224` —
+> and nothing checks cites outside `formal/tla/wal/`, so these were verified
+> by hand against the source. See `docs/tasks/task60_wal_inflight_faults.md` §8.
+
 ## Global Constraints
 
 - **Do not duplicate `tests/corruption_recovery.rs`.** Its 11 tests cover *post-hoc* corruption (truncate, zero tail, garbage tail, bit-flip, checkpoint damage). This plan covers only faults that occur *during* an operation, which post-hoc editing cannot produce.
@@ -28,10 +35,10 @@
 ## File Structure
 
 - **Modify `src/mutation.rs`** — three new variants with payloads, plus parsing. One responsibility: what fault is active.
-- **Modify `src/wal.rs`** — three `#[cfg]`-gated injection points: the zero-fill loop in `preallocate_to` (`:628-643`), that function's `sync_all` (`:641`), and `PreallocFileSink::sync`'s positioned write (`:1205`).
+- **Modify `src/wal.rs`** — three `#[cfg]`-gated injection points: the zero-fill loop in `preallocate_to` (`:628-667`), that function's `sync_all` (`:665`), and `PreallocFileSink::sync`'s positioned write (`:1229`).
 - **Create one test file per mutation value** — `tests/wal_fault_failed_extend.rs` (Task 3), `tests/wal_fault_fsync.rs` (Task 4), `tests/wal_fault_torn_tail.rs` (Task 5). Siblings to `corruption_recovery.rs`, deliberately separate from it: that file's helpers all assume post-hoc editing of a closed file.
 
-  **One mutation value per binary is a correctness requirement, not tidiness.** `crate::mutation::active()` memoises in a `OnceLock`, so the *first* `ULTIMA_MUTATION` read wins for the whole process. Demonstrated: a second test in the same file setting `tear-frame-at=64` ran co-resident and got `Err(Poisoned(…injected ENOSPC))` — the *first* test's fault — and passed; run alone it got `Ok`. It executed a fault it never named, and went green. `--test-threads=1` does not help; it is one process either way. Cargo's auto-discovery gives one process per `tests/*.rs` file, so no `[[test]]` stanza is needed.
+  **One mutation value per binary is a correctness requirement, not tidiness.** `crate::mutation::active()` memoises in a `OnceLock`, so the *first* `ULTIMA_MUTATION` read wins for the whole process. Demonstrated: a second test in the same file setting `tear-frame-at=64` ran co-resident and got `Err(Poisoned(…injected ENOSPC))` — the *first* test's fault — and passed; run alone it got `Ok`. It executed a fault it never named, and went green. `--test-threads=1` does not help *with that*; it is one process either way. Cargo's auto-discovery gives one process per `tests/*.rs` file, so no `[[test]]` stanza is needed. (`--test-threads=1` is required for a different reason — it is what makes the `unsafe env::set_var` sound, since co-resident tests read the environment. See `docs/tasks/task60_wal_inflight_faults.md` §3: one mutation per binary buys determinism, single-threading buys soundness, and neither substitutes for the other.)
 - **Modify `Makefile`** — a target that runs this suite with the feature enabled, since a default `cargo test` cannot reach it.
 
 ---
@@ -90,7 +97,7 @@ Extend the enum (keep the existing three untouched):
     TearFrameAt(u64),
 ```
 
-and extend `parse` (`src/mutation.rs:21-29`):
+and extend `parse` (`src/mutation.rs:32-51`):
 
 ```rust
         Some(s) if s.starts_with("fail-write-after=") => s["fail-write-after=".len()..]
@@ -138,7 +145,7 @@ first write would make every test using it pass for the wrong reason."
 ### Task 2: Injection points, still unreached
 
 **Files:**
-- Modify: `src/wal.rs` — `preallocate_to` (`:628-643`) and `PreallocFileSink::sync` (`:1183-1205`)
+- Modify: `src/wal.rs` — `preallocate_to` (`:628-667`) and `PreallocFileSink::sync` (`:1207-1229`)
 
 **Interfaces:**
 - Consumes: `Mutation::FailWriteAfter`, `FailSync`, `TearFrameAt` from Task 1.
@@ -165,7 +172,7 @@ first 64 KiB chunk — which is what produces a *partial* extension.
 
 - [ ] **Step 2: Inject into the two syncs**
 
-Before `file.sync_all()` in `preallocate_to` (`:641`), and before the
+Before `file.sync_all()` in `preallocate_to` (`:665`), and before the
 `sync_data()` at the end of `PreallocFileSink::sync`:
 
 ```rust
@@ -213,7 +220,7 @@ it wrote the whole batch."
 - Consumes: the injection points from Task 2.
 - Produces: `standalone_prealloc_config(dir)`, `seed_commits(dir, n)`, `recovered_count(store)` helpers for Tasks 4–5.
 
-**This task is the reason the plan exists.** `src/wal.rs:1199`'s `set_len`
+**This task is the reason the plan exists.** `src/wal.rs:1223`'s `set_len`
 rollback has never been executed by a test.
 
 - [ ] **Step 1: Write the failing test**
@@ -291,7 +298,7 @@ fn a_failed_extend_does_not_leave_the_file_longer_than_capacity() {
 ```
 
 **Do not assert `len % chunk == 0`.** `WAL_PREALLOC_CHUNK` is **16 MiB**
-(`src/wal.rs:1133`), and the partial zero-fill leaves 65536 bytes — which *is* a
+(`src/wal.rs:1157`), and the partial zero-fill leaves 65536 bytes — which *is* a
 multiple of 4096, so a modulo assertion passes with and without the rollback and
 the acceptance gate becomes vacuous. Assert the exact expected length.
 
@@ -307,7 +314,7 @@ Expected: PASS.
 - [ ] **Step 3: Prove it fails without the rollback — the acceptance gate**
 
 Back up `src/wal.rs` with a checksum. Remove the two rollback lines at
-`src/wal.rs:1199-1200` (`set_len` and its `sync_all`), leaving the `return Err(e)`.
+`src/wal.rs:1223-1224` (`set_len` and its `sync_all`), leaving the `return Err(e)`.
 
 Run the same command.
 Expected: **FAIL**, with the file length not a multiple of the chunk size.
@@ -322,7 +329,7 @@ the rollback — say so rather than proceeding.
 git add tests/wal_fault_failed_extend.rs
 git commit -m "test(wal): execute the failed-extend rollback (F2, issue #23)
 
-The rollback at src/wal.rs:1199 shipped in 1e5d2b7 with only a regression
+The rollback at src/wal.rs:1223-1224 shipped in 1e5d2b7 with only a regression
 guard, whose assertions held before the fix too — a read-only handle fails
 on the first write and leaves no partial extension to roll back. This
 injects ENOSPC after the first 64 KiB chunk, which does."

@@ -633,10 +633,34 @@ fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
     let zeros = [0u8; 64 * 1024];
     file.seek(SeekFrom::Start(from)).map_err(|e| Error::Persistence(e.to_string()))?;
     let mut remaining = to - from;
+    #[cfg(feature = "mutation-testing")]
+    let mut written: u64 = 0;
     while remaining > 0 {
+        // BUG-INJECTION: models ENOSPC partway through the zero-fill. The
+        // threshold is *bytes actually written*, not an iteration count, so
+        // `FailWriteAfter(0)` fails before anything lands and
+        // `FailWriteAfter(65536)` fails with one 64 KiB chunk on disk — the
+        // partial extension the caller's rollback exists to undo.
+        #[cfg(feature = "mutation-testing")]
+        if let Some(crate::mutation::Mutation::FailWriteAfter(after)) = crate::mutation::active()
+            && written >= after
+        {
+            return Err(Error::Persistence("injected ENOSPC".into()));
+        }
         let n = remaining.min(zeros.len() as u64) as usize;
         file.write_all(&zeros[..n]).map_err(|e| Error::Persistence(e.to_string()))?;
         remaining -= n as u64;
+        #[cfg(feature = "mutation-testing")]
+        {
+            written += n as u64;
+        }
+    }
+    // BUG-INJECTION: the size/allocation barrier fails, so the extension is
+    // physically present but never durable — the other half of what the
+    // caller's rollback has to handle.
+    #[cfg(feature = "mutation-testing")]
+    if matches!(crate::mutation::active(), Some(crate::mutation::Mutation::FailSync)) {
+        return Err(Error::Persistence("injected fsync failure".into()));
     }
     file.sync_all().map_err(|e| Error::Persistence(e.to_string()))?;
     Ok(())
@@ -1203,9 +1227,30 @@ impl WalSink for PreallocFileSink {
                 self.capacity = new_cap;
             }
             self.file.seek(SeekFrom::Start(self.write_head)).map_err(|e| Error::Persistence(e.to_string()))?;
-            self.file.write_all(&self.buf).map_err(|e| Error::Persistence(e.to_string()))?;
+            // BUG-INJECTION: write only the first `n` bytes of the batch and
+            // then report success, so the sink advances `write_head` by the
+            // whole batch and believes it all landed. The resulting tail is
+            // *torn* (a half-written frame followed by preallocated zeros),
+            // not merely short — returning an error here would give the sink a
+            // chance to react and produce the already-covered short tail.
+            #[cfg(feature = "mutation-testing")]
+            let to_write: &[u8] = match crate::mutation::active() {
+                Some(crate::mutation::Mutation::TearFrameAt(n)) => {
+                    &self.buf[..(n as usize).min(self.buf.len())]
+                }
+                _ => &self.buf[..],
+            };
+            #[cfg(not(feature = "mutation-testing"))]
+            let to_write: &[u8] = &self.buf[..];
+            self.file.write_all(to_write).map_err(|e| Error::Persistence(e.to_string()))?;
             self.write_head += self.buf.len() as u64;
             self.buf.clear();
+        }
+        // BUG-INJECTION: the steady-state barrier fails, so a batch already
+        // written into the preallocated region never becomes durable.
+        #[cfg(feature = "mutation-testing")]
+        if matches!(crate::mutation::active(), Some(crate::mutation::Mutation::FailSync)) {
+            return Err(Error::Persistence("injected fsync failure".into()));
         }
         // Steady-state barrier: size unchanged, so fdatasync suffices.
         self.file.sync_data().map_err(|e| Error::Persistence(e.to_string()))

@@ -10,7 +10,7 @@
 | `fanout-t8` | B-tree fanout T=8 instead of the default T=32, for write-dominated SMR deployments. | — |
 | `wal-iouring` | io_uring WAL sink. Implies `persistence`. | `io-uring` |
 | `bench-internals` | Internal handles (e.g. `BenchWal`) for the benchmark crates. Implies `persistence`. **Not public API.** | `memmap2` |
-| `mutation-testing` | Test-only fault injection for the Elle consistency harness. Compiled into no normal build; inert unless the `ULTIMA_MUTATION` environment variable is set. **Not public API.** | — |
+| `mutation-testing` | Test-only fault injection, for the Elle consistency harness (isolation/merge logic switches, task47) and for the in-flight WAL fault tests (I/O faults — a partial `write`, a failing `fsync`, a torn frame; task60). Compiled into no normal build; inert unless the `ULTIMA_MUTATION` environment variable is set. **Not public API.** | — |
 
 docs.rs builds the API documentation with `persistence`, `fulltext`, and
 `metrics` enabled.
