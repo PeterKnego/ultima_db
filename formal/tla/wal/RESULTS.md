@@ -188,7 +188,7 @@ two affected.
 `scan_wal` treats a CRC mismatch as end-of-log only when `tail_tolerant`,
 which `Store::recover` passes for `CoalescedPrealloc` and nothing else
 (`src/store.rs:1073-1078`). Every other sink gets `Err(WalCorrupted)`
-(`src/wal.rs:681-683`), which `recover` propagates with `?`
+(`src/wal.rs:705-707`), which `recover` propagates with `?`
 (`src/store.rs:1079`) **before applying any entry** — so frames the scan had
 already accepted, at offsets *before* the tear, are discarded with it. A
 full-length-but-CRC-bad tail is physically ordinary on an appending sink.
@@ -211,7 +211,7 @@ Re-home the harm first.
 
 > **Adjudicated 2026-08-03** ([#23](https://github.com/PeterKnego/ultima_db/issues/23)): real, **low severity** — a robustness and invariant-integrity gap, not a durability hole. In-process the post-error state is retry-safe (`capacity` not advanced, `buf` not cleared), and across a restart `capacity` is re-derived from `metadata().len()`, so it is self-correcting. What genuinely breaks is task37 §4 invariant 2, leaving safety to rest on the `fdatasync` semantics preallocation exists to be independent of, and costing the metadata-free fsync until the next clean extend. Fixed in `1e5d2b7` by rolling the size back to the last durable `capacity` on a failed extend. The analysis below stands as written — it was accurate about the mechanism.
 
-`preallocate_to` (`src/wal.rs:628-643`) exists to establish one invariant:
+`preallocate_to` (`src/wal.rs:628-667`) exists to establish one invariant:
 *the new size is durable before any record is written into the region*
 (task37 §4 invariant 2). It does that by physically zero-filling `[from, to)`
 and then `sync_all`. **That invariant does not hold on its own error path.**
@@ -219,14 +219,14 @@ If the zero-fill is interrupted — ENOSPC is the realistic trigger — the
 `write_all` error propagates out of `preallocate_to` *before* its `sync_all`,
 and out of `PreallocFileSink::sync` before `self.capacity = new_cap`
 (`1e5d2b7^ src/wal.rs:1130-1136` — cited at the pre-fix revision, because the
-described error path no longer exists: the same block is `src/wal.rs:1183-1204`
+described error path no longer exists: the same block is `src/wal.rs:1207-1228`
 today and now rolls the size back with `set_len` + `sync_all` before returning
 the error). The file is then physically longer, the extension was never
 `sync_all`'d, and in-memory `capacity` still holds the old value.
 
 The consequence is on the *next open*, not on the retry:
 `PreallocFileSink::open` adopts `capacity` from `metadata().len()`
-(`src/wal.rs:1168-1169`) — i.e. it adopts the partially-extended,
+(`src/wal.rs:1192-1193`) — i.e. it adopts the partially-extended,
 never-`sync_all`'d size as though it were durable, and steady-state writes
 into it are covered by `sync_data` only. That is precisely the shape M5 was
 built to model (task37 §4 invariant 2), reached **without any mutation**.
@@ -251,7 +251,7 @@ disposition it states is not.*
 `PreallocFileSink::open` scans **tolerantly, unconditionally** —
 `scan_wal(&path, true)` at `5df6d23^ src/wal.rs:1119`, to reconstruct
 `write_head`. Cited at the pre-fix revision: the hardcoded `true` is gone, and
-that call is `src/wal.rs:1168` today, routed through
+that call is `src/wal.rs:1192` today, routed through
 `WalSinkKind::CoalescedPrealloc.tail_tolerant()`.
 `Store::recover` decided tolerance **separately**, from the configured
 `WalWrite` — that call site is `src/store.rs:1073-1078` today and now derives
@@ -381,7 +381,7 @@ Three of these are doing more work than "something happens":
 
 - **`NoTornTailTruncation`** demands specifically that recovery truncated at a
   **torn** frame. An *absent* frame is a clean end-of-log in both scan modes
-  (`src/wal.rs:668-673`, unconditional `break`), so reaching only that case
+  (`src/wal.rs:692-697`, unconditional `break`), so reaching only that case
   would prove nothing about tolerance.
 - **`NoEventualAckLoss`** (red) is paired with
   `modes/ConsistentAckKeptCheck.cfg`, which runs the **same invariant** with
@@ -419,9 +419,9 @@ mutation is a green with nothing behind it.
 | **`M3Dup.cfg`** | — (`MaxCommits = 3`) | `NoDupLive` | 12 | M3's documented **symptom**: two writers bumped to the same version, the second `snapshots.insert(v, ..)` silently replacing the first. |
 | `M4.cfg` | `WalCrashPrealloc.cfg` | `TailTolerance` | 9 | `ScanIsTolerant` loses its `CoalescedPrealloc` arm (`src/store.rs:1073-1078`), so a preallocated WAL is scanned strictly and a legal torn tail aborts recovery — task37 §7. |
 | `M4Abort.cfg` | `modes/ConsistentPrealloc.cfg` | `StrictScanErrLosesDurableAck` | 10 | M4's **harm**: a durably-acked commit made unreachable because a later frame tore. |
-| `M5.cfg` | `WalCrashPrealloc.cfg` | `PreallocInvariant` | 5 | `SyncData` loses its `metaDurable` guard — a batch written into a freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s `sync_all` (`src/wal.rs:641`) never ran before the positioned write at `:1206`. task37 §4 invariant 2. |
+| `M5.cfg` | `WalCrashPrealloc.cfg` | `PreallocInvariant` | 5 | `SyncData` loses its `metaDurable` guard — a batch written into a freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s `sync_all` (`src/wal.rs:665`) never ran before the positioned write at `:1245`. task37 §4 invariant 2. |
 | **`M5Strand.cfg`** | `modes/ConsistentPrealloc3.cfg` | `NoAckLossAfterLiveExtend` | 16 | M5's **harm** rather than its mechanism: an acked commit lost behind an un-synced *live-log* extend. |
-| `M6.cfg` | `modes/ConsistentPrealloc.cfg` | `RecoverySound` clause (c) | 9 | `ScanLen` loses the stop at a CRC-bad frame (`src/wal.rs:677-684`), keeping only the end-of-log stop — corruption passes CRC, half a commit record lands in the store, and recovery reports success. |
+| `M6.cfg` | `modes/ConsistentPrealloc.cfg` | `RecoverySound` clause (c) | 9 | `ScanLen` loses the stop at a CRC-bad frame (`src/wal.rs:701-708`), keeping only the end-of-log stop — corruption passes CRC, half a commit record lands in the store, and recovery reports success. |
 | `M7.cfg` | `modes/ConsistentPrealloc.cfg` | `RecoverySound` clause (a) | 9 | `Replay` swaps the `cid`/`tbl` identity of chain positions 1 and 2, leaving `ver`, `sub`, `forkedFrom` as computed — the store restarts with the right versions, the right fork chain, and the wrong rows in them. |
 
 Controls, all clean at the same bound as the mutation they pair with —
@@ -584,8 +584,8 @@ the model or the Rust is wrong. This is the full list, classified.
 
 | # | Finding | Cites | Disposition |
 |---|---|---|---|
-| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:1073-1078`, `:1079`; `src/wal.rs:681-683` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
-| A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:628-643`, `:1168-1169`, `:1183-1204`; the error path as described is `1e5d2b7^ src/wal.rs:1130-1136` | **F2** — code-reading finding, outside the model's state space; adjudicated low severity and **fixed in `1e5d2b7`** (see F2) |
+| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:1073-1078`, `:1079`; `src/wal.rs:705-707` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
+| A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:628-667`, `:1192-1193`, `:1207-1228`; the error path as described is `1e5d2b7^ src/wal.rs:1130-1136` | **F2** — code-reading finding, outside the model's state space; adjudicated low severity and **fixed in `1e5d2b7`** (see F2) |
 | A3 | Scan tolerance decided independently in two modules | `5df6d23^ src/wal.rs:1119` vs `src/store.rs:1073-1078` (both route through `WalSinkKind::tail_tolerant()` today) | **F3** — code-reading finding; adjudicated low severity and **fixed in `5df6d23`** (see F3) |
 
 ### Model artifacts and methodology corrections
@@ -613,8 +613,8 @@ the model or the Rust is wrong. This is the full list, classified.
 
 1. **The rest of the battery.** S1 covered one of the brief's property groups.
    The full S1–S5/L1/`BulkLoadGuard` set across the mode matrix is outstanding.
-2. **A `Checkpoint` action**, which drags in WAL pruning (`src/wal.rs:720`,
-   and the preallocating prune at `:764-799`). This is where
+2. **A `Checkpoint` action**, which drags in WAL pruning (`src/wal.rs:744`,
+   and the preallocating prune at `:788-823`). This is where
    checkpoint/prune/crash interleavings bite, and it is currently untouched.
    Note it will break `PreallocInvariant`'s `writeHead = Len(walDurable)`
    clause **on purpose** — a useful tripwire for whoever adds it.

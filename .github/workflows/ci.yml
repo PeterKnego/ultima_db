@@ -18,6 +18,14 @@ name: ci
 #     an observation nobody has ruled on, so red means "an unruled cell's
 #     behaviour changed" — re-read its doc comment and update the recorded
 #     value if the new behaviour is better. Red in any other step is a bug.
+#     The two `mutation-testing` steps are the same argument for the in-flight
+#     WAL fault suite (task60): the feature is off in every other pass, so
+#     without them all three tests/wal_fault_*.rs binaries compile nowhere and
+#     gate nothing — including the one test that executes `1e5d2b7`'s `set_len`
+#     rollback. They are split from the main pass because the feature set is
+#     different, and split from each other because the torn-tail cell is
+#     `#[ignore]`d for the same "awaiting a ruling" reason as the lifecycle
+#     cells above; triage its red the same way. See `make test/wal-faults`.
 # Deliberately NOT run here:
 #   * compare_benches (RocksDB/Fjall/ReDB) — opt-in competitor tier, keeps
 #     those deps out of CI by design (see `make bench/compare-engines`).
@@ -47,6 +55,14 @@ jobs:
         run: cargo test --features persistence,fulltext,metrics
       - name: Tests (table-lifecycle races, --ignored cells)
         run: cargo test --features persistence,fulltext,metrics --test table_lifecycle_races -- --ignored
+      - name: Tests (in-flight WAL faults)
+        run: |
+          cargo test --features persistence,fulltext,mutation-testing \
+            --test wal_fault_failed_extend --test wal_fault_fsync
+      - name: Tests (in-flight WAL faults, --ignored F1 cell)
+        run: |
+          cargo test --features persistence,fulltext,mutation-testing \
+            --test wal_fault_torn_tail -- --ignored
       - name: Tests (no features)
         run: cargo test --lib
       - name: Tests (ultima-vector, persistence)

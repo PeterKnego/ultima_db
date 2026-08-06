@@ -13,13 +13,13 @@
 //!
 //! ## The two scanners — the whole subject of this file
 //!
-//! One function, `scan_wal(path, tail_tolerant)` (`src/wal.rs:678`), reads the
+//! One function, `scan_wal(path, tail_tolerant)` (`src/wal.rs:677`), reads the
 //! same torn tail two opposite ways, and which one you get is decided by the
 //! sink kind:
 //!
 //! | caller | `tail_tolerant` | CRC mismatch |
 //! |---|---|---|
-//! | `Store::recover` for `CoalescedPrealloc` (`src/store.rs:1072-1078`) | `true` | `break` — clean end-of-log |
+//! | `Store::recover` for `CoalescedPrealloc` (`src/store.rs:1073-1078`) | `true` | `break` — clean end-of-log |
 //! | `Store::recover` for `PerEntry` / `Coalesced` (same lines) | `false` | `Err(WalCorrupted)`, propagated by `?` **before any entry is applied** |
 //! | `read_wal` / `prune_wal` (`src/wal.rs:730-732`) | `false` | same hard error |
 //! | `PreallocFileSink::open_with_chunk` (`src/wal.rs:1192`) | `true` | `break` |
@@ -93,9 +93,13 @@
 //!
 //! `PREALLOC_CHUNK` and the `torn_len` bound are *preconditions* rather than
 //! findings: they fail loudly if the setup stops producing the state F1 needs,
-//! and they hold equally in the vacuous `TEAR_AT >= batch` configuration, so
-//! neither is evidence on its own. The two assertions that carry the property
-//! are the strict byte-offset equality and the tolerant row count.
+//! and both still hold in the vacuous *lower*-edge configuration (`TEAR_AT <
+//! 32`, where every batch tears — the len prefixes survive, so
+//! `seed_frames_end` still walks to 96), so neither is evidence on its own
+//! there. `torn_len + 8 > TEAR_AT` is not weak in the other direction: it is
+//! what goes red at the **upper** edge, and it is the only assertion that
+//! does. The two assertions that carry the property are the strict byte-offset
+//! equality and the tolerant row count.
 //!
 //! Requires `--features mutation-testing`.
 #![cfg(feature = "mutation-testing")]
@@ -174,7 +178,7 @@ fn strict_config(dir: &Path) -> StoreConfig {
 /// `len + 8` bytes available). Deliberately does **not** verify CRCs — that is
 /// the discriminator under test, and re-implementing it here would make the
 /// assertion a tautology of `scan_wal`. Framing is `[u32 len][payload][u32
-/// crc]` (`frame_entry_into`, `src/wal.rs:601-610`).
+/// crc]` (`frame_entry_into`, `src/wal.rs:602-611`).
 fn structural_frames_end(bytes: &[u8]) -> u64 {
     let mut offset = 0usize;
     while offset + 4 <= bytes.len() {
@@ -188,7 +192,7 @@ fn structural_frames_end(bytes: &[u8]) -> u64 {
 }
 
 /// Parse the trailing byte offset out of `CRC mismatch at entry starting at
-/// byte N` (`src/wal.rs:697-699`).
+/// byte N` (`src/wal.rs:705-707`).
 fn crc_mismatch_offset(msg: &str) -> u64 {
     msg.rsplit(' ')
         .next()
