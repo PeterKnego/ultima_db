@@ -29,7 +29,9 @@
 
 - **Modify `src/mutation.rs`** — three new variants with payloads, plus parsing. One responsibility: what fault is active.
 - **Modify `src/wal.rs`** — three `#[cfg]`-gated injection points: the zero-fill loop in `preallocate_to` (`:628-643`), that function's `sync_all` (`:641`), and `PreallocFileSink::sync`'s positioned write (`:1205`).
-- **Create `tests/wal_inflight_faults.rs`** — the whole suite. Sibling to `corruption_recovery.rs`, deliberately separate: that file's helpers all assume post-hoc editing of a closed file.
+- **Create one test file per mutation value** — `tests/wal_fault_failed_extend.rs` (Task 3), `tests/wal_fault_fsync.rs` (Task 4), `tests/wal_fault_torn_tail.rs` (Task 5). Siblings to `corruption_recovery.rs`, deliberately separate from it: that file's helpers all assume post-hoc editing of a closed file.
+
+  **One mutation value per binary is a correctness requirement, not tidiness.** `crate::mutation::active()` memoises in a `OnceLock`, so the *first* `ULTIMA_MUTATION` read wins for the whole process. Demonstrated: a second test in the same file setting `tear-frame-at=64` ran co-resident and got `Err(Poisoned(…injected ENOSPC))` — the *first* test's fault — and passed; run alone it got `Ok`. It executed a fault it never named, and went green. `--test-threads=1` does not help; it is one process either way. Cargo's auto-discovery gives one process per `tests/*.rs` file, so no `[[test]]` stanza is needed.
 - **Modify `Makefile`** — a target that runs this suite with the feature enabled, since a default `cargo test` cannot reach it.
 
 ---
@@ -205,7 +207,7 @@ it wrote the whole batch."
 ### Task 3: F2 — the rollback that ships unproven
 
 **Files:**
-- Create: `tests/wal_inflight_faults.rs`
+- Create: `tests/wal_fault_failed_extend.rs`
 
 **Interfaces:**
 - Consumes: the injection points from Task 2.
@@ -299,7 +301,7 @@ chunk.
 
 - [ ] **Step 2: Run to verify it passes with the fix present**
 
-Run: `cargo test --features persistence,fulltext,mutation-testing --test wal_inflight_faults -- --test-threads=1`
+Run: `cargo test --features persistence,fulltext,mutation-testing --test wal_fault_failed_extend`
 Expected: PASS.
 
 - [ ] **Step 3: Prove it fails without the rollback — the acceptance gate**
@@ -317,7 +319,7 @@ the rollback — say so rather than proceeding.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/wal_inflight_faults.rs
+git add tests/wal_fault_failed_extend.rs
 git commit -m "test(wal): execute the failed-extend rollback (F2, issue #23)
 
 The rollback at src/wal.rs:1199 shipped in 1e5d2b7 with only a regression
@@ -331,7 +333,7 @@ injects ENOSPC after the first 64 KiB chunk, which does."
 ### Task 4: fsync failure
 
 **Files:**
-- Modify: `tests/wal_inflight_faults.rs`
+- Create: `tests/wal_fault_fsync.rs` (its own binary — see File Structure)
 
 - [ ] **Step 1: Write the test**
 
@@ -376,7 +378,7 @@ vacuous. State that in the doc comment.
 
 - [ ] **Step 2: Run, and report what it shows**
 
-Run: `cargo test --features persistence,fulltext,mutation-testing --test wal_inflight_faults -- --test-threads=1`
+Run: `cargo test --features persistence,fulltext,mutation-testing --test wal_fault_failed_extend`
 
 **Either outcome is a result.** If it passes, the fsync path already upholds the
 contract and the test pins it. If it fails, that is a finding — **do not fix
@@ -385,7 +387,7 @@ contract and the test pins it. If it fails, that is a finding — **do not fix
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/wal_inflight_faults.rs
+git add tests/wal_fault_fsync.rs
 git commit -m "test(wal): a failing fsync must not report a durable commit"
 ```
 
@@ -394,7 +396,7 @@ git commit -m "test(wal): a failing fsync must not report a durable commit"
 ### Task 5: F1 — the torn tail a strict scan cannot survive
 
 **Files:**
-- Modify: `tests/wal_inflight_faults.rs`
+- Create: `tests/wal_fault_torn_tail.rs` (its own binary — see File Structure)
 
 **F1 currently exists only as a TLA property** (`StrictScanErrLosesDurableAck`,
 `formal/tla/wal/RESULTS.md:197`). This gives it an executable counterpart.
@@ -424,7 +426,7 @@ the implementation disagree, and the report should say which you believe and why
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/wal_inflight_faults.rs
+git add tests/wal_fault_torn_tail.rs
 git commit -m "test(wal): F1 — a strict scan and a torn tail (unresolved)"
 ```
 
