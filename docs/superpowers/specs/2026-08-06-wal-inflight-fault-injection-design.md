@@ -5,6 +5,13 @@
 **Retires:** the untested half of the F2 fix (`1e5d2b7`), the F1 property that
 exists only in the TLA model, and the entirely-untested fsync failure path.
 
+> **Cites re-anchored 2026-08-06 (task60).** Every `src/*.rs:LINE` below names
+> the **current** tree, not the tree this document was written against. The
+> implementation's own `#[cfg]`-gated insertions in `src/wal.rs` moved the
+> lines it cites — e.g. the F2 rollback moved from `:1199` to `:1223-1224` —
+> and nothing checks cites outside `formal/tla/wal/`, so these were verified
+> by hand against the source. See `docs/tasks/task60_wal_inflight_faults.md` §8.
+
 ## The gap, stated precisely
 
 `tests/corruption_recovery.rs` already covers **post-hoc** corruption with 11
@@ -25,7 +32,7 @@ F2 is the canonical example. `preallocate_to` (`src/wal.rs:628`) zero-fills
 durable before any record is written into the region*. When ENOSPC interrupts
 the zero-fill, the error escapes before `sync_all` and before
 `self.capacity = new_cap`, so the file is physically longer than `capacity` and
-that extension was never synced. The fix (`src/wal.rs:1199`) rolls the size back
+that extension was never synced. The fix (`src/wal.rs:1223`) rolls the size back
 with `set_len`. **That rollback has never been executed by a test** — its
 accompanying test is explicitly a regression guard whose assertions held before
 the fix too, because a read-only handle fails on the *first* write and leaves no
@@ -38,8 +45,8 @@ to happen while the sink is mid-operation.
 
 | fault | injects at | retires |
 |---|---|---|
-| **Short write / ENOSPC** after N bytes of a `write_all` | `preallocate_to`'s zero-fill loop; the sinks' batch write | F2's rollback (`src/wal.rs:1199`), currently unproven |
-| **`sync_all` / `sync_data` returns an error** | `preallocate_to`'s sync; `WalSink::sync` (`:1055`, `:1104`, `:1180`) | the fsync failure path — no test anywhere assumes fsync can fail |
+| **Short write / ENOSPC** after N bytes of a `write_all` | `preallocate_to`'s zero-fill loop; the sinks' batch write | F2's rollback (`src/wal.rs:1223-1224`), currently unproven |
+| **`sync_all` / `sync_data` returns an error** | `preallocate_to`'s sync; `WalSink::sync` (`:1079`, `:1128`, `:1204`) | the fsync failure path — no test anywhere assumes fsync can fail |
 | **Torn frame at a chosen offset**, under a **strict-scan** config | the sink's positioned write | F1 — `StrictScanErrLosesDurableAck` exists only as a TLA property |
 
 The third is the one the existing corruption suite structurally cannot reach:
@@ -105,7 +112,7 @@ assertions per the oracle.
 ## Success criteria
 
 1. **F2's rollback is executed by a test that fails without it.** Revert the
-   `set_len` at `src/wal.rs:1199` and a named test must go red. This is the
+   `set_len` at `src/wal.rs:1223` and a named test must go red. This is the
    whole reason the work is being done — the fix currently ships unproven.
 2. **F1 is reproduced against real I/O**, not just in the model: a strict-scan
    config loses access to a durably-acked commit on a torn tail, and the test

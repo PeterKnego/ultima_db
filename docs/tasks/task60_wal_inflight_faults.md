@@ -353,16 +353,69 @@ occurrences across 15 corpus files plus the manifest** — the 31 the checker
 flagged, plus 6 more ranges whose *end* had drifted without tripping it, because
 their expectation token happened to stay inside the stale range. (`check-cites.py`
 verifies the token, not the extent; a range that has silently stopped covering
-the function it names still passes.) The map is piecewise — `+0` / `+24` / `+39` / `+45`, with one
-line rewritten — derived from the diff, **not** a uniform offset. Two
-column-boxed comment lines in `WalCrash.tla` needed their padding re-trimmed
+the function it names still passes.)
+
+The map is **seven buckets**, derived line by line from the diff, not a uniform
+offset — and not the four it is tempting to summarise it as, because both
+injection sites insert *inside* a block rather than between blocks:
+
+| old `src/wal.rs` | shift | |
+|---|---|---|
+| ≤ 635 | `+0` | above the first insertion |
+| 636 | `+2` | `while remaining > 0 {` — the `written` counter went in above it |
+| 637–639 | `+13` | the zero-fill body — the `FailWriteAfter` block went in above it |
+| 640 | `+17` | the `}` closing that `while` |
+| 641–1205 | `+24` | below the whole first hunk |
+| 1206 | → **1245**, and the line was **rewritten** (`write_all(&self.buf)` → `write_all(to_write)`), so its manifest token changed too |
+| 1207–1209 | `+39` | between the `TearFrameAt` block and the `FailSync` block |
+| ≥ 1210 | `+45` | below both |
+
+The three middle buckets are the ones a summary loses, and they are not
+cosmetic: the anchor `633-640` (the zero-fill loop) becomes `633-657`, whereas
+`+24` would put its end at 664 — a *different* `}` at the same indent, closing
+the injected `FailSync` `if` rather than the `while`. It would have passed the
+checker, since the expectation token is on the range's first line. **Do not
+diff-align braces mechanically; read what each one closes.** (`difflib` gets
+this wrong too, aligning old 640 to 664 and old 1209 to 1254.)
+
+Two column-boxed comment lines in `WalCrash.tla` needed their padding re-trimmed
 because `977` → `1001` is one character wider.
 
-The lesson generalises past this task: **any change to `src/wal.rs`,
-`src/store.rs` or `src/persistence.rs` — including a pure insertion with no
-semantic content — owes a `make formal/cite-check` run.** The drift guard does
-not catch it; its predicate is "did anything under `formal/` change", which has
-no relation to whether the cites were re-checked.
+Three lessons generalise past this task, in increasing order of how hard they
+are to notice:
+
+1. **Any change to `src/wal.rs`, `src/store.rs` or `src/persistence.rs` —
+   including a pure insertion with no semantic content — owes a
+   `make formal/cite-check` run.** The drift guard does not catch it; its
+   predicate is "did anything under `formal/` change", which has no relation to
+   whether the cites were re-checked.
+
+   **And `check-cites.py` only governs `formal/tla/wal/`.** Cites anywhere else
+   — `docs/tasks/`, `docs/superpowers/`, module docs, test files — have no
+   guard at all and rot silently. This task's own design and plan documents were
+   among the casualties: both still cited the F2 rollback at `src/wal.rs:1199`
+   after the implementation moved it to `:1223-1224`, and they are the first
+   thing a future contributor reads. Twenty cites across the two were re-checked
+   by hand and twelve corrected; both now carry a dated note saying they name the
+   *current* tree. The alternative idiom, when a document genuinely means
+   historical code, is the corpus's frozen form — `<sha>^ src/wal.rs:1130-1136`
+   — which `check-cites.py` resolves with `git show` and verifies like any other.
+2. **The checker verifies a range's token, not its extent.** Six ranges here had
+   stopped covering the function they name while staying green. After a
+   re-anchor, re-read the *range*, not just the first line.
+3. **A large mechanical re-anchor can leave every anchor correct and the
+   surrounding sentences wrong, and nothing in the repo detects that.** This
+   one did: `formal/tla/wal/README.md:493-530` taught "a bare cite may not name
+   a range two source files both anchor" using `720` as its worked example —
+   valid in both `src/store.rs:720` and, before this task, `prune_wal` at line
+   720 of `src/wal.rs`. Moving `prune_wal` to `src/wal.rs:744` dissolved the
+   collision, so the paragraph went on asserting a refusal (`AMBIGUOUS BARE
+   CITE`) that has no live instance — with `check-cites.py` green throughout,
+   because 744 genuinely is `prune_wal`. **Re-read the prose around every changed
+   cite, not just the cite.** The paragraph now states the rule, records that no
+   collision exists in the tree today, and carries the disappearance as its
+   example; both directions were verified by running the checker rather than
+   asserted.
 
 ## 9. Follow-ups and open questions
 

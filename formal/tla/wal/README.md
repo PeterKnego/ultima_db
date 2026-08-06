@@ -492,24 +492,42 @@ checker holds them to the manifest like any other.
 
 **A bare cite may not name a range that two source files both anchor.**
 Inheritance picks a bare cite's file by document position alone, and no other
-check here can tell a right answer from a lucky one. `720` is a valid anchor in
-*both* `src/store.rs:720` (`begin_write`'s `active_writer_count` check) and
-`src/wal.rs:744` (`prune_wal`). A bare one written under a `src/store.rs`
-prefix is therefore correct only until prose churn puts a `src/wal.rs:` prefix
-earlier in the same comment block — at which point it silently re-targets to a
-*different, also-valid* anchor, and every check above stays green because both
-anchors hold. The only thing that catches that today is incidental: the
-abandoned anchor trips `STALE MANIFEST ROW`, and only because it happens to
-have exactly one citer. So the checker refuses the bare form there —
-`AMBIGUOUS BARE CITE`, naming both candidate anchors and their tokens. **To fix
-it, write that cite in prefixed form**: a cite carrying its own file cannot be
-mis-attributed by inheritance. `WalCrash.tla`'s M1 block is the live example —
-its `active_writer_count` cite spells `src/store.rs` out, and the surrounding
-lines were re-wrapped to keep the column box square. Do *not* fix it by
-deleting the colliding manifest row; the collision is a fact about the two
-source files, not a defect in the manifest. The rule ignores `rev`, because
-inheritance carries the revision along with the path — a frozen prefix
-re-targets a bare cite just as effectively as a working-tree one.
+check here can tell a right answer from a lucky one. When some line number `N`
+anchors under two source files, a bare `:N` written under one file's prefix is
+correct only until prose churn puts the other file's prefix earlier in the same
+comment block — at which point it silently re-targets to a *different,
+also-valid* anchor, and every check above stays green because both anchors hold.
+The only thing that would otherwise catch that is incidental: the abandoned
+anchor trips `STALE MANIFEST ROW`, and only because it happens to have exactly
+one citer. So the checker refuses the bare form there — `AMBIGUOUS BARE CITE`,
+naming both candidate anchors and their tokens. **The fix is to write that cite
+in prefixed form**: a cite carrying its own file cannot be mis-attributed by
+inheritance. Do *not* fix it by deleting the colliding manifest row; the
+collision is a fact about the two source files, not a defect in the manifest.
+The rule ignores `rev`, because inheritance carries the revision along with the
+path — a frozen prefix re-targets a bare cite just as effectively as a
+working-tree one.
+
+**No such collision exists in the tree today** (measured 2026-08-06: no range in
+`cite-anchors.tsv` is anchored under more than one source file), so this guard
+currently has no live instance — a bare `:N` is accepted everywhere. That is a
+fact with a shelf life, not a property of the corpus: until task60 it *did* have
+one. `720` anchored in both `src/store.rs:720` (`begin_write`'s
+`active_writer_count` check) and, at line 720 of `src/wal.rs`, `prune_wal`'s
+signature — which is why `WalCrash.tla`'s M1 block spells `src/store.rs` out and
+why its surrounding lines were re-wrapped to keep the column box square. Task60's
+`#[cfg]`-gated insertions in `src/wal.rs` moved `prune_wal` down to
+`src/wal.rs:744`, and the collision evaporated — nobody edited a cite to make
+that happen. **Collisions appear and disappear with
+any edit that moves a line in a cited file, so do not read "the checker is quiet"
+as "the bare form is safe here"; write new cites prefixed by default.** Both
+directions were verified against the checker rather than assumed: with the M1
+cite rewritten bare it reports `all anchors verified — ok`, and with a throwaway
+second anchor added at that same line of `src/wal.rs` the same bare cite reports
+`AMBIGUOUS BARE CITE` naming both candidates. The guard works; there is simply
+nothing for it to catch. (Both probes were reverted; writing the collision out
+in prefixed form here would have re-created it, which is the trap the paragraph
+above warns about — this section's examples are live cites.)
 
 **Every cited source must be in the workflow's push filter.** This checker runs
 in `formal.yml`'s `drift` job, and on a direct-to-main push that job runs only
