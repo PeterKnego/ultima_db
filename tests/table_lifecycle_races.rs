@@ -19,6 +19,13 @@
 //! `make test/lifecycle-races` both do, because a recorded behaviour nothing
 //! executes is a comment, not a test, and plain `cargo test` skips all three.
 //!
+//! Every one of those 42 runs at **both** isolation levels. The tests above the
+//! `Phase 2` divider are the `SnapshotIsolation` pass, one test per cell, and
+//! are the level all five bugs were found at; the section below it is the
+//! `Serializable` pass, one test per [`BOp`] column. Ten cells differ between
+//! the two, and [`ssi_expect`] is where that list lives. The `#[ignore]`d cells
+//! are ignored at both levels, so the `--ignored` pass is six tests, not three.
+//!
 //! The ignored count went 4 → 5 → 3: review un-pinned `Delete × StreamInstallDrop`
 //! on 2026-08-05, then the ruling of 2026-08-06 pinned it *and* its
 //! `TxDelete` twin against `src/store.rs:283-288`, retiring two questions.
@@ -36,6 +43,13 @@
 //! cargo test --features persistence,fulltext --test table_lifecycle_races
 //! cargo test --features persistence,fulltext --test table_lifecycle_races -- --ignored
 //! ```
+//!
+//! **The four cell lists below are the `SnapshotIsolation` pass**, unchanged by
+//! the Serializable pass — which added no textual change to any SI cell, so the
+//! 2026-08-06 measurements still stand as measured. What the Serializable
+//! columns add on top of each is in `## What the Serializable pass adds` below;
+//! the short version is that it adds cells to three of the four mutations and
+//! is **blind to the fourth**.
 //!
 //! **Mutation A — bugs 1 and 2** (`b990951`). In the `concurrent_flags`
 //! predicate (`WriteTx::commit`), drop `|| cws.deleted_tables.contains(n)`, so
@@ -117,6 +131,47 @@
 //! of C's installing ones — so re-measure it rather than trusting it if another
 //! removal spelling is added. Neither 9 nor 2 is a constant.
 //!
+//! ## What the Serializable pass adds
+//!
+//! Measured 2026-08-06, the same five mutations one at a time. The SI lists
+//! above are unchanged in every case; these are the Serializable column tests
+//! that go red *in addition*, with the cells each one names.
+//!
+//! | mutation | SI cells | + Serializable cells |
+//! |---|---|---|
+//! | A (bugs 1, 2) | 11 live + 1 ignored | **5** — `OpenDdl` against every column but `TxWrite` |
+//! | B (bug 3) | 3 live + 1 ignored | **0 — sees nothing** |
+//! | C (bug 4) | 9 live | **9** — the same three delete-flavoured states × three installing columns |
+//! | D (bug 5) | 2 live | **2** — `WriteDeleteRecreate` against each removing column |
+//! | ruling reversal | 4 live tests, 6 cells (2 masked) | **6** — all three delete-flavoured states × both removing columns, none masked |
+//!
+//! **Mutation B is the one to read.** Bug 3 was a write-free `open_table`
+//! resurrecting a deleted table, and every cell that can see it is an `OpenOnly`
+//! cell — which under SSI aborts with `SerializationFailure` before Phase 2 runs
+//! at all. The stronger isolation level *masks the bug*: the transaction that
+//! would have resurrected the table never gets to commit, so the defect is
+//! invisible at exactly the cells built to catch it. Mutation A is the same
+//! story in miniature — its 11 SI cells include four `OpenOnly` ones that
+//! contribute nothing under SSI, and all five SSI cells it does redden are
+//! `OpenDdl`, which is checked before the read set and so still reaches the
+//! mutated predicate.
+//!
+//! So **the Serializable pass is not a substitute for the SI pass**, and if the
+//! two ever have to be run separately it is the SI one that must survive. That
+//! is a general property of this surface rather than a quirk of these
+//! mutations: SSI aborts a transaction for having *read* something, which
+//! pre-empts every bug whose mechanism is in what the commit path does *after*
+//! deciding not to conflict.
+//!
+//! What it adds where it is not blind is a sharper failure report. The column
+//! tests run all seven cells of a column and name every one that failed, so
+//! under mutation D the `TxDelete` column prints exactly
+//! `WriteDeleteRecreate x TxDelete`, with `DeleteRecreate` conspicuously absent
+//! — the halves-moved-apart signal, without the line-swapping the packed SI test
+//! needs. Under the ruling reversal the same column prints all three
+//! delete-flavoured cells, which is halves-moved-together. See the section
+//! below for what that distinction means.
+//!
 //! ## The discriminator the packed tests exist for
 //!
 //! Both packed tests assert an *equality*, so what matters is not that they go
@@ -139,12 +194,22 @@
 //! So a red packed test means "the bug came back" only if the halves moved
 //! apart; if they moved together, the ruling changed and these are the cells
 //! that record it.
+//!
+//! Since the Serializable pass landed there is a third way to tell, and it is
+//! the quickest: [`serializable_concurrent_delete_column`] and
+//! [`serializable_stream_install_drop_column`] run both halves as separate
+//! cells and report each by name, so their failure text says outright which
+//! moved. Measured on both mutations — D names `WriteDeleteRecreate` alone, the
+//! ruling reversal names all three delete-flavoured states. That does not
+//! retire the packing: the SI cells are still where the equality is *asserted*,
+//! and the SSI columns assert their own values, which happen to be
+//! `SerializationFailure` for both halves rather than `Ok`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use ultima_db::{
-    AddOptions, BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind, Store,
-    StoreConfig, WriterMode,
+    AddOptions, BulkDelta, BulkLoadInput, BulkLoadOptions, BulkSource, Error, IndexKind,
+    IsolationLevel, Store, StoreConfig, WriterMode,
 };
 
 /// The table under test. Every [`AState`] acts on this one and no other.
@@ -230,6 +295,15 @@ enum Expect {
     Conflicts,
     /// A must fail with `Error::IndexDdlConflict`.
     DdlConflicts,
+    /// A must fail with `Error::SerializationFailure` — reachable only under
+    /// [`IsolationLevel::Serializable`], where `validate_read_set` runs.
+    ///
+    /// Deliberately its own variant rather than a widening of
+    /// [`Expect::Conflicts`]: SSI aborts a cell for a different reason than
+    /// OCC does (A *read* something a concurrent commit invalidated, not A
+    /// *wrote* something it collided with), and the two error values are what
+    /// tell a maintainer which validator fired.
+    SerializationFails,
 }
 
 /// Post-race observation of **every** table in [`WATCHED`], not just `T`.
@@ -288,10 +362,11 @@ impl CellOutcome {
     }
 }
 
-fn mw_store() -> Store {
+fn mw_store(iso: IsolationLevel) -> Store {
     let store = Store::new(
         StoreConfig::builder()
             .writer_mode(WriterMode::MultiWriter)
+            .isolation_level(iso)
             .build(),
     )
     .unwrap();
@@ -425,8 +500,8 @@ fn bulk_delta_input() -> BulkLoadInput<String> {
     })
 }
 
-fn run_cell(a: AState, b: BOp) -> CellOutcome {
-    let store = mw_store();
+fn run_cell(a: AState, b: BOp, iso: IsolationLevel) -> CellOutcome {
+    let store = mw_store(iso);
     seed(&store);
 
     // ── A begins and does its thing ─────────────────────────────────────
@@ -524,8 +599,11 @@ fn run_cell(a: AState, b: BOp) -> CellOutcome {
             use ultima_db::{InstallOptions, OnExtra};
 
             // The source holds `U` and nothing else, so the stream declares
-            // `U` alone and `T` is an extra at the destination.
-            let src = mw_store();
+            // `U` alone and `T` is an extra at the destination. It is built at
+            // the cell's isolation level for uniformity only — nothing races on
+            // it, so its `WriteTx` has no concurrent commit to validate against
+            // and the choice cannot affect the cell either way.
+            let src = mw_store(iso);
             {
                 let mut w = src.begin_write(None).unwrap();
                 let mut t = w.open_table::<String>(U).unwrap();
@@ -845,48 +923,80 @@ fn expected_presence(a: AState, b: BOp) -> Option<bool> {
     }
 }
 
-/// Runs a cell and asserts all three parts of the oracle.
+/// Runs a cell under [`IsolationLevel::SnapshotIsolation`] and asserts all
+/// three parts of the oracle.
+///
+/// Every cell Tasks 1–5 wrote calls this, and calls it exactly as it did before
+/// the isolation level became a parameter. Keeping the two-argument spelling is
+/// not laziness: it means the Serializable pass added no textual change to a
+/// single SI cell, so the five calibrations still measure what they measured.
 fn check_cell(a: AState, b: BOp, expect: Expect) {
-    let out = run_cell(a, b);
-    let label = format!("{a:?} x {b:?}");
+    check_cell_at(a, b, IsolationLevel::SnapshotIsolation, expect);
+}
+
+/// Runs a cell at a named isolation level and asserts all three parts of the
+/// oracle.
+fn check_cell_at(a: AState, b: BOp, iso: IsolationLevel, expect: Expect) {
+    if let Some(why) = cell_failure(a, b, iso, expect) {
+        panic!("{why}");
+    }
+}
+
+/// The body of [`check_cell_at`], returning the first violated clause instead of
+/// panicking on it. `None` means the cell passed.
+///
+/// Split out for the column tests of the Serializable pass, which run seven
+/// cells apiece and must report *all* of the failures rather than aborting on
+/// the first. This file already knows what abort-on-first costs: the two packed
+/// bug-5 tests hide their second cell, and the module docs have to explain twice
+/// that a naive run shows eight failures where ten cells moved.
+fn cell_failure(a: AState, b: BOp, iso: IsolationLevel, expect: Expect) -> Option<String> {
+    let out = run_cell(a, b, iso);
+    let label = format!("{a:?} x {b:?} @ {iso:?}");
 
     // (i) the outcome is the one the rules predict
-    match expect {
-        Expect::Commits => assert!(
-            out.commit.is_ok(),
-            "{label}: expected commit, got {:?}",
-            out.commit
-        ),
-        Expect::Conflicts => assert!(
+    let (matched, wanted) = match expect {
+        Expect::Commits => (out.commit.is_ok(), "commit"),
+        Expect::Conflicts => (
             matches!(out.commit, Err(Error::WriteConflict { .. })),
-            "{label}: expected WriteConflict, got {:?}",
-            out.commit
+            "WriteConflict",
         ),
-        Expect::DdlConflicts => assert!(
+        Expect::DdlConflicts => (
             matches!(out.commit, Err(Error::IndexDdlConflict { .. })),
-            "{label}: expected IndexDdlConflict, got {:?}",
-            out.commit
+            "IndexDdlConflict",
         ),
+        Expect::SerializationFails => (
+            matches!(out.commit, Err(Error::SerializationFailure { .. })),
+            "SerializationFailure",
+        ),
+    };
+    if !matched {
+        return Some(format!(
+            "{label}: expected {wanted}, got {:?}",
+            out.commit
+        ));
     }
 
     // (ii) THE UMBRELLA PROPERTY: whatever committed Ok is never silently
     // reverted.
     if let Err(why) = effect_intact(a, b, &out) {
-        panic!(
+        return Some(format!(
             "{label}: {why} — something that committed Ok was silently \
              reverted. rows={:?} commit={:?}",
             out.rows_after(), out.commit
-        );
+        ));
     }
 
     // (iii) the table's existence, where a specific ruling pinned it
-    if let Some(want) = expected_presence(a, b) {
-        assert_eq!(
-            out.table_present(), want,
-            "{label}: expected table_present={want}, rows={:?} commit={:?}",
-            out.rows_after(), out.commit
-        );
+    if let Some(want) = expected_presence(a, b)
+        && out.table_present() != want
+    {
+        return Some(format!(
+            "{label}: expected table_present={want}, got {}, rows={:?} commit={:?}",
+            out.table_present(), out.rows_after(), out.commit
+        ));
     }
+    None
 }
 
 /// Bug 1 (fixed in b990951): a transaction that opened the table and wrote
@@ -1233,32 +1343,29 @@ fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
 /// `:283-288` already answers it.
 ///
 /// **`Serializable` is not the reason, contrary to the design spec** (`…
-/// races-design.md:119-121`, which lists this cell as one where "SSI's
+/// races-design.md:119-121`, which listed this cell as one where "SSI's
 /// `validate_read_set` aborts it"). It does not. `AState::Delete` calls only
 /// `delete_table`, which never reads, so there is no read-set entry for `T` and
 /// `validate_read_set`'s delete arm (`src/store.rs:4541`) cannot fire. Measured
-/// under `IsolationLevel::Serializable`: still `Ok`. Anyone extending this suite
-/// to SSI should not start here.
+/// under `IsolationLevel::Serializable`: still `Ok`, and
+/// [`serializable_concurrent_delete_column`] now asserts it. The spec carries a
+/// dated correction to that effect as of 2026-08-06.
 ///
-/// Where SSI *does* diverge, re-measured 2026-08-05 across all 42 cells after
-/// Task 4 — ten of them, every one `Ok` under SI and `SerializationFailure`
-/// under SSI:
+/// Where SSI *does* diverge — ten cells, every one `Ok` under SI and
+/// `SerializationFailure` under SSI — is stated and asserted in the Phase 2
+/// section; [`ssi_expect`] is the list. Nine of the ten are pinned there and the
+/// tenth is an unruled cell recorded in the `--ignored` pass.
 ///
-/// - `OpenOnly` against **every** `BOp`: `BulkReplace`, `BulkDelta`, `TxWrite`,
-///   `TxDelete`, `BulkBatch`, `StreamInstallDrop`.
-/// - `DeleteRecreate` and `WriteDeleteRecreate` against each of the two
-///   table-removing columns, `TxDelete` and `StreamInstallDrop`.
-///
-/// That is the real scope of an SSI pass: `OpenOnly`'s `t.len()` records a read
-/// that every B invalidates without exception, and the recreate cells read the
-/// table they recreated. Note the second group is the bug-5 pair in both of its
-/// spellings, so an SSI pass must decide whether that equality is asserted per
-/// isolation level or only under SI.
-///
-/// The count was six before Task 4 and is stated per *cell*, not per test: both
-/// bug-5 tests pack two `check_cell`s and abort on the first, so a naive run
-/// shows eight failures and hides the two `DeleteRecreate` halves. Those were
-/// unmasked by swapping the lines and confirmed to diverge too.
+/// Two notes that used to live here and are now settled. The second group of
+/// divergences is the bug-5 pair in both of its spellings, so the equality those
+/// packed tests assert had to be decided per isolation level: it is asserted at
+/// **both**, and holds at both, at `Ok` under SI and `SerializationFailure`
+/// under SSI — the halves move together across the change, which is the whole
+/// content of the property. And the count is stated per *cell*, not per test,
+/// because the packed tests abort on the first of their two: a naive SI run
+/// shows eight where ten cells moved. The Serializable columns do not have that
+/// problem — they report every failing cell in the column — so the ten are
+/// directly observable now rather than reconstructed by swapping lines.
 ///
 /// **Current behaviour, measured 2026-08-05 under SI and unchanged by the
 /// pinning:** commits `Ok`; `T` is absent afterwards. Absence is asserted, not
@@ -1501,6 +1608,13 @@ fn write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop()
 // - `DeleteRecreateWrite × StreamInstallDrop`
 // - `OpenOnly × StreamInstallDrop`
 //
+// Each is observed at **both** isolation levels: the three tests here, and three
+// more at the end of the Phase 2 section. So the `--ignored` pass is six tests
+// over three cells, not six cells. Running the matrix under `Serializable` did
+// not settle any of them — only one even changes behaviour, and it changes it by
+// aborting *before* the disputed code runs, which is not a vote. See
+// [`open_only_vs_stream_install_drop_under_serializable_is_unruled`].
+//
 // Note the first two are the *fourth corner* of the delete/recreate square in
 // each removal column, and they are not covered by the 2026-08-06 ruling:
 // `:283-288` speaks to a transaction that **deleted** a table meeting a commit
@@ -1609,6 +1723,289 @@ fn delete_recreate_write_vs_stream_install_drop_outcome_is_unruled() {
     check_cell(
         AState::DeleteRecreateWrite,
         BOp::StreamInstallDrop,
+        Expect::Conflicts,
+    );
+}
+
+
+// ── Phase 2: the same matrix under `IsolationLevel::Serializable` ───────────
+//
+// Everything above runs under `SnapshotIsolation`, which is the level all five
+// bugs were found and fixed at. This section runs the same 42 cells under
+// `Serializable` — same fixtures, same oracle, same determinism, one line of
+// `StoreConfig` different.
+//
+// **Ten of the 42 diverge**, and every one of them the same way: `Ok` under SI,
+// `Error::SerializationFailure` under SSI. Nothing goes the other way, and no
+// cell changes between two *error* kinds. Measured 2026-08-06 across all 42,
+// reproducing the reading Task 4 recorded in
+// [`delete_vs_concurrent_delete_commits`].
+//
+// The mechanism is `validate_read_set`, which SSI runs and SI does not, and one
+// of its arms accounts for nine of the ten: a concurrent commit that *deleted* a
+// table this transaction read is an unconditional abort
+// (`src/store.rs:4541-4545`), consulted before either of the arms that compare
+// keys. Every `BOp` in this matrix except `TxWrite` puts `T` in `deleted_tables`
+// — the bulk installs no less than the two removals, since an install replaces
+// the table wholesale — so any A that *read* `T` aborts against five of the six
+// columns. `TxWrite` is the sixth, and it reaches `OpenOnly` through the
+// `table_scan` arm instead: `Table::len()` records a scan, and B modified a key
+// in `T`.
+//
+// Which A-states read, then, is the whole of the story:
+//
+// - `OpenOnly` does — its `t.len()` is a scan — so it diverges in **all six**
+//   columns. Six of the ten.
+// - `DeleteRecreate` and `WriteDeleteRecreate` do, on the reopened table, so
+//   they diverge in the two columns where they committed under SI: `TxDelete`
+//   and `StreamInstallDrop`. Four more, and that is the ten.
+// - `OpenWrite` reads only the row it updates, so the point-read arm applies
+//   and `OpenWrite x TxWrite` still commits — A read key 1, B wrote key 2.
+//   This is the one cell in the matrix where SSI's read tracking is *finer*
+//   than a table-level rule would be, and it is why the abort arm above cannot
+//   be described as "SSI aborts anything that opened the table".
+// - `OpenDdl`, `Delete` and `DeleteRecreateWrite` are unchanged in every column,
+//   for three different reasons: DDL is checked before the read set, a bare
+//   `delete_table` never reads, and `DeleteRecreateWrite` was already
+//   conflicting on its write set everywhere.
+//
+// **`Delete x TxDelete` is not among the ten**, contrary to the design spec —
+// see [`delete_vs_concurrent_delete_commits`], and the dated correction in
+// `docs/superpowers/specs/2026-08-05-table-lifecycle-races-design.md`.
+//
+// SSI aborting where SI commits is not a bug: SSI is strictly stronger, and an
+// abort is a safe answer that a caller retries. What matters is that it is
+// pinned *as its own expectation* rather than absorbed by loosening the SI
+// cells to accept either outcome — a cell that accepts two outcomes tests
+// nothing. Hence [`Expect::SerializationFails`] as a distinct variant, and
+// hence [`ssi_expect`] listing every cell rather than only the interesting ones.
+
+/// Every [`AState`], in the order the enum declares them.
+const ALL_A: &[AState] = &[
+    AState::OpenOnly,
+    AState::OpenWrite,
+    AState::OpenDdl,
+    AState::Delete,
+    AState::DeleteRecreate,
+    AState::DeleteRecreateWrite,
+    AState::WriteDeleteRecreate,
+];
+
+/// The cells carried `#[ignore]`d because no ruling pins them.
+///
+/// The Serializable column tests skip these, so the `--ignored` cells stay
+/// unpinned at *both* isolation levels: an unruled cell is unruled whatever the
+/// store is configured to do. Their SSI behaviour is recorded in the three
+/// `#[ignore]`d tests at the end of this section — and one of them, `OpenOnly x
+/// StreamInstallDrop`, is the tenth divergent cell, which is why this section's
+/// live tests pin only nine of the ten.
+fn unruled(a: AState, b: BOp) -> bool {
+    match (a, b) {
+        (AState::DeleteRecreateWrite, BOp::TxDelete) => true,
+        #[cfg(feature = "persistence")]
+        (AState::OpenOnly | AState::DeleteRecreateWrite, BOp::StreamInstallDrop) => true,
+        _ => false,
+    }
+}
+
+/// The commit outcome every cell must produce under
+/// [`IsolationLevel::Serializable`].
+///
+/// Stated for all 42 cells, including the 32 that behave exactly as they do
+/// under SI. Listing only the divergent ten would make this a diff against a
+/// table that does not exist as data — the SI expectations live in 37 hand
+/// written test bodies, each with its own citation, and that is where they
+/// belong. Here every cell says what it is.
+///
+/// The [`Expect::SerializationFails`] arms *are* the divergence list: ten cells,
+/// nine of them pinned by the column tests below and the tenth (`OpenOnly x
+/// StreamInstallDrop`) unruled and merely recorded. Every other arm is the same
+/// value the corresponding SI test asserts.
+fn ssi_expect(a: AState, b: BOp) -> Expect {
+    let b_removes = !b_leaves_table(b);
+    match a {
+        // Reads the table (`t.len()` is a scan) and contributes nothing, so
+        // every column invalidates it: five through the deleted-table arm, and
+        // `TxWrite` through the scan arm.
+        AState::OpenOnly => Expect::SerializationFails,
+        // Point reads only. Disjoint from B's key in the `TxWrite` column, and
+        // conflicted on the write set before the read set matters elsewhere.
+        AState::OpenWrite => match b {
+            BOp::TxWrite => Expect::Commits,
+            _ => Expect::Conflicts,
+        },
+        // The DDL check precedes read-set validation, so SSI never gets a say.
+        AState::OpenDdl => Expect::DdlConflicts,
+        // `delete_table` alone never reads: no read-set entry for `T` exists,
+        // so `validate_read_set`'s deleted-table arm has nothing to fire on.
+        // This is the cell the design spec got wrong.
+        AState::Delete => {
+            if b_removes {
+                Expect::Commits
+            } else {
+                Expect::Conflicts
+            }
+        }
+        // Both read the recreated table, so where they committed under SI —
+        // against the two removing columns — SSI aborts them instead. Against
+        // an installing column they conflict on the write set first, exactly as
+        // under SI. The bug-5 equality between these two therefore *survives*
+        // the change of isolation level: both halves move together, which is
+        // the property those packed tests assert.
+        AState::DeleteRecreate | AState::WriteDeleteRecreate => {
+            if b_removes {
+                Expect::SerializationFails
+            } else {
+                Expect::Conflicts
+            }
+        }
+        // Already conflicting on its write set in every column.
+        AState::DeleteRecreateWrite => Expect::Conflicts,
+    }
+}
+
+/// Runs one whole column under `Serializable` and reports **every** failing
+/// cell, not just the first.
+///
+/// The unruled cells are skipped; see [`unruled`].
+fn check_ssi_column(b: BOp) {
+    let failures: Vec<String> = ALL_A
+        .iter()
+        .filter(|a| !unruled(**a, b))
+        .filter_map(|a| cell_failure(*a, b, IsolationLevel::Serializable, ssi_expect(*a, b)))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of the {:?} column failed under Serializable:\n  {}",
+        failures.len(),
+        b,
+        failures.join("\n  ")
+    );
+}
+
+/// `OpenOnly` aborts (the read of a table B replaced); everything else is as
+/// under SI.
+#[test]
+fn serializable_bulk_replace_column() {
+    check_ssi_column(BOp::BulkReplace);
+}
+
+#[test]
+fn serializable_bulk_delta_column() {
+    check_ssi_column(BOp::BulkDelta);
+}
+
+/// The only column reached through `validate_read_set`'s *scan* arm rather than
+/// its deleted-table arm, and so the only one where the two `OpenOnly`-shaped
+/// states part company: `OpenOnly`'s `len()` is a scan and aborts, while
+/// `OpenWrite`'s point read of key 1 does not collide with B's key 2 and still
+/// commits.
+#[test]
+fn serializable_concurrent_write_column() {
+    check_ssi_column(BOp::TxWrite);
+}
+
+/// The bug-3 and bug-5 column. Three of its cells commit under SI and abort
+/// here — `OpenOnly`, `DeleteRecreate`, `WriteDeleteRecreate` — and the last two
+/// abort *together*, so the equality the packed bug-5 test asserts under SI
+/// holds under SSI as well, at a different value. That is the answer to the
+/// question Task 4 left open ("whether that equality is asserted per isolation
+/// level or only under SI"): per isolation level, and it holds at both.
+#[test]
+fn serializable_concurrent_delete_column() {
+    check_ssi_column(BOp::TxDelete);
+}
+
+#[test]
+fn serializable_bulk_batch_column() {
+    check_ssi_column(BOp::BulkBatch);
+}
+
+/// The `TxDelete` column's keep-set-drop twin, and it diverges identically —
+/// which is the point. `validate_read_set` keys off `deleted_tables`, and a
+/// keep-set drop populates that field exactly as `delete_table` does, so SSI
+/// cannot tell the two spellings apart either. Two of this column's seven cells
+/// are unruled and skipped; five run.
+#[cfg(feature = "persistence")]
+#[test]
+fn serializable_stream_install_drop_column() {
+    check_ssi_column(BOp::StreamInstallDrop);
+}
+
+// ── The unruled cells, observed under `Serializable` ────────────────────────
+//
+// Recorded, not pinned — the same standing as their SI twins above, and for the
+// same reason: no ruling exists, and running the matrix at a second isolation
+// level does not create one. A red test here means the behaviour of an unruled
+// cell changed; re-read the SI twin's doc comment and decide, do not assume a
+// regression.
+
+/// UNRESOLVED. The SSI reading of
+/// [`delete_recreate_write_vs_concurrent_delete_outcome_is_unruled`].
+///
+/// **Unchanged from SI, measured 2026-08-06:** `Err(WriteConflict)`. A's write
+/// set for the recreated `T` is non-empty and `T` is in B's `deleted_tables`, so
+/// `validate_write_set` conflicts it before `validate_read_set` is consulted —
+/// which is why the read of the recreated table, the very thing that moves
+/// `DeleteRecreate` and `WriteDeleteRecreate` to `SerializationFailure` in this
+/// column, changes nothing here.
+///
+/// So SSI does not help with the open question. It does narrow it slightly: the
+/// fourth corner is now the odd one out under *both* isolation levels, and any
+/// ruling that makes it commit has to survive both.
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn delete_recreate_write_vs_concurrent_delete_under_serializable_is_unruled() {
+    check_cell_at(
+        AState::DeleteRecreateWrite,
+        BOp::TxDelete,
+        IsolationLevel::Serializable,
+        Expect::Conflicts,
+    );
+}
+
+/// UNRESOLVED. The SSI reading of
+/// [`open_only_vs_stream_install_drop_outcome_is_unruled`], and **the tenth
+/// divergent cell** — the one the live tests in this section do not pin.
+///
+/// **Changed from SI, measured 2026-08-06:** `Ok` under SI, `SerializationFailure`
+/// here. A's `t.len()` records a scan of `T`, B's keep-set drop puts `T` in
+/// `deleted_tables`, and `validate_read_set` aborts on that without reaching
+/// either key-comparing arm.
+///
+/// This does not resolve the SI question, and is not evidence about it. The open
+/// question is whether a write-free open should survive a snapshot install that
+/// dropped the table — a question about `installed_tables` and Phase 2's
+/// `(None, _)` arm. SSI answers a *different* one, by refusing the transaction
+/// on the grounds that it read a table the install removed, which it would do
+/// whatever those two mechanisms decided. A cell that aborts before the disputed
+/// code runs cannot be a vote on it.
+#[cfg(feature = "persistence")]
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn open_only_vs_stream_install_drop_under_serializable_is_unruled() {
+    check_cell_at(
+        AState::OpenOnly,
+        BOp::StreamInstallDrop,
+        IsolationLevel::Serializable,
+        Expect::SerializationFails,
+    );
+}
+
+/// UNRESOLVED. The SSI reading of
+/// [`delete_recreate_write_vs_stream_install_drop_outcome_is_unruled`].
+///
+/// **Unchanged from SI, measured 2026-08-06:** `Err(WriteConflict)`, for the
+/// same reason as its `TxDelete` twin — the write set decides it first. The two
+/// stay twins under SSI, so a ruling still has to move them together.
+#[cfg(feature = "persistence")]
+#[test]
+#[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
+fn delete_recreate_write_vs_stream_install_drop_under_serializable_is_unruled() {
+    check_cell_at(
+        AState::DeleteRecreateWrite,
+        BOp::StreamInstallDrop,
+        IsolationLevel::Serializable,
         Expect::Conflicts,
     );
 }

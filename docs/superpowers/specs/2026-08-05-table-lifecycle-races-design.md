@@ -129,6 +129,41 @@ without a decision freezes an accident. Known in advance:
 The implementer must **surface these rather than choose**, and no such cell is
 pinned until a ruling exists.
 
+> **Correction, 2026-08-06 (Task 6, the Serializable pass).** The first bullet's
+> reason is wrong, and half of its cell list is wrong with it.
+>
+> `A4 × B5` (`delete_table` vs a concurrent `delete_table`) is **not** aborted by
+> SSI. `A4` calls only `delete_table`, which never reads, so no `read_set` entry
+> for the table is ever created and `validate_read_set`'s `deleted_tables` arm
+> (`src/store.rs:4541`) has nothing to fire on. Probed under
+> `IsolationLevel::Serializable`, the cell commits `Ok`, exactly as under SI. It
+> has since been pinned as `Commits` at both levels — by a ruling of 2026-08-06
+> citing `src/store.rs:283-288`, not by anything to do with isolation.
+>
+> `A5 × B5` *does* diverge, but for a reason this bullet does not give: `A5`
+> reopens the table and reads it, and it is that read the deleted-table arm
+> aborts. Nothing about "delete vs delete" is what makes it diverge.
+>
+> **The real SSI divergence, measured across all 42 cells:** exactly ten, every
+> one `Ok` under `SnapshotIsolation` and `Error::SerializationFailure` under
+> `Serializable`, none in the other direction and none changing between two error
+> kinds —
+>
+> - `A1` (`open_table` only) against **every** `B`. Its `len()` records a table
+>   scan, and every column either deletes the table or writes a key in it.
+> - `A5` and `A7` against the two *removing* columns, `B5` and `B6`. Both reopen
+>   and read; both were `Ok` under SI.
+>
+> Nine are pinned by the `Serializable` column tests in
+> `tests/table_lifecycle_races.rs`; the tenth, `A1 × B6`, is the third bullet
+> above and stays unruled at both levels.
+>
+> One further finding from that pass, which bears on this section's premise:
+> SSI is **not** uniformly the stronger test. Reverting bug 3's fix reddens three
+> SI cells and **no** Serializable cell, because every cell that can observe bug 3
+> is an `A1` cell and SSI aborts those before the defective code runs. The
+> Serializable pass adds cells to the other calibrations and is blind to that one.
+
 ## Scope
 
 **In:** `WriterMode::MultiWriter`; `IsolationLevel::SnapshotIsolation` for

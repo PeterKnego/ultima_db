@@ -12,8 +12,9 @@ test/integration:
 	cargo test --test store_integration
 
 # The table-lifecycle race matrix (tests/table_lifecycle_races.rs). Three of its
-# 42 cells are `#[ignore]`d as questions awaiting a ruling; their recorded
-# behaviour is what the doc comments cite, so it has to be *run* or it rots.
+# 42 cells are `#[ignore]`d as questions awaiting a ruling — six tests, since
+# each is observed under both isolation levels; their recorded behaviour is what
+# the doc comments cite, so it has to be *run* or it rots.
 # Nothing else passes `--ignored`, which is why this target exists separately
 # from `test/integration`.
 test/lifecycle-races:

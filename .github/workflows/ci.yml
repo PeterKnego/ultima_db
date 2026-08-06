@@ -10,8 +10,9 @@ name: ci
 #     does not reach. ultima-vector clippy is included alongside the root
 #     clippy pass since it currently passes clean with -D warnings. The
 #     `--ignored` pass exists because plain `cargo test` skips the three
-#     unresolved cells of tests/table_lifecycle_races.rs, whose recorded
-#     behaviour their doc comments cite — unrun, it silently rots. It is the
+#     unresolved cells of tests/table_lifecycle_races.rs (six tests — each is
+#     observed under both isolation levels), whose recorded behaviour their doc
+#     comments cite — unrun, it silently rots. It is the
 #     only place anything here passes `--ignored`; see `make test/lifecycle-races`.
 #     Triaging a failure in THAT step differs from the others: those cells pin
 #     an observation nobody has ruled on, so red means "an unruled cell's
