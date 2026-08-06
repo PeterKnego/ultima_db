@@ -72,6 +72,15 @@
 //! Restoring the arm to an unconditional `(None, _) => install` instead —
 //! the other spelling of the same revert — yields the identical cell list.
 //!
+//! **Mutations A and B share three cells, and that overlap is structural — not
+//! a gap in the matrix.** Mutation A makes `has_concurrent` false, so Phase 2
+//! takes the fast-path `continue` at `src/store.rs:4053-4058` and never reaches
+//! the arm bug 3 lives in at `:4065-4087`. Any cell capable of detecting bug 3
+//! must therefore also fail under A: A removes the only route to the code B
+//! mutates. So no cell exists that would isolate bug 3 from A, and none needs
+//! to be added — **mutation B is what shows bug 3 has independent coverage**,
+//! and a reader who sees only A's 11-cell list should not conclude otherwise.
+//!
 //! **Mutation C — bug 4** (`dbd56d4`). Drop
 //! `|| cws.installed_tables.contains(deleted)` from `validate_write_set`'s
 //! second loop. **Exactly 9 live cells, 0 ignored** — the three
@@ -91,7 +100,10 @@
 //! packed `write_delete_recreate_matches_delete_recreate_against_{a_concurrent_delete,
 //! a_stream_install_drop}`, and only their **first** line
 //! (`WriteDeleteRecreate`), `expected commit, got Err(WriteConflict { table:
-//! "t", … })`.
+//! "t", … })`. As with mutation C, the count is structural: it tracks the
+//! number of *removing* columns (`TxDelete`, `StreamInstallDrop`) — the mirror
+//! of C's installing ones — so re-measure it rather than trusting it if another
+//! removal spelling is added. Neither 9 nor 2 is a constant.
 //!
 //! ## The discriminator the packed tests exist for
 //!
@@ -1089,12 +1101,23 @@ fn write_delete_recreate_over_a_concurrent_write_conflicts() {
 
 // ── Axis A × B5 (a concurrent transaction's `delete_table`) ─────────────────
 //
-// The column bugs 3 and 5 live in, and the only one that can calibrate them.
-// B's `CommittedWriteSet` here names `T` in `deleted_tables` **and nowhere
-// else** — `tables` is empty because `delete_table` never opens the table, and
+// The column bugs 3 and 5 live in — but **not** the only one that can
+// calibrate them, and this header said otherwise until 2026-08-06. Task 4's
+// `StreamInstallDrop` column is a second calibrator for both: measured,
+// mutation D reddens that column's packed test as well as this one's, and
+// mutation B reddens both. See the module-level calibration list, and
+// [`write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete`]
+// for the per-cell version of the same correction.
+//
+// What is still unique here is the *shape* of B's commit. Its
+// `CommittedWriteSet` names `T` in `deleted_tables` **and nowhere else** —
+// `tables` is empty because `delete_table` never opens the table, and
 // `installed_tables` is empty because an ordinary commit installs nothing. So
 // this is the one column where "B removed `T`" is the entire post-condition,
 // and `table_present` carries the assertion that row contents cannot.
+// `StreamInstallDrop` reaches the same `deleted_tables`-only shape for `T` by a
+// different route (a keep-set drop), which is why it calibrates the same two
+// bugs; it is not a *narrower* column, just a differently spelled one.
 
 /// Bug 3 (fixed in dbd56d4): a write-free `open_table` resurrected a table a
 /// concurrent `delete_table` removed — commit returned `Ok` and `T` came back
@@ -1154,6 +1177,14 @@ fn ddl_only_over_a_concurrent_delete_fails_loudly() {
 /// `WriteDeleteRecreate` still fails, which is the asymmetry. Packing is still
 /// right, because the property under test is the equality of the two, not either
 /// outcome alone.
+///
+/// **If this test is red, you do not have to swap anything to find out which
+/// cause it is.** Check whether [`delete_vs_concurrent_delete_commits`] and
+/// [`delete_vs_stream_install_drop_commits`] are also red. They are under a
+/// reversal of the 2026-08-06 ruling and are *not* under a bug-5 revert, so the
+/// failure list alone separates "the bug came back" (halves moved apart) from
+/// "the ruling changed" (halves moved together). Full mapping and both reverts:
+/// the `# Calibration` section in the module docs.
 #[test]
 fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
     check_cell(AState::WriteDeleteRecreate, BOp::TxDelete, Expect::Commits);
@@ -1404,6 +1435,14 @@ fn delete_vs_stream_install_drop_commits() {
 /// Both halves also assert, through [`a_whole_table`], that the write-free
 /// recreate does **not** bring `T` back: `b_leaves_table` is false here, so the
 /// pinned 2026-08-05 choice applies by the same Phase 2 `(None, _)` arm.
+///
+/// **If this test is red**, the same shortcut applies as for the `TxDelete`
+/// twin: check whether [`delete_vs_concurrent_delete_commits`] and
+/// [`delete_vs_stream_install_drop_commits`] are also red. Both red means the
+/// 2026-08-06 ruling was reversed (the halves moved *together*, equality intact,
+/// only the pinned value changed); both green means bug 5 came back (the halves
+/// moved *apart*). No line-swapping needed to tell them apart. Full mapping: the
+/// `# Calibration` section in the module docs.
 #[cfg(feature = "persistence")]
 #[test]
 fn write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop() {
@@ -1426,6 +1465,16 @@ fn write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop()
 // "The implementer must surface these rather than choose, and no such cell is
 // pinned until a ruling exists." Run them with `-- --ignored`; the doc comments
 // record what they do *today*, which is not the same as what they should do.
+//
+// **Reading a failure here.** CI and `make test/lifecycle-races` run this pass
+// (added 2026-08-06 — before that nothing did, and the "measured" values below
+// were executed nowhere). But a red `--ignored` pass does not mean the same
+// thing as a red main pass. These cells assert an *observation*, not a
+// requirement: nobody has ruled that the recorded outcome is correct. So a
+// failure here means "the behaviour of an unruled cell changed" — which is a
+// prompt to re-read the doc comment and decide whether the new behaviour is
+// better, and to update the recorded value if it is. It is not, on its own,
+// a regression. The live cells above are where a red result means a bug.
 //
 // **Three remain**, down from five. The delete-vs-delete pair —
 // `Delete × TxDelete` and `Delete × StreamInstallDrop` — left this section on

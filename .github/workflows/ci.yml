@@ -13,6 +13,10 @@ name: ci
 #     unresolved cells of tests/table_lifecycle_races.rs, whose recorded
 #     behaviour their doc comments cite — unrun, it silently rots. It is the
 #     only place anything here passes `--ignored`; see `make test/lifecycle-races`.
+#     Triaging a failure in THAT step differs from the others: those cells pin
+#     an observation nobody has ruled on, so red means "an unruled cell's
+#     behaviour changed" — re-read its doc comment and update the recorded
+#     value if the new behaviour is better. Red in any other step is a bug.
 # Deliberately NOT run here:
 #   * compare_benches (RocksDB/Fjall/ReDB) — opt-in competitor tier, keeps
 #     those deps out of CI by design (see `make bench/compare-engines`).
