@@ -8,7 +8,16 @@ name: ci
 #     no features keeps the in-memory-only default build green; the
 #     ultima-vector pass covers a workspace member that root `cargo test`
 #     does not reach. ultima-vector clippy is included alongside the root
-#     clippy pass since it currently passes clean with -D warnings.
+#     clippy pass since it currently passes clean with -D warnings. The
+#     `--ignored` pass exists because plain `cargo test` skips the three
+#     unresolved cells of tests/table_lifecycle_races.rs (six tests — each is
+#     observed under both isolation levels), whose recorded behaviour their
+#     doc comments cite — unrun, it silently rots. It is the only place
+#     anything here passes `--ignored`; see `make test/lifecycle-races`.
+#     Triaging a failure in THAT step differs from the others: those cells pin
+#     an observation nobody has ruled on, so red means "an unruled cell's
+#     behaviour changed" — re-read its doc comment and update the recorded
+#     value if the new behaviour is better. Red in any other step is a bug.
 # Deliberately NOT run here:
 #   * compare_benches (RocksDB/Fjall/ReDB) — opt-in competitor tier, keeps
 #     those deps out of CI by design (see `make bench/compare-engines`).
@@ -36,6 +45,8 @@ jobs:
         run: cargo clippy -p ultima-vector -- -D warnings
       - name: Tests (persistence, fulltext, metrics)
         run: cargo test --features persistence,fulltext,metrics
+      - name: Tests (table-lifecycle races, --ignored cells)
+        run: cargo test --features persistence,fulltext,metrics --test table_lifecycle_races -- --ignored
       - name: Tests (no features)
         run: cargo test --lib
       - name: Tests (ultima-vector, persistence)
