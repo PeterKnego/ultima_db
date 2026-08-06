@@ -395,9 +395,13 @@ are to notice:
    guard at all and rot silently. This task's own design and plan documents were
    among the casualties: both still cited the F2 rollback at `src/wal.rs:1199`
    after the implementation moved it to `:1223-1224`, and they are the first
-   thing a future contributor reads. Twenty cites across the two were re-checked
-   by hand and twelve corrected; both now carry a dated note saying they name the
-   *current* tree. The alternative idiom, when a document genuinely means
+   thing a future contributor reads. All **20** `src/*.rs` cites across the two
+   were re-checked by hand against the current source; **17 were stale and were
+   corrected, 3 were already right** — and those 3 are exactly the cites the line
+   shift could not have moved (`src/wal.rs:628`, above the first insertion, and
+   `src/store.rs:4438-4444` twice, in a file this branch never touched). Both docs
+   now carry a dated note saying they name the *current* tree. The alternative
+   idiom, when a document genuinely means
    historical code, is the corpus's frozen form — `<sha>^ src/wal.rs:1130-1136`
    — which `check-cites.py` resolves with `git show` and verifies like any other.
 2. **The checker verifies a range's token, not its extent.** Six ranges here had

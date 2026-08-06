@@ -8,7 +8,7 @@ exists only in the TLA model, and the entirely-untested fsync failure path.
 > **Cites re-anchored 2026-08-06 (task60).** Every `src/*.rs:LINE` below names
 > the **current** tree, not the tree this document was written against. The
 > implementation's own `#[cfg]`-gated insertions in `src/wal.rs` moved the
-> lines it cites — e.g. the F2 rollback moved from `:1199` to `:1223-1224` —
+> lines it cites — e.g. the F2 rollback moved from line 1199 to `:1223-1224` —
 > and nothing checks cites outside `formal/tla/wal/`, so these were verified
 > by hand against the source. See `docs/tasks/task60_wal_inflight_faults.md` §8.
 
