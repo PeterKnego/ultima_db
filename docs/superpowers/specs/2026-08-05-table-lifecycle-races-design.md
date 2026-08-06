@@ -150,7 +150,12 @@ pinned until a ruling exists.
 > kinds —
 >
 > - `A1` (`open_table` only) against **every** `B`. Its `len()` records a table
->   scan, and every column either deletes the table or writes a key in it.
+>   scan. Five of the six columns then abort it through `validate_read_set`'s
+>   *deleted-table* arm, which is unconditional and consulted first: the two
+>   removals put the table in `deleted_tables`, and so do the three bulk
+>   installs, since an install substitutes the whole table and is recorded as a
+>   removal plus an install. `B4` is the sixth and the only one that reaches
+>   `A1` through the *table-scan* arm instead, by writing a key in the table.
 > - `A5` and `A7` against the two *removing* columns, `B5` and `B6`. Both reopen
 >   and read; both were `Ok` under SI.
 >
@@ -163,6 +168,12 @@ pinned until a ruling exists.
 > SI cells and **no** Serializable cell, because every cell that can observe bug 3
 > is an `A1` cell and SSI aborts those before the defective code runs. The
 > Serializable pass adds cells to the other calibrations and is blind to that one.
+>
+> Bug 4 is masked partially by the same mechanism: reverting its fix reddens nine
+> Serializable cells, but only the three `A4` ones exhibit the silent `Ok`. The
+> other six are `A5`/`A7`, which SSI aborts on the read of the recreated table
+> before the missing write-set term can produce a wrong commit — red, but not
+> showing the data loss. See `docs/tasks/task59_table_lifecycle_races.md`.
 
 ## Scope
 

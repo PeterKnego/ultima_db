@@ -30,7 +30,10 @@
 //! on 2026-08-05, then the ruling of 2026-08-06 pinned it *and* its
 //! `TxDelete` twin against `src/store.rs:283-288`, retiring two questions.
 //!
-//! See `docs/superpowers/specs/2026-08-05-table-lifecycle-races-design.md`.
+//! `docs/tasks/task59_table_lifecycle_races.md` is the canonical record — why
+//! the suite exists, the root shape all five bugs share, the oracle's two
+//! mutation-found holes, and the calibration caveats. The design history is
+//! `docs/superpowers/specs/2026-08-05-table-lifecycle-races-design.md`.
 //!
 //! # Calibration — measured 2026-08-06
 //!
@@ -43,6 +46,14 @@
 //! cargo test --features persistence,fulltext --test table_lifecycle_races
 //! cargo test --features persistence,fulltext --test table_lifecycle_races -- --ignored
 //! ```
+//!
+//! **Restore with `git checkout`, or `touch src/store.rs` after restoring.**
+//! Cargo decides what to rebuild from mtime, so a restore that preserves the
+//! original timestamp — `cp -p`, or any copy from a backup taken before the
+//! mutation — leaves the *mutated* binary in place and the next run reports the
+//! mutation's failures against what looks like clean source. This has cost at
+//! least one reader a run. The failure mode is silent in the direction that
+//! matters: it makes a clean tree look broken, never the reverse.
 //!
 //! **The four cell lists below are the `SnapshotIsolation` pass**, unchanged by
 //! the Serializable pass — which added no textual change to any SI cell, so the
@@ -141,7 +152,7 @@
 //! |---|---|---|
 //! | A (bugs 1, 2) | 11 live + 1 ignored | **5** — `OpenDdl` against every column but `TxWrite` |
 //! | B (bug 3) | 3 live + 1 ignored | **0 — sees nothing** |
-//! | C (bug 4) | 9 live | **9** — the same three delete-flavoured states × three installing columns |
+//! | C (bug 4) | 9 live | **9** — the same three delete-flavoured states × three installing columns, but see below: only 3 fail *as bug 4* |
 //! | D (bug 5) | 2 live | **2** — `WriteDeleteRecreate` against each removing column |
 //! | ruling reversal | 4 live tests, 6 cells (2 masked) | **6** — all three delete-flavoured states × both removing columns, none masked |
 //!
@@ -155,6 +166,20 @@
 //! contribute nothing under SSI, and all five SSI cells it does redden are
 //! `OpenDdl`, which is checked before the read set and so still reaches the
 //! mutated predicate.
+//!
+//! **Mutation C makes the same point more finely, and a raw count of reds
+//! hides it.** Its nine Serializable cells are all red, but they are not all
+//! red *for bug 4's reason*. Bug 4 is a delete that fails to conflict with a
+//! concurrent install and silently drops the fresh data — its signature is
+//! `Ok(4)`. Only the three `Delete` cells show that. The other six —
+//! `DeleteRecreate` and `WriteDeleteRecreate` against the three installing
+//! columns — report `Err(SerializationFailure)`, because those two states read
+//! the table they recreated and SSI aborts them on the read before the missing
+//! write-set term can produce a wrong commit. They are red only because the
+//! *expected* value is `WriteConflict`, so they detect that something changed
+//! without exhibiting the data loss. SSI masks bug 4's symptom on two thirds of
+//! that column just as it masks bug 3's on all of its own — which is why "nine
+//! cells went red under both levels" would be the wrong summary.
 //!
 //! So **the Serializable pass is not a substitute for the SI pass**, and if the
 //! two ever have to be run separately it is the SI one that must survive. That
@@ -1799,6 +1824,28 @@ const ALL_A: &[AState] = &[
 /// `#[ignore]`d tests at the end of this section — and one of them, `OpenOnly x
 /// StreamInstallDrop`, is the tenth divergent cell, which is why this section's
 /// live tests pin only nine of the ten.
+///
+/// # This list is duplicated, and only half the duplication is checked
+///
+/// It restates the six `#[ignore]`d tests, and `#[ignore]` is an attribute — no
+/// test can enumerate it. So the two are tied by assertion in the direction
+/// that can be tied: **every `#[ignore]`d cell test asserts `unruled` is true
+/// of its own cell**, so clearing an entry here while leaving the tests in
+/// place turns the `--ignored` pass red and names the cell.
+///
+/// The other direction is not checkable and is a real gap: delete an
+/// `#[ignore]`d test without deleting the entry here and that cell is silently
+/// dropped from the Serializable columns while looking covered. **Ruling on a
+/// cell is therefore three edits, not two**, and they are safe in this order:
+///
+/// 1. pin the cell as a live `SnapshotIsolation` test above, with its citation;
+/// 2. delete both of its `#[ignore]`d tests;
+/// 3. remove it here — at which point the SSI column picks it up and
+///    [`ssi_expect`] must already give it the right value.
+///
+/// Do (3) before (2) and the assertion catches you. Do (2) without (3) and
+/// nothing does, which is the gap; the count in the section header above is the
+/// only backstop, so keep it current.
 fn unruled(a: AState, b: BOp) -> bool {
     match (a, b) {
         (AState::DeleteRecreateWrite, BOp::TxDelete) => true,
@@ -1862,6 +1909,31 @@ fn ssi_expect(a: AState, b: BOp) -> Expect {
         // Already conflicting on its write set in every column.
         AState::DeleteRecreateWrite => Expect::Conflicts,
     }
+}
+
+/// Runs an `#[ignore]`d observation cell, first asserting it is still listed in
+/// [`unruled`].
+///
+/// This is the half of the duplication that can be checked: if someone rules on
+/// a cell and removes it from [`unruled`] but leaves its observation tests
+/// standing, the `--ignored` pass goes red and names the cell instead of quietly
+/// asserting an outcome twice under two contradictory policies.
+///
+/// Only the three Serializable observations call it. The three
+/// `SnapshotIsolation` ones above are left **byte-identical** to what Tasks 1–4
+/// wrote, deliberately: two of them appear in mutation A's and B's calibration
+/// lists, and the value of those lists rests on the cells not having been
+/// touched since they were measured. One assertion per cell is enough to tie the
+/// lists together, and it costs nothing to put it on the new tests rather than
+/// the calibrated ones.
+fn check_unruled_cell(a: AState, b: BOp, iso: IsolationLevel, expect: Expect) {
+    assert!(
+        unruled(a, b),
+        "{a:?} x {b:?} is not in `unruled`, but is still carried as an \
+         `#[ignore]`d observation. Ruling on a cell means deleting its \
+         observation tests too — see the procedure on `unruled`."
+    );
+    check_cell_at(a, b, iso, expect);
 }
 
 /// Runs one whole column under `Serializable` and reports **every** failing
@@ -1956,7 +2028,7 @@ fn serializable_stream_install_drop_column() {
 #[test]
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn delete_recreate_write_vs_concurrent_delete_under_serializable_is_unruled() {
-    check_cell_at(
+    check_unruled_cell(
         AState::DeleteRecreateWrite,
         BOp::TxDelete,
         IsolationLevel::Serializable,
@@ -1984,7 +2056,7 @@ fn delete_recreate_write_vs_concurrent_delete_under_serializable_is_unruled() {
 #[test]
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn open_only_vs_stream_install_drop_under_serializable_is_unruled() {
-    check_cell_at(
+    check_unruled_cell(
         AState::OpenOnly,
         BOp::StreamInstallDrop,
         IsolationLevel::Serializable,
@@ -2002,7 +2074,7 @@ fn open_only_vs_stream_install_drop_under_serializable_is_unruled() {
 #[test]
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn delete_recreate_write_vs_stream_install_drop_under_serializable_is_unruled() {
-    check_cell_at(
+    check_unruled_cell(
         AState::DeleteRecreateWrite,
         BOp::StreamInstallDrop,
         IsolationLevel::Serializable,
