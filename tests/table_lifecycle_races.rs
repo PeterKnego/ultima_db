@@ -15,13 +15,106 @@
 //!
 //! The matrix is complete as of Task 4: 7 [`AState`]s × 6 [`BOp`]s = 42 cells,
 //! 39 of them live (two tests pack two cells each) and 3 carried `#[ignore]`d
-//! as questions awaiting a ruling. Run those with `-- --ignored`.
+//! as questions awaiting a ruling. Run those with `-- --ignored` — CI and
+//! `make test/lifecycle-races` both do, because a recorded behaviour nothing
+//! executes is a comment, not a test, and plain `cargo test` skips all three.
 //!
 //! The ignored count went 4 → 5 → 3: review un-pinned `Delete × StreamInstallDrop`
 //! on 2026-08-05, then the ruling of 2026-08-06 pinned it *and* its
 //! `TxDelete` twin against `src/store.rs:283-288`, retiring two questions.
 //!
 //! See `docs/superpowers/specs/2026-08-05-table-lifecycle-races-design.md`.
+//!
+//! # Calibration — measured 2026-08-06
+//!
+//! A matrix that passes against the buggy code proves nothing, so the gate on
+//! this suite is that reverting each fix turns named cells red. All five bugs
+//! were re-found. Reproduce with the mutations below applied one at a time to
+//! `src/store.rs`, each on its own against an otherwise clean tree:
+//!
+//! ```text
+//! cargo test --features persistence,fulltext --test table_lifecycle_races
+//! cargo test --features persistence,fulltext --test table_lifecycle_races -- --ignored
+//! ```
+//!
+//! **Mutation A — bugs 1 and 2** (`b990951`). In the `concurrent_flags`
+//! predicate (`WriteTx::commit`), drop `|| cws.deleted_tables.contains(n)`, so
+//! the flag is computed from `cws.tables` alone. **11 live cells + 1 ignored:**
+//!
+//! - `open_only_does_not_revert_a_bulk_{replace, delta, batch}` — bug 1's
+//!   named cell is the `replace` one; each reports `row 1: B installed …,
+//!   found "seed1"`, `commit=Ok(4)`.
+//! - `ddl_only_over_a_bulk_{replace, delta, batch}_fails_loudly` — bug 2's
+//!   named cell is the `replace` one; `expected IndexDdlConflict, got Ok(4)`.
+//! - `ddl_only_over_a_concurrent_delete_fails_loudly`,
+//!   `ddl_only_over_a_stream_install_drop_fails_loudly`,
+//!   `open_only_does_not_resurrect_a_concurrently_deleted_table`, and **both**
+//!   packed `write_delete_recreate_matches_delete_recreate_against_*` (first
+//!   line, as a resurrection: `still present as []`, not a `WriteConflict`).
+//! - Ignored: `open_only_vs_stream_install_drop_outcome_is_unruled`.
+//!
+//! The blast radius is wider than the bulk columns because the two *removal*
+//! columns (`TxDelete`, `StreamInstallDrop`) also record `T` only in
+//! `deleted_tables`. The predicate is what routes both families to the merge
+//! slow path, so all five extra cells are the same mechanism, not a second one.
+//!
+//! **Mutation B — bug 3** (`dbd56d4`). Weaken Phase 2's install guard from
+//! `(None, Some(digests)) if !digests.is_empty()` to `(None, Some(_))`.
+//! **3 live + 1 ignored:**
+//!
+//! - `open_only_does_not_resurrect_a_concurrently_deleted_table` — bug 3's
+//!   named cell. `T` comes back as `[(1, "seed1"), (2, "seed2")]` with
+//!   `commit=Ok(4)`.
+//! - both packed `write_delete_recreate_matches_delete_recreate_against_*`,
+//!   again as a resurrection (`still present as []`).
+//! - Ignored: `open_only_vs_stream_install_drop_outcome_is_unruled`.
+//!
+//! Restoring the arm to an unconditional `(None, _) => install` instead —
+//! the other spelling of the same revert — yields the identical cell list.
+//!
+//! **Mutation C — bug 4** (`dbd56d4`). Drop
+//! `|| cws.installed_tables.contains(deleted)` from `validate_write_set`'s
+//! second loop. **Exactly 9 live cells, 0 ignored** — the three
+//! delete-flavoured [`AState`]s (`Delete`, `DeleteRecreate`,
+//! `WriteDeleteRecreate`) against each of the three *installing* columns
+//! (`BulkReplace`, `BulkDelta`, `BulkBatch`), all `expected WriteConflict, got
+//! Ok(4)`. Bug 4's named cell is `delete_over_a_bulk_replace_conflicts`. Note
+//! `delete_recreate_write_over_a_bulk_*` stays **green** and the
+//! `StreamInstallDrop` column is untouched — see
+//! [`delete_recreate_write_over_a_bulk_replace_conflicts`] for why neither is a
+//! gap. The count tracks the number of installing columns; re-measure it if one
+//! is added.
+//!
+//! **Mutation D — bug 5** (`68cd794`). Drop the
+//! `if let Some(digests) = self.write_set.get_mut(name) { digests.clear(); }`
+//! block from `delete_table`. **Exactly 2 live cells, 0 ignored** — the two
+//! packed `write_delete_recreate_matches_delete_recreate_against_{a_concurrent_delete,
+//! a_stream_install_drop}`, and only their **first** line
+//! (`WriteDeleteRecreate`), `expected commit, got Err(WriteConflict { table:
+//! "t", … })`.
+//!
+//! ## The discriminator the packed tests exist for
+//!
+//! Both packed tests assert an *equality*, so what matters is not that they go
+//! red but **how**. Measured both ways, on both tests:
+//!
+//! - **Bug 5's revert (mutation D) moves the halves apart.** Swap the two
+//!   `check_cell` lines and re-run: `DeleteRecreate` now passes and
+//!   `WriteDeleteRecreate` still fails. That asymmetry — the outcome depending
+//!   on whether the transaction happened to write before deleting — *is* bug 5.
+//! - **Reversing the 2026-08-06 ruling at the mechanism level moves them
+//!   together.** Change `validate_write_set`'s second loop to
+//!   `cws.tables.contains_key(deleted) || cws.deleted_tables.contains(deleted)`
+//!   (i.e. make a removal conflict like an install, contradicting
+//!   `src/store.rs:283-288`) and both halves conflict: swapped, it is the
+//!   `DeleteRecreate` line that fails. The equality survives; only the pinned
+//!   value changes, `Commits` → `Conflicts`. That revert also turns
+//!   `delete_vs_{concurrent_delete, stream_install_drop}_commits` red, which
+//!   mutation D does not — a second, independent way to tell the two apart.
+//!
+//! So a red packed test means "the bug came back" only if the halves moved
+//! apart; if they moved together, the ruling changed and these are the cells
+//! that record it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1033,8 +1126,12 @@ fn ddl_only_over_a_concurrent_delete_fails_loudly() {
     check_cell(AState::OpenDdl, BOp::TxDelete, Expect::DdlConflicts);
 }
 
-/// Bug 5 (fixed in 68cd794), and **the only cell that can calibrate it** — the
-/// bulk columns cannot, see `write_delete_recreate_over_a_bulk_replace_conflicts`.
+/// Bug 5 (fixed in 68cd794), and **one of the only two cells that can
+/// calibrate it** — the bulk columns cannot, see
+/// `write_delete_recreate_over_a_bulk_replace_conflicts`. The other is the
+/// keep-set-drop twin, [`write_delete_recreate_matches_delete_recreate_against_a_stream_install_drop`],
+/// added in Task 4; this comment said "the only" before it existed. The
+/// 2026-08-06 calibration measured exactly those two and nothing else.
 ///
 /// The two halves are deliberately in one test, because bug 5 was not a wrong
 /// answer in isolation: it was the *difference* between them. `delete_table`

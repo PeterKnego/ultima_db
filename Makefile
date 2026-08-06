@@ -1,15 +1,24 @@
-.PHONY: build test test/unit test/integration lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
+.PHONY: build test test/unit test/integration test/lifecycle-races lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
 
 build:
 	cargo build
 
-test: lint test/unit test/integration
+test: lint test/unit test/integration test/lifecycle-races
 
 test/unit:
 	cargo test --lib
 
 test/integration:
 	cargo test --test store_integration
+
+# The table-lifecycle race matrix (tests/table_lifecycle_races.rs). Three of its
+# 42 cells are `#[ignore]`d as questions awaiting a ruling; their recorded
+# behaviour is what the doc comments cite, so it has to be *run* or it rots.
+# Nothing else passes `--ignored`, which is why this target exists separately
+# from `test/integration`.
+test/lifecycle-races:
+	cargo test --features persistence,fulltext,metrics --test table_lifecycle_races
+	cargo test --features persistence,fulltext,metrics --test table_lifecycle_races -- --ignored
 
 # Formal verification tier (opt-in): differential test of the Lean-verified
 # B-tree kernel port (formal/). Lean proofs: see formal/README.md.
