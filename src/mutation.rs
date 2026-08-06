@@ -15,6 +15,17 @@ pub(crate) enum Mutation {
     /// edited keys during the commit slow-path merge — a lost update below the
     /// isolation layer (the write-set validation still passes).
     DropMergeKey,
+    /// I/O fault: the next `write_all` in the WAL write path writes `n` bytes
+    /// and then returns `ENOSPC`. Models a disk filling mid-operation, which
+    /// leaves the file longer than the sink's in-memory `capacity`.
+    FailWriteAfter(u64),
+    /// I/O fault: the next `sync_all`/`sync_data` in the WAL write path returns
+    /// an error instead of succeeding.
+    FailSync,
+    /// I/O fault: the sink's positioned batch write is truncated at this byte
+    /// offset — a torn frame, produced while the sink still believes it wrote
+    /// the whole batch.
+    TearFrameAt(u64),
 }
 
 /// Pure mapping from the env-var value to a mutation (testable without env).
@@ -23,6 +34,17 @@ fn parse(v: Option<&str>) -> Option<Mutation> {
         Some("skip-readset-validation") => Some(Mutation::SkipReadSetValidation),
         Some("skip-writeset-validation") => Some(Mutation::SkipWriteSetValidation),
         Some("drop-merge-key") => Some(Mutation::DropMergeKey),
+        Some(s) if s.starts_with("fail-write-after=") => s["fail-write-after=".len()..]
+            .parse()
+            .ok()
+            .map(Mutation::FailWriteAfter)
+            .or_else(|| panic!("unknown ULTIMA_MUTATION value: {s}")),
+        Some("fail-sync") => Some(Mutation::FailSync),
+        Some(s) if s.starts_with("tear-frame-at=") => s["tear-frame-at=".len()..]
+            .parse()
+            .ok()
+            .map(Mutation::TearFrameAt)
+            .or_else(|| panic!("unknown ULTIMA_MUTATION value: {s}")),
         None | Some("") => None,
         Some(other) => panic!("unknown ULTIMA_MUTATION value: {other}"),
     }
@@ -57,5 +79,22 @@ mod tests {
     #[should_panic(expected = "unknown ULTIMA_MUTATION")]
     fn parse_panics_on_unknown() {
         let _ = parse(Some("bogus"));
+    }
+
+    #[test]
+    fn parses_the_io_fault_variants() {
+        assert_eq!(parse(Some("fail-write-after=0")), Some(Mutation::FailWriteAfter(0)));
+        assert_eq!(parse(Some("fail-write-after=65536")), Some(Mutation::FailWriteAfter(65536)));
+        assert_eq!(parse(Some("fail-sync")), Some(Mutation::FailSync));
+        assert_eq!(parse(Some("tear-frame-at=12")), Some(Mutation::TearFrameAt(12)));
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown ULTIMA_MUTATION")]
+    fn rejects_an_io_fault_with_no_payload() {
+        // `fail-write-after` without `=<n>` is a typo, not a default — an
+        // unparameterised fault would silently fail the *first* write and make
+        // every test using it pass for the wrong reason.
+        let _ = parse(Some("fail-write-after"));
     }
 }
