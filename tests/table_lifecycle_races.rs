@@ -1368,7 +1368,7 @@ fn write_delete_recreate_matches_delete_recreate_against_a_concurrent_delete() {
 /// `:283-288` already answers it.
 ///
 /// **`Serializable` is not the reason, contrary to the design spec** (`…
-/// races-design.md:119-121`, which listed this cell as one where "SSI's
+/// races-design.md:119-120`, which listed this cell as one where "SSI's
 /// `validate_read_set` aborts it"). It does not. `AState::Delete` calls only
 /// `delete_table`, which never reads, so there is no read-set entry for `T` and
 /// `validate_read_set`'s delete arm (`src/store.rs:4541`) cannot fire. Measured

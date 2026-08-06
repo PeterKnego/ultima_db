@@ -19,8 +19,11 @@ handling of *table*-level operations (`b990951`, `dbd56d4`, `68cd794`):
 3. A write-free `open_table` resurrected a concurrently deleted table.
 4. `delete_table` did not conflict with a concurrent install, dropping freshly
    loaded data — and a write-free delete-and-recreate silently lost the delete.
-5. `delete_table` left stale write-set digests, making (3)'s pinned semantic
-   conditional on whether the transaction happened to write before deleting.
+5. `delete_table` left stale write-set digests, making the *delete-and-recreate*
+   semantic — the one pinned by
+   `delete_then_reopen_without_writing_leaves_a_concurrently_deleted_table_absent`
+   (`src/store.rs:6281`) — conditional on whether the transaction happened to
+   write before deleting.
 
 **Four of the five were silent**: `commit()` returned `Ok`, no conflict, no
 error, data gone. And **all five were found by reading**, because nothing in the
@@ -102,7 +105,9 @@ No threads, no scheduler, no sleeps, no timing. The axes:
 
 **The determinism is not a stylistic preference, it is the main result.** This
 suite is **80/80 clean** across 20 consecutive runs × 2 feature sets × 2 passes.
-The repo's one threaded concurrency test,
+The repo has at least **eleven** threaded concurrency tests — nine in
+`tests/store_integration.rs` alone, two in `tests/persistence_integration.rs` —
+and one of them,
 `tests/store_integration.rs::concurrent_same_table_overlapping_keys_with_retry`,
 flakes roughly **1 in 5**. A sequential harness that reproduces the whole bug
 class is strictly better than a threaded one that reproduces it sometimes — and
@@ -115,8 +120,13 @@ behaviour would be a change-detector. Each cell asserts three things.
 
 **(i) The commit outcome**, derived from five stated rules rather than from
 observation — e.g. "if A contributed nothing to `T`, B's effect stands"; "if A
-deleted `T` and B *installed* `T`, conflict (B *deleting* `T` is not a conflict:
-both parties want it gone)".
+deleted `T` and B *installed* **or merely modified** `T`, conflict (B *deleting*
+`T` is not a conflict: both parties want it gone)". The "modified" half of rule 4
+is not decoration — the implementation is
+`cws.tables.contains_key(deleted) || cws.installed_tables.contains(deleted)`
+(`src/store.rs:4475`), and four live cells rest on the first term alone:
+`{delete, delete_recreate, delete_recreate_write,
+write_delete_recreate}_over_a_concurrent_write_conflicts`.
 
 **(ii) The umbrella property**, which is where the value is:
 
@@ -124,10 +134,41 @@ both parties want it gone)".
 > that returned `Ok` may be silently reverted.**
 
 Checked on **every** cell, conflicts included — a conflicting A must leave B's
-effect entirely intact. Rule (ii) alone would have caught all five bugs.
+effect entirely intact. It is the backstop that catches the majority of this bug
+class, but it is *not* a sufficient oracle on its own — see below.
 
 **(iii) Table existence**, where a specific ruling pinned it, each arm carrying
 the citation that decided it.
+
+### Rule (ii) is the backstop, not the whole oracle
+
+**Do not drop the expectation half as redundant.** Measured 2026-08-06 by
+disabling clause (i) (and clause (iii), so only the umbrella can fail a cell)
+and re-running each §5 mutation; a clean tree stays 43/43 green with rule (ii)
+alone armed:
+
+| mutation | cells red normally | cells red with **rule (ii) only** |
+|---|---|---|
+| A (bugs 1, 2) | 11 SI live | **11** — rule (ii) suffices |
+| B (bug 3) | 3 SI live | **3** — rule (ii) suffices |
+| C (bug 4) | 9 SI live | **6** |
+| D (bug 5) | 2 SI live | **0 — completely blind** |
+
+The three C misses are `delete_over_a_bulk_{replace,delta,batch}_conflicts`,
+which include **bug 4's own named cell**: for `Delete × Bulk*`, `effect_intact`
+takes `(true, None) => a_effect_intact(…)` and switches the entire check onto A,
+dropping every claim about B. A committed `Ok` and A's effect (the table is
+gone) *is* visible, so the umbrella is satisfied even though B's freshly
+installed rows silently vanished. And bug 5's symptom is a **spurious abort** —
+nothing that committed `Ok` was reverted, so rule (ii) has nothing to bite on by
+construction; only `Expect::Commits` catches it.
+
+So the expectation half is load-bearing for bugs 4 and 5, and is the *only*
+thing that catches bug 5. Weakening it in a future refactor retires bug 5's
+entire coverage. (The design spec asserts "rule (ii) alone would have caught all
+five bugs". That is refuted; it stands there as design history, and the standing
+correction lives in `effect_intact`'s doc comment,
+`tests/table_lifecycle_races.rs:834-837`.)
 
 ### The umbrella was twice found one-directional, and mutation is what found it
 
@@ -170,12 +211,28 @@ backup taken before the mutation — leaves the *mutated* binary in place and th
 next run reports the mutation's failures against what looks like clean source.
 This has cost at least one reader a run.
 
-### Two structural caveats on those counts
+### Structural caveats on those counts
 
 **The counts are not constants.** 9 tracks the number of *installing* columns
 (Replace, Delta, Batch); 2 tracks the number of *removing* columns (`TxDelete`,
 `StreamInstallDrop`). Add a column in either family and the count moves.
 Re-measure rather than trusting the number.
+
+**The counts also do not compose.** Every row above was measured with **one**
+mutation applied, and C and D interact: with bug 5's fix reverted as well, only
+**six** of bug 4's nine fire — the three `write_delete_recreate_over_a_bulk_*`
+go green (measured 2026-08-06: C alone = 9, C+D = 6). Mutation D stops
+`delete_table` clearing `write_set[T]`, so `WriteDeleteRecreate` keeps the
+digests from its pre-delete write; `validate_write_set`'s **first** loop then
+sees a non-empty write set against `T ∈ cws.deleted_tables` (an install
+populates `deleted_tables`) and re-raises the very conflict mutation C removed
+from the **second** loop. It is the same "second independent path to the same
+conflict" already documented for `DeleteRecreateWrite` at
+`tests/table_lifecycle_races.rs:1065-1076`. Benign — bug 4 is still caught by
+six cells including its named one — but **read a multi-revert failure list as a
+union with interactions, not as a sum.** Reverting more than one fix at a time
+is not hypothetical: a bad rebase dropping the three 2026-08-05 merges is
+precisely what this suite guards against.
 
 **Mutation A necessarily over-triggers, and that is not a gap.** It makes
 `has_concurrent` false, so Phase 2 takes its fast-path `continue` and never
@@ -185,14 +242,53 @@ no cell exists that could isolate bug 3 from A, and none needs to be added:
 **mutation B is what shows bug 3 has independent coverage.** A reader who sees
 only A's 11-cell list should not conclude otherwise.
 
+### All four mutations at once
+
+Run 2026-08-06, in a throwaway detached worktree, with every one of the four
+mutations above applied simultaneously — the state the suite was built to
+detect, and one nobody had run until the final review:
+
+```
+main pass:     21 passed; 22 failed;  6 ignored
+--ignored:      5 passed;  1 failed;  0 ignored
+```
+
+- **No harness panic, no hang, no compile break, no cascade.** Every failure is
+  an assertion in `cell_failure`, in the oracle's own message format, naming the
+  cell, the isolation level, the expected and actual outcome and the surviving
+  rows. The list decomposes cleanly by bug.
+- **Not a degenerate blanket failure.** 21 of 43 stayed green, including the
+  whole `TxWrite` column, which no mutation touches. The blast radius is bounded
+  and explicable.
+- **The `--ignored` pass reddens exactly the one predicted unruled cell**,
+  `open_only_vs_stream_install_drop_outcome_is_unruled`, on the umbrella clause,
+  with `commit=Ok(4)` and the pre-B rows resurrected. Unruled ≠ unasserted.
+- **Bug 5's discriminator still reads correctly under composition:** both
+  removing columns print `WriteDeleteRecreate` alone with `DeleteRecreate`
+  conspicuously absent — the "halves moved apart" signature, i.e. *the bug came
+  back*, not *the ruling changed*.
+- **"SSI masks bug 3" holds in composition too** — no `OpenOnly` cell appears in
+  any Serializable column failure list.
+- The 22 failures are 17 SI live tests + 5 Serializable column tests. **17, not
+  the 20 the union of the four lists predicts** — that is the C↔D interaction
+  above, not an under-firing suite.
+
 ## 6. The repo-wide finding: a stronger isolation level is not a superset
 
 Phase 2 of the work ran the same 42 cells under `IsolationLevel::Serializable`.
 Ten cells diverge, every one `Ok` under SI and `SerializationFailure` under SSI:
 `OpenOnly` against all six columns, and the two recreate states against the two
-removing columns. The mechanism is `validate_read_set`'s deleted-table arm
+removing columns.
+
+The mechanism for **nine of the ten** is `validate_read_set`'s deleted-table arm
 (`src/store.rs:4541`), which aborts unconditionally and is consulted before
-either key-comparing arm.
+either key-comparing arm: every column except `TxWrite` puts `T` in
+`deleted_tables` — the three bulk installs no less than the two removals, since
+an install replaces the table wholesale. The tenth, `OpenOnly × TxWrite`,
+reaches the same verdict through the **table-scan** arm
+(`src/store.rs:4547-4553`) instead. An ordinary row-write commit records `T` in
+`cws.tables` and leaves `deleted_tables` empty, so the `:4541` arm cannot fire;
+what aborts it is `OpenOnly`'s `len()` scan against the key B wrote.
 
 That much is unsurprising — SSI is strictly stronger, and an abort where SI
 commits is correct behaviour. **What is surprising, and what generalises:**
