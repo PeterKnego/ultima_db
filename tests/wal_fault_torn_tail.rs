@@ -21,8 +21,8 @@
 //! |---|---|---|
 //! | `Store::recover` for `CoalescedPrealloc` (`src/store.rs:1073-1078`) | `true` | `break` — clean end-of-log |
 //! | `Store::recover` for `PerEntry` / `Coalesced` (same lines) | `false` | `Err(WalCorrupted)`, propagated by `?` **before any entry is applied** |
-//! | `read_wal` / `prune_wal` (`src/wal.rs:730-732`) | `false` | same hard error |
-//! | `PreallocFileSink::open_with_chunk` (`src/wal.rs:1192`) | `true` | `break` |
+//! | `read_wal` (`src/wal.rs:730-732`), and `prune_wal` through it (`:744-745`) | `false` | same hard error |
+//! | `PreallocFileSink::open_with_chunk` (`src/wal.rs:1177-1192`) | `true` | `break` |
 //!
 //! A test that observes this tail through the wrong scanner asserts on the
 //! wrong error and pins the wrong behaviour, so the single test below is split
@@ -52,9 +52,26 @@
 //! second test in `wal_fault_fsync.rs` or `wal_fault_failed_extend.rs`: a
 //! co-resident test with a different value silently runs the *first* test's
 //! fault and still passes, because a wrong-fault `Err` is still an `Err`.
-//! `--test-threads=1` does not help — it is one process either way. Cargo gives
-//! one binary per `tests/*.rs`, so process isolation is free. **Do not add a
-//! test with a different `ULTIMA_MUTATION` value to this file.**
+//! `--test-threads=1` does not help *with that* — the `OnceLock` is
+//! per-process, and it is one process either way. Cargo gives one binary per
+//! `tests/*.rs`, so process isolation is free. **Do not add a test with a
+//! different `ULTIMA_MUTATION` value to this file.**
+//!
+//! ## …but this binary must still be run with `--test-threads=1`
+//!
+//! Two separate facts, and conflating them is how the `unsafe` below acquired a
+//! false justification once already: **one mutation value per binary** is what
+//! makes the fault *deterministic*, and no thread count substitutes for it;
+//! **`--test-threads=1`** is what makes the `unsafe { env::set_var }` below
+//! *sound*, and nothing else substitutes for that.
+//!
+//! This binary is not single-test: `mod common;` pulls in `src/test_scratch.rs`,
+//! whose `#[cfg(test)] mod tests` contributes two more `#[test]` fns. libtest
+//! runs them concurrently by default, and both `scratch_dir()`
+//! (`ULTIMA_ALLOW_TMPFS`, `src/test_scratch.rs:63`) and `Store::new`
+//! (`ULTIMA_OVERLAY_CAP`, `src/store.rs:563`) call `std::env::var*`. A getenv
+//! concurrent with a setenv is UB, so every gate invocation passes
+//! `--test-threads=1` — see `make test/wal-faults` and `.github/workflows/ci.yml`.
 //!
 //! ## Calibration — what this test can and cannot detect, measured 2026-08-06
 //!
@@ -67,7 +84,7 @@
 //!
 //! ```text
 //! cargo test --features persistence,fulltext,mutation-testing \
-//!            --test wal_fault_torn_tail -- --ignored
+//!            --test wal_fault_torn_tail -- --ignored --test-threads=1
 //! ```
 //!
 //! **Mutation S — the policy is fixed at tolerant.** In `scan_wal`'s CRC arm
@@ -273,7 +290,11 @@ fn crc_mismatch_offset(msg: &str) -> u64 {
 #[test]
 #[ignore = "unresolved: see the doc comment; do not pin until ruled on"]
 fn a_torn_tail_costs_a_strict_scan_its_durably_acked_commits() {
-    // SAFETY: single-threaded test binary; set before any store is built.
+    // SAFETY: this binary is run with `--test-threads=1` (see the module docs,
+    // `make test/wal-faults` and `.github/workflows/ci.yml`), so no other test
+    // is executing while the environment is mutated — which matters because
+    // `scratch_dir()` and `Store::new` both call `std::env::var*`. Set before
+    // any store, and therefore before any WAL thread, exists.
     unsafe { std::env::set_var("ULTIMA_MUTATION", format!("tear-frame-at={TEAR_AT}")) };
     // Real disk, not tmpfs: fsync is a no-op there, and "acknowledged durable"
     // is the entire premise of this test (see src/test_scratch.rs).
@@ -444,5 +465,10 @@ fn a_torn_tail_costs_a_strict_scan_its_durably_acked_commits() {
 
     // Hygiene only: `active()` has already memoised, so this does not
     // deactivate the fault for the rest of the process.
+    //
+    // SAFETY: as above — `--test-threads=1`, so no other test is running. The
+    // tolerant store above is still alive, but its WAL thread reads the
+    // environment only through `mutation::active()`, whose `OnceLock` was
+    // initialised long before this line.
     unsafe { std::env::remove_var("ULTIMA_MUTATION") };
 }

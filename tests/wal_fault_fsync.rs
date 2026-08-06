@@ -17,11 +17,33 @@
 //! different value would run under this one's fault while naming its own — and
 //! still pass, because a wrong-fault error is still an error. That is not
 //! hypothetical; see the module docs of `tests/wal_fault_failed_extend.rs` for
-//! the observed case. `--test-threads=1` does not help: it is one process
-//! either way. The only remedy is process isolation, so each mutation value
-//! gets its own `tests/*.rs` file (cargo gives one binary per file, no
-//! `[[test]]` stanza needed). **Do not add a test with a different
-//! `ULTIMA_MUTATION` value to this file.**
+//! the observed case. `--test-threads=1` does not help *with that*: the
+//! `OnceLock` is per-process, and it is one process either way. The only remedy
+//! is process isolation, so each mutation value gets its own `tests/*.rs` file
+//! (cargo gives one binary per file, no `[[test]]` stanza needed). **Do not add
+//! a test with a different `ULTIMA_MUTATION` value to this file.**
+//!
+//! ## …but this binary must still be run with `--test-threads=1`
+//!
+//! Two separate facts, and conflating them is how the `unsafe` below acquired a
+//! false justification once already: **one mutation value per binary** is what
+//! makes the fault *deterministic*, and no thread count substitutes for it;
+//! **`--test-threads=1`** is what makes the `unsafe { env::set_var }` below
+//! *sound*, and nothing else substitutes for that.
+//!
+//! This binary is not single-test: `mod common;` pulls in `src/test_scratch.rs`,
+//! whose `#[cfg(test)] mod tests` contributes two more `#[test]` fns. libtest
+//! runs them concurrently by default, and both `scratch_dir()`
+//! (`ULTIMA_ALLOW_TMPFS`, `src/test_scratch.rs:63`) and `Store::new`
+//! (`ULTIMA_OVERLAY_CAP`, `src/store.rs:563`) call `std::env::var*`. A getenv
+//! concurrent with a setenv is UB, so every gate invocation passes
+//! `--test-threads=1` — see `make test/wal-faults` and `.github/workflows/ci.yml`.
+//! Run it by hand the same way:
+//!
+//! ```text
+//! cargo test --features persistence,fulltext,mutation-testing \
+//!            --test wal_fault_fsync -- --test-threads=1
+//! ```
 //!
 //! Requires `--features mutation-testing`.
 #![cfg(feature = "mutation-testing")]
@@ -79,7 +101,11 @@ fn standalone_prealloc_config(dir: &Path) -> StoreConfig {
 /// data has actually reached the file at the moment durability is lost.
 #[test]
 fn a_failing_fsync_is_never_reported_as_a_durable_commit() {
-    // SAFETY: single-threaded test binary; set before the store is built.
+    // SAFETY: this binary is run with `--test-threads=1` (see the module docs,
+    // `make test/wal-faults` and `.github/workflows/ci.yml`), so no other test
+    // is executing while the environment is mutated — which matters because
+    // `scratch_dir()` and `Store::new` both call `std::env::var*`. Set before
+    // the store, and therefore before any WAL thread, exists.
     unsafe { std::env::set_var("ULTIMA_MUTATION", "fail-sync") };
     // Real disk, not tmpfs: fsync is a no-op there, which for *this* test in
     // particular would void the entire subject matter (see src/test_scratch.rs).
@@ -185,5 +211,10 @@ fn a_failing_fsync_is_never_reported_as_a_durable_commit() {
 
     // Hygiene only: `active()` has already memoised, so this does not
     // deactivate the fault for the rest of the process.
+    //
+    // SAFETY: as above — `--test-threads=1`, so no other test is running. The
+    // recovery store above is still alive, but its WAL thread reads the
+    // environment only through `mutation::active()`, whose `OnceLock` was
+    // initialised long before this line.
     unsafe { std::env::remove_var("ULTIMA_MUTATION") };
 }

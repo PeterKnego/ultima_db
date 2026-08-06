@@ -55,14 +55,28 @@ jobs:
         run: cargo test --features persistence,fulltext,metrics
       - name: Tests (table-lifecycle races, --ignored cells)
         run: cargo test --features persistence,fulltext,metrics --test table_lifecycle_races -- --ignored
+      # --test-threads=1 is required, not cosmetic: these binaries also host
+      # src/test_scratch.rs's #[test] fns, and the fault tests set ULTIMA_MUTATION
+      # with `unsafe { env::set_var }` while scratch_dir()/Store::new read the
+      # environment. Concurrent getenv/setenv is UB. (It does NOT substitute for
+      # one mutation value per binary — see tests/wal_fault_*.rs module docs.)
       - name: Tests (in-flight WAL faults)
         run: |
           cargo test --features persistence,fulltext,mutation-testing \
-            --test wal_fault_failed_extend --test wal_fault_fsync
+            --test wal_fault_failed_extend --test wal_fault_fsync \
+            --test wal_fault_torn_tail -- --test-threads=1
+      # A libtest filter matching zero tests exits 0, so `-- --ignored` alone
+      # would stay green if the F1 cell were deleted or de-ignored. No cargo or
+      # libtest flag requires a non-zero match, so assert it against the output.
       - name: Tests (in-flight WAL faults, --ignored F1 cell)
         run: |
+          set -o pipefail
           cargo test --features persistence,fulltext,mutation-testing \
-            --test wal_fault_torn_tail -- --ignored
+            --test wal_fault_torn_tail -- --ignored --test-threads=1 \
+            --exact a_torn_tail_costs_a_strict_scan_its_durably_acked_commits \
+            | tee /tmp/f1.log
+          grep -q '^test a_torn_tail_costs_a_strict_scan_its_durably_acked_commits \.\.\. ok$' /tmp/f1.log \
+            || { echo "ERROR: the --ignored F1 cell did not run and pass (a zero-match filter exits 0)."; exit 1; }
       - name: Tests (no features)
         run: cargo test --lib
       - name: Tests (ultima-vector, persistence)

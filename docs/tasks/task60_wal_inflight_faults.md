@@ -70,10 +70,14 @@ the same negative test. Measured against a 1 MiB `preallocate_to` —
 genuine partial extension); `=1048576` → `Ok`, full length. No iteration counter
 produces that table.
 
-The default build is unaffected. Exactly one line escapes the `#[cfg]` gate (the
-`to_write` binding, literally `&self.buf[..]` when the feature is off), and both
-commits were extracted into throwaway trees with separate target dirs and their
-test result lines diffed — identical.
+The default build is unaffected. Every injection block is `#[cfg]`-gated, and so
+is the `to_write` binding — in **both** directions (`src/wal.rs:1236` selects the
+mutation arm, `:1243` the `not(mutation-testing)` arm, which is literally
+`&self.buf[..]`). The one line that *escapes* the gate is the existing
+`write_all(to_write)` at `src/wal.rs:1245`, rewritten from `write_all(&self.buf)`
+— semantically identical off the feature: no allocation, no branch, no reborrow
+difference. Both commits were extracted into throwaway trees with separate target
+dirs and their test result lines diffed — identical.
 
 ### No counters — a deliberate constraint
 
@@ -104,11 +108,37 @@ failed-extend test observed `Err(Poisoned(..injected ENOSPC))` and a 0-byte WAL;
 run alone with `--exact` the same test observed `Ok(1)` and a 16 MiB WAL. Same
 code, opposite behaviour, both green.
 
-> **`--test-threads=1` is not the mechanism and does not help.** The falsifying
-> run above already had it. It is one *process* either way, and the `OnceLock`
-> is per-process. The plan originally claimed determinism came from "the
-> no-counters constraint plus `--test-threads=1`"; that half is wrong and was
-> amended (`f398ba2`).
+> **`--test-threads=1` is not the mechanism and does not help *with this*.** The
+> falsifying run above already had it. It is one *process* either way, and the
+> `OnceLock` is per-process. The plan originally claimed determinism came from
+> "the no-counters constraint plus `--test-threads=1`"; that half is wrong and
+> was amended (`f398ba2`).
+
+### …and yet every invocation passes `--test-threads=1`, for an unrelated reason
+
+The correction above was over-generalised into "thread count is irrelevant
+here", and it is not. **Two independent facts, and they must not be collapsed:**
+
+- **One mutation value per binary** is what makes the fault *deterministic*. No
+  thread count substitutes for it.
+- **`--test-threads=1`** is what makes each test's `unsafe { env::set_var }`
+  *sound*. Nothing else substitutes for that.
+
+None of the three binaries is single-test: each has `mod common;`, which
+`#[path]`-includes `src/test_scratch.rs`, whose `#[cfg(test)] mod tests` adds two
+more `#[test]` fns. libtest runs them concurrently by default, so `set_var`
+executes while other test threads are live — and both `scratch_dir()`
+(`ULTIMA_ALLOW_TMPFS`, `src/test_scratch.rs:63`) and `Store::new`
+(`ULTIMA_OVERLAY_CAP`, `src/store.rs:563`) call `std::env::var*`. Concurrent
+getenv/setenv is UB. There was no *live* race — neither co-resident test reaches
+either read — but the invariant the `SAFETY` notes claimed ("single-threaded
+test binary") was false, and the files' own advice (*"do not add a test with a
+**different** `ULTIMA_MUTATION` value"*, i.e. a same-value one is fine) steers
+straight into it: any added test calling `scratch_dir()` makes the race real.
+
+So `make test/wal-faults` and both CI steps pass `-- --test-threads=1`, and the
+`SAFETY` notes now name that as their justification instead of asserting
+something untrue. Keep the flag on any new invocation.
 
 The actual mechanism is **process isolation**, and cargo gives it for free: one
 binary per `tests/*.rs`, no `[[test]]` stanza needed. Hence three files rather
@@ -302,6 +332,33 @@ un-synced frame would pass silently here.
 - **MultiWriter.** All three tests run under the default `SingleWriter`. See the
   follow-up in §9 — this one is not just uncovered, it is *unreachable* by
   anything in the repository.
+- **The fsync path of every sink except `PreallocFileSink` — including the
+  `#[default]` one.** This is a *reduction from the design spec* and the most
+  consequential thing on this list, so it is spelled out rather than implied.
+  The spec's fault table put `FailSync` at three sites: `preallocate_to`'s
+  `sync_all`, and `WalSink::sync` for all three sinks (`src/wal.rs:1079`,
+  `:1128`, `:1204`). **Only the prealloc sink's got the injection**
+  (`src/wal.rs:1249-1254`, plus `preallocate_to`'s at `:658-664`).
+  `FileSink::sync` (`:1079-1083`, i.e. `WalWrite::PerEntry` — **the
+  `#[default]`**) and `BufferedFileSink::sync` (`:1128-1137`, i.e.
+  `WalWrite::Coalesced`) carry none. So `wal_fault_fsync.rs` exercises a failing
+  durability barrier for `CoalescedPrealloc` only, and the configuration most
+  users actually run has no fsync-fault test at all.
+
+  What limits the damage, and it is genuinely a limit rather than an excuse: the
+  store-side propagation machinery under test — the poison latch, the durability
+  waiter, non-promotion, the refusal of subsequent writes — is sink-independent,
+  reached through `WalSink::sync`'s `Result` and not through any sink's
+  internals. The sink-specific part that goes untested is the small matter of
+  *which* error each sink returns, and there `PerEntry` and `Coalesced` differ
+  from `CoalescedPrealloc` (`Error::Persistence` straight from the `map_err`, no
+  positioned-write bookkeeping). Adding the two injections is two `#[cfg]`
+  blocks; see the follow-up in §9.
+- **`FailWriteAfter` in the sinks' batch write.** The spec's table named that
+  surface too; the variant landed only in `preallocate_to`'s zero-fill
+  (`src/wal.rs:639-649`). `TearFrameAt` covers the batch-write surface instead,
+  which is a deliberate substitution (a torn frame is the interesting shape of a
+  partial batch write) and is why this one is a substitution rather than a gap.
 
 ## 8. Where it runs
 
@@ -331,11 +388,51 @@ have gated nothing on a PR. Two steps, split because the torn-tail cell needs
 ```yaml
 - name: Tests (in-flight WAL faults)
   run: cargo test --features persistence,fulltext,mutation-testing \
-         --test wal_fault_failed_extend --test wal_fault_fsync
+         --test wal_fault_failed_extend --test wal_fault_fsync \
+         --test wal_fault_torn_tail -- --test-threads=1
 - name: Tests (in-flight WAL faults, --ignored F1 cell)
-  run: cargo test --features persistence,fulltext,mutation-testing \
-         --test wal_fault_torn_tail -- --ignored
+  run: |                       # + an explicit non-zero-match assertion, see below
+    cargo test --features persistence,fulltext,mutation-testing \
+      --test wal_fault_torn_tail -- --ignored --test-threads=1 \
+      --exact a_torn_tail_costs_a_strict_scan_its_durably_acked_commits | tee /tmp/f1.log
+    grep -q '^test a_torn_tail_…_acked_commits \.\.\. ok$' /tmp/f1.log || exit 1
 ```
+
+`--test-threads=1` on both: see §3's second subsection — it is the `unsafe
+set_var` soundness condition, not the determinism mechanism.
+
+### The `--ignored` step had to be made non-vacuous by hand
+
+**A libtest filter matching zero tests exits 0.** Measured:
+
+```text
+$ cargo test … --test wal_fault_torn_tail -- --ignored a_torn_tail_costs_…
+running 0 tests
+test result: ok. 0 passed; 0 failed; … 3 filtered out
+EXIT=0
+```
+
+So the original two-step arrangement would have stayed green if F1 were deleted,
+renamed, or de-ignored — and the de-ignore case was the worse one, because F1 ran
+in **no** non-`--ignored` invocation anywhere, so removing `#[ignore]` deleted it
+from CI entirely. That is strictly weaker than the `table_lifecycle_races`
+precedent it was modelled on: that suite runs a plain pass *and* an `--ignored`
+pass, so de-ignoring a cell merely moves it between two live gates.
+
+Both halves are closed:
+
+1. **`--test wal_fault_torn_tail` was added to the first invocation.** F1 stays
+   gated if it is ever de-ignored. (Today it contributes only its two
+   scratch-dir guards there.)
+2. **The `--ignored` step asserts the match explicitly.** There is no flag for
+   it: cargo 1.96 has no `--no-tests` (`error: unexpected argument '--no-tests'`)
+   and libtest's `-- --help` lists nothing equivalent — `--exact` narrows a
+   filter but a zero-match `--exact` run still exits 0. So the step greps its own
+   output for `test <name> … ok` and fails otherwise. Verified in both
+   directions: renaming the cell turns the old command shape green (`EXIT=0`) and
+   the new one red; de-ignoring it turns the *first* invocation into F1's gate
+   and the second red, which is deliberate — landing the ruling means moving the
+   cell, and that should be a loud edit, not a silent one.
 
 `make lint` still lints only the default feature set. Clippy is clean under
 `persistence,fulltext`, `persistence,fulltext,metrics` and
@@ -435,7 +532,17 @@ are to notice:
   code** (after task47). The design spec flagged deciding whether that is *a
   pattern or an accumulation* as a plan-owner call, to be made before the code
   landed rather than after. It was not made. **Recorded as open; not ruled on
-  here.**
+  here** — it is a decision owed by the repo owner, not an implementer's backlog
+  item, and the final whole-branch review re-flagged it as the most substantive
+  open question on the branch.
+- **`FailSync` reaches only `PreallocFileSink`, so the `#[default]` sink's fsync
+  path is untested.** The spec named three `WalSink::sync` sites; one landed. See
+  §7 for the full statement and why the marginal loss is bounded. The work is two
+  `#[cfg]` blocks at `src/wal.rs:1079-1083` and `:1128-1137` plus a test file per
+  mutation value — but note that `FailSync` cannot be aimed, so a `PerEntry` test
+  would need the same pre-sizing trick `wal_fault_fsync.rs` uses, and the
+  expected error identity differs (`Error::Persistence`, not `Poisoned`, for the
+  non-prealloc sinks under some tiers — see the `ConsistentInline` minor below).
 
 **Deferred minors, carried rather than dropped:**
 
@@ -451,7 +558,22 @@ are to notice:
 - `wal_fault_torn_tail.rs` adopts `tests/table_lifecycle_races.rs`'s
   ignore-string but not its **registry guard** (`:1819-1933`), which is what
   stops an unruled cell being silently deleted. With one cell the guard is
-  arguably overkill; with a second it will not be.
+  arguably overkill; with a second it will not be. Partly mitigated by the
+  explicit non-zero-match assertion added to the gate (§8), which catches a
+  deleted or renamed cell — but that guard lives in the `Makefile` and
+  `ci.yml`, not beside the test, and the precedent's own doc admits even the
+  registry guard only ties one direction.
+
+The list above was carried in the plan's `.superpowers/` ledger, which is
+gitignored and evaporates at merge; the final whole-branch review made moving it
+here a condition. Four ledger-only items were named. Three were **fixed in the
+final round rather than deferred** — the false `SAFETY` note (§3), the vacuous
+`--ignored` gate (§8), and the `open_with_chunk` cite in
+`tests/wal_fault_torn_tail.rs:25`. The fourth was ruled **no action**: an earlier
+report claimed the known `tests/store_integration.rs` flake
+(`concurrent_same_table_overlapping_keys_with_retry`) "did not appear in any
+run", which overstated a claim about a report rather than about the code; the
+flake is real, pre-existing, and out of scope here.
 
 **Fixed here:** stale line cites in `tests/wal_fault_torn_tail.rs`
 (`src/wal.rs` `:678`→`677`, `:697-699`→`705-707`, `:601-610`→`602-611`;
@@ -460,6 +582,21 @@ rather than shifted; and a contradiction about which of the torn-tail
 preconditions is anti-vacuity load-bearing (`torn_len + 8 > TEAR_AT` is the
 **upper**-edge guard and goes red at `TEAR_AT >= 5502`; only `seed_frames_end >
 0` is weak by construction, and it is weak because it never checks a CRC).
+
+**Fixed in the final whole-branch fix round:** the false `SAFETY: single-threaded
+test binary` note on all three `unsafe { env::set_var }` blocks, closed by
+passing `--test-threads=1` everywhere rather than by re-wording the claim (§3);
+the vacuously-green `--ignored` CI/`make` step (§8); the `mutation-testing`
+feature described as Elle-only in `src/mutation.rs` and
+`docs/reference/cargo-features.md`; two cite imprecisions in
+`tests/wal_fault_torn_tail.rs` (`read_wal`/`prune_wal` conflated at
+`src/wal.rs:730-732` — `prune_wal` is `:744` and inherits strictness *through*
+`read_wal`; `open_with_chunk` cited at its body line `:1192` rather than its
+signature `:1177`); the payload of `wal_fault_failed_extend.rs` hoisted into a
+documented `const FAIL_WRITE_AFTER` to match its two siblings, and its trailing
+`remove_var` given the "hygiene only" note they carry; §2's inverted account of
+which line escapes the `#[cfg]` gate; and §7 gaining the fsync-injection scope
+reduction it had omitted.
 
 ## 10. Maintenance notes
 

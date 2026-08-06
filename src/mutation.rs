@@ -1,7 +1,19 @@
-//! Test-only fault injection for the Elle mutation-testing harness (task47).
+//! Test-only fault injection, with two consumers:
+//!
+//! * the Elle mutation-testing harness (task47) — the three isolation/merge
+//!   logic switches, which prove the consistency checks have teeth;
+//! * the in-flight WAL fault tests (task60, `tests/wal_fault_*.rs`) — the three
+//!   payload-carrying I/O faults, which make a failing syscall reachable from a
+//!   test.
+//!
 //! Compiled ONLY under the `mutation-testing` cargo feature and selected at
 //! runtime by the `ULTIMA_MUTATION` env var. Feature-on + var-unset = no
 //! mutation, so a mutation-testing build with the var unset behaves normally.
+//!
+//! `active()` memoises in a `OnceLock`, so **one mutation value per process**:
+//! a test binary can arm exactly one fault, and a second `set_var` in the same
+//! process is silently ignored. See `docs/tasks/task60_wal_inflight_faults.md`
+//! §3 before adding a fault or a test.
 
 use std::sync::OnceLock;
 

@@ -38,15 +38,40 @@ test/lifecycle-races:
 # Two invocations, not one: each file pins a different ULTIMA_MUTATION, and
 # `crate::mutation::active()` memoises in a OnceLock, so two mutation values in
 # one *process* silently collapse to whichever was read first. Cargo gives one
-# process per tests/*.rs, which is the isolation (`--test-threads=1` does not
-# help — it is one process either way). The second line is the torn-tail cell
-# (F1), `#[ignore]`d as a question awaiting a ruling; like the lifecycle-race
-# cells it records a measurement its doc comment cites, so it has to be *run*.
+# process per tests/*.rs, which is the isolation. `--test-threads=1` is NOT that
+# mechanism and does not help with it — but it is passed to every invocation
+# anyway, for an unrelated and equally load-bearing reason: each binary also
+# hosts src/test_scratch.rs's two #[test] fns, and the fault tests call
+# `unsafe { env::set_var }` while `scratch_dir()`/`Store::new` call env::var*.
+# Concurrent getenv/setenv is UB; one test thread is what makes those `unsafe`
+# blocks sound. Keep the flag on both lines.
+#
+# All three binaries run in the first invocation. The torn-tail cell (F1) is
+# `#[ignore]`d as a question awaiting a ruling, so the first line only runs its
+# scratch-dir guards today — but if the #[ignore] is ever removed, F1 stays
+# gated instead of silently dropping out of CI.
+#
+# The second line is F1 itself, and it is guarded: a libtest filter matching
+# ZERO tests exits 0, so `-- --ignored` alone would go green if the cell were
+# deleted or de-ignored. cargo/libtest have no "require a non-zero match" flag
+# (no --no-tests on cargo 1.96, nothing equivalent in libtest -- --help), so the
+# match is asserted explicitly against the output. Deleting or renaming the cell
+# now fails loudly; so does de-ignoring it, which is deliberate — landing the
+# ruling means moving this cell, and that should not be a silent edit.
 test/wal-faults:
 	cargo test --features persistence,fulltext,mutation-testing \
-		--test wal_fault_failed_extend --test wal_fault_fsync
-	cargo test --features persistence,fulltext,mutation-testing \
-		--test wal_fault_torn_tail -- --ignored
+		--test wal_fault_failed_extend --test wal_fault_fsync \
+		--test wal_fault_torn_tail -- --test-threads=1
+	@out=$$(cargo test --features persistence,fulltext,mutation-testing \
+		--test wal_fault_torn_tail -- --ignored --test-threads=1 \
+		--exact a_torn_tail_costs_a_strict_scan_its_durably_acked_commits 2>&1); \
+	printf '%s\n' "$$out"; \
+	printf '%s\n' "$$out" | grep -q \
+		'^test a_torn_tail_costs_a_strict_scan_its_durably_acked_commits \.\.\. ok$$' || { \
+		echo "ERROR: the --ignored F1 cell did not run and pass. A libtest filter"; \
+		echo "       matching zero tests exits 0, so this is checked explicitly."; \
+		echo "       If F1 was deliberately de-ignored or renamed, update this target."; \
+		exit 1; }
 
 # Formal verification tier (opt-in): differential test of the Lean-verified
 # B-tree kernel port (formal/). Lean proofs: see formal/README.md.
