@@ -272,23 +272,30 @@ fn a_failed_extend_does_not_leave_the_file_longer_than_capacity() {
     assert!(res.is_err(), "an injected ENOSPC must surface, got {res:?}");
     drop(store);
 
-    // The invariant: the file on disk is no longer than the last size that was
-    // sync_all'd. Without the rollback it is longer by the partial zero-fill.
+    // The invariant: the file on disk is exactly the last size that was
+    // sync_all'd. A fresh prealloc WAL opens with `capacity = 0`, so a failed
+    // FIRST extend must roll back to 0. Without the rollback the file is
+    // 65536 bytes — the partial zero-fill that ENOSPC interrupted.
     let wal = dir.path().join("wal.bin");
     let len = std::fs::metadata(&wal).unwrap().len();
     assert_eq!(
-        len % 4096,
-        0,
-        "wal.bin is {len} bytes — not a whole number of chunks, so a partial \
-         extension survived the failed preallocate_to"
+        len, 0,
+        "wal.bin is {len} bytes; a failed first extend must leave it at the \
+         capacity that was last sync_all'd (0), not at the partial zero-fill"
     );
 
     unsafe { std::env::remove_var("ULTIMA_MUTATION") };
 }
 ```
 
-Confirm the chunk size against `PreallocFileSink`'s `chunk` field before relying
-on 4096 — read it rather than assuming.
+**Do not assert `len % chunk == 0`.** `WAL_PREALLOC_CHUNK` is **16 MiB**
+(`src/wal.rs:1133`), and the partial zero-fill leaves 65536 bytes — which *is* a
+multiple of 4096, so a modulo assertion passes with and without the rollback and
+the acceptance gate becomes vacuous. Assert the exact expected length.
+
+Verify `WAL_PREALLOC_CHUNK` yourself before relying on any of this; if it has
+changed, the 65536 figure moves with `FailWriteAfter`'s payload, not with the
+chunk.
 
 - [ ] **Step 2: Run to verify it passes with the fix present**
 
