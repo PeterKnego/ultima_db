@@ -75,11 +75,23 @@
 //! **Mutations A and B share three cells, and that overlap is structural — not
 //! a gap in the matrix.** Mutation A makes `has_concurrent` false, so Phase 2
 //! takes the fast-path `continue` at `src/store.rs:4053-4058` and never reaches
-//! the arm bug 3 lives in at `:4065-4087`. Any cell capable of detecting bug 3
-//! must therefore also fail under A: A removes the only route to the code B
-//! mutates. So no cell exists that would isolate bug 3 from A, and none needs
-//! to be added — **mutation B is what shows bug 3 has independent coverage**,
-//! and a reader who sees only A's 11-cell list should not conclude otherwise.
+//! the two `None` arms at `:4082-4110`, where bug 3 lives. Any cell capable of
+//! detecting bug 3 must therefore also fail under A: A removes the only route to
+//! the code B mutates. So no cell exists that would isolate bug 3 from A, and
+//! none needs to be added — **mutation B is what shows bug 3 has independent
+//! coverage**, and a reader who sees only A's 11-cell list should not conclude
+//! otherwise.
+//!
+//! The two `None` arms are cited as a **pair** deliberately, so please do not
+//! narrow this to one of them. Bug 3's fix *is* the split between them —
+//! `(None, Some(digests)) if !digests.is_empty()` at `:4082-4087` installing
+//! wholesale, and `(None, _)` at `:4088-4110` skipping — and mutation B's
+//! second spelling ("restore to an unconditional `(None, _)`") collapses the
+//! pair back into one arm. Citing only `:4088-4110` would name where the bug
+//! lived without showing what its guard distinguishes it *from*, which is the
+//! whole content of the fix. (`:4065-4087` appeared here between 2026-08-06 and
+//! this correction; it spanned the `match` header and two unrelated `Some` arms
+//! and stopped one line short of `(None, _)`.)
 //!
 //! **Mutation C — bug 4** (`dbd56d4`). Drop
 //! `|| cws.installed_tables.contains(deleted)` from `validate_write_set`'s
