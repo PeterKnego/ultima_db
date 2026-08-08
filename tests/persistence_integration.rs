@@ -2261,3 +2261,76 @@ fn a_delta_chain_carries_updates_and_deletes() {
     assert_eq!(t.get(3).unwrap().name, "carol");
     assert_eq!(t.get(4).unwrap().name, "dave");
 }
+
+#[test]
+fn an_unresolvable_chain_does_not_fail_the_checkpoint() {
+    let dir = common::test_scratch::scratch_dir();
+    // Default config: the setting that never opted into deltas at all.
+    let store = open_store(standalone_config(dir.path(), Durability::Consistent));
+    insert_user(&store, "alice");
+    store.checkpoint().unwrap();
+
+    // A foreign file that outranks the head, so chain resolution fails. By the
+    // time that matters the new checkpoint is durable and the WAL is pruned —
+    // the irreversible work has succeeded, and only the opportunistic cleanup
+    // is left. Failing here would report failure for a checkpoint that in fact
+    // happened.
+    std::fs::write(
+        dir.path().join("checkpoint_999.bin"),
+        b"this is not a checkpoint",
+    )
+    .unwrap();
+
+    insert_user(&store, "bob");
+    let v = store.checkpoint().unwrap();
+    assert_eq!(v, 2);
+
+    // Cleanup was skipped rather than guessed at: nothing was deleted.
+    let files = checkpoint_files(dir.path());
+    assert!(
+        files.contains(&"checkpoint_1.bin".to_string()),
+        "cleanup should have been skipped, not run blind: {files:?}"
+    );
+    assert!(files.contains(&"checkpoint_2.bin".to_string()), "{files:?}");
+}
+
+/// SMR is checkpoint-only — no WAL, no prune — so the checkpoint chain carries
+/// the entire durability burden there. Same code path as Standalone, which is
+/// exactly why it is worth asserting rather than assuming.
+#[test]
+fn smr_delta_chain_recovers_every_row() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = StoreConfig::builder()
+        .persistence(Persistence::smr(dir.path().to_path_buf()))
+        .checkpoint_chain_max(4)
+        .build();
+    {
+        let store = open_store(config.clone());
+        for i in 0..6 {
+            insert_user(&store, &format!("u{i}"));
+            store.checkpoint().unwrap();
+        }
+        // A delete inside a delta interval too — the chain has to carry
+        // removals, not just new rows.
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users").unwrap().delete(3).unwrap();
+        wtx.commit().unwrap();
+        store.checkpoint().unwrap();
+
+        assert!(
+            checkpoint_files(dir.path()).len() > 1,
+            "chain_max(4) should have left deltas on disk: {:?}",
+            checkpoint_files(dir.path())
+        );
+    }
+
+    let store2 = open_store(config);
+    assert_eq!(store2.latest_version(), 7);
+    let rtx = store2.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.len(), 5);
+    assert!(t.get(3).is_none(), "deleted row came back through the chain");
+    for id in [1u64, 2, 4, 5, 6] {
+        assert_eq!(t.get(id).unwrap().name, format!("u{}", id - 1));
+    }
+}

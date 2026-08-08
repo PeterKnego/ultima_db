@@ -1067,30 +1067,47 @@ impl Store {
 
         // Resolve the chain from the directory rather than from the in-memory
         // counter: this is the state a crash cannot desynchronise, and it is
-        // what cleanup below must be driven by. A chain that will not resolve
-        // also drops the retained base, so the next checkpoint starts a fresh
-        // full instead of extending something unverifiable.
+        // what cleanup below must be driven by. Resolved unconditionally, not
+        // just when `checkpoint_chain_max > 1` — the knob governs what this
+        // call *writes*, while the head on disk may be a delta with real
+        // ancestors written before the knob was lowered.
+        //
+        // A failure here is not a failed checkpoint. The file is already
+        // durable and the WAL prune below is the irreversible step; cleanup is
+        // opportunistic disk reclamation. Deleting nothing is always safe,
+        // whereas returning an error would report failure for work that
+        // succeeded and send a retrying operator into a checkpoint loop. So:
+        // warn, skip cleanup, and drop the retained base so the next
+        // checkpoint starts a fresh full rather than extending a chain this
+        // one could not verify.
         let chain = match crate::checkpoint::find_head_chain(&dir) {
-            Ok(chain) => chain,
+            Ok(chain) => Some(chain),
             Err(e) => {
-                let mut inner = self.inner.write();
-                inner.checkpoint_base = None;
-                inner.checkpoint_chain_len = 0;
-                return Err(e);
+                eprintln!(
+                    "ultima_db: cannot resolve the checkpoint chain in {} ({e}); \
+                     checkpoint {version} is written and durable, but no old \
+                     checkpoint was deleted — inspect the directory by hand",
+                    dir.display()
+                );
+                None
             }
         };
         {
             let mut inner = self.inner.write();
-            if inner.config.checkpoint_chain_max > 1 {
-                inner.checkpoint_base = Some(Arc::clone(&snap));
-                inner.checkpoint_chain_len = chain.len();
-            } else {
-                // Retaining a base a delta can never use would keep this
-                // snapshot's unshared nodes alive for nothing: at the default
-                // the memory profile stays exactly what it was before
-                // incremental checkpoints existed.
-                inner.checkpoint_base = None;
-                inner.checkpoint_chain_len = 0;
+            match &chain {
+                Some(chain) if inner.config.checkpoint_chain_max > 1 => {
+                    inner.checkpoint_base = Some(Arc::clone(&snap));
+                    inner.checkpoint_chain_len = chain.len();
+                }
+                // Either the chain is unverifiable, or a delta could never use
+                // the base anyway. Retaining one would keep this snapshot's
+                // unshared nodes alive for nothing: at the default the memory
+                // profile stays exactly what it was before incremental
+                // checkpoints existed.
+                _ => {
+                    inner.checkpoint_base = None;
+                    inner.checkpoint_chain_len = 0;
+                }
             }
         }
 
@@ -1122,8 +1139,12 @@ impl Store {
 
         // Clean up old checkpoints (never deletes newer ones, never deletes an
         // ancestor of the head — the file just written may be a delta that is
-        // nothing without them).
-        crate::checkpoint::cleanup_old_checkpoints(&dir, version, &chain)?;
+        // nothing without them). Skipped entirely when the chain would not
+        // resolve: without it there is no way to tell an obsolete file from a
+        // load-bearing one.
+        if let Some(chain) = &chain {
+            crate::checkpoint::cleanup_old_checkpoints(&dir, version, chain)?;
+        }
 
         Ok(version)
     }
