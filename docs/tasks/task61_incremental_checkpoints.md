@@ -83,7 +83,7 @@ for each table:
 version/kind bytes, so a full checkpoint is a self-contained chain of length
 one by construction — nothing about reading one changed.
 
-**The four `TableEntryKind` values** (`src/checkpoint.rs:70-81`), one per
+**The four `TableEntryKind` values** (`src/checkpoint.rs:72-81`), one per
 table per checkpoint file:
 
 - **`Unchanged`** — byte-identical to the base version; no payload at all.
@@ -122,7 +122,7 @@ exists to avoid (see §5).
 `find_head_chain` (`src/checkpoint.rs:682`) resolves the directory's newest
 checkpoint file backward to its nearest `Full` ancestor by following each
 delta's `base_version` back-pointer, reading only each file's small fixed
-header (`HEADER_PREFIX_LEN`, `src/checkpoint.rs:519`) — a chain walk costs
+header (`HEADER_PREFIX_LEN`, `src/checkpoint.rs:526`) — a chain walk costs
 `O(chain length)` in bytes read, not `O(sum of every file's full size)`, even
 though a chain can have arbitrarily many full-table-sized deltas behind the
 head. Each hop is pinned to the filename it was reached by (`expected_version`
@@ -131,7 +131,7 @@ detectable rather than an infinite loop — two files can each individually
 satisfy "my base is older than me" while still pointing at each other, so
 that check alone does not bound the walk.
 
-`load_chain` (`src/checkpoint.rs:868`) then applies the resolved chain
+`load_chain` (`src/checkpoint.rs:875`) then applies the resolved chain
 base-first: load the full, then replay each delta's `Put`/`Del`/`next_id` in
 version order, honoring `Unchanged`/`Full`/`Dropped` table entries as it goes.
 
@@ -296,7 +296,7 @@ what a full write already pays).
 Produced by:
 
 ```bash
-cd bench-infra && make bench-oneshot TARGET=autobench
+cd bench-infra && make bench-oneshot TARGET=checkpoint-delta
 make status     # confirm nothing is left running afterward
 ```
 

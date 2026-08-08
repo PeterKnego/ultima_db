@@ -35,11 +35,12 @@
 //! perf conclusion, record any timing, or compute any ratio from that run.**
 //!
 //! On the bench-infra NVMe host — the only place a number from this bench is
-//! trustworthy — this rides the existing `autobench` target (real, billable
-//! AWS resources; requires explicit authorization before provisioning):
+//! trustworthy — this rides the dedicated `checkpoint-delta` target (real,
+//! billable AWS resources; requires explicit authorization before
+//! provisioning):
 //!
 //! ```text
-//! cd bench-infra && make bench-oneshot TARGET=autobench
+//! cd bench-infra && make bench-oneshot TARGET=checkpoint-delta
 //! make status   # confirm nothing is left running
 //! ```
 //!

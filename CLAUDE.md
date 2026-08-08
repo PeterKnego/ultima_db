@@ -32,9 +32,10 @@ make up                         # provision + configure (cold build: several min
 make bench/competitor           # UltimaDB vs RocksDB/Fjall/ReDB, both durability tiers
 make bench/wal-ab               # ultima-only WAL/durability A/B sweep
 make bench/autobench            # autobench Gate-A microbenches + baseline record
+make bench/checkpoint-delta     # incremental-checkpoint crossover + recovery-vs-chain-length
 make status                     # list host + uptime (cost guard)
 make destroy                    # tear everything down
-make bench-oneshot TARGET=competitor|wal-ab|autobench   # up -> bench -> destroy
+make bench-oneshot TARGET=competitor|wal-ab|autobench|checkpoint-delta   # up -> bench -> destroy
 ```
 
 **Guardrails — read before touching `make up`/`bench-oneshot`:**

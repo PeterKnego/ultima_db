@@ -52,6 +52,7 @@ Persistent: `make up` once, `make bench/*` repeatedly, `make ssh` to poke,
 | `competitor` | `make bench/ycsb/compare` | UltimaDB vs RocksDB/Fjall/ReDB, both durability tiers. Reproduces `docs/benchmarks/competitor-nvme-2026-06-26.md`. |
 | `wal-ab` | `make bench/wal-ab` | ultima-only: nondurable vs consistent vs inline vs standalone_fast. |
 | `autobench` | `make perf/baseline` | Gate-A microbenches (smr-apply + mw-commit). **Gate B is NOT run** — it needs `ultima_cluster` and is a local-only step. |
+| `checkpoint-delta` | `cargo bench --bench checkpoint_delta --features persistence` | Incremental-checkpoint crossover (dirty % vs `checkpoint_chain_max`) + recovery-vs-chain-length. See `docs/tasks/task61_incremental_checkpoints.md`. |
 
 ## Notes
 
