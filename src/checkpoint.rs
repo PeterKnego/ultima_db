@@ -423,6 +423,14 @@ fn checkpoint_filename(version: u64) -> String {
     format!("checkpoint_{version}.bin")
 }
 
+/// The path [`write_checkpoint`]/[`write_delta_checkpoint`] give version
+/// `version`. Callers use it to check that a resolved chain head really is the
+/// file they just wrote — the filename is the trusted half of the pairing that
+/// [`walk_chain_from`] pins headers against.
+pub(crate) fn checkpoint_path(dir: &Path, version: u64) -> PathBuf {
+    dir.join(checkpoint_filename(version))
+}
+
 /// Find the latest checkpoint file in a directory.
 pub(crate) fn find_latest_checkpoint(dir: &Path) -> Result<Option<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
@@ -902,14 +910,15 @@ pub(crate) fn checkpoint_file_exists(dir: &Path, version: u64) -> bool {
 ///   standing between an incremental checkpoint and an unrecoverable database.
 ///
 /// Unparseable `checkpoint_*.bin` names are left alone.
-pub(crate) fn cleanup_old_checkpoints(
-    dir: &Path,
-    keep_version: u64,
-    chain: &[PathBuf],
-) -> Result<()> {
+///
+/// Infallible by construction, and deliberately so: by the time this runs the
+/// checkpoint file is durable and the WAL prune has happened, so there is no
+/// failure here worth turning a checkpoint that succeeded into one that
+/// reports failure. Every I/O problem is warned about and skipped.
+pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64, chain: &[PathBuf]) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Ok(()),
+        Err(_) => return,
     };
 
     // Match on file name, not full path: `chain`'s entries and `read_dir`'s
@@ -919,7 +928,22 @@ pub(crate) fn cleanup_old_checkpoints(
         chain.iter().filter_map(|p| p.file_name()).collect();
 
     for entry in entries {
-        let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
+        // One unreadable directory entry says nothing about the others, and
+        // cleanup is opportunistic: reclaiming the files we *can* see beats
+        // failing a checkpoint that is already durable. Same reason the
+        // unreadable-directory case above returns `Ok(())` rather than an
+        // error.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "ultima_db: skipping an unreadable entry in {} ({e}); \
+                     old checkpoints there were left in place",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
         if protected.contains(name.as_os_str()) {
             continue;
@@ -934,8 +958,6 @@ pub(crate) fn cleanup_old_checkpoints(
             let _ = std::fs::remove_file(entry.path());
         }
     }
-
-    Ok(())
 }
 
 /// Test-only: is the checkpoint file at `path` a full one (rather than a
@@ -1110,7 +1132,7 @@ mod tests {
         write_checkpoint(dir.path(), &snap10, &reg).unwrap();
         write_checkpoint(dir.path(), &snapshot, &reg).unwrap(); // version 42
 
-        cleanup_old_checkpoints(dir.path(), 42, &[]).unwrap();
+        cleanup_old_checkpoints(dir.path(), 42, &[]);
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1136,7 +1158,7 @@ mod tests {
             write_checkpoint(dir.path(), &snap, &reg).unwrap();
         }
 
-        cleanup_old_checkpoints(dir.path(), 10, &[]).unwrap();
+        cleanup_old_checkpoints(dir.path(), 10, &[]);
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1184,7 +1206,7 @@ mod tests {
         let chain = find_head_chain(dir.path()).unwrap();
         assert_eq!(chain.len(), 3, "chain should be full@5 + two deltas");
 
-        cleanup_old_checkpoints(dir.path(), 7, &chain).unwrap();
+        cleanup_old_checkpoints(dir.path(), 7, &chain);
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1396,7 +1418,7 @@ mod tests {
     #[test]
     fn cleanup_old_checkpoints_nonexistent_dir() {
         // Should not error on missing directory
-        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1, &[]).unwrap();
+        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1, &[]);
     }
 
     #[test]

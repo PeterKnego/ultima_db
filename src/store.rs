@@ -1072,16 +1072,35 @@ impl Store {
         // call *writes*, while the head on disk may be a delta with real
         // ancestors written before the knob was lowered.
         //
-        // A failure here is not a failed checkpoint. The file is already
-        // durable and the WAL prune below is the irreversible step; cleanup is
-        // opportunistic disk reclamation. Deleting nothing is always safe,
-        // whereas returning an error would report failure for work that
-        // succeeded and send a retrying operator into a checkpoint loop. So:
-        // warn, skip cleanup, and drop the retained base so the next
-        // checkpoint starts a fresh full rather than extending a chain this
-        // one could not verify.
+        // `find_head_chain` answers for the highest-versioned file in the
+        // directory, which is *not* necessarily the file just written — a
+        // stray `checkpoint_999.bin` outranks it. Everything below (pruning
+        // behind a delta, deleting old files) is only sound for the chain that
+        // ends at our own file, so the head is checked against it rather than
+        // assumed. A chain we cannot vouch for is treated exactly like one
+        // that failed to resolve.
+        //
+        // Neither case is a failed checkpoint: the file is written and
+        // durable, and returning an error would report failure for work that
+        // succeeded and send a retrying operator into a checkpoint loop. So
+        // warn and degrade — skip what is unsafe, keep the `Ok`.
+        let our_head = crate::checkpoint::checkpoint_path(&dir, version);
         let chain = match crate::checkpoint::find_head_chain(&dir) {
-            Ok(chain) => Some(chain),
+            Ok(chain) if chain.last() == Some(&our_head) => Some(chain),
+            Ok(chain) => {
+                eprintln!(
+                    "ultima_db: the newest checkpoint in {} is {}, not the \
+                     checkpoint {version} just written; {version} is durable, \
+                     but no old checkpoint was deleted — inspect the directory \
+                     by hand",
+                    dir.display(),
+                    chain
+                        .last()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "nothing".into()),
+                );
+                None
+            }
             Err(e) => {
                 eprintln!(
                     "ultima_db: cannot resolve the checkpoint chain in {} ({e}); \
@@ -1111,13 +1130,34 @@ impl Store {
             }
         }
 
+        // Durable is not the same property as loadable, and it is *loadable*
+        // that the prune spends. A full checkpoint is self-contained: it can
+        // be read back on its own, so pruning behind it is safe however
+        // confusing the rest of the directory is — which is why the default
+        // path's prune behaviour is untouched here. A delta is only as good as
+        // its chain, so it may only be pruned behind once that chain has
+        // resolved *and* proven to be ours. Otherwise the WAL is the only
+        // remaining copy of those commits and must stay.
+        let wrote_delta = base.is_some();
+        let prune_is_safe = !wrote_delta || chain.is_some();
+        if !prune_is_safe {
+            eprintln!(
+                "ultima_db: checkpoint {version} is a delta whose chain in {} \
+                 could not be verified; the WAL was NOT pruned, so it still \
+                 covers every committed version — recovery needs it",
+                dir.display()
+            );
+        }
+
         // Prune WAL in Standalone mode — routed through the WAL background
         // thread (serialized with appends). Only the brief request is made
         // under the store lock; the wait happens with no lock held.
         let prune_rx = {
             let inner = self.inner.read();
             match (&inner.config.persistence, &inner.wal_handle) {
-                (crate::persistence::Persistence::Standalone { .. }, Some(wal)) => {
+                (crate::persistence::Persistence::Standalone { .. }, Some(wal))
+                    if prune_is_safe =>
+                {
                     Some(wal.request_prune(version)?)
                 }
                 _ => None,
@@ -1143,7 +1183,7 @@ impl Store {
         // resolve: without it there is no way to tell an obsolete file from a
         // load-bearing one.
         if let Some(chain) = &chain {
-            crate::checkpoint::cleanup_old_checkpoints(&dir, version, chain)?;
+            crate::checkpoint::cleanup_old_checkpoints(&dir, version, chain);
         }
 
         Ok(version)

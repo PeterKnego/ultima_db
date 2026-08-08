@@ -2285,6 +2285,15 @@ fn an_unresolvable_chain_does_not_fail_the_checkpoint() {
     let v = store.checkpoint().unwrap();
     assert_eq!(v, 2);
 
+    // A full checkpoint is self-contained, so it is safe to prune behind
+    // however confusing the directory is — the skip that protects a delta must
+    // not become a blanket one.
+    let entries = ultima_db::wal::read_wal(&dir.path().join("wal.bin")).unwrap();
+    assert!(
+        entries.is_empty(),
+        "a full checkpoint must still prune the WAL: {entries:?}"
+    );
+
     // Cleanup was skipped rather than guessed at: nothing was deleted.
     let files = checkpoint_files(dir.path());
     assert!(
@@ -2333,4 +2342,95 @@ fn smr_delta_chain_recovers_every_row() {
     for id in [1u64, 2, 4, 5, 6] {
         assert_eq!(t.get(id).unwrap().name, format!("u{}", id - 1));
     }
+}
+
+/// Durable and loadable are different properties, and it is *loadable* that
+/// the WAL prune spends. A delta whose chain is broken is durable but not
+/// loadable — pruning behind it destroys the only remaining copy of the
+/// commits it claims to cover.
+#[test]
+fn a_delta_whose_chain_is_broken_does_not_prune_the_wal() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 4);
+    let store = open_store(config.clone());
+    for i in 0..3 {
+        insert_user(&store, &format!("u{i}"));
+        store.checkpoint().unwrap();
+    }
+    // full@1 <- delta@2 <- delta@3; now the base disappears behind our back.
+    std::fs::remove_file(dir.path().join("checkpoint_1.bin")).unwrap();
+
+    insert_user(&store, "u3");
+    // The write itself succeeds — it is only the chain that is unusable.
+    let v = store.checkpoint().unwrap();
+    assert_eq!(v, 4);
+
+    let entries = ultima_db::wal::read_wal(&dir.path().join("wal.bin")).unwrap();
+    assert!(
+        !entries.is_empty(),
+        "the WAL was pruned behind a delta whose chain does not resolve; \
+         those four commits now exist nowhere"
+    );
+
+    // The directory needs an operator, and says so loudly — the one thing it
+    // must not do is silently come back with fewer rows.
+    drop(store);
+    let store2 = Store::new(config).unwrap();
+    store2.register_table::<User>("users").unwrap();
+    match store2.recover() {
+        Err(Error::CheckpointChainBroken { head, missing }) => {
+            assert_eq!((head, missing), (4, 1));
+        }
+        other => panic!("expected a loud CheckpointChainBroken, got {other:?}"),
+    }
+}
+
+/// `find_head_chain` answers for the highest-versioned file in the directory,
+/// which need not be the file we just wrote. Acting on someone else's chain
+/// means deleting our own chain's ancestors — and unlike the pre-feature
+/// world, the survivor is a delta, so the loss is silent.
+#[test]
+fn a_foreign_newest_file_does_not_get_our_ancestors_deleted() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 4);
+    {
+        let store = open_store(config.clone());
+        for i in 0..2 {
+            insert_user(&store, &format!("u{i}"));
+            store.checkpoint().unwrap();
+        }
+        // full@1 <- delta@2, plus a stray full that outranks everything.
+        std::fs::copy(
+            dir.path().join("checkpoint_1.bin"),
+            dir.path().join("checkpoint_999.bin"),
+        )
+        .unwrap();
+
+        insert_user(&store, "u2");
+        store.checkpoint().unwrap();
+
+        let files = checkpoint_files(dir.path());
+        for name in ["checkpoint_1.bin", "checkpoint_2.bin", "checkpoint_3.bin"] {
+            assert!(
+                files.contains(&name.to_string()),
+                "{name} was deleted on account of a chain that is not ours: {files:?}"
+            );
+        }
+    }
+
+    // The stray file still outranks the real head, so recovery picks it — that
+    // is recovery's "highest version wins" rule, not this call's doing, and no
+    // checkpoint can tell a planted file from a legitimately newer one. What
+    // this guard buys is that the state stays *repairable*: our chain is
+    // intact on disk, so removing the stray file recovers every row. Before
+    // the guard, checkpoint_1 and checkpoint_2 were deleted and no amount of
+    // operator work brought those rows back.
+    std::fs::remove_file(dir.path().join("checkpoint_999.bin")).unwrap();
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(
+        rtx.open_table::<User>("users").unwrap().len(),
+        3,
+        "rows went missing permanently"
+    );
 }
