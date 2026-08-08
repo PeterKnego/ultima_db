@@ -558,8 +558,16 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         // MAX_KEYS root entries just to find every one of them unchanged.
         if Arc::ptr_eq(&self.root, &base.root) {
             return BTreeDiff {
-                new: DiffCursor { stack: Vec::new() },
-                base: DiffCursor { stack: Vec::new() },
+                new: DiffCursor {
+                    stack: Vec::new(),
+                    #[cfg(test)]
+                    descends: 0,
+                },
+                base: DiffCursor {
+                    stack: Vec::new(),
+                    #[cfg(test)]
+                    descends: 0,
+                },
             };
         }
         BTreeDiff {
@@ -1071,11 +1079,21 @@ pub enum Change<'a, K, V> {
 /// odd `slot` means "entry `slot / 2` is the next entry to yield".
 struct DiffCursor<'a, K, V> {
     stack: Vec<(&'a Arc<BTreeNode<K, V>>, usize)>,
+    /// Subtrees this cursor has entered via `descend`. Test-only: it is the
+    /// load-bearing counter for proving the `Arc::ptr_eq` skip in
+    /// `BTreeDiff::next` actually fires, rather than just producing correct
+    /// output while silently walking every node.
+    #[cfg(test)]
+    descends: usize,
 }
 
 impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
     fn new(root: &'a Arc<BTreeNode<K, V>>) -> Self {
-        DiffCursor { stack: vec![(root, 0)] }
+        DiffCursor {
+            stack: vec![(root, 0)],
+            #[cfg(test)]
+            descends: 0,
+        }
     }
 
     /// The subtree this cursor is about to descend into, if any.
@@ -1117,6 +1135,10 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
             let last = self.stack.len() - 1;
             self.stack[last].1 += 1;
             self.stack.push((child, 0));
+            #[cfg(test)]
+            {
+                self.descends += 1;
+            }
         }
     }
 
@@ -1223,6 +1245,18 @@ impl<'a, K: Ord + Clone, V> Iterator for BTreeDiff<'a, K, V> {
                 },
             };
         }
+    }
+}
+
+#[cfg(test)]
+impl<K: Ord + Clone, V> BTreeDiff<'_, K, V> {
+    /// Subtrees descended into by either cursor, summed. Test-only: no
+    /// oracle comparing `diff`'s output to a full scan can distinguish an
+    /// implementation that skips shared subtrees from one that walks every
+    /// node and happens to compute the same answer — this counter is the
+    /// only thing that can.
+    pub fn nodes_visited(&self) -> usize {
+        self.new.descends + self.base.descends
     }
 }
 
@@ -3344,6 +3378,44 @@ mod tests {
         let arc = base.get_arc(&1).unwrap();
         let new = base.insert_arc(1, arc);
         assert_eq!(new.diff(&base).count(), 0);
+    }
+
+    #[test]
+    fn diff_skips_shared_subtrees_instead_of_walking_them() {
+        // Deep enough to be several levels tall under both T=32 (63-key,
+        // 64-way nodes) and T=8 (`fanout-t8`, 15-key, 16-way nodes) — see
+        // `diff_oracle_tree_height` above for why a shallow tree can't
+        // exercise the multi-level skip at all.
+        let mut base = BTree::<u64, u64>::new();
+        for i in 0..20_000u64 {
+            base = base.insert(i, i);
+        }
+        let new = base.insert(10_000, 999_999);
+
+        let mut d = new.diff(&base);
+        let changes: Vec<_> = (&mut d).collect();
+        assert_eq!(changes.len(), 1, "exactly one key changed");
+
+        // A single changed key touches only the root-to-leaf path on each
+        // side (roughly 2 * height descends, one path per cursor). Both
+        // construction and traversal are deterministic (no hashing, no
+        // randomized ops), so the measured counts below are exact, not a
+        // typical case: 6 descends at T=32 (63-key, 64-way nodes, height 3),
+        // 20 at T=8 (`fanout-t8`, 15-key, 16-way nodes, height 5 — narrower
+        // fan-out means a taller tree for the same key count). The ceilings
+        // give ~4x headroom over the measured value on each side — enough
+        // that an incidental one-level height change doesn't trip the test,
+        // nowhere close to the low thousands of descends a full walk of a
+        // 20,000-key tree would cost if the `Arc::ptr_eq` skip in
+        // `BTreeDiff::next` regressed to always-false.
+        let ceiling = if cfg!(feature = "fanout-t8") { 64 } else { 24 };
+        assert!(
+            d.nodes_visited() <= ceiling,
+            "diff visited {} nodes for a single changed key (ceiling {}) — \
+             subtree skip is not firing",
+            d.nodes_visited(),
+            ceiling
+        );
     }
 
     // -----------------------------------------------------------------
