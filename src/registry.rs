@@ -501,19 +501,41 @@ const DELTA_FORMAT_V1: u8 = 1;
 /// `[key_len: u32-be, key_bytes, op: u8]*` — `op` is `0` (Put, followed by
 /// `[rec_len: u32-be, rec_bytes]`) or `1` (Del, no further bytes).
 ///
-/// `new.data_ref()`/`base.data_ref()` require an empty write overlay (task58);
-/// callers that might have buffered-but-unflushed rows must flush an O(1)
-/// clone before calling in, the same discipline `bulk_load`'s Delta path
-/// already follows.
+/// `data_ref()` requires an empty write overlay, and a SingleWriter table's
+/// *committed* snapshot can legitimately carry up to `OVERLAY_CAP` (32)
+/// buffered-but-unflushed rows (task58; see `src/store.rs`'s
+/// `install_after_delta_check`/bulk-load Delta path for the precedent this
+/// follows). Both `new` and `base` may be exactly such a table — that is
+/// precisely what a checkpoint diffs — so this clones each (O(1): a `BTree`
+/// root `Arc` bump plus the overlay's own `Arc` bump) and flushes the
+/// *clones* before calling `data_ref()`, leaving the caller's originals
+/// (which may be the live snapshot's `Arc<Table>`) untouched. Skipping this
+/// would silently omit every overlay-buffered row from the delta in release
+/// builds (debug builds catch it via `data_ref`'s `debug_assert!`, release
+/// builds do not) — exactly the silent-row-loss failure mode incremental
+/// checkpoints exist to avoid.
 fn diff_table<R: Record, K: PrimaryKey>(new: &Table<R, K>, base: &Table<R, K>) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     let mut buf = Vec::new();
+
+    // Flush before either `data_ref()` call below, and keep both flushed
+    // clones alive for the whole function: `BTree::diff`'s borrow ties the
+    // `BTreeDiff` iterator's lifetime to both trees, so `new_flushed`/
+    // `base_flushed` must outlive the `for` loop that consumes it.
+    let mut new_flushed = new.clone();
+    new_flushed.flush_overlay();
+    let mut base_flushed = base.clone();
+    base_flushed.flush_overlay();
 
     buf.push(DELTA_MAGIC);
     buf.push(DELTA_FORMAT_V1);
     buf.extend_from_slice(&K::KEY_TYPE_ID.to_be_bytes());
 
-    match new.next_id_opt() {
+    // Read off the flushed clone rather than the original `new`: the two
+    // agree (`flush_overlay` only moves rows from the overlay into the tree
+    // and never touches `next_id`), and reading a single consistent view
+    // avoids a second, easy-to-forget dependency on the pre-flush table.
+    match new_flushed.next_id_opt() {
         Some(id) => {
             buf.push(1u8);
             let enc = id.encode();
@@ -526,7 +548,7 @@ fn diff_table<R: Record, K: PrimaryKey>(new: &Table<R, K>, base: &Table<R, K>) -
     // Count is written up front, so it is collected before it can be emitted.
     let mut body = Vec::new();
     let mut count: u64 = 0;
-    for change in new.data_ref().diff(base.data_ref()) {
+    for change in new_flushed.data_ref().diff(base_flushed.data_ref()) {
         let (key, record) = match change {
             Change::Added(k, v) | Change::Updated(k, v) => (k, Some(v)),
             Change::Removed(k) => (k, None),
@@ -1650,5 +1672,80 @@ mod tests {
             matches!(err, Error::TableTypeChanged { ref table } if table == "items"),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// Regression for a Critical bug in the first cut of `diff_table`: a
+    /// SingleWriter table's *committed* snapshot can carry up to
+    /// `OVERLAY_CAP` (32) buffered-but-unflushed rows (task58; see
+    /// `src/store.rs`'s bulk-load Delta path for the precedent). Reading
+    /// `data_ref()` without first flushing a clone trips a `debug_assert!` in
+    /// debug builds and, worse, *silently omits every overlay-buffered row*
+    /// from the delta in release builds — exactly the silent-row-loss this
+    /// feature exists to prevent. This puts rows in `new`'s overlay and
+    /// checks they still show up as `Added` in the delta.
+    #[test]
+    fn diff_table_sees_rows_buffered_in_the_new_side_overlay() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        // No indexes and a cap bigger than the write count keeps both rows
+        // in the overlay rather than flushing them into the tree.
+        let base = Table::<TestRecord, u64>::new();
+        let mut new = base.clone();
+        new.set_overlay_cap(8);
+        new.put(1, TestRecord { name: "a".into() }).unwrap();
+        new.put(2, TestRecord { name: "b".into() }).unwrap();
+        assert_eq!(
+            new.overlay_len_for_test(),
+            2,
+            "test setup: rows must actually be buffered, not flushed"
+        );
+
+        let delta = (info.diff_table)(&new as &dyn Any, &base as &dyn Any).unwrap();
+        let changes = decode_delta_changes(&delta);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].0, 1u64);
+        assert!(changes[0].1.is_some(), "buffered row 1 missing from delta");
+        assert_eq!(changes[1].0, 2u64);
+        assert!(changes[1].1.is_some(), "buffered row 2 missing from delta");
+
+        // The fix clones-and-flushes internally; the caller's own table must
+        // be left untouched.
+        assert_eq!(new.overlay_len_for_test(), 2, "diff_table must not flush the caller's table");
+    }
+
+    /// Mirror of the above with the overlay on the *base* side. Rows 1 and 2
+    /// live only in `base`'s overlay, never flushed to its tree; `new` is a
+    /// clone with row 1 deleted. If `base`'s overlay were ignored, `base`'s
+    /// tree would look empty and the diff would miss the removal of row 1
+    /// entirely (silently treating it as never having existed) instead of
+    /// reporting `Removed(1)`.
+    #[test]
+    fn diff_table_sees_rows_buffered_in_the_base_side_overlay() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        let mut base = Table::<TestRecord, u64>::new();
+        base.set_overlay_cap(8);
+        base.put(1, TestRecord { name: "a".into() }).unwrap();
+        base.put(2, TestRecord { name: "b".into() }).unwrap();
+        assert_eq!(
+            base.overlay_len_for_test(),
+            2,
+            "test setup: rows must actually be buffered, not flushed"
+        );
+
+        let mut new = base.clone();
+        new.delete(&1).unwrap();
+
+        let delta = (info.diff_table)(&new as &dyn Any, &base as &dyn Any).unwrap();
+        let changes = decode_delta_changes(&delta);
+        // Row 2 is unchanged (same buffered Arc on both sides) and must not
+        // appear; row 1's removal must.
+        assert_eq!(changes, vec![(1u64, None)], "base's buffered row must be visible to the diff");
+
+        assert_eq!(base.overlay_len_for_test(), 2, "diff_table must not flush the caller's table");
     }
 }
