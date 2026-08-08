@@ -556,9 +556,12 @@ fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
     Ok((kind, version, base_version))
 }
 
-/// Walk backwards from the highest-versioned `checkpoint_*.bin` file in
-/// `dir` to the nearest `Full` ancestor, returning the chain base-first (so
-/// [`load_chain`] can apply it in order). Empty if no checkpoint exists.
+/// Walk backwards from `head_path` to the nearest `Full` ancestor, returning
+/// the chain base-first (so [`load_chain`] can apply it in order). Shared by
+/// [`find_head_chain`] (head = the directory's latest checkpoint) and
+/// [`find_chain_for_version`] (head = a specific, caller-named version) — the
+/// walk itself doesn't care why `head_path` was chosen, only that it is the
+/// file the caller wants resolved to a full chain.
 ///
 /// Only headers are read (see [`read_header`]) — the chain walk never reads
 /// a table entry.
@@ -574,12 +577,7 @@ fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
 /// back to an older `Full`: the WAL is already pruned to the head version,
 /// so an older full plus the surviving WAL reconstructs less than was
 /// committed, silently.
-pub(crate) fn find_head_chain(dir: &Path) -> Result<Vec<PathBuf>> {
-    let head_path = match find_latest_checkpoint(dir)? {
-        Some(p) => p,
-        None => return Ok(Vec::new()),
-    };
-
+fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
     let mut chain = vec![head_path.clone()];
     let mut current_path = head_path;
     let mut head_version: Option<u64> = None;
@@ -615,6 +613,30 @@ pub(crate) fn find_head_chain(dir: &Path) -> Result<Vec<PathBuf>> {
 
     chain.reverse();
     Ok(chain)
+}
+
+/// Resolve the chain headed by the highest-versioned `checkpoint_*.bin` file
+/// in `dir`. Empty if no checkpoint exists.
+pub(crate) fn find_head_chain(dir: &Path) -> Result<Vec<PathBuf>> {
+    match find_latest_checkpoint(dir)? {
+        Some(head_path) => walk_chain_from(dir, head_path),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Resolve the chain whose head is exactly `version` — for opening a
+/// specific historical checkpoint (`Store::open_checkpoint_reader`) rather
+/// than the directory's latest. Once `write_delta_checkpoint` is in regular
+/// use, most on-disk versions are `Delta` files that are not self-contained;
+/// this is what makes every checkpointed version openable again, not just
+/// the ones that happened to land on a `Full`.
+///
+/// Unlike [`find_head_chain`], there is no "nothing exists" case: a missing
+/// `checkpoint_{version}.bin` fails the same way it always has for this
+/// caller — `read_header`'s `File::open` errors with `Error::Persistence`,
+/// propagated as-is.
+pub(crate) fn find_chain_for_version(dir: &Path, version: u64) -> Result<Vec<PathBuf>> {
+    walk_chain_from(dir, dir.join(checkpoint_filename(version)))
 }
 
 /// Apply one delta file onto `base`, producing the snapshot at the delta's
@@ -1766,6 +1788,145 @@ mod tests {
 
         let snap = load_chain(&find_head_chain(dir.path()).unwrap(), &registry).unwrap();
         assert!(!snap.tables.contains_key("b"));
+    }
+
+    /// Fix-round regression test: the upsert path in `registry::apply_delta`
+    /// must recover an *updated* row's new value, not just rows that were
+    /// newly inserted or removed. `make_base_and_changed_a`/
+    /// `write_a_three_link_chain` only ever add rows to table "a" across the
+    /// chain, which happens to never exercise `Change::Updated` (an
+    /// already-present key changing value) — this test targets that case
+    /// directly, since it's exactly the case a naive `replay_insert`-only
+    /// apply (which errors on an existing key) would break.
+    #[test]
+    fn a_chain_replays_an_updated_row_not_just_inserted_and_deleted_ones() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (mut base_snap, registry) = make_snapshot_with_users(); // "users": 1=Alice/30, 2=Bob/25
+        base_snap.version = 1; // make_snapshot_with_users defaults to 42, which
+        // would otherwise sort *after* the delta below and be picked as
+        // "latest" on its own, defeating the chain this test means to build.
+
+        write_checkpoint(dir.path(), &base_snap, &registry).unwrap(); // v1 full
+
+        let mut table = base_snap
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap()
+            .clone();
+        // A genuine in-place update of an already-present key — this is what
+        // `BTree::diff` reports as `Change::Updated`, and what the delta
+        // payload's `op = 0` (indistinguishable from an Added row) must
+        // still replay correctly onto a base that already has this key.
+        table
+            .update(
+                &1,
+                User {
+                    name: "Alice".into(),
+                    age: 31,
+                },
+            )
+            .unwrap();
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let mut new_snap = base_snap.clone();
+        new_snap.version = 2;
+        new_snap.tables = tables;
+
+        write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap(); // v2 delta
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 2);
+        let snap = load_chain(&chain, &registry).unwrap();
+
+        let users = snap
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(users.len(), 2, "an update must not change the row count");
+        assert_eq!(
+            users.get(&1).unwrap(),
+            &User {
+                name: "Alice".into(),
+                age: 31,
+            },
+            "the updated row must carry the new value, not the base's"
+        );
+        assert_eq!(
+            users.get(&2).unwrap(),
+            &User {
+                name: "Bob".into(),
+                age: 25,
+            }
+        );
+    }
+
+    /// `Store::open_checkpoint_reader` (public API; the SMR snapshot-
+    /// streaming path uses it to send a specific checkpoint to a follower)
+    /// must resolve a requested version that happens to be a `Delta` file to
+    /// its full chain, rather than assuming the file is self-contained.
+    /// Before chain-aware recovery, every `checkpoint_{v}.bin` was a `Full`
+    /// file and every version was openable; once incremental checkpoints are
+    /// in use, most on-disk versions are deltas, and this is what keeps them
+    /// all openable rather than only the ones that happen to land on a full.
+    #[test]
+    fn open_checkpoint_reader_resolves_a_delta_headed_version() {
+        let dir = crate::test_scratch::scratch_dir();
+        // v1 full, v2 delta, v3 delta — written directly through the
+        // checkpoint module (as `Store::checkpoint()` does not yet choose
+        // deltas on its own; that write-side policy is a later task). This
+        // test only needs the files to exist on disk, not to have been
+        // written by the `Store` instance that reads them back — exactly
+        // the SMR scenario `open_checkpoint_reader` exists for (a checkpoint
+        // written by a previous process/run).
+        write_a_three_link_chain(dir.path());
+
+        let src = crate::Store::new(crate::StoreConfig {
+            persistence: crate::Persistence::Smr {
+                dir: dir.path().to_path_buf(),
+            },
+            ..crate::StoreConfig::default()
+        })
+        .unwrap();
+        src.register_table::<User>("a").unwrap();
+        src.register_table::<User>("b").unwrap();
+
+        // Version 2 is a Delta file on disk (see `write_a_three_link_chain`).
+        // Reading it must succeed and stream table "a"'s *full* state at v2
+        // (Alice from the base plus Carol added in the v2 delta) — not just
+        // the one changed row the delta payload itself carries, and not an
+        // error from trying to parse v2 as a self-contained snapshot.
+        let mut reader = src.open_checkpoint_reader(2).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+
+        let dst = crate::Store::new(crate::StoreConfig::default()).unwrap();
+        dst.register_table::<User>("a").unwrap();
+        dst.register_table::<User>("b").unwrap();
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+
+        let read = dst.begin_read(None).unwrap();
+        let a = read.open_table::<User>("a").unwrap();
+        assert_eq!(
+            a.len(),
+            2,
+            "must stream 'a's full v2 state, not just the delta's one changed row"
+        );
+        assert_eq!(a.get(1u64).unwrap().name, "Alice");
+        assert_eq!(a.get(2u64).unwrap().name, "Carol");
+
+        let b = read.open_table::<User>("b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.get(1u64).unwrap().name, "Bob");
     }
 
     #[test]

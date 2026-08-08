@@ -1342,11 +1342,16 @@ impl Store {
             (dir, registry)
         };
 
-        // Build the path: checkpoint_{version}.bin
-        let path = dir.join(format!("checkpoint_{version}.bin"));
-
-        // Load without installing — reuse the existing checkpoint load path.
-        let snapshot = crate::checkpoint::load_checkpoint(&path, &registry)?;
+        // `version` may itself be a Delta file — resolve the chain headed by
+        // it rather than assuming the file is self-contained, then fold the
+        // chain into the snapshot at that version. `find_chain_for_version`/
+        // `load_chain` return `crate::Error`, which `?` converts to
+        // `SnapshotStreamError::BulkLoad` via its `#[from]` — the same
+        // variant this already returned for a missing/corrupt/undeserializable
+        // single file, so `CheckpointChainBroken` (a missing ancestor) surfaces
+        // through that existing contract rather than a new error case here.
+        let chain = crate::checkpoint::find_chain_for_version(&dir, version)?;
+        let snapshot = crate::checkpoint::load_chain(&chain, &registry)?;
 
         crate::snapshot_stream::build::SnapshotReader::new(std::sync::Arc::new(snapshot), registry)
     }

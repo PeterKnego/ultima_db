@@ -110,6 +110,14 @@ pub(crate) struct TableTypeInfo {
     pub replay_update: ReplayUpdateFn,
     /// Delete a record from a `Table<R, K>` (as `&mut dyn Any`) by encoded key.
     pub replay_delete: ReplayDeleteFn,
+    /// Upsert a record into a `Table<R, K>` (as `&mut dyn Any`) at an encoded
+    /// key — unlike `replay_insert`, does not error when the key already
+    /// exists. Used by checkpoint delta replay (`apply_delta`), where a
+    /// delta's `op = 0` means "this row now looks like this" for both a row
+    /// added since the base and one that already existed and changed —
+    /// `replay_insert`'s duplicate-key check is exactly the WAL-replay-only
+    /// invariant this must *not* enforce.
+    pub replay_upsert: ReplayInsertFn,
     /// Deserialize raw `(encoded key, bytes)` pairs and build a fresh
     /// `Table<R, K>`.
     /// If a destination table by the same name already exists, its index
@@ -245,6 +253,20 @@ impl TableRegistry {
                         })?;
                         let key = K::decode(key)?;
                         table.delete(&key)?;
+                        Ok(())
+                    }),
+                    replay_upsert: Box::new(|table_any, key, data| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_upsert downcast failed".into())
+                        })?;
+                        let key = K::decode(key)?;
+                        let (record, _): (R, _) =
+                            bincode::serde::decode_from_slice(data, bincode::config::standard())
+                                .map_err(|e| Error::Persistence(e.to_string()))?;
+                        // `Table::put` is already unconditional upsert — no
+                        // existence check to add or skip, unlike
+                        // `replay_insert`, which layers one on deliberately.
+                        table.put(key, record)?;
                         Ok(())
                     }),
                     build_from_raw_rows: Box::new(|raw_rows, existing| {
@@ -583,12 +605,12 @@ fn diff_table<R: Record, K: PrimaryKey>(new: &Table<R, K>, base: &Table<R, K>) -
 ///
 /// `op = 0` (Put) covers both `Change::Added` and `Change::Updated` — the
 /// diff format does not distinguish them, since distinguishing would cost a
-/// base lookup `diff_table` already avoids by walking both trees in lockstep.
-/// So a Put is applied as an upsert: try `replay_insert` first (an
-/// interval's changes skew toward inserts on an append-heavy workload) and
-/// fall back to `replay_update` on `Error::DuplicateKey` rather than
-/// duplicating the existence check those two closures already do — one
-/// decoder (theirs), two ways to reach it.
+/// base lookup `diff_table` already avoids by walking both trees in
+/// lockstep. So a Put is applied via `replay_upsert`, which is unconditional
+/// (`Table::put` itself has no existence check) — not `replay_insert`, whose
+/// duplicate-key check exists specifically to enforce the WAL-replay
+/// invariant that an `Insert` op never targets an already-present key, an
+/// invariant a checkpoint delta's `op = 0` does not carry.
 ///
 /// The key-type code is checked against `info.key_type_code` before a single
 /// row is applied, exactly like WAL replay's `check_replay_key_type`: several
@@ -649,13 +671,7 @@ pub(crate) fn apply_delta(
             0 => {
                 let rlen = take_u32(payload, &mut at)? as usize;
                 let rec_bytes = take(payload, &mut at, rlen)?;
-                match (info.replay_insert)(table_any, key_bytes, rec_bytes) {
-                    Ok(()) => {}
-                    Err(Error::DuplicateKey(_)) => {
-                        (info.replay_update)(table_any, key_bytes, rec_bytes)?;
-                    }
-                    Err(e) => return Err(e),
-                }
+                (info.replay_upsert)(table_any, key_bytes, rec_bytes)?;
             }
             1 => {
                 (info.replay_delete)(table_any, key_bytes)?;
