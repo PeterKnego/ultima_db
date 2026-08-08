@@ -118,6 +118,13 @@ pub(crate) struct TableTypeInfo {
     /// `replay_insert`'s duplicate-key check is exactly the WAL-replay-only
     /// invariant this must *not* enforce.
     pub replay_upsert: ReplayInsertFn,
+    /// Advance a `Table<R, K>`'s (as `&mut dyn Any`) auto-increment counter
+    /// to `max(current, decoded key)` — never backwards. Used by checkpoint
+    /// delta replay to apply the delta payload's own `next_id` field:
+    /// `apply_delta` operates on `&mut dyn Any` and has no concrete `K` to
+    /// decode that field into or `Table::set_next_id` to call, so the
+    /// max-with-current logic has to live behind this closure instead.
+    pub replay_advance_next_id: ReplayDeleteFn,
     /// Deserialize raw `(encoded key, bytes)` pairs and build a fresh
     /// `Table<R, K>`.
     /// If a destination table by the same name already exists, its index
@@ -267,6 +274,19 @@ impl TableRegistry {
                         // existence check to add or skip, unlike
                         // `replay_insert`, which layers one on deliberately.
                         table.put(key, record)?;
+                        Ok(())
+                    }),
+                    replay_advance_next_id: Box::new(|table_any, key| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_advance_next_id downcast failed".into())
+                        })?;
+                        let candidate = K::decode(key)?;
+                        // `advance_next_id_to` is spelled without the
+                        // `AutoKey` bound `Table::set_next_id` carries, since
+                        // this closure is instantiated for every registered
+                        // `K`, not just `u64`; it already applies the "never
+                        // backwards" rule.
+                        table.advance_next_id_to(candidate);
                         Ok(())
                     }),
                     build_from_raw_rows: Box::new(|raw_rows, existing| {
@@ -617,6 +637,17 @@ fn diff_table<R: Record, K: PrimaryKey>(new: &Table<R, K>, base: &Table<R, K>) -
 /// key types decode each other's encodings without complaint, and the
 /// order-preserving encoding means the reinterpreted keys would pass every
 /// later ascending-order check too.
+///
+/// The delta's own `next_id` field **is** applied (via
+/// `replay_advance_next_id`, taking the max with the accumulator's current
+/// counter rather than overwriting) — folding only the Puts is not enough.
+/// A row added and deleted again *within one interval* advances the
+/// interval's ending `next_id` but leaves no trace in the Put/Del stream at
+/// all (`BTree::diff` compares two endpoints; a key that existed at neither
+/// endpoint is invisible to it), so a reader that only replayed Puts would
+/// silently reissue an id that was already handed out — no row is lost, but
+/// recovery would then diverge from the full-checkpoint path on the next
+/// auto-assigned key.
 pub(crate) fn apply_delta(
     table_any: &mut dyn Any,
     payload: &[u8],
@@ -641,18 +672,17 @@ pub(crate) fn apply_delta(
         )));
     }
 
-    // Not applied: `replay_insert`'s underlying `Table::put` advances the
-    // auto-increment counter on every Put (see `Table::put` /
-    // `PrimaryKey::advance_auto_counter`), the same mechanism WAL replay
-    // relies on. Any key that ever advanced the counter first appeared as a
-    // Put in the interval it was added, so folding every delta's Puts in
-    // order reproduces the counter without ever decoding this field —
-    // skipped here only to keep the offset correct for what follows.
+    // Applied via `replay_advance_next_id`, not just parsed for offset
+    // bookkeeping: folding only the Puts under-counts whenever a key was
+    // added *and* deleted again within this one interval (see this
+    // function's doc comment) — the diff never mentions such a key, so
+    // nothing about replaying it would advance the counter.
     match take(payload, &mut at, 1)?[0] {
         0 => {}
         1 => {
             let len = take_u32(payload, &mut at)? as usize;
-            take(payload, &mut at, len)?;
+            let next_id_bytes = take(payload, &mut at, len)?;
+            (info.replay_advance_next_id)(table_any, next_id_bytes)?;
         }
         other => {
             return Err(Error::CheckpointCorrupted(format!(

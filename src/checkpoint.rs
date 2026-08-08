@@ -207,8 +207,11 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     offset += read;
     let kind = CheckpointKind::try_from(kind_byte)?;
     if kind != CheckpointKind::Full {
-        // Delta bodies are produced starting task 6; this build never writes
-        // them and doesn't yet know how to read them.
+        // This function is deliberately full-only: it's what `load_checkpoint`
+        // uses to load the *base* of a chain, and a chain's base must be a
+        // `Full` checkpoint by construction (`find_head_chain` walks back to
+        // one). Deltas are real and readable — see `apply_delta_file`/
+        // `registry::apply_delta` — just never through this entry point.
         return Err(Error::CheckpointCorrupted(format!(
             "checkpoint kind {kind:?} is not supported by this build"
         )));
@@ -234,9 +237,13 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
         offset += read;
         let entry_kind = TableEntryKind::try_from(entry_kind_byte)?;
         if entry_kind != TableEntryKind::Full {
-            // Unchanged/Delta/Dropped entries are produced starting task 6;
-            // this build only ever writes Full and doesn't yet know how to
-            // read the others.
+            // Same restriction as the file-level `CheckpointKind` check
+            // above, for the same reason: this is the full-checkpoint-only
+            // reader, and a `Full` checkpoint (by construction — see
+            // `serialize_snapshot`) never contains an `Unchanged`/`Delta`/
+            // `Dropped` entry. Those kinds are real and readable through
+            // `apply_delta_file`, which parses delta files directly rather
+            // than through this function.
             return Err(Error::CheckpointCorrupted(format!(
                 "table entry kind {entry_kind:?} is not supported by this build"
             )));
@@ -590,14 +597,34 @@ fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
             CheckpointKind::Full => break,
             CheckpointKind::Delta => {
                 // Written by `serialize_delta`, which always emits a
-                // `base_version` for `CheckpointKind::Delta` — `None` here
-                // would mean `read_header`'s own encoding disagrees with the
-                // writer's, not a possibility a corrupt file on disk can
-                // trigger (a corrupt `has_next_id`-style byte fails the
-                // decode above instead).
-                let base_version = base_version.expect(
-                    "read_header always returns Some(base_version) for CheckpointKind::Delta",
-                );
+                // `base_version` for `CheckpointKind::Delta`. `read_header`
+                // deliberately does not verify the file's CRC (a chain walk
+                // must not have to read a whole checkpoint just to learn its
+                // kind), so a hand-corrupted header can still reach here with
+                // no `base_version` — fail with the same corruption error a
+                // CRC mismatch would produce rather than panicking on the
+                // recovery path.
+                let base_version = base_version.ok_or_else(|| {
+                    Error::CheckpointCorrupted(format!(
+                        "delta checkpoint at {} is missing base_version",
+                        current_path.display()
+                    ))
+                })?;
+                // A delta's base must be strictly older than the delta
+                // itself. Without this, a corrupted `base_version` pointing
+                // *forward or at itself* — e.g. v2 claiming base 3 while v3
+                // claims base 2 — sends the walk in a cycle that never
+                // reaches a `Full` file: an unbounded loop with no error and
+                // no exit, strictly worse than any failure this function
+                // could return instead. Since every hop strictly decreases
+                // the version, this one check is also what guarantees the
+                // walk terminates at all.
+                if base_version >= version {
+                    return Err(Error::CheckpointCorrupted(format!(
+                        "delta checkpoint {version} claims base_version {base_version}, which is \
+                         not older than the delta itself"
+                    )));
+                }
                 let base_path = dir.join(checkpoint_filename(base_version));
                 if !base_path.exists() {
                     return Err(Error::CheckpointChainBroken {
@@ -1736,6 +1763,14 @@ mod tests {
         for (k, v) in expected_a.iter() {
             assert_eq!(a.get(k), Some(v));
         }
+        // Rows aren't the whole state: `next_id` must also come out right,
+        // or a later auto-assigned insert on the recovered store could
+        // reissue a key that was already used (see
+        // `a_chain_replays_next_id_past_a_row_inserted_and_deleted_within_one_interval`
+        // for the case this actually catches — this chain never inserts and
+        // deletes within one interval, so it only proves the ordinary path
+        // still agrees).
+        assert_eq!(a.next_id_opt(), expected_a.next_id_opt());
 
         let b = snap
             .tables
@@ -1774,6 +1809,53 @@ mod tests {
         let err = find_head_chain(dir.path()).unwrap_err();
         assert!(
             matches!(err, Error::CheckpointChainBroken { head: 3, missing: 2 }),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// Fix-round-2 regression: a chain walk that only checks "does the file
+    /// named by `base_version` exist" can be sent into an infinite loop by a
+    /// cyclic `base_version` — here v2 claims base 3 while v3 claims base 2,
+    /// so the walk bounces between the two and never reaches a `Full` file.
+    /// Both files below have a *valid* whole-file CRC: this is not testing
+    /// "reject a corrupt file" (`read_header` deliberately never checks the
+    /// CRC — a chain walk must not read a whole checkpoint just to learn its
+    /// kind), it is testing that `walk_chain_from` independently enforces
+    /// `base_version < version` on every hop, which is also what guarantees
+    /// the walk terminates at all. A hang has no error message and no exit,
+    /// strictly worse than any failure this function could return instead.
+    #[test]
+    fn a_cyclic_base_version_fails_loudly_instead_of_hanging() {
+        let dir = crate::test_scratch::scratch_dir();
+
+        // v1: a real Full checkpoint, so a correct implementation has
+        // somewhere to terminate if it weren't for the cycle below.
+        let (mut base_snap, registry) = make_snapshot_with_users();
+        base_snap.version = 1;
+        write_checkpoint(dir.path(), &base_snap, &registry).unwrap();
+
+        // v2 and v3: minimal, well-formed (valid CRC, num_tables = 0 — a
+        // chain walk never reads table entries) Delta headers whose
+        // base_version fields point at each other instead of at v1.
+        let write_minimal_delta_with_cyclic_base = |version: u64, base_version: u64| {
+            let config = bincode::config::standard();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(MAGIC);
+            bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(CheckpointKind::Delta as u8, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(base_version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(0u32, &mut buf, config).unwrap(); // num_tables
+            let crc = crc32(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            write_checkpoint_bytes(dir.path(), version, &buf).unwrap();
+        };
+        write_minimal_delta_with_cyclic_base(2, 3);
+        write_minimal_delta_with_cyclic_base(3, 2);
+
+        let err = find_head_chain(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_)),
             "unexpected: {err:?}"
         );
     }
@@ -1866,6 +1948,107 @@ mod tests {
                 name: "Bob".into(),
                 age: 25,
             }
+        );
+    }
+
+    /// Fix-round-2 regression, reproducing the coordinator's finding
+    /// directly: a row inserted *and* deleted again within a single
+    /// checkpoint interval leaves no trace in a delta's Put/Del stream
+    /// (`BTree::diff` compares two endpoints; a key present at neither is
+    /// invisible to it) but must still advance `next_id`, or recovery hands
+    /// out a primary key that was already used — silently diverging from
+    /// what a full checkpoint at the same version would carry, with no row
+    /// actually lost (so nothing about the row *contents* catches it, which
+    /// is why `a_chain_recovers_to_the_same_state_as_a_full_checkpoint`'s
+    /// row-by-row comparison doesn't).
+    ///
+    /// Base v1 has ids {1, 2} (`next_id` = 3); id 3 is inserted and then
+    /// deleted again within the v1 -> v2 interval. The row set at v2 is
+    /// identical to v1's, but `next_id` must come out as 4 — matching a full
+    /// checkpoint of the same in-memory state — not 3.
+    #[test]
+    fn a_chain_replays_next_id_past_a_row_inserted_and_deleted_within_one_interval() {
+        let dir = crate::test_scratch::scratch_dir();
+        let mut reg = TableRegistry::default();
+        reg.register::<User, u64>("users").unwrap();
+
+        let mut base_table = Table::<User>::new();
+        base_table
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap(); // id 1
+        base_table
+            .insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap(); // id 2
+        let mut base_tables = std::collections::BTreeMap::new();
+        base_tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(base_table.clone()) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let base_snap = Snapshot {
+            version: 1,
+            tables: base_tables,
+        };
+        write_checkpoint(dir.path(), &base_snap, &reg).unwrap();
+
+        let mut new_table = base_table.clone();
+        let id3 = new_table
+            .insert(User {
+                name: "Carol".into(),
+                age: 40,
+            })
+            .unwrap(); // id 3, next_id -> 4
+        new_table.delete(&id3).unwrap(); // row gone again; next_id must stay 4
+        assert_eq!(new_table.len(), 2, "row count must be back to base's");
+
+        let mut new_tables = std::collections::BTreeMap::new();
+        new_tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(new_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let new_snap = Snapshot {
+            version: 2,
+            tables: new_tables,
+        };
+        write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &reg).unwrap();
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 2);
+        let snap = load_chain(&chain, &reg).unwrap();
+        let users = snap
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(users.len(), 2, "no row is lost or gained");
+
+        // What a full checkpoint of the same in-memory v2 state carries —
+        // the ground truth this chain-loaded result must match.
+        let full_bytes = serialize_snapshot(&new_snap, &reg).unwrap();
+        let full = deserialize_snapshot(&full_bytes, &reg).unwrap();
+        let full_users = full
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(
+            full_users.next_id_opt(),
+            Some(4),
+            "sanity check on the full-checkpoint path itself"
+        );
+        assert_eq!(
+            users.next_id_opt(),
+            full_users.next_id_opt(),
+            "chain replay must match the full-checkpoint path's next_id, not silently reissue id 3"
         );
     }
 

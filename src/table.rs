@@ -388,6 +388,22 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         self.next_id.clone()
     }
 
+    /// Raise the auto-increment counter to `candidate` if it is currently
+    /// unset or behind it — never backwards. Spelled without the
+    /// [`AutoKey`] bound (unlike [`Table::set_next_id`], which assigns
+    /// unconditionally) so the type-erased checkpoint-delta replay path
+    /// (`registry::apply_delta`, via `TableTypeInfo::replay_advance_next_id`)
+    /// can call it for *any* key type without knowing statically whether
+    /// this table auto-increments — a no-op for the `None` counter of an
+    /// explicitly-keyed table's `candidate`, since a delta payload only ever
+    /// carries `Some(next_id)` when the base table had one to begin with.
+    #[allow(dead_code)]
+    pub(crate) fn advance_next_id_to(&mut self, candidate: K) {
+        if self.next_id.as_ref().is_none_or(|cur| candidate > *cur) {
+            self.next_id = Some(candidate);
+        }
+    }
+
     /// An empty table carrying `next_id` as its auto-increment counter.
     ///
     /// Spelled without the [`AutoKey`] bound so the type-erased registry
