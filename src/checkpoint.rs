@@ -876,22 +876,54 @@ pub(crate) fn load_chain(paths: &[PathBuf], registry: &TableRegistry) -> Result<
     Ok(snapshot)
 }
 
-/// Delete checkpoint files *older* than `keep_version`.
+/// True iff `dir` holds a `checkpoint_{version}.bin` file. Used to confirm a
+/// retained in-memory base is still backed by the file a delta would name as
+/// its `base_version` — writing a delta against a base that is gone produces
+/// a head no recovery can load.
+pub(crate) fn checkpoint_file_exists(dir: &Path, version: u64) -> bool {
+    dir.join(checkpoint_filename(version)).exists()
+}
+
+/// Delete checkpoint files *older* than `keep_version`, except those in
+/// `chain`.
 ///
-/// Newer checkpoints are never deleted: a slower checkpoint finishing after
-/// a faster concurrent one must not remove the newer file — it may be the
-/// only checkpoint covering WAL entries the faster checkpoint already
-/// pruned, and deleting it would make those commits unrecoverable.
+/// Two files must survive, for different reasons:
+///
+/// - **Newer than `keep_version`.** A slower checkpoint finishing after a
+///   faster concurrent one must not remove the newer file — it may be the
+///   only checkpoint covering WAL entries the faster checkpoint already
+///   pruned, and deleting it would make those commits unrecoverable.
+/// - **Anything in `chain`.** `chain` is the head's ancestry as
+///   [`find_head_chain`] resolved it *from disk*. A delta is not
+///   self-contained: deleting its base (or any file between) leaves the head
+///   loadable only as far as `Error::CheckpointChainBroken`, while the WAL
+///   covering those versions has already been pruned. The ancestors are older
+///   than `keep_version` by construction, so this rule is the only thing
+///   standing between an incremental checkpoint and an unrecoverable database.
+///
 /// Unparseable `checkpoint_*.bin` names are left alone.
-pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64) -> Result<()> {
+pub(crate) fn cleanup_old_checkpoints(
+    dir: &Path,
+    keep_version: u64,
+    chain: &[PathBuf],
+) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
     };
 
+    // Match on file name, not full path: `chain`'s entries and `read_dir`'s
+    // are both built from `dir`, but comparing names cannot be defeated by a
+    // path that normalizes differently.
+    let protected: std::collections::HashSet<&std::ffi::OsStr> =
+        chain.iter().filter_map(|p| p.file_name()).collect();
+
     for entry in entries {
         let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
         let name = entry.file_name();
+        if protected.contains(name.as_os_str()) {
+            continue;
+        }
         let name_str = name.to_string_lossy();
         if let Some(version) = name_str
             .strip_prefix("checkpoint_")
@@ -904,6 +936,15 @@ pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64) -> Result<(
     }
 
     Ok(())
+}
+
+/// Test-only: is the checkpoint file at `path` a full one (rather than a
+/// delta)? Behind [`crate::checkpoint_is_full_for_test`] so integration tests
+/// can assert a file's kind through the real header reader instead of a
+/// hard-coded byte offset, which would silently start testing the wrong byte
+/// the moment the header layout changes.
+pub(crate) fn is_full_checkpoint(path: &Path) -> Result<bool> {
+    Ok(read_header(path)?.0 == CheckpointKind::Full)
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,7 +1110,7 @@ mod tests {
         write_checkpoint(dir.path(), &snap10, &reg).unwrap();
         write_checkpoint(dir.path(), &snapshot, &reg).unwrap(); // version 42
 
-        cleanup_old_checkpoints(dir.path(), 42).unwrap();
+        cleanup_old_checkpoints(dir.path(), 42, &[]).unwrap();
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1095,7 +1136,7 @@ mod tests {
             write_checkpoint(dir.path(), &snap, &reg).unwrap();
         }
 
-        cleanup_old_checkpoints(dir.path(), 10).unwrap();
+        cleanup_old_checkpoints(dir.path(), 10, &[]).unwrap();
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1114,6 +1155,55 @@ mod tests {
             files.iter().any(|f| f.contains("checkpoint_12")),
             "newer checkpoint must never be deleted: {files:?}"
         );
+    }
+
+    /// The head's ancestors are older than `keep_version` by construction —
+    /// the never-delete-newer rule does nothing for them. Deleting one leaves
+    /// a head that only `CheckpointChainBroken` can answer for, so the chain
+    /// must be spared explicitly.
+    #[test]
+    fn cleanup_old_checkpoints_spares_the_head_chain() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (snapshot, reg) = make_snapshot_with_users();
+
+        // full@5 <- delta@6 <- delta@7, plus an unrelated stale full@4.
+        let mut base = snapshot.clone();
+        base.version = 5;
+        write_checkpoint(dir.path(), &base, &reg).unwrap();
+        let mut stale = snapshot.clone();
+        stale.version = 4;
+        write_checkpoint(dir.path(), &stale, &reg).unwrap();
+        for v in [6u64, 7] {
+            let mut snap = snapshot.clone();
+            snap.version = v;
+            let mut prev = snapshot.clone();
+            prev.version = v - 1;
+            write_delta_checkpoint(dir.path(), &snap, &prev, &reg).unwrap();
+        }
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 3, "chain should be full@5 + two deltas");
+
+        cleanup_old_checkpoints(dir.path(), 7, &chain).unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains("checkpoint_4")),
+            "a stale checkpoint outside the chain should still be removed: {files:?}"
+        );
+        for v in [5, 6, 7] {
+            assert!(
+                files.iter().any(|f| f.contains(&format!("checkpoint_{v}"))),
+                "chain member checkpoint_{v} was deleted: {files:?}"
+            );
+        }
+        // And the head still loads.
+        let recovered = load_chain(&find_head_chain(dir.path()).unwrap(), &reg).unwrap();
+        assert_eq!(recovered.version, 7);
     }
 
     /// A crafted checkpoint with a *valid* whole-file CRC but an absurd
@@ -1306,7 +1396,7 @@ mod tests {
     #[test]
     fn cleanup_old_checkpoints_nonexistent_dir() {
         // Should not error on missing directory
-        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1).unwrap();
+        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1, &[]).unwrap();
     }
 
     #[test]
