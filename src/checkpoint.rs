@@ -293,7 +293,11 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
 /// `num_tables` can be a true count instead of a reserved-and-backfilled
 /// length — the latter silently desynchronises the moment an entry kind is
 /// added later and one write site forgets to update the placeholder.
-fn serialize_delta(snapshot: &Snapshot, base: &Snapshot, registry: &TableRegistry) -> Result<Vec<u8>> {
+fn serialize_delta(
+    snapshot: &Snapshot,
+    base: &Snapshot,
+    registry: &TableRegistry,
+) -> Result<Vec<u8>> {
     struct Entry<'a> {
         name: &'a str,
         kind: TableEntryKind,
@@ -541,6 +545,14 @@ mod tests {
     struct User {
         name: String,
         age: u32,
+    }
+
+    /// A second, unrelated record type — stands in for what a table looked
+    /// like *before* it was dropped and recreated under the same name, in
+    /// `a_table_recreated_with_a_different_type_is_recorded_in_full` below.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Widget {
+        label: String,
     }
 
     fn make_snapshot_with_users() -> (Snapshot, TableRegistry) {
@@ -1056,13 +1068,25 @@ mod tests {
         assert!(!tmp_path.exists());
     }
 
-    /// Parse a delta (or full) checkpoint file's header and per-table entry
-    /// kinds without decoding payloads — enough for tests to assert which
-    /// tables landed as `Unchanged`/`Delta`/`Full`/`Dropped`.
-    fn parse_table_entry_kinds(raw: &[u8]) -> std::collections::HashMap<String, TableEntryKind> {
+    /// One decoded table entry: its kind, and its raw payload bytes for
+    /// `Full`/`Delta` (`None` for `Unchanged`/`Dropped`, which carry none).
+    struct ParsedEntry {
+        kind: TableEntryKind,
+        payload: Option<Vec<u8>>,
+    }
+
+    /// Parse a delta (or full) checkpoint file's header and every per-table
+    /// entry — verifying the whole-file CRC and that the entries exactly
+    /// consume the payload with no trailing or overrun bytes. That
+    /// exactly-self-delimiting property is precisely what Task 6's loader
+    /// will depend on to find the next entry, so tests built on this parser
+    /// prove it on every call rather than assuming it.
+    fn parse_checkpoint_entries(raw: &[u8]) -> std::collections::HashMap<String, ParsedEntry> {
         let config = bincode::config::standard();
         let crc_offset = raw.len() - 4;
         let payload = &raw[..crc_offset];
+        let stored_crc = u32::from_le_bytes(raw[crc_offset..].try_into().unwrap());
+        assert_eq!(crc32(payload), stored_crc, "checkpoint file CRC mismatch");
         let mut offset = 4; // magic
 
         let (_fmt_version, read): (u32, _) =
@@ -1099,16 +1123,49 @@ mod tests {
                 bincode::decode_from_slice(&payload[offset..], config).unwrap();
             offset += read;
 
-            if matches!(entry_kind, TableEntryKind::Full | TableEntryKind::Delta) {
+            let is_inline = matches!(entry_kind, TableEntryKind::Full | TableEntryKind::Delta);
+            let table_payload = if is_inline {
                 let (data_len, read): (u64, _) =
                     bincode::decode_from_slice(&payload[offset..], config).unwrap();
                 offset += read;
-                offset += data_len as usize;
-            }
+                let end = offset + data_len as usize;
+                let bytes = payload[offset..end].to_vec();
+                offset = end;
+                Some(bytes)
+            } else {
+                None
+            };
 
-            out.insert(name, entry_kind);
+            out.insert(
+                name,
+                ParsedEntry {
+                    kind: entry_kind,
+                    payload: table_payload,
+                },
+            );
         }
+
+        // Entries must exactly consume the payload: no unparsed trailing
+        // bytes (a length that undershot) and no overrun into the CRC (a
+        // length that overshot — `payload[offset..end]` above would already
+        // have panicked, but this also catches a *short* final entry).
+        assert_eq!(
+            offset,
+            payload.len(),
+            "table entries did not exactly consume the checkpoint payload"
+        );
+
         out
+    }
+
+    /// [`parse_checkpoint_entries`], keeping only the entry kind — enough
+    /// for tests that only care which tables landed as
+    /// `Unchanged`/`Delta`/`Full`/`Dropped`.
+    fn parse_table_entry_kinds(raw: &[u8]) -> std::collections::HashMap<String, TableEntryKind> {
+        parse_checkpoint_entries(raw)
+            .into_iter()
+            .map(|(name, entry)| (name, entry.kind))
+            .collect()
     }
 
     /// Build two snapshots sharing table Arcs except where the test wants a
@@ -1209,6 +1266,82 @@ mod tests {
         assert_eq!(
             parse_table_entry_kinds(&raw).get("b"),
             Some(&TableEntryKind::Full)
+        );
+    }
+
+    /// `TableRegistry::register` refuses to re-register a name under a
+    /// different concrete type, but a table can still end up recreated with
+    /// a different `R`/`K` between two checkpoints: `WriteTx::delete_table`
+    /// removes a name entirely, and `Store::register_table_keyed`'s guard
+    /// only compares the *key* type against the live table
+    /// (`src/store.rs:917`), not the record type `R`. If the base
+    /// snapshot — kept alive in memory as `Arc<Snapshot>`, never reloaded
+    /// from a file — still holds the table under its old type, `diff_table`'s
+    /// base-side downcast fails with `Error::TableTypeChanged`, and this is
+    /// the fallback that must fire: a `Full` entry carrying the *new* type's
+    /// whole table, not a diff against the incomparable old one.
+    #[test]
+    fn a_table_recreated_with_a_different_type_is_recorded_in_full() {
+        let dir = crate::test_scratch::scratch_dir();
+
+        // Base holds "a" as a `Table<User>` — not registered under this name
+        // at all, standing in for a type the current registry no longer
+        // describes (the old registration is gone once the table was
+        // dropped).
+        let mut old_table = Table::<User>::new();
+        old_table
+            .insert(User {
+                name: "Old".into(),
+                age: 99,
+            })
+            .unwrap();
+        let mut base_tables = std::collections::BTreeMap::new();
+        base_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(old_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let base_snap = Snapshot {
+            version: 1,
+            tables: base_tables,
+        };
+
+        // New snapshot and registry both describe "a" as `Table<Widget>` —
+        // a different concrete record type recreated under the same name.
+        let mut reg = TableRegistry::default();
+        reg.register::<Widget, u64>("a").unwrap();
+        let mut new_table = Table::<Widget>::new();
+        new_table
+            .insert(Widget {
+                label: "fresh".into(),
+            })
+            .unwrap();
+        let mut new_tables = std::collections::BTreeMap::new();
+        new_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(new_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let new_snap = Snapshot {
+            version: 2,
+            tables: new_tables,
+        };
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &reg).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        let entries = parse_checkpoint_entries(&raw);
+        let entry = entries.get("a").expect("table 'a' must have an entry");
+        assert_eq!(entry.kind, TableEntryKind::Full);
+
+        // The payload round-trips as a whole table of the *new* type, not a
+        // delta against the incomparable old one.
+        let info = reg.get("a").unwrap();
+        let restored = (info.deserialize_table)(entry.payload.as_ref().unwrap()).unwrap();
+        let restored = restored.as_any().downcast_ref::<Table<Widget>>().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.get(&1).unwrap(),
+            &Widget {
+                label: "fresh".into()
+            }
         );
     }
 
