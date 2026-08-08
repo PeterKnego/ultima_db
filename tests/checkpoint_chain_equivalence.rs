@@ -26,7 +26,14 @@
 //!
 //! So this file's equivalence is **rows + next_id + latest_version**:
 //!
-//! - **rows**: every table's full key/value set, compared exactly.
+//! - **rows**: every table's full key/value set, compared exactly. One
+//!   caveat: a table `ops` never touches is read back as `TableNotFound`
+//!   rather than an existing-but-empty table (see `run_workload`), and this
+//!   file treats the two as the same "no rows" case. That is safe today only
+//!   because `store_op` never issues table-lifecycle DDL, so both runs always
+//!   agree on which tables exist — it is the one place this file's
+//!   "indistinguishable" claim is narrower than it sounds, and it would stop
+//!   being safe the moment the generator grew a create/drop operation.
 //! - **next_id**: `Table<R, u64>::next_id()` has no public accessor on
 //!   `TableReader`/`TableWriter` (by design — see `src/store.rs`, `TableReader`
 //!   has no such method), so it is observed the same way any caller of the
@@ -73,6 +80,18 @@
 //! interval often enough to exercise the Task 6 shape — see
 //! `generator_produces_insert_delete_within_one_interval_often_enough` for
 //! the measured frequency, not an assumption of it.
+//!
+//! ## Blind spot
+//!
+//! This is a **differential** test: it compares chained recovery against
+//! full recovery, not against an independent oracle of what the ops *should*
+//! produce. A bug present on both paths — e.g. a wrong `next_id` field in
+//! the *full*-checkpoint serializer itself, or a WAL-replay bug that both
+//! `run_workload` calls exercise identically for whatever trails the last
+//! checkpoint — is invisible here, because both sides would be wrong the
+//! same way. What this file catches is exactly what its name says: chain
+//! recovery *diverging* from full recovery, not either of them being wrong
+//! in a way the other shares.
 
 #![cfg(feature = "persistence")]
 
@@ -353,7 +372,10 @@ proptest! {
     #[test]
     fn chain_recovery_matches_full_recovery(
         ops in prop::collection::vec(store_op(), 1..80),
-        chain_max in 1usize..6,
+        // Starts at 2, not 1: chain_max = 1 makes the "chained" run identical
+        // to the "full" baseline it's compared against (both write only
+        // fulls), which is a tautology, not a case that could ever fail.
+        chain_max in 2usize..6,
         checkpoint_every in 1usize..7,
     ) {
         let chained = run_workload(&ops, chain_max, checkpoint_every);
@@ -603,6 +625,16 @@ fn a_delta_headed_directory_is_refused_rather_than_read_as_stale() {
     // fail on it, not silently fall back to the full whose WAL tail is
     // already pruned.
     let head = dir.path().join("checkpoint_3.bin");
+    // Assert the precondition through the crate's own header reader rather
+    // than assuming the file layout — same rationale as
+    // `tests/persistence_integration.rs`'s `assert_full_checkpoint`, inverted
+    // (we need the *head* to be a delta, not a full, or this test would be
+    // exercising the full-checkpoint format-version path instead).
+    assert!(
+        !ultima_db::checkpoint_is_full_for_test(&head).unwrap(),
+        "expected checkpoint_3.bin to be a delta — chain_max(8) with 3 rounds \
+         should leave a full base at v1 and deltas at v2/v3"
+    );
     let mut raw = std::fs::read(&head).unwrap();
     // Byte 4 is the first (and, for the current value, only) byte of the
     // format_version varint, right after the 4-byte "ULDB" magic
@@ -615,13 +647,40 @@ fn a_delta_headed_directory_is_refused_rather_than_read_as_stale() {
         "checkpoint header layout changed — update this offset against src/checkpoint.rs"
     );
     raw[4] = 1; // format_version -> 1
+    // The whole file is CRC-protected (src/checkpoint.rs's `apply_delta_file`
+    // checks the last 4 bytes against crc32 of everything before them), so
+    // flipping the version byte alone corrupts the CRC too — and the CRC
+    // check runs *before* the format-version check there, so an unpatched
+    // CRC would fail this test for the wrong reason (CRC mismatch, not a
+    // version mismatch), without ever exercising the format-version checks
+    // this test exists to exercise. Re-stamp it so the version path is what
+    // actually runs: `crc32fast` mirrors `crate::wal::crc32`'s
+    // hardware-accelerated CRC-32 exactly (see that function's doc comment),
+    // and it is already a plain (non-optional, non-persistence-gated) crate
+    // dependency.
+    //
+    // Note this does not isolate any *one* format-version check: both
+    // `read_header` (chain discovery) and `apply_delta_file` (chain load)
+    // independently re-parse and re-validate the header on the same
+    // `recover()` call, by design (see `apply_delta_file`'s own doc comment).
+    // What this test pins is the pipeline-level guarantee — a
+    // downgraded/corrupted delta head is refused with a format-version
+    // message — not a specific line.
+    let crc_offset = raw.len() - 4;
+    let recomputed = crc32fast::hash(&raw[..crc_offset]);
+    raw[crc_offset..].copy_from_slice(&recomputed.to_le_bytes());
     std::fs::write(&head, &raw).unwrap();
 
     let store2 = Store::new(config).unwrap();
     store2.register_table::<User>("users").unwrap();
     let err = store2.recover().unwrap_err();
+    // Asserting on the message, not just the variant: `CheckpointCorrupted`
+    // is also what a CRC mismatch produces (see the comment above), so
+    // matching the variant alone would pass whether or not a format-version
+    // check ever ran. Mirrors `deserialize_unsupported_format_version_errors`'s
+    // own check at `src/checkpoint.rs:1289` (`msg.contains("unsupported format")`).
     assert!(
-        matches!(err, Error::CheckpointCorrupted(_)),
-        "a downgraded read must fail loudly, got {err:?}"
+        matches!(&err, Error::CheckpointCorrupted(msg) if msg.contains("unsupported format version")),
+        "a downgraded read must fail on the format-version check specifically, got {err:?}"
     );
 }
