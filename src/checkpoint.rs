@@ -6,17 +6,23 @@
 //! A checkpoint is a full serialized snapshot of all tables at a specific version.
 //! Used for fast recovery in both Standalone and SMR modes.
 //!
-//! File format:
+//! File format (v2):
 //! ```text
 //! [magic: 4 bytes "ULDB"]
-//! [format_version: u32]
+//! [format_version: u32]              // 2
+//! [kind: u8]                         // CheckpointKind: Full=0, Delta=1
 //! [snapshot_version: u64]
+//! [base_version: u64]                // Delta only
 //! [num_tables: u32]
 //! for each table:
+//!     [entry_kind: u8]               // TableEntryKind: Unchanged=0, Delta=1, Full=2, Dropped=3
 //!     [name_len: u32][name: bytes]
-//!     [data_len: u64][serialized table data: bytes]
+//!     [data_len: u64][serialized table data: bytes]   // Full/Delta entries only
 //! [crc32: u32]
 //! ```
+//!
+//! Deltas deliberately share the `checkpoint_{version}.bin` filename namespace
+//! with full checkpoints — see [`CheckpointKind`] for why.
 
 #![allow(dead_code)]
 
@@ -30,9 +36,71 @@ use crate::wal::crc32;
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"ULDB";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+/// What a `checkpoint_*.bin` file contains.
+///
+/// Deltas deliberately share the `checkpoint_{version}.bin` namespace with
+/// full checkpoints. An older binary reading a delta-headed directory picks
+/// the delta as "latest" and fails its format check loudly, instead of
+/// silently loading an older full whose WAL tail has already been pruned —
+/// which would lose committed data with no error anywhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum CheckpointKind {
+    Full = 0,
+    Delta = 1,
+}
+
+impl TryFrom<u8> for CheckpointKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(CheckpointKind::Full),
+            1 => Ok(CheckpointKind::Delta),
+            other => Err(Error::CheckpointCorrupted(format!(
+                "unknown checkpoint kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// How one table appears inside a checkpoint file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum TableEntryKind {
+    /// Byte-identical to the base — no payload.
+    Unchanged = 0,
+    /// Changed rows only, as produced by `TableInfo::diff_table`.
+    Delta = 1,
+    /// Whole table inline, as produced by `TableInfo::serialize_table`.
+    Full = 2,
+    /// Present in the base, gone in this version — no payload.
+    Dropped = 3,
+}
+
+impl TryFrom<u8> for TableEntryKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(TableEntryKind::Unchanged),
+            1 => Ok(TableEntryKind::Delta),
+            2 => Ok(TableEntryKind::Full),
+            3 => Ok(TableEntryKind::Dropped),
+            other => Err(Error::CheckpointCorrupted(format!(
+                "unknown table entry kind: {other}"
+            ))),
+        }
+    }
+}
 
 /// Serialize a snapshot to bytes using the type registry.
+///
+/// This always writes `CheckpointKind::Full` with every table entry as
+/// `TableEntryKind::Full` — the delta path (task 6) is what will make this
+/// function ever choose otherwise.
 fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     let mut buf = Vec::new();
@@ -40,6 +108,8 @@ fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<V
     // Header
     buf.extend_from_slice(MAGIC);
     bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut buf, config)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     bincode::encode_into_std_write(snapshot.version, &mut buf, config)
         .map_err(|e| Error::Persistence(e.to_string()))?;
@@ -59,6 +129,10 @@ fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<V
         let info = registry
             .get(name)
             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+
+        // Table entry kind — always Full in this task.
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut buf, config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
 
         // Table name
         bincode::encode_into_std_write(name.as_str(), &mut buf, config)
@@ -80,10 +154,22 @@ fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<V
 }
 
 /// Deserialize a snapshot from bytes using the type registry.
+///
+/// Only `CheckpointKind::Full` is understood in this task — `Delta` is
+/// rejected with a named error rather than silently misparsed; task 6 gives
+/// it real handling.
 fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapshot> {
-    // Minimum: 4 (magic) + 1 (format_version varint) + 1 (version varint)
-    //        + 1 (num_tables varint) + 4 (crc32) = 11 bytes
-    if data.len() < 4 + 1 + 1 + 1 + 4 {
+    // Minimum: 4 (magic) + 1 (format_version varint, smallest encoding) + 4
+    // (crc32) = 9 bytes. That's deliberately just enough to safely check the
+    // magic and read a format version and bail on mismatch — not enough for
+    // a full v2 header (kind/snapshot_version/num_tables). A v1 (or garbage)
+    // file that's shorter than a real v2 header must still be rejected with
+    // the *version* error, not "too short": that's the error message that
+    // names what actually happened (see `a_v1_checkpoint_is_refused_with_a_named_version`).
+    // Every field read past this point is itself bounds-checked, so a file
+    // that passes this gate but is truncated later fails with a specific
+    // error rather than a panic.
+    if data.len() < 4 + 1 + 4 {
         return Err(Error::CheckpointCorrupted("file too short".into()));
     }
 
@@ -115,6 +201,19 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
         )));
     }
 
+    // Checkpoint kind
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+    if kind != CheckpointKind::Full {
+        // Delta bodies are produced starting task 6; this build never writes
+        // them and doesn't yet know how to read them.
+        return Err(Error::CheckpointCorrupted(format!(
+            "checkpoint kind {kind:?} is not supported by this build"
+        )));
+    }
+
     // Snapshot version
     let (version, read): (u64, _) = bincode::decode_from_slice(&payload[offset..], config)
         .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
@@ -128,6 +227,21 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     let mut tables = std::collections::BTreeMap::new();
 
     for _ in 0..num_tables {
+        // Table entry kind
+        let (entry_kind_byte, read): (u8, _) =
+            bincode::decode_from_slice(&payload[offset..], config)
+                .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        offset += read;
+        let entry_kind = TableEntryKind::try_from(entry_kind_byte)?;
+        if entry_kind != TableEntryKind::Full {
+            // Unchanged/Delta/Dropped entries are produced starting task 6;
+            // this build only ever writes Full and doesn't yet know how to
+            // read the others.
+            return Err(Error::CheckpointCorrupted(format!(
+                "table entry kind {entry_kind:?} is not supported by this build"
+            )));
+        }
+
         // Table name
         let (name, read): (String, _) = bincode::decode_from_slice(&payload[offset..], config)
             .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
@@ -317,6 +431,32 @@ mod tests {
     }
 
     #[test]
+    fn v2_full_checkpoint_round_trips() {
+        let (snap, registry) = make_snapshot_with_users();
+        let bytes = serialize_snapshot(&snap, &registry).unwrap();
+        assert_eq!(&bytes[0..4], MAGIC);
+        let restored = deserialize_snapshot(&bytes, &registry).unwrap();
+        assert_eq!(restored.version, snap.version);
+        assert_eq!(restored.tables.len(), snap.tables.len());
+    }
+
+    #[test]
+    fn a_v1_checkpoint_is_refused_with_a_named_version() {
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(1u32, &mut v1, bincode::config::standard()).unwrap();
+        v1.extend_from_slice(&crc32(&v1).to_le_bytes());
+        let registry = TableRegistry::default();
+        let Err(err) = deserialize_snapshot(&v1, &registry) else {
+            panic!("a v1 checkpoint must be rejected");
+        };
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(ref m) if m.contains("unsupported format version: 1")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn checkpoint_serialize_deserialize_roundtrip() {
         let (snapshot, reg) = make_snapshot_with_users();
         let data = serialize_snapshot(&snapshot, &reg).unwrap();
@@ -456,8 +596,10 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut buf, config).unwrap();
         bincode::encode_into_std_write(7u64, &mut buf, config).unwrap(); // snapshot version
         bincode::encode_into_std_write(1u32, &mut buf, config).unwrap(); // num_tables
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut buf, config).unwrap();
         bincode::encode_into_std_write("users", &mut buf, config).unwrap();
         bincode::encode_into_std_write(u64::MAX, &mut buf, config).unwrap(); // data_len
         let crc = crc32(&buf);
@@ -489,6 +631,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(b"XXXX"); // bad magic
         bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write(1u64, &mut data, config).unwrap();
         bincode::encode_into_std_write(0u32, &mut data, config).unwrap();
         let checksum = crc32(&data);
@@ -523,9 +666,12 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC);
         bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
         bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // 1 table
 
+        // Table entry kind
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut data, config).unwrap();
         // Table name
         bincode::encode_into_std_write("users", &mut data, config).unwrap();
         // Claim data_len = 9999 but don't write that much data
@@ -568,8 +714,10 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC);
         bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // snapshot version
         bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // num_tables
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write("users", &mut data, config).unwrap();
         bincode::encode_into_std_write(body.len() as u64, &mut data, config).unwrap();
         data.extend_from_slice(&body);
