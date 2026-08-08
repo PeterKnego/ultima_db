@@ -197,7 +197,15 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     offset += read;
     if fmt_version != FORMAT_VERSION {
         return Err(Error::CheckpointCorrupted(format!(
-            "unsupported format version: {fmt_version}"
+            "unsupported format version: {fmt_version} (checkpoint; this build reads \
+             v{FORMAT_VERSION}). If this file predates incremental-checkpoint support (v1, \
+             written by 0.3.0 or earlier): there is no in-place upgrade, and once a checkpoint \
+             has pruned the WAL the WAL alone cannot make up the gap — with the old UltimaDB \
+             binary, `Store::recover()` the existing persistence directory, read the rows out \
+             through a `ReadTx`, and load them into this build with `Store::bulk_load` / \
+             `Store::bulk_load_batch`, into a fresh, empty persistence directory, then \
+             `checkpoint()`. If this file is from a newer UltimaDB: upgrade the binary to read \
+             it."
         )));
     }
 
@@ -547,7 +555,15 @@ fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
     offset += read;
     if fmt_version != FORMAT_VERSION {
         return Err(Error::CheckpointCorrupted(format!(
-            "unsupported format version: {fmt_version}"
+            "unsupported format version: {fmt_version} (checkpoint; this build reads \
+             v{FORMAT_VERSION}). If this file predates incremental-checkpoint support (v1, \
+             written by 0.3.0 or earlier): there is no in-place upgrade, and once a checkpoint \
+             has pruned the WAL the WAL alone cannot make up the gap — with the old UltimaDB \
+             binary, `Store::recover()` the existing persistence directory, read the rows out \
+             through a `ReadTx`, and load them into this build with `Store::bulk_load` / \
+             `Store::bulk_load_batch`, into a fresh, empty persistence directory, then \
+             `checkpoint()`. If this file is from a newer UltimaDB: upgrade the binary to read \
+             it."
         )));
     }
 

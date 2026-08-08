@@ -123,7 +123,11 @@ pub(crate) struct TableTypeInfo {
     /// delta replay to apply the delta payload's own `next_id` field:
     /// `apply_delta` operates on `&mut dyn Any` and has no concrete `K` to
     /// decode that field into or `Table::set_next_id` to call, so the
-    /// max-with-current logic has to live behind this closure instead.
+    /// max-with-current logic has to live behind this closure instead. A
+    /// destination table whose counter is `None` (explicitly-keyed, no
+    /// auto-increment) stays `None`: `Table::advance_next_id_to` only ever
+    /// raises an existing `Some` counter, so this cannot hand an
+    /// explicitly-keyed table an auto-increment counter it never had.
     pub replay_advance_next_id: ReplayDeleteFn,
     /// Deserialize raw `(encoded key, bytes)` pairs and build a fresh
     /// `Table<R, K>`.

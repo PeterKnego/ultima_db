@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+Incremental (delta) checkpoints: `Store::checkpoint()` can now write a
+*delta* checkpoint file chained to a base full checkpoint instead of always
+re-serializing every table, and recovery replays the chain transparently.
+This is an on-disk format break — **read the migration note below before
+upgrading a store that has data on disk.**
+
+### Migration from 0.3.0 — required if you use `persistence`
+
+There is no in-place upgrade. Checkpoint `FORMAT_VERSION` moved 1 → 2 to
+carry the delta-chain header (`CheckpointKind`, per-table
+`TableEntryKind`); a checkpoint file written by 0.3.0 or earlier is
+rejected by this build. The WAL format is unchanged, but that alone does
+not help: `Store::recover()` fails on the v1 checkpoint file before it
+ever reaches WAL replay, and any row an earlier `checkpoint()` already
+pruned out of the WAL exists nowhere but that checkpoint. The path is the
+same shape as the 0.2.x → 0.3.0 migration:
+
+1. With the **0.3.0** binary, `Store::recover()` the existing persistence
+   directory.
+2. Read the rows out through a `ReadTx`.
+3. Load them into this build's store with `Store::bulk_load` /
+   `Store::bulk_load_batch`, into a **fresh, empty** persistence directory
+   — the same reason as before: a fresh store restarts at version 0, so a
+   stale higher-versioned checkpoint left in a reused directory would
+   outrank the migrated data forever — and then `checkpoint()`.
+
+(There is no `export` API; the steps above are the export. Both rejection
+messages state this path in full.)
+
+### Breaking — on-disk format
+
+- **Checkpoint format v2.** `FORMAT_VERSION` 1 → 2, adding an explicit
+  `CheckpointKind` (Full/Delta) and, per table, a `TableEntryKind`
+  (Unchanged/Delta/Full/Dropped), so a checkpoint file can be a delta
+  chained to a base full checkpoint instead of a complete snapshot. Deltas
+  deliberately share the `checkpoint_{version}.bin` filename namespace
+  with full checkpoints: an older binary that picks a delta up as
+  "latest" fails loudly on the format-version check instead of silently
+  falling back to an older full checkpoint whose WAL tail has already
+  been pruned, which would lose committed data with no error anywhere.
+  Rejected at `recover()` (and at direct checkpoint reads) with an error
+  naming the migration path above. The WAL and snapshot-stream formats
+  are unaffected. See `docs/tasks/task61_incremental_checkpoints.md`.
+
 ## 0.3.0 — 2026-07-31
 
 Arbitrary primary keys: a table can now be keyed by `String`, `Vec<u8>`, any
