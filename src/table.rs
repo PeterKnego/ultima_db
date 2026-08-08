@@ -388,18 +388,23 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         self.next_id.clone()
     }
 
-    /// Raise the auto-increment counter to `candidate` if it is currently
-    /// unset or behind it — never backwards. Spelled without the
-    /// [`AutoKey`] bound (unlike [`Table::set_next_id`], which assigns
-    /// unconditionally) so the type-erased checkpoint-delta replay path
-    /// (`registry::apply_delta`, via `TableTypeInfo::replay_advance_next_id`)
-    /// can call it for *any* key type without knowing statically whether
-    /// this table auto-increments — a no-op for the `None` counter of an
-    /// explicitly-keyed table's `candidate`, since a delta payload only ever
-    /// carries `Some(next_id)` when the base table had one to begin with.
+    /// Raise the auto-increment counter to `candidate` if it is already set
+    /// and behind it — never backwards, and never bootstraps a counter onto
+    /// an explicitly-keyed table. Spelled without the [`AutoKey`] bound
+    /// (unlike [`Table::set_next_id`], which assigns unconditionally) so the
+    /// type-erased checkpoint-delta replay path (`registry::apply_delta`,
+    /// via `TableTypeInfo::replay_advance_next_id`) can call it for *any*
+    /// key type without knowing statically whether this table
+    /// auto-increments. A no-op when `self.next_id` is `None`: a legitimate
+    /// delta only ever carries `Some(next_id)` when the base table already
+    /// had a counter (an `AutoKey` table has one — `Some(K::first())` at
+    /// minimum — from the moment it's created, never `None`), so a `None`
+    /// counter here only happens via a corrupted/forged delta, and the safe
+    /// reading of that is "ignore it," not "give an explicitly-keyed table a
+    /// counter it was never supposed to have."
     #[allow(dead_code)]
     pub(crate) fn advance_next_id_to(&mut self, candidate: K) {
-        if self.next_id.as_ref().is_none_or(|cur| candidate > *cur) {
+        if self.next_id.as_ref().is_some_and(|cur| candidate > *cur) {
             self.next_id = Some(candidate);
         }
     }

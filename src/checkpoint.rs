@@ -584,14 +584,43 @@ fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
 /// back to an older `Full`: the WAL is already pruned to the head version,
 /// so an older full plus the surviving WAL reconstructs less than was
 /// committed, silently.
+///
+/// Termination needs two independent checks, not one. `base_version <
+/// version` alone bounds each file's *own* header fields against each
+/// other, but the hop between files is by filename
+/// (`checkpoint_{base_version}.bin`) — nothing ties the landed file's own
+/// `version` field to the `base_version` used to reach it. Two files whose
+/// headers each individually satisfy `base_version < version` can still
+/// reference each other (e.g. `checkpoint_5.bin` header-claims `version =
+/// 100, base = 3` while `checkpoint_3.bin` header-claims `version = 50, base
+/// = 5`): the walk cycles between them forever, since every step it inspects
+/// passes the per-file check. So every hop also checks that the file it just
+/// opened self-reports the exact `version` its filename was chosen for
+/// (`expected_version` below) — that pins the untrusted header to the
+/// trusted filename, and *that* is what makes the version sequence the walk
+/// actually visits strictly decreasing, not just each file's internal
+/// fields.
 fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
     let mut chain = vec![head_path.clone()];
     let mut current_path = head_path;
     let mut head_version: Option<u64> = None;
+    // `None` for the head (nothing named it, so nothing to check it
+    // against); `Some(v)` once a `Delta` hop has chosen `checkpoint_{v}.bin`
+    // as the next file to open.
+    let mut expected_version: Option<u64> = None;
 
     loop {
         let (kind, version, base_version) = read_header(&current_path)?;
         let head_version = *head_version.get_or_insert(version);
+
+        if let Some(expected) = expected_version
+            && version != expected
+        {
+            return Err(Error::CheckpointCorrupted(format!(
+                "checkpoint file {} claims version {version}, but was opened as base_version {expected}",
+                current_path.display()
+            )));
+        }
 
         match kind {
             CheckpointKind::Full => break,
@@ -611,14 +640,11 @@ fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
                     ))
                 })?;
                 // A delta's base must be strictly older than the delta
-                // itself. Without this, a corrupted `base_version` pointing
-                // *forward or at itself* — e.g. v2 claiming base 3 while v3
-                // claims base 2 — sends the walk in a cycle that never
-                // reaches a `Full` file: an unbounded loop with no error and
-                // no exit, strictly worse than any failure this function
-                // could return instead. Since every hop strictly decreases
-                // the version, this one check is also what guarantees the
-                // walk terminates at all.
+                // itself. On its own this does not guarantee the walk
+                // terminates (see this function's doc comment) — it is the
+                // `expected_version` check above, on the *next* iteration,
+                // that closes the gap — but it is still a real invariant
+                // worth failing on immediately rather than deferring.
                 if base_version >= version {
                     return Err(Error::CheckpointCorrupted(format!(
                         "delta checkpoint {version} claims base_version {base_version}, which is \
@@ -634,6 +660,7 @@ fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
                 }
                 chain.push(base_path.clone());
                 current_path = base_path;
+                expected_version = Some(base_version);
             }
         }
     }
@@ -1853,6 +1880,51 @@ mod tests {
         write_minimal_delta_with_cyclic_base(2, 3);
         write_minimal_delta_with_cyclic_base(3, 2);
 
+        let err = find_head_chain(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// Fix-round-3 regression: the round-2 `base_version < version` guard is
+    /// necessary but not sufficient — it only compares a file's *own*
+    /// header fields to each other, and the hop between files is by
+    /// filename, not by anything that ties the landed file's `version`
+    /// field back to the `base_version` used to choose it. Two files can
+    /// each individually satisfy `base_version < version` and still cycle:
+    /// `checkpoint_5.bin` header-claims `version = 100, base = 3`;
+    /// `checkpoint_3.bin` header-claims `version = 50, base = 5`. Every hop
+    /// the round-2 guard alone ever inspects passes (100 > 3, 50 > 5), so
+    /// the walk bounces between the two filenames forever. This is what
+    /// `walk_chain_from`'s `expected_version` check exists to catch: the
+    /// file opened as `checkpoint_3.bin` must itself claim `version = 3`,
+    /// not `50`.
+    #[test]
+    fn a_filename_header_version_mismatch_fails_loudly_instead_of_hanging() {
+        let dir = crate::test_scratch::scratch_dir();
+
+        let write_delta_at_filename = |filename_version: u64, header_version: u64, base_version: u64| {
+            let config = bincode::config::standard();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(MAGIC);
+            bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(CheckpointKind::Delta as u8, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(header_version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(base_version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(0u32, &mut buf, config).unwrap(); // num_tables
+            let crc = crc32(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            write_checkpoint_bytes(dir.path(), filename_version, &buf).unwrap();
+        };
+        // checkpoint_5.bin: header says version=100, base=3 (100 > 3, the
+        // round-2 guard alone is satisfied).
+        write_delta_at_filename(5, 100, 3);
+        // checkpoint_3.bin: header says version=50, base=5 (50 > 5, also
+        // satisfied) — and points straight back at checkpoint_5.bin.
+        write_delta_at_filename(3, 50, 5);
+
+        // `find_latest_checkpoint` picks the highest *filename*: 5.
         let err = find_head_chain(dir.path()).unwrap_err();
         assert!(
             matches!(err, Error::CheckpointCorrupted(_)),

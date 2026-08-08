@@ -1276,6 +1276,46 @@ mod tests {
         assert_eq!(restored.next_id_opt(), None);
     }
 
+    /// Fix-round-3 regression: `Table::advance_next_id_to` must be a no-op
+    /// when the table has no counter at all, not just "never go backwards."
+    /// A real writer never emits a delta with `has_next_id = 1` for an
+    /// explicitly-keyed table (`diff_table` reads it off
+    /// `new_flushed.next_id_opt()`, which is `None` for any non-`AutoKey`
+    /// `K`) — this is only reachable via a CRC-valid forged delta — but the
+    /// doc comment on `advance_next_id_to` promises "a no-op for the `None`
+    /// counter," and the code must actually do that rather than bootstrapping
+    /// a counter onto a table that was never supposed to have one.
+    #[test]
+    fn replay_advance_next_id_is_a_noop_on_a_table_with_no_counter() {
+        let mut reg = TableRegistry::default();
+        reg.register::<String, String>("emails").unwrap();
+        let info = reg.get("emails").unwrap();
+
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
+        assert_eq!(
+            table_box
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap()
+                .next_id_opt(),
+            None,
+            "sanity: an explicitly-keyed table starts with no counter"
+        );
+
+        let candidate = "zzz".to_string().encode();
+        (info.replay_advance_next_id)(table_box.as_any_mut(), &candidate).unwrap();
+
+        assert_eq!(
+            table_box
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap()
+                .next_id_opt(),
+            None,
+            "an explicitly-keyed table must not acquire a counter through delta replay"
+        );
+    }
+
     #[test]
     fn roundtrip_u64_keyed_table_preserves_next_id() {
         let mut reg = TableRegistry::default();
