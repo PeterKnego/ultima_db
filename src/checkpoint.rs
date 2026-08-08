@@ -284,6 +284,126 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     Ok(Snapshot { version, tables })
 }
 
+/// Serialize `snapshot` as a delta against `base`: unchanged tables cost a
+/// single byte-and-a-name, changed tables carry only their changed rows, and
+/// created/dropped/type-changed tables are called out by an explicit entry
+/// kind rather than left for the loader to infer.
+///
+/// Entries are decided into a `Vec` before anything is written so
+/// `num_tables` can be a true count instead of a reserved-and-backfilled
+/// length — the latter silently desynchronises the moment an entry kind is
+/// added later and one write site forgets to update the placeholder.
+fn serialize_delta(snapshot: &Snapshot, base: &Snapshot, registry: &TableRegistry) -> Result<Vec<u8>> {
+    struct Entry<'a> {
+        name: &'a str,
+        kind: TableEntryKind,
+        payload: Option<Vec<u8>>,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+
+    for (name, table) in snapshot
+        .tables
+        .iter()
+        .filter(|(name, _)| registry.contains(name))
+    {
+        let info = registry
+            .get(name)
+            .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+        match base.tables.get(name) {
+            // Same Arc: the table was not touched since the base checkpoint,
+            // so there is provably nothing to write.
+            Some(base_table) if std::sync::Arc::ptr_eq(table, base_table) => {
+                entries.push(Entry {
+                    name,
+                    kind: TableEntryKind::Unchanged,
+                    payload: None,
+                });
+            }
+            Some(base_table) => {
+                match (info.diff_table)(table.as_ref().as_any(), base_table.as_ref().as_any()) {
+                    Ok(payload) => entries.push(Entry {
+                        name,
+                        kind: TableEntryKind::Delta,
+                        payload: Some(payload),
+                    }),
+                    // Dropped and recreated with a different R or K: the base
+                    // rows are not comparable, so the whole table goes inline.
+                    Err(Error::TableTypeChanged { .. }) => {
+                        let payload = (info.serialize_table)(table.as_ref().as_any())?;
+                        entries.push(Entry {
+                            name,
+                            kind: TableEntryKind::Full,
+                            payload: Some(payload),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            None => {
+                let payload = (info.serialize_table)(table.as_ref().as_any())?;
+                entries.push(Entry {
+                    name,
+                    kind: TableEntryKind::Full,
+                    payload: Some(payload),
+                });
+            }
+        }
+    }
+
+    // Tables in the base that are gone from this snapshot.
+    for name in base.tables.keys() {
+        if !snapshot.tables.contains_key(name) && registry.contains(name) {
+            entries.push(Entry {
+                name,
+                kind: TableEntryKind::Dropped,
+                payload: None,
+            });
+        }
+    }
+
+    let config = bincode::config::standard();
+    let mut buf = Vec::new();
+
+    // Header
+    buf.extend_from_slice(MAGIC);
+    bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(CheckpointKind::Delta as u8, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(snapshot.version, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(base.version, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(entries.len() as u32, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    for entry in &entries {
+        bincode::encode_into_std_write(entry.kind as u8, &mut buf, config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        bincode::encode_into_std_write(entry.name, &mut buf, config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        // Unchanged/Dropped entries carry no payload at all — not even a
+        // zero-length one — so the loader's byte accounting matches what was
+        // actually decided above, not a placeholder for something that was
+        // never computed.
+        if let Some(payload) = &entry.payload {
+            bincode::encode_into_std_write(payload.len() as u64, &mut buf, config)
+                .map_err(|e| Error::Persistence(e.to_string()))?;
+            buf.extend_from_slice(payload);
+        }
+    }
+
+    // Append CRC32 of everything before it — the delta payload itself
+    // carries no CRC or length trailer of its own (it mirrors
+    // `serialize_table`'s framing), so this whole-file checksum is what
+    // protects it.
+    let checksum = crc32(&buf);
+    buf.extend_from_slice(&checksum.to_le_bytes());
+
+    Ok(buf)
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint file management
 // ---------------------------------------------------------------------------
@@ -317,6 +437,29 @@ pub(crate) fn find_latest_checkpoint(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(best.map(|(_, path)| path))
 }
 
+/// Write already-serialized checkpoint bytes to `checkpoint_{version}.bin`,
+/// via write-to-temp + `sync_all` + atomic rename + `sync_dir` — the crash
+/// safety dance shared by both the full and delta writers, so a process
+/// crash mid-write never leaves a corrupt or partially-visible checkpoint
+/// file.
+fn write_checkpoint_bytes(dir: &Path, version: u64, data: &[u8]) -> Result<u64> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+
+    let final_path = dir.join(checkpoint_filename(version));
+    let tmp_path = dir.join(format!("{}.tmp", checkpoint_filename(version)));
+
+    let mut file = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    file.write_all(data)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    drop(file);
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    crate::wal::sync_dir(dir)?;
+
+    Ok(version)
+}
+
 /// Write a checkpoint to disk.
 ///
 /// Uses write-to-temp + atomic rename to avoid leaving a corrupt checkpoint
@@ -326,22 +469,23 @@ pub(crate) fn write_checkpoint(
     snapshot: &Snapshot,
     registry: &TableRegistry,
 ) -> Result<u64> {
-    std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
-
     let data = serialize_snapshot(snapshot, registry)?;
-    let final_path = dir.join(checkpoint_filename(snapshot.version));
-    let tmp_path = dir.join(format!("{}.tmp", checkpoint_filename(snapshot.version)));
+    write_checkpoint_bytes(dir, snapshot.version, &data)
+}
 
-    let mut file = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
-    file.write_all(&data)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    file.sync_all()
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    drop(file);
-    std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
-    crate::wal::sync_dir(dir)?;
-
-    Ok(snapshot.version)
+/// Write a delta checkpoint — `snapshot` serialized against `base`, so
+/// tables untouched since `base` cost no payload and only genuinely changed
+/// rows are written. Shares the `checkpoint_{version}.bin` namespace and
+/// crash-safety discipline with [`write_checkpoint`]; see [`CheckpointKind`]
+/// for why deltas are not given their own filename pattern.
+pub(crate) fn write_delta_checkpoint(
+    dir: &Path,
+    snapshot: &Snapshot,
+    base: &Snapshot,
+    registry: &TableRegistry,
+) -> Result<u64> {
+    let data = serialize_delta(snapshot, base, registry)?;
+    write_checkpoint_bytes(dir, snapshot.version, &data)
 }
 
 /// Load a checkpoint from a file.
@@ -910,6 +1054,162 @@ mod tests {
         let tmp_path = dir.path().join("checkpoint_42.bin.tmp");
         assert!(final_path.exists());
         assert!(!tmp_path.exists());
+    }
+
+    /// Parse a delta (or full) checkpoint file's header and per-table entry
+    /// kinds without decoding payloads — enough for tests to assert which
+    /// tables landed as `Unchanged`/`Delta`/`Full`/`Dropped`.
+    fn parse_table_entry_kinds(raw: &[u8]) -> std::collections::HashMap<String, TableEntryKind> {
+        let config = bincode::config::standard();
+        let crc_offset = raw.len() - 4;
+        let payload = &raw[..crc_offset];
+        let mut offset = 4; // magic
+
+        let (_fmt_version, read): (u32, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+
+        let (kind_byte, read): (u8, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+        let kind = CheckpointKind::try_from(kind_byte).unwrap();
+
+        let (_snapshot_version, read): (u64, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+
+        if kind == CheckpointKind::Delta {
+            let (_base_version, read): (u64, _) =
+                bincode::decode_from_slice(&payload[offset..], config).unwrap();
+            offset += read;
+        }
+
+        let (num_tables, read): (u32, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+
+        let mut out = std::collections::HashMap::new();
+        for _ in 0..num_tables {
+            let (entry_kind_byte, read): (u8, _) =
+                bincode::decode_from_slice(&payload[offset..], config).unwrap();
+            offset += read;
+            let entry_kind = TableEntryKind::try_from(entry_kind_byte).unwrap();
+
+            let (name, read): (String, _) =
+                bincode::decode_from_slice(&payload[offset..], config).unwrap();
+            offset += read;
+
+            if matches!(entry_kind, TableEntryKind::Full | TableEntryKind::Delta) {
+                let (data_len, read): (u64, _) =
+                    bincode::decode_from_slice(&payload[offset..], config).unwrap();
+                offset += read;
+                offset += data_len as usize;
+            }
+
+            out.insert(name, entry_kind);
+        }
+        out
+    }
+
+    /// Build two snapshots sharing table Arcs except where the test wants a
+    /// difference: `base` has "a" and "b"; `new` is `base` with "a" replaced
+    /// by a table with an extra row, so "b"'s `Arc` is byte-identical between
+    /// the two snapshots.
+    fn make_base_and_changed_a() -> (Snapshot, Snapshot, TableRegistry) {
+        let mut reg = TableRegistry::default();
+        reg.register::<User, u64>("a").unwrap();
+        reg.register::<User, u64>("b").unwrap();
+
+        let mut table_a = Table::<User>::new();
+        table_a
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+
+        let mut table_b = Table::<User>::new();
+        table_b
+            .insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
+        let table_b: std::sync::Arc<dyn crate::table::MergeableTable> =
+            std::sync::Arc::new(table_b);
+
+        let mut base_tables = std::collections::BTreeMap::new();
+        base_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(table_a.clone()) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        base_tables.insert("b".to_string(), table_b.clone());
+        let base_snap = Snapshot {
+            version: 1,
+            tables: base_tables,
+        };
+
+        table_a
+            .insert(User {
+                name: "Carol".into(),
+                age: 40,
+            })
+            .unwrap();
+        let mut new_tables = std::collections::BTreeMap::new();
+        new_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(table_a) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        // Same Arc as base — "b" was not touched in this interval.
+        new_tables.insert("b".to_string(), table_b);
+        let new_snap = Snapshot {
+            version: 2,
+            tables: new_tables,
+        };
+
+        (base_snap, new_snap, reg)
+    }
+
+    #[test]
+    fn a_delta_records_only_changed_tables() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (base_snap, new_snap, registry) = make_base_and_changed_a();
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap();
+        assert_eq!(v, new_snap.version);
+
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        let entries = parse_table_entry_kinds(&raw);
+        assert_eq!(entries.get("a"), Some(&TableEntryKind::Delta));
+        assert_eq!(entries.get("b"), Some(&TableEntryKind::Unchanged));
+    }
+
+    #[test]
+    fn a_table_absent_from_the_new_snapshot_is_recorded_as_dropped() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (base_snap, mut new_snap, registry) = make_base_and_changed_a();
+        new_snap.tables.remove("b");
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        assert_eq!(
+            parse_table_entry_kinds(&raw).get("b"),
+            Some(&TableEntryKind::Dropped)
+        );
+    }
+
+    #[test]
+    fn a_table_absent_from_the_base_is_recorded_in_full() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (mut base_snap, new_snap, registry) = make_base_and_changed_a();
+        base_snap.tables.remove("b");
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        assert_eq!(
+            parse_table_entry_kinds(&raw).get("b"),
+            Some(&TableEntryKind::Full)
+        );
     }
 
     #[test]
