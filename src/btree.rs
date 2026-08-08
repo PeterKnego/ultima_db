@@ -541,6 +541,23 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         ))
     }
 
+    /// Changes that turn `base` into `self`, in ascending key order.
+    ///
+    /// Runs in time proportional to what changed, not to tree size: any
+    /// subtree the two versions still share is a single `Arc` on both sides
+    /// and is skipped whole. Equal keys bound to the same value `Arc` are not
+    /// reported — a re-insert of an identical `Arc` is not a change.
+    ///
+    /// Both trees must be versions of the same logical tree. Diffing two
+    /// unrelated trees is well-defined (it degenerates to a full ordered
+    /// merge) but pointless.
+    pub fn diff<'a>(&'a self, base: &'a BTree<K, V>) -> BTreeDiff<'a, K, V> {
+        BTreeDiff {
+            new: DiffCursor::new(&self.root),
+            base: DiffCursor::new(&base.root),
+        }
+    }
+
     /// Iterate over every entry the monotone `locate` predicate reports as
     /// [`Ordering::Equal`], in ascending key order.
     ///
@@ -1008,6 +1025,172 @@ fn maybe_split<K: Clone, V>(
                 children: right_children,
             }),
             replaced,
+        }
+    }
+}
+
+/// A single difference between two versions of a `BTree`.
+///
+/// Yielded by [`BTree::diff`] in ascending key order. Lifetimes borrow from
+/// *both* trees: `Removed` borrows its key from the base tree, the other two
+/// from the newer tree.
+pub enum Change<'a, K, V> {
+    /// Key is present in the newer tree and absent from the base.
+    Added(&'a K, &'a Arc<V>),
+    /// Key is present in both, bound to a different value `Arc`.
+    Updated(&'a K, &'a Arc<V>),
+    /// Key is present in the base and absent from the newer tree.
+    Removed(&'a K),
+}
+
+/// In-order cursor over a `BTree` that exposes *subtree* boundaries.
+///
+/// `BTreeRange` stores `&BTreeNode` frames, which cannot be compared with
+/// `Arc::ptr_eq`; the diff needs the `Arc` itself to detect shared subtrees,
+/// so it gets its own cursor.
+///
+/// A frame's `slot` interleaves children and entries in traversal order:
+/// even `slot` means "child `slot / 2` has not been descended into yet",
+/// odd `slot` means "entry `slot / 2` is the next entry to yield".
+struct DiffCursor<'a, K, V> {
+    stack: Vec<(&'a Arc<BTreeNode<K, V>>, usize)>,
+}
+
+impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
+    fn new(root: &'a Arc<BTreeNode<K, V>>) -> Self {
+        DiffCursor { stack: vec![(root, 0)] }
+    }
+
+    /// The subtree this cursor is about to descend into, if any.
+    ///
+    /// `None` for a leaf frame or when the next step is an entry rather than
+    /// a child — that is the signal the diff loop uses to fall back to a
+    /// key-wise comparison.
+    fn peek_child(&self) -> Option<&'a Arc<BTreeNode<K, V>>> {
+        let (node, slot) = *self.stack.last()?;
+        if node.children.is_empty() || slot % 2 == 1 {
+            return None;
+        }
+        let idx = slot / 2;
+        // FixedVec has no `get`; index only within the live prefix.
+        if idx < node.children.len() {
+            Some(&node.children[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Descend into the pending child.
+    fn descend(&mut self) {
+        if let Some(child) = self.peek_child() {
+            let last = self.stack.len() - 1;
+            self.stack[last].1 += 1;
+            self.stack.push((child, 0));
+        }
+    }
+
+    /// Step over the pending child without visiting any of its keys.
+    fn skip_child(&mut self) {
+        if self.peek_child().is_some() {
+            let last = self.stack.len() - 1;
+            self.stack[last].1 += 1;
+        }
+    }
+
+    /// Advance until the top frame's next step is an entry, then return it.
+    ///
+    /// Does not consume the entry; call `bump` to move past it.
+    fn peek_entry(&mut self) -> Option<(&'a K, &'a Arc<V>)> {
+        loop {
+            let (node, slot) = *self.stack.last()?;
+            if node.children.is_empty() {
+                // Leaf: slots are entries directly, no interleaving.
+                if slot < node.entries.len() {
+                    let (k, v) = &node.entries[slot];
+                    return Some((k, v));
+                }
+                self.stack.pop();
+                continue;
+            }
+            if slot % 2 == 0 {
+                self.descend();
+                continue;
+            }
+            let idx = slot / 2;
+            if idx < node.entries.len() {
+                let (k, v) = &node.entries[idx];
+                return Some((k, v));
+            }
+            self.stack.pop();
+        }
+    }
+
+    /// Consume the entry last returned by `peek_entry`.
+    fn bump(&mut self) {
+        if let Some(last) = self.stack.last_mut() {
+            // Leaf frames advance one slot per entry; internal frames advance
+            // from odd slot `2i+1` (the entry just yielded) to the next
+            // pending child at even slot `2i+2`. Same `+= 1`, two different
+            // meanings, so it is spelled out here rather than folded into
+            // `peek_entry`.
+            last.1 += 1;
+        }
+    }
+}
+
+/// Iterator returned by [`BTree::diff`].
+pub struct BTreeDiff<'a, K, V> {
+    new: DiffCursor<'a, K, V>,
+    base: DiffCursor<'a, K, V>,
+}
+
+impl<'a, K: Ord + Clone, V> Iterator for BTreeDiff<'a, K, V> {
+    type Item = Change<'a, K, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Opportunistic skip: when both cursors are poised on the *same*
+            // subtree, every key inside it is unchanged by CoW construction,
+            // so neither side needs to walk it. This is where the O(changed)
+            // behaviour comes from; correctness never depends on it firing.
+            match (self.new.peek_child(), self.base.peek_child()) {
+                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {
+                    self.new.skip_child();
+                    self.base.skip_child();
+                    continue;
+                }
+                _ => {}
+            }
+
+            return match (self.new.peek_entry(), self.base.peek_entry()) {
+                (None, None) => None,
+                (Some((k, v)), None) => {
+                    self.new.bump();
+                    Some(Change::Added(k, v))
+                }
+                (None, Some((k, _))) => {
+                    self.base.bump();
+                    Some(Change::Removed(k))
+                }
+                (Some((nk, nv)), Some((bk, bv))) => match nk.cmp(bk) {
+                    Ordering::Less => {
+                        self.new.bump();
+                        Some(Change::Added(nk, nv))
+                    }
+                    Ordering::Greater => {
+                        self.base.bump();
+                        Some(Change::Removed(bk))
+                    }
+                    Ordering::Equal => {
+                        self.new.bump();
+                        self.base.bump();
+                        if Arc::ptr_eq(nv, bv) {
+                            continue;
+                        }
+                        Some(Change::Updated(nk, nv))
+                    }
+                },
+            };
         }
     }
 }
@@ -3083,5 +3266,51 @@ mod tests {
             assert_eq!(t.len(), n as usize);
             check_invariants(&t);
         }
+    }
+
+    #[test]
+    fn diff_reports_added_updated_and_removed() {
+        let base = BTree::<u64, String>::new()
+            .insert(1, "one".into())
+            .insert(2, "two".into())
+            .insert(3, "three".into());
+        let new = base
+            .insert(2, "TWO".into())            // update
+            .insert(4, "four".into())           // add
+            .remove(&1)
+            .unwrap();                          // remove
+
+        let changes: Vec<_> = new
+            .diff(&base)
+            .map(|c| match c {
+                Change::Added(k, v) => (*k, Some(v.to_string()), "add"),
+                Change::Updated(k, v) => (*k, Some(v.to_string()), "upd"),
+                Change::Removed(k) => (*k, None, "rem"),
+            })
+            .collect();
+
+        assert_eq!(
+            changes,
+            vec![
+                (1, None, "rem"),
+                (2, Some("TWO".to_string()), "upd"),
+                (4, Some("four".to_string()), "add"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_of_a_tree_against_itself_is_empty() {
+        let t = BTree::<u64, u64>::new().insert(1, 10).insert(2, 20);
+        assert_eq!(t.diff(&t).count(), 0);
+        assert_eq!(t.clone().diff(&t).count(), 0);
+    }
+
+    #[test]
+    fn diff_reports_no_change_when_the_same_value_arc_is_reinserted() {
+        let base = BTree::<u64, u64>::new().insert(1, 10);
+        let arc = base.get_arc(&1).unwrap();
+        let new = base.insert_arc(1, arc);
+        assert_eq!(new.diff(&base).count(), 0);
     }
 }

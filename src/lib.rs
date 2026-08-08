@@ -75,7 +75,7 @@ pub mod wal;
 #[cfg(all(test, feature = "persistence"))]
 mod test_scratch;
 
-pub use btree::BTree;
+pub use btree::{BTree, BTreeDiff, Change};
 pub use bulk_load::{
     AddOptions, BulkDelta, BulkLoadBatch, BulkLoadInput, BulkLoadOptions, BulkSource,
 };
