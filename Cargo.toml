@@ -105,6 +105,11 @@ harness = false
 required-features = ["persistence"]
 
 [[bench]]
+name = "checkpoint_delta"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
 name = "singlewriter_persistence_bench"
 harness = false
 required-features = ["persistence"]
