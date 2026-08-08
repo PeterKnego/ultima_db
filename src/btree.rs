@@ -552,6 +552,16 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// unrelated trees is well-defined (it degenerates to a full ordered
     /// merge) but pointless.
     pub fn diff<'a>(&'a self, base: &'a BTree<K, V>) -> BTreeDiff<'a, K, V> {
+        // Common no-op-checkpoint case: nothing changed since `base` at all,
+        // so the roots are still the same `Arc` (no CoW clone ever
+        // happened). Short-circuit to empty cursors instead of walking up to
+        // MAX_KEYS root entries just to find every one of them unchanged.
+        if Arc::ptr_eq(&self.root, &base.root) {
+            return BTreeDiff {
+                new: DiffCursor { stack: Vec::new() },
+                base: DiffCursor { stack: Vec::new() },
+            };
+        }
         BTreeDiff {
             new: DiffCursor::new(&self.root),
             base: DiffCursor::new(&base.root),
@@ -1034,6 +1044,13 @@ fn maybe_split<K: Clone, V>(
 /// Yielded by [`BTree::diff`] in ascending key order. Lifetimes borrow from
 /// *both* trees: `Removed` borrows its key from the base tree, the other two
 /// from the newer tree.
+///
+/// `#[derive(Debug)]` bounds both `K: Debug` and `V: Debug` (the latter via
+/// `&Arc<V>: Debug`, which requires it) — genuinely needed for the `Added`/
+/// `Updated` variants, so this isn't over-restrictive despite `Removed`
+/// alone not needing `V: Debug`: derive bounds per type parameter, not per
+/// variant.
+#[derive(Debug)]
 pub enum Change<'a, K, V> {
     /// Key is present in the newer tree and absent from the base.
     Added(&'a K, &'a Arc<V>),
@@ -1081,8 +1098,22 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
     }
 
     /// Descend into the pending child.
+    ///
+    /// Only ever called when `peek_entry` has already determined the top
+    /// frame's next step is a child (even `slot`, non-leaf node), so
+    /// `peek_child` returning `None` here means the node's `children` count
+    /// doesn't match its `entries` count — a malformed tree, not a
+    /// legitimate "no pending child" state. Silently no-op-ing on that would
+    /// leave `slot` unchanged, so `peek_entry`'s loop would call `descend`
+    /// again and spin forever instead of failing.
     fn descend(&mut self) {
-        if let Some(child) = self.peek_child() {
+        let child = self.peek_child();
+        debug_assert!(
+            child.is_some(),
+            "DiffCursor::descend: no pending child on a non-leaf frame — \
+             malformed node (children.len() != entries.len() + 1)"
+        );
+        if let Some(child) = child {
             let last = self.stack.len() - 1;
             self.stack[last].1 += 1;
             self.stack.push((child, 0));
@@ -2027,6 +2058,7 @@ fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn insert_range(start: u64, end: u64) -> BTree<u64, u64> {
         let mut t = BTree::new();
@@ -3312,5 +3344,159 @@ mod tests {
         let arc = base.get_arc(&1).unwrap();
         let new = base.insert_arc(1, arc);
         assert_eq!(new.diff(&base).count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // BTree::diff proptest oracle, deep-tree case.
+    //
+    // `tests/btree_diff_oracle.rs` covers narrow-key, high-collision
+    // histories (small key space, so inserts/removes/updates collide
+    // constantly) — but under the default T=32 (MAX_KEYS=63, 64-way
+    // fan-out) that key space caps the tree at height 2, so it never
+    // builds an internal node whose children are themselves internal:
+    // exactly the case the multi-frame `stack.pop()` chain in
+    // `DiffCursor::peek_entry`/`peek_child` and a non-leaf `Arc::ptr_eq`
+    // subtree skip exist for. This case lives here instead of in the
+    // integration test because proving it actually reached that depth
+    // needs `root`/`children`, which aren't public API.
+    //
+    // Deterministic seed (`DIFF_ORACLE_DEEP_SEED` sequential inserts)
+    // guarantees height >= 3 regardless of what the randomized ops layered
+    // on top do, so update/remove coverage at depth isn't left to chance:
+    // widening the key space alone (without the seed) would make collisions
+    // — and therefore Updated/Removed coverage — vanishingly rare within a
+    // few hundred random ops.
+    // -----------------------------------------------------------------
+
+    /// Levels from root to leaf, inclusive — a single-leaf (empty or small)
+    /// tree is height 1. `height(t) >= 3` means some node's children are
+    /// themselves internal nodes, not leaves.
+    fn diff_oracle_tree_height<K, V>(t: &BTree<K, V>) -> usize {
+        fn go<K, V>(node: &Arc<BTreeNode<K, V>>) -> usize {
+            if node.children.is_empty() {
+                1
+            } else {
+                1 + go(&node.children[0])
+            }
+        }
+        go(&t.root)
+    }
+
+    #[derive(Debug, Clone)]
+    enum DiffOracleOp {
+        Insert(u64, u64),
+        Remove(u64),
+    }
+
+    // 64-way fan-out means a single overflowing child of the root (>63
+    // entries) is already enough to reach height 3; this is a wide margin
+    // over that, so the assertion in the proptest below is not a near thing.
+    const DIFF_ORACLE_DEEP_SEED: u64 = 5_000;
+
+    fn diff_oracle_deep_ops() -> impl Strategy<Value = Vec<DiffOracleOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                (0u64..DIFF_ORACLE_DEEP_SEED, 0u64..1000)
+                    .prop_map(|(k, v)| DiffOracleOp::Insert(k, v)),
+                (0u64..DIFF_ORACLE_DEEP_SEED).prop_map(DiffOracleOp::Remove),
+            ],
+            0..300,
+        )
+    }
+
+    // Same generation-counter trick as the integration test's oracle (see
+    // its `apply` doc comment): `diff` compares `Arc::ptr_eq`, not value
+    // equality, and `BTree::insert` allocates a fresh value `Arc` on every
+    // call, so the model must track per-key identity, not just the value.
+    fn diff_oracle_apply(
+        tree: &BTree<u64, u64>,
+        model: &mut std::collections::BTreeMap<u64, (u64, u64)>,
+        generation: &mut u64,
+        op: &DiffOracleOp,
+    ) -> BTree<u64, u64> {
+        match op {
+            DiffOracleOp::Insert(k, v) => {
+                *generation += 1;
+                model.insert(*k, (*v, *generation));
+                tree.insert(*k, *v)
+            }
+            DiffOracleOp::Remove(k) => {
+                model.remove(k);
+                tree.remove(k).unwrap_or_else(|_| tree.clone())
+            }
+        }
+    }
+
+    fn diff_oracle_expected(
+        new: &std::collections::BTreeMap<u64, (u64, u64)>,
+        base: &std::collections::BTreeMap<u64, (u64, u64)>,
+    ) -> Vec<(u64, Option<u64>, &'static str)> {
+        let mut out = Vec::new();
+        let mut keys: Vec<u64> = new.keys().chain(base.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for k in keys {
+            match (new.get(&k), base.get(&k)) {
+                (Some((_, ng)), Some((_, bg))) if ng == bg => {}
+                (Some((nv, _)), Some(_)) => out.push((k, Some(*nv), "upd")),
+                (Some((nv, _)), None) => out.push((k, Some(*nv), "add")),
+                (None, Some(_)) => out.push((k, None, "rem")),
+                (None, None) => unreachable!("key came from one of the two maps"),
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn diff_matches_full_scan_oracle_deep_tree(
+            rand_base in diff_oracle_deep_ops(),
+            rand_then in diff_oracle_deep_ops(),
+        ) {
+            let mut model = std::collections::BTreeMap::new();
+            let mut generation = 0u64;
+            let mut tree = BTree::<u64, u64>::new();
+
+            // Deterministic seed first: forces height >= 3 no matter what
+            // the randomized ops (which may remove far more than they add)
+            // do afterward.
+            for k in 0..DIFF_ORACLE_DEEP_SEED {
+                tree = diff_oracle_apply(
+                    &tree, &mut model, &mut generation, &DiffOracleOp::Insert(k, k),
+                );
+            }
+            for op in &rand_base {
+                tree = diff_oracle_apply(&tree, &mut model, &mut generation, op);
+            }
+            let base_tree = tree.clone();
+            let base_model = model.clone();
+
+            // Confirm the deep path is actually reached, rather than assume
+            // the seed size is adequate.
+            let base_height = diff_oracle_tree_height(&base_tree);
+            prop_assert!(
+                base_height >= 3,
+                "deep-tree proptest case only reached height {} — \
+                 DIFF_ORACLE_DEEP_SEED needs raising",
+                base_height
+            );
+
+            for op in &rand_then {
+                tree = diff_oracle_apply(&tree, &mut model, &mut generation, op);
+            }
+
+            let got: Vec<(u64, Option<u64>, &'static str)> = tree
+                .diff(&base_tree)
+                .map(|c| match c {
+                    Change::Added(k, v) => (*k, Some(**v), "add"),
+                    Change::Updated(k, v) => (*k, Some(**v), "upd"),
+                    Change::Removed(k) => (*k, None, "rem"),
+                })
+                .collect();
+
+            prop_assert_eq!(got, diff_oracle_expected(&model, &base_model));
+        }
     }
 }

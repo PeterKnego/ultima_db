@@ -8,6 +8,16 @@
 //! Example tests cannot cover the structural cases (splits, merges, root
 //! collapse) that make a key move between nodes, so this compares against a
 //! full scan of both trees over randomly generated histories.
+//!
+//! This is the narrow-key, high-collision half of the oracle: a small key
+//! space (`0..200`) so `Add`/`Update`/`Remove` all happen constantly and the
+//! tree gets restructured (splits, merges, root collapse) under a shallow
+//! (height <= 2 under the default `T=32`) tree. The complementary deep-tree
+//! case — wide key space, deterministic seed forcing height >= 3, proving
+//! the multi-level subtree-skip and multi-frame pop-chain paths — lives in
+//! `src/btree.rs`'s unit tests (`diff_matches_full_scan_oracle_deep_tree`),
+//! because confirming it reaches that depth needs `root`/`children`, which
+//! this integration test's public-API-only view doesn't have.
 
 use std::collections::BTreeMap;
 
@@ -97,7 +107,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
-    fn diff_matches_full_scan_oracle(base_ops in ops(), then_ops in ops()) {
+    fn diff_matches_full_scan_oracle_narrow_keys(base_ops in ops(), then_ops in ops()) {
         let mut model: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
         let mut generation: u64 = 0;
         let mut tree = BTree::<u64, u64>::new();
