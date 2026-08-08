@@ -35,6 +35,19 @@ pub(crate) struct Snapshot {
     pub(crate) tables: BTreeMap<String, Arc<dyn MergeableTable>>,
 }
 
+// Manual, not derived: `Arc<dyn MergeableTable>` has no `Debug` impl (the
+// trait doesn't require one — it would force every `Record` to be `Debug`
+// too). Printing the table names is enough for what this is for: unwrapping
+// a `Result<Snapshot, _>` in tests without needing the tables' contents.
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("version", &self.version)
+            .field("tables", &self.tables.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl Snapshot {
     /// Returns the names of all tables in this snapshot, in sorted alphabetical order.
     /// (BTreeMap keys are already sorted.)
@@ -1045,13 +1058,14 @@ impl Store {
             }
         };
 
-        // Load latest checkpoint if present.
-        if let Some(cp_path) = crate::checkpoint::find_latest_checkpoint(&dir)? {
+        // Load latest checkpoint (base full + any chained deltas) if present.
+        let chain = crate::checkpoint::find_head_chain(&dir)?;
+        if !chain.is_empty() {
             let registry = {
                 let inner = self.inner.read();
                 Arc::clone(&inner.registry)
             };
-            let snapshot = crate::checkpoint::load_checkpoint(&cp_path, &registry)?;
+            let snapshot = crate::checkpoint::load_chain(&chain, &registry)?;
 
             let mut inner = self.inner.write();
             let v = snapshot.version;

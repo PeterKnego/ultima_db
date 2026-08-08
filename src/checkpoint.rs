@@ -501,6 +501,305 @@ pub(crate) fn load_checkpoint(path: &Path, registry: &TableRegistry) -> Result<S
     deserialize_snapshot(&data, registry)
 }
 
+/// Bytes needed to decode a checkpoint header: magic (4) + `format_version`
+/// varint (bincode caps a u32 varint at 5 bytes) + `kind` (1) +
+/// `snapshot_version` varint (u64 varint, capped at 9 bytes) + `base_version`
+/// varint (9, `Delta` only). Reading this bounded prefix — instead of the
+/// whole file — is what makes a chain walk cost O(chain length) in bytes
+/// read, not O(sum of every checkpoint's full size): a chain can have
+/// arbitrarily many full-table-sized deltas behind the head.
+const HEADER_PREFIX_LEN: usize = 4 + 5 + 1 + 9 + 9;
+
+/// Read just enough of `path` to learn its `CheckpointKind`, snapshot
+/// version, and (for a `Delta`) base version — without reading the table
+/// entries that make up the rest of the file.
+fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
+    let mut file = File::open(path).map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut buf = Vec::with_capacity(HEADER_PREFIX_LEN);
+    (&mut file)
+        .take(HEADER_PREFIX_LEN as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    if buf.len() < 4 || &buf[0..4] != MAGIC {
+        return Err(Error::CheckpointCorrupted("bad magic".into()));
+    }
+    let config = bincode::config::standard();
+    let mut offset = 4;
+
+    let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&buf[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if fmt_version != FORMAT_VERSION {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unsupported format version: {fmt_version}"
+        )));
+    }
+
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&buf[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+
+    let (version, read): (u64, _) = bincode::decode_from_slice(&buf[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let base_version = if kind == CheckpointKind::Delta {
+        let (bv, _read): (u64, _) = bincode::decode_from_slice(&buf[offset..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        Some(bv)
+    } else {
+        None
+    };
+
+    Ok((kind, version, base_version))
+}
+
+/// Walk backwards from the highest-versioned `checkpoint_*.bin` file in
+/// `dir` to the nearest `Full` ancestor, returning the chain base-first (so
+/// [`load_chain`] can apply it in order). Empty if no checkpoint exists.
+///
+/// Only headers are read (see [`read_header`]) — the chain walk never reads
+/// a table entry.
+///
+/// A file that is simply absent (deleted by `cleanup_old_checkpoints`, or
+/// never written) is expected once the walk passes the newest surviving
+/// file: tmp+rename makes a checkpoint atomically present or absent, so an
+/// absent file below the walk's starting point just means the head *is*
+/// that file, a complete chain on its own. What must never happen is an
+/// absent file *in the middle* of a chain the walk has already committed to
+/// by reading a `Delta` header that names it as `base_version` — that is
+/// [`Error::CheckpointChainBroken`], and it is not recoverable by falling
+/// back to an older `Full`: the WAL is already pruned to the head version,
+/// so an older full plus the surviving WAL reconstructs less than was
+/// committed, silently.
+pub(crate) fn find_head_chain(dir: &Path) -> Result<Vec<PathBuf>> {
+    let head_path = match find_latest_checkpoint(dir)? {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut chain = vec![head_path.clone()];
+    let mut current_path = head_path;
+    let mut head_version: Option<u64> = None;
+
+    loop {
+        let (kind, version, base_version) = read_header(&current_path)?;
+        let head_version = *head_version.get_or_insert(version);
+
+        match kind {
+            CheckpointKind::Full => break,
+            CheckpointKind::Delta => {
+                // Written by `serialize_delta`, which always emits a
+                // `base_version` for `CheckpointKind::Delta` — `None` here
+                // would mean `read_header`'s own encoding disagrees with the
+                // writer's, not a possibility a corrupt file on disk can
+                // trigger (a corrupt `has_next_id`-style byte fails the
+                // decode above instead).
+                let base_version = base_version.expect(
+                    "read_header always returns Some(base_version) for CheckpointKind::Delta",
+                );
+                let base_path = dir.join(checkpoint_filename(base_version));
+                if !base_path.exists() {
+                    return Err(Error::CheckpointChainBroken {
+                        head: head_version,
+                        missing: base_version,
+                    });
+                }
+                chain.push(base_path.clone());
+                current_path = base_path;
+            }
+        }
+    }
+
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Apply one delta file onto `base`, producing the snapshot at the delta's
+/// own version. `base` must be the snapshot at the delta's recorded
+/// `base_version` — [`load_chain`] enforces this by construction (it walks
+/// `paths` in the order [`find_head_chain`] returned), and this function
+/// double-checks it against the file's own header rather than trusting the
+/// caller silently.
+fn apply_delta_file(path: &Path, base: Snapshot, registry: &TableRegistry) -> Result<Snapshot> {
+    let mut file = File::open(path).map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    if data.len() < 4 + 1 + 4 {
+        return Err(Error::CheckpointCorrupted("file too short".into()));
+    }
+
+    // Whole-file CRC first — a delta's per-table entries carry no CRC of
+    // their own (see the module doc comment), so this is what protects them.
+    let crc_offset = data.len() - 4;
+    let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+    let computed_crc = crc32(&data[..crc_offset]);
+    if stored_crc != computed_crc {
+        return Err(Error::CheckpointCorrupted("CRC mismatch".into()));
+    }
+
+    let payload = &data[..crc_offset];
+    let config = bincode::config::standard();
+    let mut offset = 0;
+
+    if &payload[offset..offset + 4] != MAGIC {
+        return Err(Error::CheckpointCorrupted("bad magic".into()));
+    }
+    offset += 4;
+
+    let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if fmt_version != FORMAT_VERSION {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unsupported format version: {fmt_version}"
+        )));
+    }
+
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+    if kind != CheckpointKind::Delta {
+        return Err(Error::CheckpointCorrupted(format!(
+            "expected a delta checkpoint at {}, found {kind:?}",
+            path.display()
+        )));
+    }
+
+    let (version, read): (u64, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let (base_version, read): (u64, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if base_version != base.version {
+        return Err(Error::CheckpointCorrupted(format!(
+            "delta at {} expects base version {base_version}, but the chain so far is at {}",
+            path.display(),
+            base.version
+        )));
+    }
+
+    let (num_tables, read): (u32, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let mut tables = base.tables;
+
+    for _ in 0..num_tables {
+        let (entry_kind_byte, read): (u8, _) =
+            bincode::decode_from_slice(&payload[offset..], config)
+                .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        offset += read;
+        let entry_kind = TableEntryKind::try_from(entry_kind_byte)?;
+
+        let (name, read): (String, _) = bincode::decode_from_slice(&payload[offset..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        offset += read;
+
+        match entry_kind {
+            // Byte-identical to what the accumulated table already holds —
+            // nothing to read, nothing to change.
+            TableEntryKind::Unchanged => {}
+            // Present in the base, gone as of this version. Every drop is
+            // explicit (see `serialize_delta`'s doc comment / task brief
+            // contract 3), so there is no other place in this loop that
+            // needs to infer a removal from an entry's absence.
+            TableEntryKind::Dropped => {
+                tables.remove(&name);
+            }
+            TableEntryKind::Full | TableEntryKind::Delta => {
+                let (data_len, read): (u64, _) =
+                    bincode::decode_from_slice(&payload[offset..], config)
+                        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+                offset += read;
+                let end = usize::try_from(data_len)
+                    .ok()
+                    .and_then(|l| offset.checked_add(l))
+                    .ok_or_else(|| {
+                        Error::CheckpointCorrupted("table data length overflow".into())
+                    })?;
+                if end > payload.len() {
+                    return Err(Error::CheckpointCorrupted("truncated table data".into()));
+                }
+                let table_bytes = &payload[offset..end];
+                offset = end;
+
+                let info = registry
+                    .get(&name)
+                    .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+
+                if entry_kind == TableEntryKind::Full {
+                    let table_any = (info.deserialize_table)(table_bytes).map_err(|e| match e {
+                        Error::Persistence(msg) => {
+                            Error::Persistence(format!("table '{name}': {msg}"))
+                        }
+                        other => other,
+                    })?;
+                    tables.insert(name, std::sync::Arc::from(table_any));
+                } else {
+                    // A `Delta` entry is only ever emitted for a table
+                    // `serialize_delta` found in *both* base and new (see its
+                    // `Some(base_table)` match arm) — by the time a chain
+                    // reaches here the accumulator mirrors that same base, so
+                    // this table must already be present. Its absence means
+                    // corruption, not a legal chain state.
+                    let existing = tables.get(&name).ok_or_else(|| {
+                        Error::CheckpointCorrupted(format!(
+                            "delta entry for table '{name}' has no base table to apply onto"
+                        ))
+                    })?;
+                    let mut boxed = existing.boxed_clone();
+                    crate::registry::apply_delta(boxed.as_any_mut(), table_bytes, info).map_err(
+                        |e| match e {
+                            Error::Persistence(msg) => {
+                                Error::Persistence(format!("table '{name}': {msg}"))
+                            }
+                            other => other,
+                        },
+                    )?;
+                    tables.insert(name, std::sync::Arc::from(boxed));
+                }
+            }
+        }
+    }
+
+    if offset != payload.len() {
+        return Err(Error::CheckpointCorrupted(format!(
+            "table entries did not exactly consume the checkpoint payload: {} trailing bytes",
+            payload.len() - offset
+        )));
+    }
+
+    Ok(Snapshot { version, tables })
+}
+
+/// Load a checkpoint chain — a base `Full` file plus zero or more `Delta`
+/// files, in the order [`find_head_chain`] returns — into the `Snapshot` at
+/// the chain's head version.
+///
+/// The base is loaded through the existing full-checkpoint path
+/// ([`load_checkpoint`]/`deserialize_snapshot`), which already refuses
+/// anything but `CheckpointKind::Full`. Each subsequent delta is folded onto
+/// the accumulated result by [`apply_delta_file`].
+pub(crate) fn load_chain(paths: &[PathBuf], registry: &TableRegistry) -> Result<Snapshot> {
+    let (base_path, deltas) = paths
+        .split_first()
+        .ok_or_else(|| Error::CheckpointCorrupted("empty checkpoint chain".into()))?;
+
+    let mut snapshot = load_checkpoint(base_path, registry)?;
+    for delta_path in deltas {
+        snapshot = apply_delta_file(delta_path, snapshot, registry)?;
+    }
+    Ok(snapshot)
+}
+
 /// Delete checkpoint files *older* than `keep_version`.
 ///
 /// Newer checkpoints are never deleted: a slower checkpoint finishing after
@@ -1343,6 +1642,130 @@ mod tests {
                 label: "fresh".into()
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_head_chain / load_chain
+    // -----------------------------------------------------------------------
+
+    /// Write a base(v1) + delta(v2) + delta(v3) chain to `dir`: table "a"
+    /// gains a row at v2 (via `make_base_and_changed_a`) and another at v3,
+    /// "b" is untouched throughout. Returns the registry and the in-memory
+    /// snapshot at v3 (the head), so tests can compare against it directly or
+    /// corrupt/remove one of the three files on disk afterward.
+    fn write_a_three_link_chain(dir: &Path) -> (TableRegistry, Snapshot) {
+        let (base_snap, mid_snap, registry) = make_base_and_changed_a();
+        write_checkpoint(dir, &base_snap, &registry).unwrap(); // v1: full
+        write_delta_checkpoint(dir, &mid_snap, &base_snap, &registry).unwrap(); // v2: delta
+
+        let mut table_a = mid_snap
+            .tables
+            .get("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap()
+            .clone();
+        table_a
+            .insert(User {
+                name: "Dana".into(),
+                age: 22,
+            })
+            .unwrap();
+        let mut head_tables = mid_snap.tables.clone();
+        head_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(table_a) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let head_snap = Snapshot {
+            version: 3,
+            tables: head_tables,
+        };
+        write_delta_checkpoint(dir, &head_snap, &mid_snap, &registry).unwrap(); // v3: delta
+
+        (registry, head_snap)
+    }
+
+    #[test]
+    fn a_chain_recovers_to_the_same_state_as_a_full_checkpoint() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (registry, head_snap) = write_a_three_link_chain(dir.path());
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 3, "base + two deltas");
+        let snap = load_chain(&chain, &registry).unwrap();
+        assert_eq!(snap.version, 3);
+
+        let a = snap
+            .tables
+            .get("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        let expected_a = head_snap
+            .tables
+            .get("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(a.len(), expected_a.len());
+        for (k, v) in expected_a.iter() {
+            assert_eq!(a.get(k), Some(v));
+        }
+
+        let b = snap
+            .tables
+            .get("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn a_corrupt_mid_chain_delta_fails_loudly() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (registry, _head_snap) = write_a_three_link_chain(dir.path());
+
+        let mut bytes = std::fs::read(dir.path().join("checkpoint_2.bin")).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xFF;
+        std::fs::write(dir.path().join("checkpoint_2.bin"), &bytes).unwrap();
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        let err = load_chain(&chain, &registry).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_mid_chain_delta_fails_loudly_rather_than_recovering_stale_data() {
+        let dir = crate::test_scratch::scratch_dir();
+        write_a_three_link_chain(dir.path());
+
+        std::fs::remove_file(dir.path().join("checkpoint_2.bin")).unwrap();
+        let err = find_head_chain(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointChainBroken { head: 3, missing: 2 }),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_table_does_not_reappear_after_chain_replay() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (base_snap, mut new_snap, registry) = make_base_and_changed_a();
+        new_snap.tables.remove("b");
+        write_checkpoint(dir.path(), &base_snap, &registry).unwrap(); // v1 full, a+b
+        write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap(); // v2 delta, drops b
+
+        let snap = load_chain(&find_head_chain(dir.path()).unwrap(), &registry).unwrap();
+        assert!(!snap.tables.contains_key("b"));
     }
 
     #[test]

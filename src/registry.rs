@@ -18,6 +18,7 @@ use crate::btree::Change;
 use crate::persistence::Record;
 use crate::primary_key::{
     PrimaryKey, auto_counter_seed, check_encoded_key_len, key_type_mismatch_msg,
+    key_type_mismatch_msg_raw,
 };
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
@@ -573,6 +574,108 @@ fn diff_table<R: Record, K: PrimaryKey>(new: &Table<R, K>, base: &Table<R, K>) -
     buf.extend_from_slice(&count.to_be_bytes());
     buf.extend_from_slice(&body);
     Ok(buf)
+}
+
+/// Apply a delta payload — as produced by [`diff_table`] — onto an
+/// already-loaded `Table<R, K>` (as `&mut dyn Any`, downcast internally by
+/// the `replay_*` closures on `info`). Used by [`crate::checkpoint::load_chain`]
+/// to fold a chain's deltas onto the base checkpoint's tables.
+///
+/// `op = 0` (Put) covers both `Change::Added` and `Change::Updated` — the
+/// diff format does not distinguish them, since distinguishing would cost a
+/// base lookup `diff_table` already avoids by walking both trees in lockstep.
+/// So a Put is applied as an upsert: try `replay_insert` first (an
+/// interval's changes skew toward inserts on an append-heavy workload) and
+/// fall back to `replay_update` on `Error::DuplicateKey` rather than
+/// duplicating the existence check those two closures already do — one
+/// decoder (theirs), two ways to reach it.
+///
+/// The key-type code is checked against `info.key_type_code` before a single
+/// row is applied, exactly like WAL replay's `check_replay_key_type`: several
+/// key types decode each other's encodings without complaint, and the
+/// order-preserving encoding means the reinterpreted keys would pass every
+/// later ascending-order check too.
+pub(crate) fn apply_delta(
+    table_any: &mut dyn Any,
+    payload: &[u8],
+    info: &TableTypeInfo,
+) -> Result<()> {
+    let mut at = 0usize;
+
+    let header = take(payload, &mut at, 2)?;
+    if header[0] != DELTA_MAGIC || header[1] != DELTA_FORMAT_V1 {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unrecognized delta payload header: 0x{:02x}{:02x}",
+            header[0], header[1]
+        )));
+    }
+
+    let key_type = take_u32(payload, &mut at)?;
+    if key_type != info.key_type_code {
+        return Err(Error::CheckpointCorrupted(key_type_mismatch_msg_raw(
+            info.key_type_code,
+            info.key_type_name,
+            key_type,
+        )));
+    }
+
+    // Not applied: `replay_insert`'s underlying `Table::put` advances the
+    // auto-increment counter on every Put (see `Table::put` /
+    // `PrimaryKey::advance_auto_counter`), the same mechanism WAL replay
+    // relies on. Any key that ever advanced the counter first appeared as a
+    // Put in the interval it was added, so folding every delta's Puts in
+    // order reproduces the counter without ever decoding this field —
+    // skipped here only to keep the offset correct for what follows.
+    match take(payload, &mut at, 1)?[0] {
+        0 => {}
+        1 => {
+            let len = take_u32(payload, &mut at)? as usize;
+            take(payload, &mut at, len)?;
+        }
+        other => {
+            return Err(Error::CheckpointCorrupted(format!(
+                "invalid has_next_id byte {other} in delta payload"
+            )));
+        }
+    }
+
+    let count = take_u64(payload, &mut at)?;
+    for _ in 0..count {
+        let klen = take_u32(payload, &mut at)? as usize;
+        check_encoded_key_len(klen, "checkpoint delta payload")?;
+        let key_bytes = take(payload, &mut at, klen)?;
+        let op = take(payload, &mut at, 1)?[0];
+        match op {
+            0 => {
+                let rlen = take_u32(payload, &mut at)? as usize;
+                let rec_bytes = take(payload, &mut at, rlen)?;
+                match (info.replay_insert)(table_any, key_bytes, rec_bytes) {
+                    Ok(()) => {}
+                    Err(Error::DuplicateKey(_)) => {
+                        (info.replay_update)(table_any, key_bytes, rec_bytes)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            1 => {
+                (info.replay_delete)(table_any, key_bytes)?;
+            }
+            other => {
+                return Err(Error::CheckpointCorrupted(format!(
+                    "invalid op byte {other} in delta payload"
+                )));
+            }
+        }
+    }
+
+    if at != payload.len() {
+        return Err(Error::CheckpointCorrupted(format!(
+            "delta payload has {} trailing bytes after {count} changes",
+            payload.len() - at
+        )));
+    }
+
+    Ok(())
 }
 
 /// Read `n` bytes at `at`, advancing it. Every length in the payload is
