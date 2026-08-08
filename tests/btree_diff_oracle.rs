@@ -9,7 +9,7 @@
 //! collapse) that make a key move between nodes, so this compares against a
 //! full scan of both trees over randomly generated histories.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use ultima_db::{BTree, Change};
@@ -18,6 +18,15 @@ use ultima_db::{BTree, Change};
 enum Op {
     Insert(u64, u64),
     Remove(u64),
+}
+
+/// The kind of change `diff` reports, kept alongside the value so the oracle
+/// can be checked exactly rather than just on `(key, value)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    Added,
+    Updated,
+    Removed,
 }
 
 fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -32,13 +41,26 @@ fn ops() -> impl Strategy<Value = Vec<Op>> {
     )
 }
 
-fn apply(tree: &BTree<u64, u64>, model: &mut BTreeMap<u64, u64>, op: &Op) -> BTree<u64, u64> {
+/// `apply` mutates both the real tree and a model that mirrors it — but the
+/// model tracks `(value, generation)` per key, not just `value`. `diff`
+/// compares `Arc::ptr_eq`, and `BTree::insert` allocates a *fresh* value
+/// `Arc` on every call, even when the inserted value is unchanged (e.g. a
+/// remove followed by re-inserting the same value: the key's binding is
+/// physically a new `Arc`, though `==` can't tell). A model keyed on value
+/// equality alone would disagree with `diff` on exactly that case. The
+/// generation counter mirrors the Arc-identity axis directly — every insert
+/// bumps it — so the oracle built from it agrees with `diff` exactly, with
+/// no tolerance needed anywhere in the comparison.
+fn apply(
+    tree: &BTree<u64, u64>,
+    model: &mut BTreeMap<u64, (u64, u64)>,
+    generation: &mut u64,
+    op: &Op,
+) -> BTree<u64, u64> {
     match op {
         Op::Insert(k, v) => {
-            if model.get(k) == Some(v) {
-                return tree.clone(); // same value: keep the existing Arc
-            }
-            model.insert(*k, *v);
+            *generation += 1;
+            model.insert(*k, (*v, *generation));
             tree.insert(*k, *v)
         }
         Op::Remove(k) => {
@@ -48,20 +70,23 @@ fn apply(tree: &BTree<u64, u64>, model: &mut BTreeMap<u64, u64>, op: &Op) -> BTr
     }
 }
 
-/// Expected diff, computed the slow way: full scan of both trees.
+/// Expected diff, computed the slow way: full scan of both trees, comparing
+/// per-key generation (not value) to decide Updated vs. no-change — this is
+/// what makes the oracle agree with `diff`'s Arc-identity semantics exactly.
 fn oracle(
-    new: &BTreeMap<u64, u64>,
-    base: &BTreeMap<u64, u64>,
-) -> Vec<(u64, Option<u64>)> {
+    new: &BTreeMap<u64, (u64, u64)>,
+    base: &BTreeMap<u64, (u64, u64)>,
+) -> Vec<(u64, Option<u64>, Tag)> {
     let mut out = Vec::new();
     let mut keys: Vec<u64> = new.keys().chain(base.keys()).copied().collect();
     keys.sort_unstable();
     keys.dedup();
     for k in keys {
         match (new.get(&k), base.get(&k)) {
-            (Some(nv), Some(bv)) if nv == bv => {}
-            (Some(nv), _) => out.push((k, Some(*nv))),
-            (None, Some(_)) => out.push((k, None)),
+            (Some((_, ng)), Some((_, bg))) if ng == bg => {}
+            (Some((nv, _)), Some(_)) => out.push((k, Some(*nv), Tag::Updated)),
+            (Some((nv, _)), None) => out.push((k, Some(*nv), Tag::Added)),
+            (None, Some(_)) => out.push((k, None, Tag::Removed)),
             (None, None) => unreachable!("key came from one of the two maps"),
         }
     }
@@ -73,69 +98,28 @@ proptest! {
 
     #[test]
     fn diff_matches_full_scan_oracle(base_ops in ops(), then_ops in ops()) {
-        let mut model = BTreeMap::new();
+        let mut model: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        let mut generation: u64 = 0;
         let mut tree = BTree::<u64, u64>::new();
         for op in &base_ops {
-            tree = apply(&tree, &mut model, op);
+            tree = apply(&tree, &mut model, &mut generation, op);
         }
         let base_tree = tree.clone();
         let base_model = model.clone();
 
         for op in &then_ops {
-            tree = apply(&tree, &mut model, op);
+            tree = apply(&tree, &mut model, &mut generation, op);
         }
 
-        // `Change` carries whether a key was Added/Removed (a presence flip,
-        // unambiguous) or merely Updated (a value-Arc flip), so keep that
-        // tag around instead of collapsing straight to (k, Option<v>).
-        let got: Vec<(u64, Option<u64>, bool)> = tree
+        let got: Vec<(u64, Option<u64>, Tag)> = tree
             .diff(&base_tree)
             .map(|c| match c {
-                Change::Added(k, v) => (*k, Some(**v), false),
-                Change::Updated(k, v) => (*k, Some(**v), true),
-                Change::Removed(k) => (*k, None, false),
+                Change::Added(k, v) => (*k, Some(**v), Tag::Added),
+                Change::Updated(k, v) => (*k, Some(**v), Tag::Updated),
+                Change::Removed(k) => (*k, None, Tag::Removed),
             })
             .collect();
 
-        let expected: BTreeMap<u64, Option<u64>> =
-            oracle(&model, &base_model).into_iter().collect();
-
-        // `apply`'s same-binding guard (skip re-insert when the value is
-        // already bound) closes the obvious case, but a remove followed by
-        // re-inserting the same value slips past it: the model sees no net
-        // change (the key ends up bound to the value it had at base), yet
-        // the tree genuinely got a fresh Arc for that key in between, so
-        // `diff` — which compares Arc identity, not deep value equality —
-        // correctly reports Updated. That is documented, intended behavior
-        // (see `BTree::diff`'s doc comment), not a bug to paper over: it is
-        // conservative (an extra write on checkpoint, never a dropped one).
-        // So: every real change must show up (no drops, checked below), and
-        // the only kind of surplus tolerated is a same-value Updated.
-        let mut got_keys = BTreeSet::new();
-        for (k, v, is_updated) in &got {
-            got_keys.insert(*k);
-            match expected.get(k) {
-                Some(ev) => prop_assert_eq!(
-                    ev, v,
-                    "diff value for key {} does not match the oracle", k
-                ),
-                None => {
-                    prop_assert!(
-                        *is_updated,
-                        "diff reports {:?} for key {} but the oracle expects no change \
-                         at all (only a same-value Updated is tolerable here)",
-                        v, k
-                    );
-                    prop_assert_eq!(
-                        model.get(k).copied(), *v,
-                        "surplus Updated for key {} does not even match the final value",
-                        k
-                    );
-                }
-            }
-        }
-        for k in expected.keys() {
-            prop_assert!(got_keys.contains(k), "diff silently dropped a change for key {}", k);
-        }
+        prop_assert_eq!(got, oracle(&model, &base_model));
     }
 }
