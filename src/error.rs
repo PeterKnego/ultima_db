@@ -128,6 +128,18 @@ pub enum Error {
     /// Checkpoint file is corrupted (bad magic, bad CRC, truncated, etc.).
     #[error("checkpoint corrupted: {0}")]
     CheckpointCorrupted(String),
+    /// A delta checkpoint's base table downcast to a different concrete type
+    /// than the current table registered for this name — the table was
+    /// dropped and recreated with a different record or key type between the
+    /// base checkpoint and now. Unlike a downcast failure on the *new* side
+    /// (an internal invariant violation, reported as `Error::Persistence`),
+    /// this is a lifecycle event the delta writer can recover from: fall back
+    /// to a full-table entry instead of a delta for this table.
+    #[error("table '{table}' changed record or key type since the base checkpoint")]
+    TableTypeChanged {
+        /// Name of the table whose base-side downcast failed.
+        table: String,
+    },
     /// Recovery found WAL commits that were made on top of a bulk load no
     /// checkpoint covers. Bulk loads are not WAL-logged, so those commits
     /// cannot be replayed (their semantics assume the post-load state).
@@ -283,6 +295,17 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "serialization failure on table 'accounts' (conflicting version 5)"
+        );
+    }
+
+    #[test]
+    fn error_table_type_changed_displays() {
+        let e = Error::TableTypeChanged {
+            table: "accounts".to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "table 'accounts' changed record or key type since the base checkpoint"
         );
     }
 
