@@ -119,10 +119,10 @@ exists to avoid (see §5).
 
 ## 4. Chain resolution and recovery
 
-`find_head_chain` (`src/checkpoint.rs:682`) resolves the directory's newest
+`find_head_chain` (`src/checkpoint.rs:698`) resolves the directory's newest
 checkpoint file backward to its nearest `Full` ancestor by following each
 delta's `base_version` back-pointer, reading only each file's small fixed
-header (`HEADER_PREFIX_LEN`, `src/checkpoint.rs:526`) — a chain walk costs
+header (`HEADER_PREFIX_LEN`, `src/checkpoint.rs:534`) — a chain walk costs
 `O(chain length)` in bytes read, not `O(sum of every file's full size)`, even
 though a chain can have arbitrarily many full-table-sized deltas behind the
 head. Each hop is pinned to the filename it was reached by (`expected_version`
@@ -131,7 +131,7 @@ detectable rather than an infinite loop — two files can each individually
 satisfy "my base is older than me" while still pointing at each other, so
 that check alone does not bound the walk.
 
-`load_chain` (`src/checkpoint.rs:875`) then applies the resolved chain
+`load_chain` (`src/checkpoint.rs:891`) then applies the resolved chain
 base-first: load the full, then replay each delta's `Put`/`Del`/`next_id` in
 version order, honoring `Unchanged`/`Full`/`Dropped` table entries as it goes.
 
@@ -192,7 +192,7 @@ path, the file format's `kind` byte, and the memory profile are exactly what
 they were before this feature existed. Turning the feature on is opt-in via
 raising the knob, not a behavior change anyone gets by upgrading.
 
-Cleanup (`cleanup_old_checkpoints`, `src/checkpoint.rs:918`) keeps its
+Cleanup (`cleanup_old_checkpoints`, `src/checkpoint.rs:934`) keeps its
 pre-existing invariant — never delete a checkpoint file newer than the
 version a caller told it to keep — and adds a second one: never delete a
 file that is an ancestor of the resolved head chain, even if that file is
