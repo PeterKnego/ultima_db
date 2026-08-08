@@ -1,7 +1,7 @@
 # task61: Incremental Checkpoints via CoW Structural Diff
 
 **Status:** Implemented (Tasks 1–8, feature-complete and tested); crossover and
-recovery-time measurement pending on the bench host (see "Measurements" below).
+recovery-time measured on the bench host (see "Measurements" below).
 **Related:** `docs/superpowers/specs/2026-08-08-incremental-checkpoints.md` (plan),
 `docs/superpowers/specs/2026-08-08-incremental-checkpoints-design.md` (full design spec),
 `docs/tasks/task13_persistence.md`, `docs/tasks/task15_three_phase_consistent_persistence.md`,
@@ -268,65 +268,152 @@ of thing shrinking is good at isolating) rather than hand-picked examples:
 
 ## 9. Measurements
 
+Full raw tables also live in `docs/benchmarks/checkpoint-delta-nvme-2026-08-08.md`
+(`bench-out/` is gitignored, so the published-results doc is the durable copy
+of this run — this section is the argument built on top of it).
+
 Checkpoint cost is serialize-plus-I/O, and per `CLAUDE.md` the local sandbox
 has a **±2x noise floor** — no perf conclusion, ratio, or "X is faster than
-Y" claim may be drawn from a run there. The two questions below can only be
-answered on the `bench-infra` NVMe host, and **have not been run there yet**
-(that requires the repository owner's explicit authorization to provision
-billable AWS resources, which this task did not seek). The bench that will
-answer them is ready and lives at `benches/checkpoint_delta.rs`; it was run
-locally only to confirm it compiles and completes without panicking (it does
-— `cargo bench --bench checkpoint_delta --features persistence`, full 8-cell
-crossover sweep plus the 5-length recovery sweep, no errors), and no timing
-from that run is reported here or anywhere else.
+Y" claim may be drawn from a run there. The two questions below required the
+`bench-infra` NVMe host and the repository owner's explicit authorization to
+provision billable AWS resources; that run completed successfully.
+
+**Host and provenance** (`bench-infra/bench-out/dist/20260808T194921Z/manifest.txt`):
+AWS `c6id.2xlarge` (real local-NVMe instance store, not EBS — see
+`terraform/variables.tf`), 8 vCPU, 15701 MB RAM, kernel `6.17.0-1019-aws`,
+`rustc 1.97.1 (8bab26f4f 2026-07-14)`, UltimaDB at git `ffb2c58`. Both
+benches run in `Persistence::smr` mode (checkpoint-only; SMR has no
+`Durability` tier to sweep — that knob belongs to `Persistence::standalone`'s
+WAL, which this bench does not exercise). Per this repo's convention, the
+numbers below are **same-host relative comparisons only** — absolute
+millisecond figures do not port to any other machine, and no cross-machine
+ratio should ever be quoted from them. Criterion's bracketed triples are
+`[lower-bound point-estimate upper-bound]` of its 95%-CI regression fit,
+10 samples/cell; the `dir_bytes(informational, not a perf number)` lines are
+the checkpoint directory's total byte footprint at the moment they're
+printed (end of the sampling loop for 9a — so at `chain_max=8` it reflects
+whatever partial chain state was on disk after however many iterations
+criterion ran, not one file's size), not a timing, and are reported here as
+exactly that — informational, not a perf number.
 
 ### 9a. Crossover: `checkpoint()` cost vs. dirty fraction
 
-**PENDING — fill in from a `bench-infra` run.**
+100k-row `data` table (`ROWS = 100_000`, 64-byte payload/row), one seed
+checkpoint to establish the chain base, then one `dirty_rows` + `checkpoint()`
+per criterion iteration. Wall time is the criterion point estimate (middle of
+the bracketed triple); `dir_bytes` is the informational directory-size line
+logged right after each cell's sampling loop.
 
-What goes here: a table (or the criterion HTML report path) with `checkpoint()`
-wall time and bytes written, for dirty fractions `{1%, 10%, 50%, 100%}` of a
-fixed ~100k-row dataset, at `checkpoint_chain_max = 1` (always full) versus
-`checkpoint_chain_max = 8`, both durability tiers. The datapoint this task
-plan cares about most is **where the crossover sits** — the dirty fraction
-above which a delta stops being cheaper than a full, since a 100%-dirty delta
-is expected to lose (it pays the ordered diff *and* per-key framing on top of
-what a full write already pays).
+| dirty fraction | `chain_max=1` (always full) time | `chain_max=1` dir_bytes | `chain_max=8` time | `chain_max=8` dir_bytes |
+|---:|---:|---:|---:|---:|
+| 1%   | 32.918 ms `[32.520, 33.541]` | 8,468,870 | 4.8250 ms `[4.7254, 4.9330]` | 8,894,255 |
+| 10%  | 36.857 ms `[36.774, 36.960]` | 8,468,870 | 7.4969 ms `[7.3924, 7.5995]` | 13,569,310 |
+| 50%  | 38.272 ms `[38.170, 38.498]` | 8,468,760 | 20.298 ms `[20.097, 20.537]` | 25,468,622 |
+| 100% | 40.587 ms `[40.356, 40.963]` | 8,468,980 | 45.231 ms `[44.851, 45.648]` | 51,313,825 |
 
-Produced by:
+Reading `chain_max=8`'s time against `chain_max=1`'s at the same dirty
+fraction (point estimate ÷ point estimate):
 
-```bash
-cd bench-infra && make bench-oneshot TARGET=checkpoint-delta
-make status     # confirm nothing is left running afterward
-```
+- **1% dirty:** delta is **6.82×** cheaper (32.918 ms → 4.8250 ms).
+- **10% dirty:** delta is **4.92×** cheaper (36.857 ms → 7.4969 ms).
+- **50% dirty:** delta is **1.89×** cheaper (38.272 ms → 20.298 ms) —
+  still a clear win, but the margin has fallen an order of magnitude
+  from the 1% cell.
+- **100% dirty:** delta is **11.4% slower**, not cheaper (40.587 ms →
+  45.231 ms) — the expected result: a 100%-dirty delta pays the ordered
+  diff *and* per-key framing on top of what the full write already pays,
+  with nothing left unshared to skip.
 
-Results land in `bench-out/dist/<ts>/`; `benches/checkpoint_delta.rs`'s doc
-comment has the equivalent local-only (non-authoritative) invocation.
+**The crossover sits between 50% and 100% dirty** — the bench sampled at
+50% and 100% but nothing in between, so this run pins the crossover to that
+interval, not to an exact percentage. What is unambiguous: at 50% churn a
+delta chain (`chain_max=8`) is still substantially cheaper than always-full,
+and the two are past the point of a favorable trade somewhere before 100%.
+`chain_max=1`'s time also drifts upward with dirty fraction (32.9 ms → 40.6
+ms, ~23%) even though it always writes a full checkpoint — expected, since
+higher dirty fraction here comes from more preceding updates before the
+timed `checkpoint()` call, and a warmer/larger live tree costs a little more
+to walk regardless of chain policy.
 
 ### 9b. Recovery time vs. chain length
 
-**PENDING — fill in from a `bench-infra` run.**
+20k-row `data` table (`RECOVERY_ROWS = 20_000` — smaller than 9a's dataset
+on purpose: this measures how cost scales *with chain length*, not with
+dataset size), chain built from one full checkpoint plus `chain_len - 1`
+deltas, each dirtying ~1% of the rows (~200 rows/delta). `Store::recover()`
+wall time, point estimate of the bracketed triple:
 
-What goes here: `Store::recover()` wall time for chain lengths
-`{1, 2, 4, 8, 16}` (one full plus 0–15 deltas, each dirtying ~1% of a fixed
-row count — see `bench_recovery_vs_chain_length` in `benches/checkpoint_delta.rs`
-for the exact construction). This is the curve that should set §10's
-recommended default, once it exists.
+| chain length | `Store::recover()` time | dir_bytes | vs. chain_len=1 |
+|---:|---:|---:|---:|
+| 1  | 5.6261 ms `[5.6228, 5.6288]` | 1,679,548 | — (baseline) |
+| 2  | 5.7272 ms `[5.7140, 5.7367]` | 1,696,197 | +1.80% |
+| 4  | 5.9101 ms `[5.9063, 5.9144]` | 1,729,495 | +5.05% |
+| 8  | 6.2749 ms `[6.2712, 6.2778]` | 1,796,091 | +11.53% |
+| 16 | 7.0257 ms `[7.0167, 7.0336]` | 1,929,283 | +24.88% |
+
+The cumulative percentage looks like it accelerates because chain length is
+doubling at each row while the underlying growth is close to **linear in
+the number of files replayed**: fitting the two endpoints
+(`(7.0257 - 5.6261) / 15 ≈ 0.0933 ms` per additional delta file) predicts
+the 2/4/8 cells to within a few µs of what was actually measured
+(5.719/5.906/6.279 ms predicted vs. 5.727/5.910/6.275 ms measured). So the
+right mental model is "each extra delta in the chain costs a roughly fixed
+~0.09 ms replay increment at this row count/dirty-fraction," not "recovery
+gets disproportionately worse as chains grow" — **at chain length 8, the
+config this run's crossover results argue for, recovery costs +11.5% over
+always-full; at chain length 16 it's +24.9%.** Both are single checkpoint
+chains over a 20k-row table with ~1%-dirty deltas — a different row count or
+dirty fraction per delta would shift the per-file constant, not the
+linear shape.
 
 ---
 
 ## 10. Recommended `checkpoint_chain_max`
 
-**Remains `1` (always full — pre-task61 behavior, unchanged).** This is not
-a conservative placeholder pending a "real" answer computed elsewhere in this
-doc — it is the actual, currently-justified recommendation, because §9's
-crossover and recovery-time curves have not been measured yet. Raising the
-default is a follow-up change, and it must be justified by §9b's recovery-time
-curve specifically (the memory-vs-I/O trade in §6 is what a higher chain
-length buys and what it costs; the recovery-time curve is what bounds how
-high is still safe to default to) — not by an unmeasured guess about where
-the crossover in §9a probably sits. Anyone changing this default should
-replace the "PENDING" blocks in §9 with the real bench-host numbers first.
+**Remains `1` (always full — pre-task61 behavior, unchanged), despite §9's
+results now being favorable to raising it.** This is deliberate, not an
+oversight: §9 measured *time* only, and §6 is explicit that the design's
+real cost of a chain is *memory* — a retained base snapshot keeps its
+unshared B-tree nodes alive for as long as the chain is open, growing with
+how much of the base has since been superseded. Nothing in this task's bench
+touches that. Changing a default every existing user inherits on the
+strength of a curve that doesn't cover the cost the design itself flagged
+would be exactly the kind of unmeasured guess this doc has argued against
+throughout — just with the guess moved from "where's the crossover" (now
+measured) to "what does the retained base cost in RSS" (still not).
+
+**The measured case for raising it, at ≤50% churn between checkpoints:**
+§9a shows `chain_max=8` winning by 6.82× at 1% dirty, 4.92× at 10%, and
+1.89× at 50% — a substantial, same-host-relative win across the whole
+low-to-moderate churn range. §9b shows that win is not bought back cheaply
+at recovery time: a chain of 8 costs +11.5% over always-full recovery, and
+even a chain of 16 costs +24.9% — both modest next to the checkpoint-time
+multiples above. Taken together, if the retained-base memory cost turns out
+to be small at whatever chain length an operator would actually run, raising
+the default looks like a good trade.
+
+**What was not measured, and what would need to be before the default
+moves:** peak/steady-state RSS (or an equivalent unshared-node count) of a
+store running with `checkpoint_chain_max > 1` under realistic churn, across
+a range of chain lengths and dataset sizes — the §6 cost this task's bench
+does not touch at all. Until that exists, raising the default is a decision
+made on half the trade.
+
+**The churn caveat also still applies per-workload, independent of the
+default:** §9a's 100% cell is a real loss (chain_max=8 is 11.4% *slower*
+than always-full at 100% dirty), and the crossover between "delta wins" and
+"delta loses" sits somewhere between 50% and 100% dirty fraction (§9a did
+not sample finer than that). A workload that dirties most of its rows
+between checkpoints — a bulk-rewrite or compaction-style pattern — belongs
+at `checkpoint_chain_max = 1` regardless of what the eventual default
+becomes; raising the knob helps the common case of a store where most rows
+are quiet between checkpoints, not every workload.
+
+**Recommended follow-up:** measure §6's memory cost (retained-base RSS or
+unshared-node count vs. chain length, at a couple of representative dataset
+sizes and churn rates) on the bench host, then revisit this default with
+both halves of the trade in hand. Raising it without that measurement is the
+unmeasured guess this section exists to refuse to make.
 
 ---
 
@@ -342,3 +429,4 @@ replace the "PENDING" blocks in §9 with the real bench-host numbers first.
 | `benches/checkpoint_delta.rs` | Crossover and recovery-vs-chain-length bench (this task) |
 | `docs/tasks/task61_incremental_checkpoints.md` | This file |
 | `docs/superpowers/specs/2026-08-08-incremental-checkpoints-design.md` | Retained design history; not changed by this task |
+| `docs/benchmarks/checkpoint-delta-nvme-2026-08-08.md` | Bench-host crossover + recovery-vs-chain-length results (§9's raw numbers) |
