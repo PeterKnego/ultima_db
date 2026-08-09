@@ -5,31 +5,22 @@
 Incremental (delta) checkpoints: `Store::checkpoint()` can now write a
 *delta* checkpoint file chained to a base full checkpoint instead of always
 re-serializing every table, and recovery replays the chain transparently.
-This is an on-disk format break — **read the migration note below before
-upgrading a store that has data on disk.**
+Checkpoint `FORMAT_VERSION` moved 1 → 2 to carry the delta-chain header.
 
-### Migration from 0.3.0 — required if you use `persistence`
-
-There is no in-place upgrade. Checkpoint `FORMAT_VERSION` moved 1 → 2 to
-carry the delta-chain header (`CheckpointKind`, per-table
-`TableEntryKind`); a checkpoint file written by 0.3.0 or earlier is
-rejected by this build. The WAL format is unchanged, but that alone does
-not help: `Store::recover()` fails on the v1 checkpoint file before it
-ever reaches WAL replay, and any row an earlier `checkpoint()` already
-pruned out of the WAL exists nowhere but that checkpoint. The path is the
-same shape as the 0.2.x → 0.3.0 migration:
-
-1. With the **0.3.0** binary, `Store::recover()` the existing persistence
-   directory.
-2. Read the rows out through a `ReadTx`.
-3. Load them into this build's store with `Store::bulk_load` /
-   `Store::bulk_load_batch`, into a **fresh, empty** persistence directory
-   — the same reason as before: a fresh store restarts at version 0, so a
-   stale higher-versioned checkpoint left in a reused directory would
-   outrank the migrated data forever — and then `checkpoint()`.
-
-(There is no `export` API; the steps above are the export. Both rejection
-messages state this path in full.)
+Persistence format compatibility: this build reads checkpoints written by
+0.2.0 and 0.3.0, as well as its own v2 format — the outright rejection
+below turned out to be broader than it needed to be, and a v1 checkpoint
+container carries either generation of table payload (0.2.x's or 0.3.0's)
+just as readily as a v2 one, dispatched by each payload's own leading
+bytes rather than by the container version. This does **not** extend to
+the WAL: a pre-0.3.0 WAL entry carries no version marker at all and is
+byte-ambiguous with corruption, so it is deliberately still rejected when
+the store is opened. Net effect — a **0.3.0** persistence directory now
+recovers in full on upgrade (its WAL was already v2); a **≤0.2.x**
+directory recovers only as far as its last checkpoint, and rows committed
+after that checkpoint still need the export/re-import path in
+[the migration how-to](docs/how-to/migrate-from-0-2-to-0-3.md). See
+`docs/tasks/task62_persistence_format_compat.md`.
 
 ### Breaking — on-disk format
 
@@ -42,9 +33,12 @@ messages state this path in full.)
   "latest" fails loudly on the format-version check instead of silently
   falling back to an older full checkpoint whose WAL tail has already
   been pruned, which would lose committed data with no error anywhere.
-  Rejected at `recover()` (and at direct checkpoint reads) with an error
-  naming the migration path above. The WAL and snapshot-stream formats
-  are unaffected. See `docs/tasks/task61_incremental_checkpoints.md`.
+  **No longer a read break in practice**: this build reads v1 checkpoints
+  (see "Persistence format compatibility" above), so the rejection this
+  bullet originally described now fires only for a checkpoint written by a
+  build *newer* than this one. The WAL and snapshot-stream formats are
+  unaffected either way. See `docs/tasks/task61_incremental_checkpoints.md`
+  and `docs/tasks/task62_persistence_format_compat.md`.
 
 ## 0.3.0 — 2026-07-31
 

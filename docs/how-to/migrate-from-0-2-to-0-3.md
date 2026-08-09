@@ -1,21 +1,49 @@
 # How to migrate a persistent store from 0.2.x to 0.3.0
 
 0.3.0 changed every persisted format (WAL, checkpoint, snapshot stream) for
-arbitrary primary keys, and it refuses pre-0.3.0 data outright: a v1 WAL is
-rejected the moment the store is **opened** (in all three `WalWrite` modes),
-and a v1 checkpoint is rejected at `recover()`. This only concerns you if
-you use the `persistence` feature — an in-memory store has nothing to
-migrate.
+arbitrary primary keys. **Whether you need this guide depends on which
+directory you have:**
 
-**The trap:** there is no in-place upgrade, and checkpointing on 0.2.x
-before upgrading does not help — 0.3.0 rejects v1 checkpoints too. Worse,
-pointing a 0.3.0 store at the old directory makes it *permanently
-unrecoverable*: the fresh store restarts at version 0 and writes
+- **A 0.3.0 directory** (checkpoints and WAL both written by 0.3.0, or
+  later): just upgrade. This build's checkpoint reader accepts 0.3.0's
+  checkpoint format, and 0.3.0's WAL format was already the current one —
+  `Store::recover()` reads the whole directory, no export/re-import
+  needed. Stop reading here.
+- **A ≤0.2.x directory** (checkpoints and WAL written by 0.2.x or
+  earlier): this build's checkpoint reader accepts 0.2.x checkpoints too,
+  but **not** the 0.2.x WAL — pre-0.3.0 WAL entries carry no version
+  marker at all and are byte-ambiguous with corruption, so reading them is
+  deliberately out of scope. This makes `Store::recover()`'s behavior
+  depend on what is actually sitting in `wal.bin`, not just on which rows
+  it holds: `recover()` scans and validates *every* WAL entry before
+  filtering by version, so it hard-errors on a non-empty legacy-format
+  WAL even when every entry in it predates the checkpoint and has nothing
+  left to contribute. Two cases:
+  - **`wal.bin` is empty or absent** (e.g. you checkpointed cleanly right
+    before shutdown, or the file was already pruned to nothing): plain
+    `recover()` succeeds and gives you exactly the last checkpoint's
+    state — check your row counts against what you expect.
+  - **`wal.bin` has any legacy entries in it**: `recover()` errors before
+    it gets a chance to apply the checkpoint. If you have already
+    confirmed (via the old binary) that nothing after the last checkpoint
+    matters, move or delete `wal.bin` out of the directory and `recover()`
+    again — that reduces to the case above. If rows after the last
+    checkpoint *do* matter, the rest of this guide is the only way to get
+    them across: export with the old binary, import with the new one.
+
+  This only concerns you if you use the `persistence` feature — an
+  in-memory store has nothing to migrate.
+
+**The trap:** there is no in-place upgrade for the rows a checkpoint
+doesn't cover. Pointing a 0.3.0 store at the old directory to "top up" via
+`bulk_load` makes it *permanently unrecoverable* if you reuse the same
+directory: a fresh store restarts at version 0 and writes
 `checkpoint_1.bin`, recovery always picks the highest-versioned checkpoint
 file, and pruning only deletes files below the newest one — so a leftover
-v1 `checkpoint_500.bin` outranks your migrated data forever, and every
-later `recover()` hard-errors on it. Never mix the two formats in one
-directory.
+higher-versioned `checkpoint_500.bin` from the old directory outranks your
+migrated data forever, and every later `recover()` hard-errors on it (or,
+if it happens to parse, silently ignores the migrated data). Load into a
+**fresh, empty** directory, as below.
 
 The path is export with the old binary, import with the new one:
 
