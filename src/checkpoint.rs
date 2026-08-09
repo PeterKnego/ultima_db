@@ -205,6 +205,14 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     match fmt_version {
         1 => return deserialize_snapshot_v1(payload, offset, registry),
         v if v == FORMAT_VERSION => {}
+        0 => {
+            return Err(Error::CheckpointCorrupted(format!(
+                "unsupported format version: {fmt_version} (checkpoint; this build reads v1 \
+                 and v{FORMAT_VERSION}). Format version 0 was never assigned by any UltimaDB \
+                 release, so this is not a recognizable checkpoint file — it is corrupted, \
+                 truncated, or not a checkpoint at all."
+            )));
+        }
         _ => {
             return Err(Error::CheckpointCorrupted(format!(
                 "unsupported format version: {fmt_version} (checkpoint; this build reads v1 \
@@ -632,6 +640,14 @@ fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
         let (version, _read): (u64, _) = bincode::decode_from_slice(&buf[offset..], config)
             .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
         return Ok((CheckpointKind::Full, version, None));
+    }
+    if fmt_version == 0 {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unsupported format version: {fmt_version} (checkpoint; this build reads v1 and \
+             v{FORMAT_VERSION}). Format version 0 was never assigned by any UltimaDB release, \
+             so this is not a recognizable checkpoint file — it is corrupted, truncated, or \
+             not a checkpoint at all."
+        )));
     }
     if fmt_version != FORMAT_VERSION {
         return Err(Error::CheckpointCorrupted(format!(

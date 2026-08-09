@@ -756,6 +756,13 @@ fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64> {
 /// a legal bincode varint tag, and a v1 payload opens with the varint tag of
 /// its `next_id`, so no v1 payload can begin with it. This is the same
 /// property that made `0xFF` the right magic in the first place.
+///
+/// Forward requirement for whoever adds a v3: this two-way dispatch treats
+/// *anything* not starting with `0xFF` as v1. A v3 payload therefore must
+/// also open with `0xFF` (a new `TABLE_MAGIC_V3` sharing the same leading
+/// byte, disambiguated by a second byte, or an equivalent scheme) — if it
+/// doesn't, it will be routed into `deserialize_table_v1` and misparsed
+/// instead of rejected as unsupported.
 fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, K>> {
     match bytes.first() {
         None => Err(Error::Persistence(

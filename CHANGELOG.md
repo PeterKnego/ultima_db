@@ -17,8 +17,11 @@ the WAL: a pre-0.3.0 WAL entry carries no version marker at all and is
 byte-ambiguous with corruption, so it is deliberately still rejected when
 the store is opened. Net effect — a **0.3.0** persistence directory now
 recovers in full on upgrade (its WAL was already v2); a **≤0.2.x**
-directory recovers only as far as its last checkpoint, and rows committed
-after that checkpoint still need the export/re-import path in
+directory recovers only as far as its last checkpoint — and only once its
+legacy `wal.bin` is moved aside, since `Store::new` rejects a non-empty
+pre-0.3.0 WAL outright rather than letting `recover()` ever reach it —
+and rows committed after that checkpoint still need the export/re-import
+path in
 [the migration how-to](docs/how-to/migrate-from-0-2-to-0-3.md). See
 `docs/tasks/task62_persistence_format_compat.md`.
 
