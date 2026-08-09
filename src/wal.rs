@@ -227,11 +227,13 @@ fn check_entry_header(data: &[u8]) -> Result<usize> {
             "WAL entry carries no v{WAL_FORMAT_VERSION} format marker (leading byte 0x{:02X}, \
              expected 0x{WAL_ENTRY_MAGIC:02X}). This is either a pre-0.3.0 WAL or a corrupted \
              one — pre-0.3.0 entries carried no marker at all, so this byte alone cannot tell \
-             them apart. If the file predates 0.3.0: 0.3.0 changed the on-disk row-key encoding \
-             from fixed u64 ids to encoded primary keys, and pre-0.3.0 checkpoints are rejected \
-             too, so checkpointing with the old build does not migrate the data — instead, with \
-             the previous UltimaDB version, `Store::recover()` the old directory, read the rows \
-             out through a `ReadTx`, and load them into a 0.3.0+ store with `Store::bulk_load` / \
+             them apart. If the file predates 0.3.0: this build *can* read a pre-0.3.0 \
+             checkpoint (`checkpoint_*.bin`) directly — it is only this WAL it cannot make sense \
+             of. Move or delete `wal.bin` from the persistence directory and call \
+             `Store::recover()` again to load the last checkpoint; this discards any row \
+             committed after that checkpoint. To keep those rows too: with the previous \
+             UltimaDB version, `Store::recover()` the old directory, read the rows out through a \
+             `ReadTx`, and load them into this build with `Store::bulk_load` / \
              `Store::bulk_load_batch`. If the file is corrupt: restore from a checkpoint, or \
              delete the WAL and checkpoint files in the persistence directory to start fresh.",
             data[0]

@@ -166,6 +166,19 @@ The third, structurally similar site in `apply_delta_file` (`src/checkpoint.rs:8
 already short — deltas didn't exist before task61, so there is no old-format case for it to
 describe, and it was left as-is.
 
+A sibling message in `src/wal.rs`'s `check_entry_header` (the "no v2 format marker" rejection —
+see §5) made the same claim in the opposite direction and went stale for the same reason: it
+told an operator hitting a v1 WAL that "pre-0.3.0 checkpoints are rejected too, so checkpointing
+with the old build does not migrate the data." That was true when written (before this task) and
+false afterward, and it is the one message an operator in exactly the ≤0.2.x situation actually
+sees, so leaving it stale would have told them the checkpoint they now have working access to was
+useless. Rewritten to state plainly that this build *can* read the checkpoint, only the WAL is
+the problem, and to lead with the actionable remedy (move `wal.bin` aside and recover from the
+checkpoint, losing anything after it) before the fallback (export/re-import to keep those rows).
+The leading text existing tests pin — `"no v2 format marker"`, `"pre-0.3.0"`, `"corrupt"`,
+`"Store::bulk_load"` — is preserved; see `strict_scan_rejects_a_genuine_v1_wal`
+(`src/wal.rs`, `#[cfg(test)]`).
+
 ## 7. The fixture rule
 
 `tests/fixtures/formats/README.md` states the rule this feature's tests depend on: a fixture must
@@ -199,9 +212,11 @@ construction.
 |---|---|
 | `src/checkpoint.rs` | `deserialize_snapshot_v1`; v1 branch in `deserialize_snapshot`'s dispatch and in `read_header`; rejection messages at both version-check sites rewritten for the forward-only case |
 | `src/registry.rs` | `deserialize_table_v1`; leading-byte dispatch in `deserialize_table`; key-type guard |
+| `src/wal.rs` | `check_entry_header`'s v1-WAL rejection message rewritten: it no longer claims checkpoints are rejected too, and leads with the move-`wal.bin`-aside remedy |
 | `tests/fixtures/formats/` | Golden `checkpoint_2.bin` fixtures from 0.2.0 and 0.3.0, plus the provenance/regeneration README |
 | `tests/format_compat.rs` | Integration tests reading the fixtures end-to-end |
 | `tests/checkpoint_chain_equivalence.rs` | Adjusted for the now-successful v1 read path |
-| `docs/how-to/migrate-from-0-2-to-0-3.md` | Split into the 0.3.0 (just upgrade) and ≤0.2.x (checkpoint-only, WAL still blocks unattended `recover()`) cases |
+| `docs/how-to/migrate-from-0-2-to-0-3.md` | Split into the 0.3.0 (just upgrade) and ≤0.2.x (checkpoint-only, WAL still blocks unattended `recover()`, with the explicit move-`wal.bin`-aside/data-loss tradeoff) cases |
+| `docs/reference/key-encoding-and-formats.md` | Corrected two stale claims: "pre-0.3.0 data is refused with no compatibility branches" (checkpoint side now has one) and "a v1 checkpoint is rejected at `recover()`" (table payload) |
 | `CHANGELOG.md` | `Unreleased` entry recording the compatibility restoration; task61's breaking-change entry amended to say it no longer fires for any reachable checkpoint version |
 | `docs/tasks/task62_persistence_format_compat.md` | This file |

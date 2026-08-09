@@ -79,14 +79,14 @@
 (*   SyncData -- fdatasync. A barrier over frame DATA only. Reached by      *)
 (*               exactly one sink: PreallocFileSink's steady state, where   *)
 (*               the batch fits the already-zero-filled region so the file  *)
-(*               size does not change (src/wal.rs:1255-1256).               *)
+(*               size does not change (src/wal.rs:1257-1258).               *)
 (*   SyncAll  -- fsync. A barrier over data AND metadata (the physical file *)
 (*               size). Every append-mode sink uses it for every batch --   *)
 (*               FileSink (src/wal.rs:1079-1083) and BufferedFileSink with  *)
 (*               datasync=false, which is what WalSinkKind::Coalesced       *)
 (*               selects (src/wal.rs:1133-1137) -- because an append ALWAYS *)
 (*               changes the size. PreallocFileSink reaches it only as      *)
-(*               preallocate_to's sync (src/wal.rs:665), i.e. only on an    *)
+(*               preallocate_to's sync (src/wal.rs:667), i.e. only on an    *)
 (*               extend.                                                    *)
 (*   Extend   -- the batch overruns `capacity`, so grow by whole chunks of  *)
 (*               physically-written zeros (src/wal.rs:1207-1228, 619-667).  *)
@@ -96,8 +96,8 @@
 (* WHOLESALE on a crash -- including frames a sync_data "covered", because  *)
 (* the filesystem may still present the old size and those offsets simply   *)
 (* are not there. That is why preallocate_to sync_all's BEFORE any record   *)
-(* is written into the new region (src/wal.rs:665, and the ordering at      *)
-(* src/wal.rs:1211 preceding the write at :1245) and why task37 §4 states   *)
+(* is written into the new region (src/wal.rs:667, and the ordering at      *)
+(* src/wal.rs:1213 preceding the write at :1247) and why task37 §4 states   *)
 (* it as a barrier-discipline invariant. `syncedCapacity` is that frontier; *)
 (* SlotSafe is the crash rule; PreallocInvariant is task37 §4.              *)
 (*                                                                         *)
@@ -114,7 +114,7 @@
 (*     They differ in WHEN bytes reach the file -- FsWrite write_all's the  *)
 (*     entry's framed bytes per entry at append (src/wal.rs:1074-1078),     *)
 (*     Coalesced buffers them in a Vec and write_all's the whole batch      *)
-(*     inside sync (src/wal.rs:1125, 1129-1132). That is invisible here     *)
+(*     inside sync (src/wal.rs:1127, 1129-1132). That is invisible here     *)
 (*     because the crash rule already gives EVERY unbarriered frame an      *)
 (*     independent {present, torn, absent} outcome, which is a superset of  *)
 (*     both "some subset of the per-entry writes landed" and "a byte prefix *)
@@ -129,14 +129,14 @@
 (*     Append keeping UNCHANGED <<walDurable, ...>> is still correct.       *)
 (*     It DOES move serialization failure earlier: a framing error now      *)
 (*     surfaces in WalHandle::write, on the committing thread, before       *)
-(*     in_flight.fetch_add and before sender.send (src/wal.rs:1883-1887),   *)
+(*     in_flight.fetch_add and before sender.send (src/wal.rs:1885-1889),   *)
 (*     so a malformed entry aborts the commit with no WAL traffic at all.   *)
 (*     The model has no serialization-failure action, so nothing it asserts *)
 (*     changes -- but this removes a WAL-poison path that the model's       *)
 (*     poison abstraction implicitly covers.                                *)
 (*   - `capacity` / `writeHead` / `metaDurable` are PREALLOC-ONLY state.    *)
-(*     FileSink and BufferedFileSink have no such fields (src/wal.rs:1001,  *)
-(*     :1098); an O_APPEND file has no preallocated region. Under the other *)
+(*     FileSink and BufferedFileSink have no such fields (src/wal.rs:1003,  *)
+(*     :1100); an O_APPEND file has no preallocated region. Under the other *)
 (*     sinks they are pinned at their Init values and PreallocInvariant     *)
 (*     checks that pinning, so the two Task 1-2 baselines keep their        *)
 (*     original state counts exactly.                                       *)
@@ -157,7 +157,7 @@
 (*   Checkpointing -- `checkpointVersion` is carried (Recover honours it as *)
 (*     the replay floor, src/store.rs:1288-1291) but no action moves it off *)
 (*     0, so no committed config exercises a non-zero floor. A Checkpoint   *)
-(*     action also drags in WAL pruning (src/wal.rs:744 prune_wal), which   *)
+(*     action also drags in WAL pruning (src/wal.rs:746 prune_wal), which   *)
 (*     is where checkpoint/prune/crash interleavings would actually bite.   *)
 (*     Out of scope for Task 2's brief; see the report.                     *)
 (*   (MUTATION is no longer on this list: M1-M7 all exist and are gated in  *)
@@ -167,7 +167,7 @@
 (*     per-position row identity. Each is ONE conjunct or one substitution, *)
 (*     in the operator that carries the protection it removes.)             *)
 (*   write_head RECONSTRUCTION on open (task37 §4 invariant 3,              *)
-(*     src/wal.rs:1192-1193: PreallocFileSink::open runs a TOLERANT         *)
+(*     src/wal.rs:1194-1195: PreallocFileSink::open runs a TOLERANT         *)
 (*     scan_wal and takes `capacity` from metadata().len(); there is no     *)
 (*     persisted head pointer). Crash sets writeHead to 0 -- the in-memory  *)
 (*     cursor is gone -- and Recover leaves it there, because the bound is  *)
@@ -255,10 +255,10 @@ sinkVars == <<writeHead, capacity, syncedCapacity, metaDurable>>
 (* non-goal), so "offset" means "frame index" and ChunkSize is a count of   *)
 (* frames rather than bytes. Nothing here depends on records being equal    *)
 (* sized -- only on offsets being assigned in submission order and never    *)
-(* reused, which is what src/wal.rs:1229-1246 does.                         *)
+(* reused, which is what src/wal.rs:1231-1248 does.                         *)
 Prealloc == SinkKind = "CoalescedPrealloc"
 
-(* src/wal.rs:1210 -- `need.div_ceil(chunk) * chunk`. *)
+(* src/wal.rs:1212 -- `need.div_ceil(chunk) * chunk`. *)
 NewCap(need) == ((need + ChunkSize - 1) \div ChunkSize) * ChunkSize
 
 (* `submitted` and `acked` are HISTORY variables: they record what happened *)
@@ -341,7 +341,7 @@ Init ==
     /\ walAfterCrash = <<>>
     \* A fresh wal.bin: PreallocFileSink::open scans an empty file, so
     \* write_head = 0, and capacity = metadata().len() = 0
-    \* (src/wal.rs:1192-1193). Size 0 is trivially durable.
+    \* (src/wal.rs:1194-1195). Size 0 is trivially durable.
     /\ writeHead      = 0
     /\ capacity       = 0
     /\ syncedCapacity = 0
@@ -420,8 +420,8 @@ Submit(r) ==
     \* WalSink::append never advances the write head: FileSink write_all's the
     \* entry's already-framed bytes immediately (src/wal.rs:1074-1078) but has
     \* no head to advance; BufferedFileSink and PreallocFileSink only extend an
-    \* in-memory Vec (src/wal.rs:1125, :1200). PreallocFileSink's write_head
-    \* moves inside sync (src/wal.rs:1246), which is SyncData/SyncAll below.
+    \* in-memory Vec (src/wal.rs:1127, :1202). PreallocFileSink's write_head
+    \* moves inside sync (src/wal.rs:1248), which is SyncData/SyncAll below.
     \* Since task57 the frame is built by WalHandle::write on the committing
     \* thread (src/wal.rs:1858-1869), so `append` no longer serializes anything
     \* -- but that changes only WHERE the bytes are produced, not when they
@@ -452,7 +452,7 @@ FlushUnchanged ==
 
 (***************************************************************************)
 (* fdatasync -- a barrier over frame DATA within the already-durable file   *)
-(* SIZE. src/wal.rs:1255-1256: "Steady-state barrier: size unchanged, so    *)
+(* SIZE. src/wal.rs:1257-1258: "Steady-state barrier: size unchanged, so    *)
 (* fdatasync suffices." Reached by PreallocFileSink and by nothing else in  *)
 (* production: FileSink sync_all's (src/wal.rs:1079-1083) and the Coalesced *)
 (* sink is BufferedFileSink with datasync = false (src/wal.rs:1133-1137;    *)
@@ -461,8 +461,8 @@ FlushUnchanged ==
 (* metaDurable is the guard, and it is the ONE line that carries task37 §4  *)
 (* invariant 2: the batch may only be written into a region whose SIZE is   *)
 (* already sync_all-durable. In the Rust the ordering enforces it --        *)
-(* preallocate_to (which ends in sync_all, src/wal.rs:665) runs at          *)
-(* src/wal.rs:1211, strictly before the positioned write at :1245. Dropping *)
+(* preallocate_to (which ends in sync_all, src/wal.rs:667) runs at          *)
+(* src/wal.rs:1213, strictly before the positioned write at :1247. Dropping *)
 (* this conjunct is M5 -- an implementation that extends the file and then  *)
 (* writes the batch into the new region under a bare sync_data, i.e. that   *)
 (* skips preallocate_to's sync_all (or issues it after the write). The      *)
@@ -478,7 +478,7 @@ SyncData ==
     /\ \E n \in 1..Len(walBuffered) :
          /\ writeHead + n <= capacity     \* the batch fits the zero region
          /\ FlushPrefix(n)
-         /\ writeHead' = writeHead + n    \* src/wal.rs:1246
+         /\ writeHead' = writeHead + n    \* src/wal.rs:1248
     /\ UNCHANGED <<capacity, syncedCapacity, metaDurable>>
     /\ FlushUnchanged
 
@@ -490,7 +490,7 @@ SyncData ==
 (*    because every append changes the size, so there is never a steady     *)
 (*    state where sync_data would be sound;                                 *)
 (*  - PreallocFileSink reaches it only via preallocate_to's sync_all        *)
-(*    (src/wal.rs:665) -- i.e. only when an extend is outstanding. Hence    *)
+(*    (src/wal.rs:667) -- i.e. only when an extend is outstanding. Hence    *)
 (*    the `Prealloc => ~metaDurable` guard: a prealloc store that is        *)
 (*    already meta-durable does NOT fsync, it fdatasyncs. Without that      *)
 (*    guard the model would let prealloc buy sync_all's protection for      *)
@@ -583,7 +583,7 @@ Promote ==
 (* byte-level framing (§4 non-goal).                                        *)
 (*   "present" -- the whole record landed and its CRC verifies;             *)
 (*   "torn"    -- the record is there but the CRC does not verify           *)
-(*                (src/wal.rs:701);                                         *)
+(*                (src/wal.rs:703);                                         *)
 (*   "absent"  -- nothing landed at this offset: a zero len-prefix or a     *)
 (*                short tail (src/wal.rs:692-697).                          *)
 FrameSt   == {"present", "torn", "absent"}
@@ -601,7 +601,7 @@ CrashFrame == [cid : Cids, ver : Nat, tbl : Tables, st : FrameSt]
 (* WHAT THE CUT ACTUALLY DOES AT MUTATION = "NONE", which is the only       *)
 (* behaviour any committed config has. It removes exactly the merely-       *)
 (* buffered tail after an extend whose sync_all has not landed -- and those *)
-(* frames are still sitting in PreallocFileSink::buf (src/wal.rs:1200),     *)
+(* frames are still sitting in PreallocFileSink::buf (src/wal.rs:1202),     *)
 (* never written to the file at all, so calling them absent is not a        *)
 (* durability claim, it is arithmetic: a file of size `syncedCapacity` has  *)
 (* no slot for them. It never removes a DURABLE frame, because              *)
@@ -611,10 +611,10 @@ CrashFrame == [cid : Cids, ver : Nat, tbl : Tables, st : FrameSt]
 (* WHY IT IS STATED OVER walDurable ANYWAY, rather than only over the       *)
 (* buffered tail: the interesting case is the one this model must be ABLE   *)
 (* to express, not the one it currently reaches. A frame an fdatasync       *)
-(* "covered" (src/wal.rs:1256) still vanishes if it sits past the last      *)
+(* "covered" (src/wal.rs:1258) still vanishes if it sits past the last      *)
 (* sync_all-covered size, because the size it needs was never made durable. *)
 (* That is the M5 surface. It is unreachable here precisely because         *)
-(* preallocate_to sync_all's before returning (src/wal.rs:665) and SyncData *)
+(* preallocate_to sync_all's before returning (src/wal.rs:667) and SyncData *)
 (* is guarded on metaDurable -- drop that guard and this clause is what     *)
 (* turns the bug into lost acked data rather than a silent no-op.           *)
 (*                                                                         *)
@@ -628,7 +628,7 @@ SlotSafe(i) == ~Prealloc \/ i <= syncedCapacity
 (* POSITIONAL, deliberately: an absent frame is a HOLE at its offset, not a *)
 (* removal that slides later frames forward. Every sink assigns a frame its *)
 (* byte offset at append time, in submission order (PreallocFileSink seeks  *)
-(* to its own write_head, src/wal.rs:1229), and scan_wal walks offsets      *)
+(* to its own write_head, src/wal.rs:1231), and scan_wal walks offsets      *)
 (* strictly in order, breaking at the first record it cannot accept         *)
 (* (src/wal.rs:690-723) -- there is no skip-and-continue branch. So a frame *)
 (* that never landed makes every LATER frame unreachable to recovery,       *)
@@ -676,7 +676,7 @@ ScanIsTolerant(sk) == sk = "CoalescedPrealloc" /\ MUTATION # "M4"
 (* longest accepted prefix.                                                 *)
 (*                                                                         *)
 (* M6 -- the CALIBRATION for RecoverySound clause (c). The real scan's stop *)
-(* at a CRC-bad frame is src/wal.rs:701-708: `break` when tail_tolerant,    *)
+(* at a CRC-bad frame is src/wal.rs:703-710: `break` when tail_tolerant,    *)
 (* `return Err(WalCorrupted)` when not -- either way the frame and          *)
 (* everything past it is NOT replayed, which is the whole of clause (c)'s   *)
 (* content. M6 removes that stop and keeps ONLY the end-of-log stop (a zero *)
@@ -704,7 +704,7 @@ ScanLen(log) ==
 (* WHICH stop it is decides whether recovery is silent or loud.             *)
 (* An absent record -- zero len-prefix or short tail -- is a clean          *)
 (* end-of-log in BOTH modes (src/wal.rs:692-697, unconditional `break`).    *)
-(* A TORN record is end-of-log only when tail_tolerant (src/wal.rs:702-704);*)
+(* A TORN record is end-of-log only when tail_tolerant (src/wal.rs:704-706);*)
 (* strict mode returns Error::WalCorrupted (:705-707), which Store::recover *)
 (* propagates with `?` (src/store.rs:1284) -- so NOTHING is replayed, not   *)
 (* even the frames the scan had already accepted.                           *)
@@ -786,7 +786,7 @@ Crash ==
     /\ nextVersion'   = 1
     \* write_head is an in-memory cursor and dies with the process; it is
     \* rebuilt by scanning, never read from disk (task37 §4 invariant 3,
-    \* src/wal.rs:1192). capacity / syncedCapacity / metaDurable describe
+    \* src/wal.rs:1194). capacity / syncedCapacity / metaDurable describe
     \* the FILE, which survives, so they are carried -- that is what makes
     \* "was an extend un-synced at the moment of the crash?" observable
     \* after the fact. The model does not resolve what the post-crash
@@ -884,7 +884,7 @@ TypeOK ==
 (*      bookkeeping but exactly "the current size is covered".              *)
 (*  (5) the non-prealloc sinks own none of this state. FileSink and         *)
 (*      BufferedFileSink have no write_head/capacity fields                 *)
-(*      (src/wal.rs:1001-1004, :1098-1105); an O_APPEND file has no         *)
+(*      (src/wal.rs:1003-1006, :1100-1107); an O_APPEND file has no         *)
 (*      preallocated region. Pinning them is what keeps the Task 1-2        *)
 (*      baselines' state counts unchanged, so this clause is also the       *)
 (*      regression guard for that.                                          *)
@@ -1000,7 +1000,7 @@ NoPreallocExtend == Prealloc => (capacity = 0)
 (* per behaviour and it always fires from capacity = 0 on an empty log, so: *)
 (*   - the steady-state -> extend transition (records already durable, the  *)
 (*     next batch overruns the region) never occurs;                        *)
-(*   - src/wal.rs:1210's need.div_ceil(chunk)*chunk is only ever evaluated  *)
+(*   - src/wal.rs:1212's need.div_ceil(chunk)*chunk is only ever evaluated  *)
 (*     at need \in 1..2, never across a chunk boundary;                     *)
 (*   - preallocate_to's `from != 0` case (src/wal.rs:628-667, zero-filling  *)
 (*     a SUFFIX of an existing file rather than the whole of a new one) is  *)
@@ -1169,7 +1169,7 @@ NoAckLossAfterLiveExtend ==
 (* error: recovery stops at the last good frame and carries on. Two         *)
 (* clauses, and they are different claims:                                  *)
 (*                                                                         *)
-(*  (1) it never ABORTS. src/wal.rs:702-704 breaks out of the scan on an    *)
+(*  (1) it never ABORTS. src/wal.rs:704-706 breaks out of the scan on an    *)
 (*      undecodable frame when tail_tolerant, instead of returning          *)
 (*      Err(WalCorrupted) at :705-707. The store opens.                     *)
 (*  (2) it stops at the LAST GOOD FRAME, not before it: every frame in the  *)
@@ -1228,7 +1228,7 @@ TailTolerance ==
 (* TORN-TAIL REACHABILITY CANARY (Task 5). Must be VIOLATED under any       *)
 (* CoalescedPrealloc config. It asserts that recovery never truncates at a  *)
 (* TORN frame and carries on -- i.e. that the tolerant half of scan_wal     *)
-(* (src/wal.rs:702-704) is dead code. If it HOLDS, TailTolerance is green   *)
+(* (src/wal.rs:704-706) is dead code. If it HOLDS, TailTolerance is green   *)
 (* over a state space containing no torn tail at all, and M4 would be       *)
 (* attacking a branch nothing reaches.                                      *)
 (*                                                                         *)

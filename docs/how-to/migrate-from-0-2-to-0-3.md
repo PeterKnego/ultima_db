@@ -24,12 +24,18 @@ directory you have:**
     `recover()` succeeds and gives you exactly the last checkpoint's
     state — check your row counts against what you expect.
   - **`wal.bin` has any legacy entries in it**: `recover()` errors before
-    it gets a chance to apply the checkpoint. If you have already
-    confirmed (via the old binary) that nothing after the last checkpoint
-    matters, move or delete `wal.bin` out of the directory and `recover()`
-    again — that reduces to the case above. If rows after the last
-    checkpoint *do* matter, the rest of this guide is the only way to get
-    them across: export with the old binary, import with the new one.
+    it gets a chance to apply the checkpoint — the checkpoint being
+    readable doesn't help until the unreadable WAL is out of the way.
+    **The actionable step:** move or delete `wal.bin` from the directory,
+    then call `recover()` again; that reduces to the empty/absent case
+    above and loads the last checkpoint. **Do this only after you have
+    decided the rows it discards don't matter** — every row committed
+    *after* the last checkpoint lives only in that WAL, and moving it
+    aside throws those rows away permanently, with no error to warn you
+    (recovery just silently starts from an earlier, valid state). If you
+    need those rows too, do not touch `wal.bin` yet: the rest of this
+    guide is the only way to get them across — export with the old
+    binary, import with the new one.
 
   This only concerns you if you use the `persistence` feature — an
   in-memory store has nothing to migrate.

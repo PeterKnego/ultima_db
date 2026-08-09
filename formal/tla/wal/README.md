@@ -237,8 +237,8 @@ covers**, because that difference is the entire preallocation bug surface.
 
 | Action | Gloss |
 |---|---|
-| `SyncData` | `fdatasync` — a barrier over frame *data* inside an already-durable file size. Reached by `PreallocFileSink` and nothing else in production (`src/wal.rs:1255-1256`), and only in steady state (`metaDurable` guard). |
-| `SyncAll` | `fsync` — data **and** metadata, so the physical file size becomes durable. Every append-mode sink uses it for every batch (`src/wal.rs:1079-1083`, `:1133-1137`) because every append changes the size; `PreallocFileSink` reaches it only as `preallocate_to`'s sync (`src/wal.rs:665`), i.e. only on an extend. |
+| `SyncData` | `fdatasync` — a barrier over frame *data* inside an already-durable file size. Reached by `PreallocFileSink` and nothing else in production (`src/wal.rs:1257-1258`), and only in steady state (`metaDurable` guard). |
+| `SyncAll` | `fsync` — data **and** metadata, so the physical file size becomes durable. Every append-mode sink uses it for every batch (`src/wal.rs:1079-1083`, `:1133-1137`) because every append changes the size; `PreallocFileSink` reaches it only as `preallocate_to`'s sync (`src/wal.rs:667`), i.e. only on an extend. |
 | `Extend` | The batch overruns `capacity`, so grow by whole chunks of physically written zeros (`src/wal.rs:1207-1228`, `:619-667`) and drop `metaDurable` until a `SyncAll` covers the new size. |
 
 `sync_data` does **not** make a new file *size* durable. So bytes past the last
@@ -281,7 +281,7 @@ and at that bound there is exactly one `Extend` per behaviour, always from
 `capacity = 0` on an empty log. So the *production* shape — records already
 durable, the next batch overruns the region, `preallocate_to` zero-fills a
 **suffix** of an existing file (`src/wal.rs:628-667` with `from != 0`) and
-`need.div_ceil(chunk)*chunk` (`:1210`) crosses a chunk boundary — never happens.
+`need.div_ceil(chunk)*chunk` (`:1212`) crosses a chunk boundary — never happens.
 Measured, not assumed: `NoExtendFromLiveLog` and `NoSecondChunk` are both
 **exit 0** (unreachable) at `MaxCommits = 2` and both **exit 12** at 3. That is
 also the region M5's *already-durable-and-acked* failure lives in. 14934 states,
@@ -395,7 +395,7 @@ first.
   and looked maintained.
 - **Round 3 (this pass)** re-verified all 183 cites against the current source
   line by line, and additionally found 36 **bare continuation cites** — the
-  ``(:4193 take, :4247/:4264 wait)`` and ``(src/wal.rs:1125, 1129-1132)``
+  ``(:4193 take, :4247/:4264 wait)`` and ``(src/wal.rs:1127, 1129-1132)``
   shapes, where only the first number carries a `src/*.rs:` prefix — that a
   prefix-anchored sweep does not match at all.
 
@@ -477,7 +477,7 @@ regex finds only the first:
 |---|---|---|
 | prefixed | `` `src/store.rs:1278-1283` ``, `(src/wal.rs:677-726)` | 147 |
 | frozen | `1e5d2b7^ src/wal.rs:1130-1136` | 8 |
-| bare continuation | `` (`src/store.rs:4345`, `:4408`/`:4462`) ``, `(src/wal.rs:1125, 1129-1132)` | 38 |
+| bare continuation | `` (`src/store.rs:4345`, `:4408`/`:4462`) ``, `(src/wal.rs:1127, 1129-1132)` | 38 |
 
 The bare forms carry no file of their own; they inherit the nearest *preceding*
 prefix cite in the document, and its revision with it: in
@@ -520,7 +520,7 @@ the check, is what the example is about) and, at line 720 of `src/wal.rs`, `prun
 signature — which is why `WalCrash.tla`'s M1 block spells `src/store.rs` out and
 why its surrounding lines were re-wrapped to keep the column box square. Task60's
 `#[cfg]`-gated insertions in `src/wal.rs` moved `prune_wal` down to
-`src/wal.rs:744`, and the collision evaporated — nobody edited a cite to make
+`src/wal.rs:746`, and the collision evaporated — nobody edited a cite to make
 that happen. **Collisions appear and disappear with
 any edit that moves a line in a cited file, so do not read "the checker is quiet"
 as "the bare form is safe here"; write new cites prefixed by default.** Both
@@ -585,8 +585,8 @@ reproduce that pass's two independent hand sweeps; its **59 distinct anchors**
 does not reproduce — no grouping of this corpus yields 59. Counting distinct
 `(rev, file, range)` triples gives **65**; 53 of them are reachable from a
 prefixed cite and 12 only from a bare one, which is the most likely source of
-the gap, and several ranges share a start line (`src/wal.rs:1098` and
-`src/wal.rs:1098-1105` are different claims about the same struct). 65 is the
+the gap, and several ranges share a start line (`src/wal.rs:1100` and
+`src/wal.rs:1100-1107` are different claims about the same struct). 65 is the
 number that matters here: each triple is a separate assertion about the source
 and needs its own expectation.
 
@@ -642,12 +642,12 @@ ticket and let the rest of the FIFO proceed. That needs a per-ticket outcome on
 Checkpoint and prune — `checkpointVersion` is carried and `Recover` honours it
 as the replay floor (`src/store.rs:1288-1291`), but no action moves it off 0, so
 no committed config exercises a non-zero floor. A `Checkpoint` action also drags
-in WAL pruning (`src/wal.rs:744`), which is where checkpoint/prune/crash
+in WAL pruning (`src/wal.rs:746`), which is where checkpoint/prune/crash
 interleavings would actually bite.
 
 `write_head` **reconstruction on open** (task37 §4 invariant 3) is declared but
 inert. `PreallocFileSink::open` rebuilds the head with a *tolerant* `scan_wal`
-and takes `capacity` from `metadata().len()` (`src/wal.rs:1192-1193`); there is
+and takes `capacity` from `metadata().len()` (`src/wal.rs:1194-1195`); there is
 no persisted head pointer to corrupt. `Crash` sets `writeHead` to 0 and
 `Recover` leaves it there, because the bound is "no operation after recovery",
 so nothing would consume a reconstructed head. When S2 lifts that bound the
@@ -717,7 +717,7 @@ Clause (c) had **none**,
 because M4 is task37 §7's *other* direction — a strict scan that refuses the
 whole log, not a tolerant one that replays past the tear — and nothing in
 M1–M5 replayed a torn frame either. M6 deletes `ScanLen`'s stop at a
-CRC-bad frame (`src/wal.rs:701-708`) and the clause goes red at depth 9,
+CRC-bad frame (`src/wal.rs:703-710`) and the clause goes red at depth 9,
 exactly as this paragraph priced it before the mutation existed. See the
 calibration table below.
 
@@ -760,7 +760,7 @@ it documents — the three lost-update interleavings task15 records as
 *reproducible failure modes*
 (`docs/tasks/task15_three_phase_consistent_persistence.md:81-101`), the two
 preallocation subtleties task37 is built around (§4 invariant 2, §7), and the
-scan's stop-at-first-bad-frame (`src/wal.rs:701-708`). **M7 is
+scan's stop-at-first-bad-frame (`src/wal.rs:703-710`). **M7 is
 clause-targeted**, and the distinction is worth keeping. No shipped bug ever
 permuted a replayed row's identity; M7 exists because `RecoverySound` clause (a)
 was checked by every config and falsified by none, and a clause with no
@@ -804,12 +804,12 @@ commit 1's belongs), not to something it once did. All of them are gated in
   rule aborts recovery for it.
 - **M5** — `SyncData` loses its `metaDurable` guard: the batch is written into a
   freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s
-  `sync_all` (`src/wal.rs:665`) never ran before the positioned write at
-  `:1245`. task37 §4 invariant 2 — "new size must be durable before use".
+  `sync_all` (`src/wal.rs:667`) never ran before the positioned write at
+  `:1247`. task37 §4 invariant 2 — "new size must be durable before use".
 - **M6** — `ScanLen` loses the stop at a CRC-bad frame, keeping only the
   end-of-log stop (zero len-prefix / short tail, `src/wal.rs:692-697`). Real
   `scan_wal` walks offsets in order and halts at the first frame it cannot
-  accept — `break` under `tail_tolerant` (`:702-704`), `return Err` without it
+  accept — `break` under `tail_tolerant` (`:704-706`), `return Err` without it
   (`:705-707`) — so a torn frame is never replayed. M6 takes it as good and
   keeps going: corruption passes CRC, half a commit record lands in the store,
   and recovery reports success. That is `RecoverySound` clause (c), and M6 is
@@ -921,7 +921,7 @@ error. `TailTolerance` is that sentence, in two clauses that are different
 claims:
 
 1. recovery never **aborts** — `scan_wal` breaks out on an undecodable frame
-   (`src/wal.rs:702-704`) instead of returning `Err(WalCorrupted)`
+   (`src/wal.rs:704-706`) instead of returning `Err(WalCorrupted)`
    (`:705-707`), so the store opens;
 2. it stops at the **last good frame, not before it** — every frame in the
    maximal present-prefix of the on-disk log is replayed.

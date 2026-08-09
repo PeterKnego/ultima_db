@@ -68,14 +68,21 @@ table is left untouched. The write-side checks live in
 `TableWriter::{put, update, delete, update_batch, delete_batch}`,
 `wal::serialize_entry`, and the checkpoint serializer.
 
-## Format versions (0.3.0)
+## Format versions
 
-All three persistent formats are at version 2. Pre-0.3.0 (v1) data is refused
-with a named error; there are no compatibility branches — see
-[How to migrate from 0.2.x](../how-to/migrate-from-0-2-to-0-3.md). Each
-format stamps the table's `KEY_TYPE_ID` and validates it on read: encoded
-keys are opaque bytes that several key types decode without complaint, so a
-mismatch is refused rather than silently reinterpreted (the reasoning is in
+All three persistent formats write at version 2. Read compatibility differs
+per format: the checkpoint container and the checkpoint table payload each
+also accept their pre-0.3.0 (v1) form — a v1 payload is `u64`-keyed by
+construction, so it is refused rather than reinterpreted if the destination
+table's key type isn't `u64`. The WAL has no compatibility branch: a v1 WAL
+entry carries no format marker at all, so it is byte-ambiguous with
+corruption and is refused unconditionally. See
+[How to migrate from 0.2.x](../how-to/migrate-from-0-2-to-0-3.md) and
+[task62](../tasks/task62_persistence_format_compat.md) for what this means
+for an existing directory. Each v2 format stamps the table's `KEY_TYPE_ID`
+and validates it on read: encoded keys are opaque bytes that several key
+types decode without complaint, so a mismatch is refused rather than
+silently reinterpreted (the reasoning is in
 [the architecture explanation](../explanation/architecture.md)).
 
 ### Checkpoint table payload — v2
@@ -88,8 +95,14 @@ mismatch is refused rather than silently reinterpreted (the reasoning is in
 ```
 
 All lengths are explicit and big-endian. `has_next_id` is `0` for an
-explicitly-keyed table and `1` for an auto-increment one. A v1 checkpoint is
-rejected at `recover()` with an error naming the table.
+explicitly-keyed table and `1` for an auto-increment one. A v1 table payload
+(`[next_id][count][id, rec]*`, all `bincode`-varint, no `key_type` field) is
+also read: its leading byte is never the v2 magic `0xFF` (no legal `bincode`
+varint tag is `0xFF`), so dispatch to the v1 reader is unambiguous. Since a
+v1 payload predates arbitrary primary keys, it is `u64`-keyed by
+construction — read into a table whose `K` isn't `u64`, it is refused with
+an error naming the table rather than silently reinterpreting the row ids
+as a different key type.
 
 ### WAL entry payload — v2
 
