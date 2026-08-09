@@ -14,9 +14,11 @@ use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::btree::Change;
 use crate::persistence::Record;
 use crate::primary_key::{
     PrimaryKey, auto_counter_seed, check_encoded_key_len, key_type_mismatch_msg,
+    key_type_mismatch_msg_raw,
 };
 use crate::table::{MergeableTable, Table};
 use crate::{Error, Result};
@@ -38,6 +40,9 @@ type ReplayInsertFn = Box<dyn Fn(&mut dyn Any, &[u8], &[u8]) -> Result<()> + Sen
 type ReplayUpdateFn = Box<dyn Fn(&mut dyn Any, &[u8], &[u8]) -> Result<()> + Send + Sync>;
 type ReplayDeleteFn = Box<dyn Fn(&mut dyn Any, &[u8]) -> Result<()> + Send + Sync>;
 type NewEmptyTableFn = Box<dyn Fn() -> Box<dyn MergeableTable> + Send + Sync>;
+/// Diff two `Table<R, K>` values (as `&dyn Any`) into a delta payload.
+/// Arguments are `(new, base)`, in that order.
+pub type DiffTableFn = Box<dyn Fn(&dyn Any, &dyn Any) -> Result<Vec<u8>> + Send + Sync>;
 /// Build a `Table<R, K>` from a list of raw (encoded-key, bincode-bytes) pairs
 /// and wrap it as `Box<dyn MergeableTable>`. Used by `install_snapshot_stream`
 /// to reconstruct a table from the wire format without `R`/`K` bounds at the
@@ -86,6 +91,13 @@ pub(crate) struct TableTypeInfo {
     pub deserialize_record: DeserializeRecordFn,
     /// Serialize an entire `Table<R, K>` (as `&dyn Any`) to bytes.
     pub serialize_table: SerializeAnyFn,
+    /// Serialize only the rows that changed between a base and a new
+    /// `Table<R, K>` (both as `&dyn Any`, `(new, base)`) to a delta payload.
+    /// A base that downcasts to a different concrete type is reported as
+    /// `Error::TableTypeChanged` rather than failing outright: the table was
+    /// dropped and recreated between checkpoints, and the caller falls back
+    /// to a full-table entry for it.
+    pub diff_table: DiffTableFn,
     /// Deserialize bytes to a `Table<R, K>` (as `Box<dyn MergeableTable>`).
     pub deserialize_table: DeserializeTableFn,
     /// Create a new empty `Table<R, K>` as `Box<dyn Any + Send + Sync>`.
@@ -98,6 +110,25 @@ pub(crate) struct TableTypeInfo {
     pub replay_update: ReplayUpdateFn,
     /// Delete a record from a `Table<R, K>` (as `&mut dyn Any`) by encoded key.
     pub replay_delete: ReplayDeleteFn,
+    /// Upsert a record into a `Table<R, K>` (as `&mut dyn Any`) at an encoded
+    /// key — unlike `replay_insert`, does not error when the key already
+    /// exists. Used by checkpoint delta replay (`apply_delta`), where a
+    /// delta's `op = 0` means "this row now looks like this" for both a row
+    /// added since the base and one that already existed and changed —
+    /// `replay_insert`'s duplicate-key check is exactly the WAL-replay-only
+    /// invariant this must *not* enforce.
+    pub replay_upsert: ReplayInsertFn,
+    /// Advance a `Table<R, K>`'s (as `&mut dyn Any`) auto-increment counter
+    /// to `max(current, decoded key)` — never backwards. Used by checkpoint
+    /// delta replay to apply the delta payload's own `next_id` field:
+    /// `apply_delta` operates on `&mut dyn Any` and has no concrete `K` to
+    /// decode that field into or `Table::set_next_id` to call, so the
+    /// max-with-current logic has to live behind this closure instead. A
+    /// destination table whose counter is `None` (explicitly-keyed, no
+    /// auto-increment) stays `None`: `Table::advance_next_id_to` only ever
+    /// raises an existing `Some` counter, so this cannot hand an
+    /// explicitly-keyed table an auto-increment counter it never had.
+    pub replay_advance_next_id: ReplayDeleteFn,
     /// Deserialize raw `(encoded key, bytes)` pairs and build a fresh
     /// `Table<R, K>`.
     /// If a destination table by the same name already exists, its index
@@ -147,6 +178,10 @@ impl TableRegistry {
                 Ok(())
             }
             Entry::Vacant(e) => {
+                // Owned copy for the `diff_table` closure below: closures
+                // stored in the registry are `'static`, so the borrowed
+                // `name: &str` parameter cannot be captured directly.
+                let table_name = name.to_string();
                 e.insert(TableTypeInfo {
                     type_id: TypeId::of::<R>(),
                     key_type_id: TypeId::of::<K>(),
@@ -170,6 +205,21 @@ impl TableRegistry {
                             .downcast_ref::<Table<R, K>>()
                             .ok_or_else(|| Error::TypeMismatch("table downcast failed".into()))?;
                         serialize_table(table)
+                    }),
+                    diff_table: Box::new(move |new_any, base_any| {
+                        let new = new_any.downcast_ref::<Table<R, K>>().ok_or_else(|| {
+                            Error::Persistence("table downcast failed for delta".into())
+                        })?;
+                        // A base of a different concrete type means the table
+                        // was dropped and recreated with a different R or K
+                        // between checkpoints. The caller turns this into a
+                        // full table entry rather than a delta.
+                        let base = base_any.downcast_ref::<Table<R, K>>().ok_or_else(|| {
+                            Error::TableTypeChanged {
+                                table: table_name.clone(),
+                            }
+                        })?;
+                        diff_table(new, base)
                     }),
                     deserialize_table: Box::new(|bytes| {
                         let table = deserialize_table::<R, K>(bytes)?;
@@ -214,6 +264,33 @@ impl TableRegistry {
                         })?;
                         let key = K::decode(key)?;
                         table.delete(&key)?;
+                        Ok(())
+                    }),
+                    replay_upsert: Box::new(|table_any, key, data| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_upsert downcast failed".into())
+                        })?;
+                        let key = K::decode(key)?;
+                        let (record, _): (R, _) =
+                            bincode::serde::decode_from_slice(data, bincode::config::standard())
+                                .map_err(|e| Error::Persistence(e.to_string()))?;
+                        // `Table::put` is already unconditional upsert — no
+                        // existence check to add or skip, unlike
+                        // `replay_insert`, which layers one on deliberately.
+                        table.put(key, record)?;
+                        Ok(())
+                    }),
+                    replay_advance_next_id: Box::new(|table_any, key| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
+                            Error::TypeMismatch("replay_advance_next_id downcast failed".into())
+                        })?;
+                        let candidate = K::decode(key)?;
+                        // `advance_next_id_to` is spelled without the
+                        // `AutoKey` bound `Table::set_next_id` carries, since
+                        // this closure is instantiated for every registered
+                        // `K`, not just `u64`; it already applies the "never
+                        // backwards" rule.
+                        table.advance_next_id_to(candidate);
                         Ok(())
                     }),
                     build_from_raw_rows: Box::new(|raw_rows, existing| {
@@ -449,6 +526,206 @@ fn serialize_table<R: Record, K: PrimaryKey>(table: &Table<R, K>) -> Result<Vec<
     }
 
     Ok(buf)
+}
+
+/// Leading byte of a delta payload.
+const DELTA_MAGIC: u8 = 0xD1;
+
+/// Format version carried in the second header byte of a delta payload.
+const DELTA_FORMAT_V1: u8 = 1;
+
+/// Serialize the rows that changed between `base` and `new`.
+///
+/// Mirrors [`serialize_table`]'s header discipline — same magic/format/key-type
+/// preamble, same 64 KiB encoded-key cap — because the two formats have to
+/// agree on what a legal row is. A key one path accepts and the other refuses
+/// is a row that survives one durability path and destroys the other (task56).
+///
+/// Format:
+/// `[magic: u8 = 0xD1][version: u8 = 1][key_type: u32-be][has_next_id: u8]`
+/// `[next_id_len: u32-be, next_id_bytes]?`
+/// `[num_changes: u64-be]`
+/// `[key_len: u32-be, key_bytes, op: u8]*` — `op` is `0` (Put, followed by
+/// `[rec_len: u32-be, rec_bytes]`) or `1` (Del, no further bytes).
+///
+/// `data_ref()` requires an empty write overlay, and a SingleWriter table's
+/// *committed* snapshot can legitimately carry up to `OVERLAY_CAP` (32)
+/// buffered-but-unflushed rows (task58; see `src/store.rs`'s
+/// `install_after_delta_check`/bulk-load Delta path for the precedent this
+/// follows). Both `new` and `base` may be exactly such a table — that is
+/// precisely what a checkpoint diffs — so this clones each (O(1): a `BTree`
+/// root `Arc` bump plus the overlay's own `Arc` bump) and flushes the
+/// *clones* before calling `data_ref()`, leaving the caller's originals
+/// (which may be the live snapshot's `Arc<Table>`) untouched. Skipping this
+/// would silently omit every overlay-buffered row from the delta in release
+/// builds (debug builds catch it via `data_ref`'s `debug_assert!`, release
+/// builds do not) — exactly the silent-row-loss failure mode incremental
+/// checkpoints exist to avoid.
+fn diff_table<R: Record, K: PrimaryKey>(new: &Table<R, K>, base: &Table<R, K>) -> Result<Vec<u8>> {
+    let config = bincode::config::standard();
+    let mut buf = Vec::new();
+
+    // Flush before either `data_ref()` call below, and keep both flushed
+    // clones alive for the whole function: `BTree::diff`'s borrow ties the
+    // `BTreeDiff` iterator's lifetime to both trees, so `new_flushed`/
+    // `base_flushed` must outlive the `for` loop that consumes it.
+    let mut new_flushed = new.clone();
+    new_flushed.flush_overlay();
+    let mut base_flushed = base.clone();
+    base_flushed.flush_overlay();
+
+    buf.push(DELTA_MAGIC);
+    buf.push(DELTA_FORMAT_V1);
+    buf.extend_from_slice(&K::KEY_TYPE_ID.to_be_bytes());
+
+    // Read off the flushed clone rather than the original `new`: the two
+    // agree (`flush_overlay` only moves rows from the overlay into the tree
+    // and never touches `next_id`), and reading a single consistent view
+    // avoids a second, easy-to-forget dependency on the pre-flush table.
+    match new_flushed.next_id_opt() {
+        Some(id) => {
+            buf.push(1u8);
+            let enc = id.encode();
+            buf.extend_from_slice(&(enc.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&enc);
+        }
+        None => buf.push(0u8),
+    }
+
+    // Count is written up front, so it is collected before it can be emitted.
+    let mut body = Vec::new();
+    let mut count: u64 = 0;
+    for change in new_flushed.data_ref().diff(base_flushed.data_ref()) {
+        let (key, record) = match change {
+            Change::Added(k, v) | Change::Updated(k, v) => (k, Some(v)),
+            Change::Removed(k) => (k, None),
+        };
+        let kb = key.encode();
+        check_encoded_key_len(kb.len(), "checkpoint delta payload")?;
+        body.extend_from_slice(&(kb.len() as u32).to_be_bytes());
+        body.extend_from_slice(&kb);
+        match record {
+            Some(rec) => {
+                body.push(0u8);
+                let rb = bincode::serde::encode_to_vec(rec.as_ref(), config)
+                    .map_err(|e| Error::Persistence(e.to_string()))?;
+                body.extend_from_slice(&(rb.len() as u32).to_be_bytes());
+                body.extend_from_slice(&rb);
+            }
+            None => body.push(1u8),
+        }
+        count += 1;
+    }
+
+    buf.extend_from_slice(&count.to_be_bytes());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Apply a delta payload — as produced by [`diff_table`] — onto an
+/// already-loaded `Table<R, K>` (as `&mut dyn Any`, downcast internally by
+/// the `replay_*` closures on `info`). Used by [`crate::checkpoint::load_chain`]
+/// to fold a chain's deltas onto the base checkpoint's tables.
+///
+/// `op = 0` (Put) covers both `Change::Added` and `Change::Updated` — the
+/// diff format does not distinguish them, since distinguishing would cost a
+/// base lookup `diff_table` already avoids by walking both trees in
+/// lockstep. So a Put is applied via `replay_upsert`, which is unconditional
+/// (`Table::put` itself has no existence check) — not `replay_insert`, whose
+/// duplicate-key check exists specifically to enforce the WAL-replay
+/// invariant that an `Insert` op never targets an already-present key, an
+/// invariant a checkpoint delta's `op = 0` does not carry.
+///
+/// The key-type code is checked against `info.key_type_code` before a single
+/// row is applied, exactly like WAL replay's `check_replay_key_type`: several
+/// key types decode each other's encodings without complaint, and the
+/// order-preserving encoding means the reinterpreted keys would pass every
+/// later ascending-order check too.
+///
+/// The delta's own `next_id` field **is** applied (via
+/// `replay_advance_next_id`, taking the max with the accumulator's current
+/// counter rather than overwriting) — folding only the Puts is not enough.
+/// A row added and deleted again *within one interval* advances the
+/// interval's ending `next_id` but leaves no trace in the Put/Del stream at
+/// all (`BTree::diff` compares two endpoints; a key that existed at neither
+/// endpoint is invisible to it), so a reader that only replayed Puts would
+/// silently reissue an id that was already handed out — no row is lost, but
+/// recovery would then diverge from the full-checkpoint path on the next
+/// auto-assigned key.
+pub(crate) fn apply_delta(
+    table_any: &mut dyn Any,
+    payload: &[u8],
+    info: &TableTypeInfo,
+) -> Result<()> {
+    let mut at = 0usize;
+
+    let header = take(payload, &mut at, 2)?;
+    if header[0] != DELTA_MAGIC || header[1] != DELTA_FORMAT_V1 {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unrecognized delta payload header: 0x{:02x}{:02x}",
+            header[0], header[1]
+        )));
+    }
+
+    let key_type = take_u32(payload, &mut at)?;
+    if key_type != info.key_type_code {
+        return Err(Error::CheckpointCorrupted(key_type_mismatch_msg_raw(
+            info.key_type_code,
+            info.key_type_name,
+            key_type,
+        )));
+    }
+
+    // Applied via `replay_advance_next_id`, not just parsed for offset
+    // bookkeeping: folding only the Puts under-counts whenever a key was
+    // added *and* deleted again within this one interval (see this
+    // function's doc comment) — the diff never mentions such a key, so
+    // nothing about replaying it would advance the counter.
+    match take(payload, &mut at, 1)?[0] {
+        0 => {}
+        1 => {
+            let len = take_u32(payload, &mut at)? as usize;
+            let next_id_bytes = take(payload, &mut at, len)?;
+            (info.replay_advance_next_id)(table_any, next_id_bytes)?;
+        }
+        other => {
+            return Err(Error::CheckpointCorrupted(format!(
+                "invalid has_next_id byte {other} in delta payload"
+            )));
+        }
+    }
+
+    let count = take_u64(payload, &mut at)?;
+    for _ in 0..count {
+        let klen = take_u32(payload, &mut at)? as usize;
+        check_encoded_key_len(klen, "checkpoint delta payload")?;
+        let key_bytes = take(payload, &mut at, klen)?;
+        let op = take(payload, &mut at, 1)?[0];
+        match op {
+            0 => {
+                let rlen = take_u32(payload, &mut at)? as usize;
+                let rec_bytes = take(payload, &mut at, rlen)?;
+                (info.replay_upsert)(table_any, key_bytes, rec_bytes)?;
+            }
+            1 => {
+                (info.replay_delete)(table_any, key_bytes)?;
+            }
+            other => {
+                return Err(Error::CheckpointCorrupted(format!(
+                    "invalid op byte {other} in delta payload"
+                )));
+            }
+        }
+    }
+
+    if at != payload.len() {
+        return Err(Error::CheckpointCorrupted(format!(
+            "delta payload has {} trailing bytes after {count} changes",
+            payload.len() - at
+        )));
+    }
+
+    Ok(())
 }
 
 /// Read `n` bytes at `at`, advancing it. Every length in the payload is
@@ -1003,6 +1280,46 @@ mod tests {
         assert_eq!(restored.next_id_opt(), None);
     }
 
+    /// Fix-round-3 regression: `Table::advance_next_id_to` must be a no-op
+    /// when the table has no counter at all, not just "never go backwards."
+    /// A real writer never emits a delta with `has_next_id = 1` for an
+    /// explicitly-keyed table (`diff_table` reads it off
+    /// `new_flushed.next_id_opt()`, which is `None` for any non-`AutoKey`
+    /// `K`) — this is only reachable via a CRC-valid forged delta — but the
+    /// doc comment on `advance_next_id_to` promises "a no-op for the `None`
+    /// counter," and the code must actually do that rather than bootstrapping
+    /// a counter onto a table that was never supposed to have one.
+    #[test]
+    fn replay_advance_next_id_is_a_noop_on_a_table_with_no_counter() {
+        let mut reg = TableRegistry::default();
+        reg.register::<String, String>("emails").unwrap();
+        let info = reg.get("emails").unwrap();
+
+        let mut table_box: Box<dyn MergeableTable> = (info.new_empty_table)();
+        assert_eq!(
+            table_box
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap()
+                .next_id_opt(),
+            None,
+            "sanity: an explicitly-keyed table starts with no counter"
+        );
+
+        let candidate = "zzz".to_string().encode();
+        (info.replay_advance_next_id)(table_box.as_any_mut(), &candidate).unwrap();
+
+        assert_eq!(
+            table_box
+                .as_any()
+                .downcast_ref::<Table<String, String>>()
+                .unwrap()
+                .next_id_opt(),
+            None,
+            "an explicitly-keyed table must not acquire a counter through delta replay"
+        );
+    }
+
     #[test]
     fn roundtrip_u64_keyed_table_preserves_next_id() {
         let mut reg = TableRegistry::default();
@@ -1431,5 +1748,197 @@ mod tests {
         let info = reg.get("users").unwrap();
         let result = (info.deserialize_record)(&[0xFF, 0xFF, 0xFF]);
         assert!(matches!(result, Err(Error::Persistence(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // diff_table
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct TestRecord {
+        name: String,
+    }
+
+    /// Parse a payload written by [`diff_table`], returning `(key, Some(record
+    /// bytes))` for a Put and `(key, None)` for a Del, in payload order (which
+    /// is ascending key order — see [`BTree::diff`](crate::btree::BTree::diff)).
+    fn decode_delta_changes(bytes: &[u8]) -> Vec<(u64, Option<Vec<u8>>)> {
+        let mut at = 0usize;
+        assert_eq!(bytes[at], DELTA_MAGIC, "delta magic");
+        assert_eq!(bytes[at + 1], DELTA_FORMAT_V1, "delta format");
+        at += 2;
+        at += 4; // key_type_id
+
+        match take(bytes, &mut at, 1).unwrap()[0] {
+            0 => {}
+            1 => {
+                let len = take_u32(bytes, &mut at).unwrap() as usize;
+                take(bytes, &mut at, len).unwrap();
+            }
+            other => panic!("invalid has_next_id byte {other}"),
+        }
+
+        let count = take_u64(bytes, &mut at).unwrap();
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let klen = take_u32(bytes, &mut at).unwrap() as usize;
+            let key_bytes = take(bytes, &mut at, klen).unwrap();
+            let key = u64::decode(key_bytes).unwrap();
+            let op = take(bytes, &mut at, 1).unwrap()[0];
+            let record = match op {
+                0 => {
+                    let rlen = take_u32(bytes, &mut at).unwrap() as usize;
+                    Some(take(bytes, &mut at, rlen).unwrap().to_vec())
+                }
+                1 => None,
+                other => panic!("invalid op byte {other}"),
+            };
+            out.push((key, record));
+        }
+        assert_eq!(at, bytes.len(), "delta payload has trailing bytes");
+        out
+    }
+
+    #[test]
+    fn diff_table_encodes_only_changed_rows() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        let mut base = Table::<TestRecord, u64>::new();
+        base.put(1, TestRecord { name: "a".into() }).unwrap();
+        base.put(2, TestRecord { name: "b".into() }).unwrap();
+        let mut new = base.clone();
+        new.put(2, TestRecord { name: "B".into() }).unwrap();
+        new.delete(&1).unwrap();
+        new.put(3, TestRecord { name: "c".into() }).unwrap();
+
+        let delta = (info.diff_table)(&new as &dyn Any, &base as &dyn Any).unwrap();
+        let full = (info.serialize_table)(&new as &dyn Any).unwrap();
+
+        // Three changed rows out of a three-row table is not a size win; the
+        // point of the assertion is the *count*, decoded below.
+        assert_eq!(delta[0], DELTA_MAGIC, "delta magic");
+        assert!(!full.is_empty());
+
+        let changes = decode_delta_changes(&delta);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0], (1u64, None)); // deleted
+        assert_eq!(changes[1].0, 2u64);
+        assert!(changes[1].1.is_some()); // updated
+        assert_eq!(changes[2].0, 3u64);
+        assert!(changes[2].1.is_some()); // added
+    }
+
+    #[test]
+    fn diff_table_of_an_unchanged_table_is_empty() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        let mut t = Table::<TestRecord, u64>::new();
+        t.put(1, TestRecord { name: "a".into() }).unwrap();
+        let clone = t.clone();
+
+        let delta = (info.diff_table)(&clone as &dyn Any, &t as &dyn Any).unwrap();
+        assert_eq!(decode_delta_changes(&delta).len(), 0);
+    }
+
+    /// The brief for this task originally asserted this as
+    /// `Error::Persistence(msg)` with `msg.contains("base table")`. That is
+    /// fragile (matching an error message) and collides with the *new*-side
+    /// downcast failure, which really is an internal invariant violation.
+    /// `Error::TableTypeChanged` gives the base-side case — a table dropped
+    /// and recreated with a different record or key type between checkpoints
+    /// — its own variant, so the caller can match on it without string
+    /// sniffing (and without conflating it with the new-side case).
+    #[test]
+    fn diff_table_rejects_a_base_of_a_different_type() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        let new = Table::<TestRecord, u64>::new();
+        let wrong = Table::<TestRecord, String>::new_keyed();
+        let err = (info.diff_table)(&new as &dyn Any, &wrong as &dyn Any).unwrap_err();
+        assert!(
+            matches!(err, Error::TableTypeChanged { ref table } if table == "items"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Regression for a Critical bug in the first cut of `diff_table`: a
+    /// SingleWriter table's *committed* snapshot can carry up to
+    /// `OVERLAY_CAP` (32) buffered-but-unflushed rows (task58; see
+    /// `src/store.rs`'s bulk-load Delta path for the precedent). Reading
+    /// `data_ref()` without first flushing a clone trips a `debug_assert!` in
+    /// debug builds and, worse, *silently omits every overlay-buffered row*
+    /// from the delta in release builds — exactly the silent-row-loss this
+    /// feature exists to prevent. This puts rows in `new`'s overlay and
+    /// checks they still show up as `Added` in the delta.
+    #[test]
+    fn diff_table_sees_rows_buffered_in_the_new_side_overlay() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        // No indexes and a cap bigger than the write count keeps both rows
+        // in the overlay rather than flushing them into the tree.
+        let base = Table::<TestRecord, u64>::new();
+        let mut new = base.clone();
+        new.set_overlay_cap(8);
+        new.put(1, TestRecord { name: "a".into() }).unwrap();
+        new.put(2, TestRecord { name: "b".into() }).unwrap();
+        assert_eq!(
+            new.overlay_len_for_test(),
+            2,
+            "test setup: rows must actually be buffered, not flushed"
+        );
+
+        let delta = (info.diff_table)(&new as &dyn Any, &base as &dyn Any).unwrap();
+        let changes = decode_delta_changes(&delta);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].0, 1u64);
+        assert!(changes[0].1.is_some(), "buffered row 1 missing from delta");
+        assert_eq!(changes[1].0, 2u64);
+        assert!(changes[1].1.is_some(), "buffered row 2 missing from delta");
+
+        // The fix clones-and-flushes internally; the caller's own table must
+        // be left untouched.
+        assert_eq!(new.overlay_len_for_test(), 2, "diff_table must not flush the caller's table");
+    }
+
+    /// Mirror of the above with the overlay on the *base* side. Rows 1 and 2
+    /// live only in `base`'s overlay, never flushed to its tree; `new` is a
+    /// clone with row 1 deleted. If `base`'s overlay were ignored, `base`'s
+    /// tree would look empty and the diff would miss the removal of row 1
+    /// entirely (silently treating it as never having existed) instead of
+    /// reporting `Removed(1)`.
+    #[test]
+    fn diff_table_sees_rows_buffered_in_the_base_side_overlay() {
+        let mut registry = TableRegistry::default();
+        registry.register::<TestRecord, u64>("items").unwrap();
+        let info = registry.get("items").unwrap();
+
+        let mut base = Table::<TestRecord, u64>::new();
+        base.set_overlay_cap(8);
+        base.put(1, TestRecord { name: "a".into() }).unwrap();
+        base.put(2, TestRecord { name: "b".into() }).unwrap();
+        assert_eq!(
+            base.overlay_len_for_test(),
+            2,
+            "test setup: rows must actually be buffered, not flushed"
+        );
+
+        let mut new = base.clone();
+        new.delete(&1).unwrap();
+
+        let delta = (info.diff_table)(&new as &dyn Any, &base as &dyn Any).unwrap();
+        let changes = decode_delta_changes(&delta);
+        // Row 2 is unchanged (same buffered Arc on both sides) and must not
+        // appear; row 1's removal must.
+        assert_eq!(changes, vec![(1u64, None)], "base's buffered row must be visible to the diff");
+
+        assert_eq!(base.overlay_len_for_test(), 2, "diff_table must not flush the caller's table");
     }
 }

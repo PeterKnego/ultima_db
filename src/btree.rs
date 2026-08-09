@@ -541,6 +541,41 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         ))
     }
 
+    /// Changes that turn `base` into `self`, in ascending key order.
+    ///
+    /// Runs in time proportional to what changed, not to tree size: any
+    /// subtree the two versions still share is a single `Arc` on both sides
+    /// and is skipped whole. Equal keys bound to the same value `Arc` are not
+    /// reported — a re-insert of an identical `Arc` is not a change.
+    ///
+    /// Both trees must be versions of the same logical tree. Diffing two
+    /// unrelated trees is well-defined (it degenerates to a full ordered
+    /// merge) but pointless.
+    pub fn diff<'a>(&'a self, base: &'a BTree<K, V>) -> BTreeDiff<'a, K, V> {
+        // Common no-op-checkpoint case: nothing changed since `base` at all,
+        // so the roots are still the same `Arc` (no CoW clone ever
+        // happened). Short-circuit to empty cursors instead of walking up to
+        // MAX_KEYS root entries just to find every one of them unchanged.
+        if Arc::ptr_eq(&self.root, &base.root) {
+            return BTreeDiff {
+                new: DiffCursor {
+                    stack: Vec::new(),
+                    #[cfg(test)]
+                    descends: 0,
+                },
+                base: DiffCursor {
+                    stack: Vec::new(),
+                    #[cfg(test)]
+                    descends: 0,
+                },
+            };
+        }
+        BTreeDiff {
+            new: DiffCursor::new(&self.root),
+            base: DiffCursor::new(&base.root),
+        }
+    }
+
     /// Iterate over every entry the monotone `locate` predicate reports as
     /// [`Ordering::Equal`], in ascending key order.
     ///
@@ -1009,6 +1044,219 @@ fn maybe_split<K: Clone, V>(
             }),
             replaced,
         }
+    }
+}
+
+/// A single difference between two versions of a `BTree`.
+///
+/// Yielded by [`BTree::diff`] in ascending key order. Lifetimes borrow from
+/// *both* trees: `Removed` borrows its key from the base tree, the other two
+/// from the newer tree.
+///
+/// `#[derive(Debug)]` bounds both `K: Debug` and `V: Debug` (the latter via
+/// `&Arc<V>: Debug`, which requires it) — genuinely needed for the `Added`/
+/// `Updated` variants, so this isn't over-restrictive despite `Removed`
+/// alone not needing `V: Debug`: derive bounds per type parameter, not per
+/// variant.
+#[derive(Debug)]
+pub enum Change<'a, K, V> {
+    /// Key is present in the newer tree and absent from the base.
+    Added(&'a K, &'a Arc<V>),
+    /// Key is present in both, bound to a different value `Arc`.
+    Updated(&'a K, &'a Arc<V>),
+    /// Key is present in the base and absent from the newer tree.
+    Removed(&'a K),
+}
+
+/// In-order cursor over a `BTree` that exposes *subtree* boundaries.
+///
+/// `BTreeRange` stores `&BTreeNode` frames, which cannot be compared with
+/// `Arc::ptr_eq`; the diff needs the `Arc` itself to detect shared subtrees,
+/// so it gets its own cursor.
+///
+/// A frame's `slot` interleaves children and entries in traversal order:
+/// even `slot` means "child `slot / 2` has not been descended into yet",
+/// odd `slot` means "entry `slot / 2` is the next entry to yield".
+struct DiffCursor<'a, K, V> {
+    stack: Vec<(&'a Arc<BTreeNode<K, V>>, usize)>,
+    /// Subtrees this cursor has entered via `descend`. Test-only: it is the
+    /// load-bearing counter for proving the `Arc::ptr_eq` skip in
+    /// `BTreeDiff::next` actually fires, rather than just producing correct
+    /// output while silently walking every node.
+    #[cfg(test)]
+    descends: usize,
+}
+
+impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
+    fn new(root: &'a Arc<BTreeNode<K, V>>) -> Self {
+        DiffCursor {
+            stack: vec![(root, 0)],
+            #[cfg(test)]
+            descends: 0,
+        }
+    }
+
+    /// The subtree this cursor is about to descend into, if any.
+    ///
+    /// `None` for a leaf frame or when the next step is an entry rather than
+    /// a child — that is the signal the diff loop uses to fall back to a
+    /// key-wise comparison.
+    fn peek_child(&self) -> Option<&'a Arc<BTreeNode<K, V>>> {
+        let (node, slot) = *self.stack.last()?;
+        if node.children.is_empty() || slot % 2 == 1 {
+            return None;
+        }
+        let idx = slot / 2;
+        // FixedVec has no `get`; index only within the live prefix.
+        if idx < node.children.len() {
+            Some(&node.children[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Descend into the pending child.
+    ///
+    /// Only ever called when `peek_entry` has already determined the top
+    /// frame's next step is a child (even `slot`, non-leaf node), so
+    /// `peek_child` returning `None` here means the node's `children` count
+    /// doesn't match its `entries` count — a malformed tree, not a
+    /// legitimate "no pending child" state. Silently no-op-ing on that would
+    /// leave `slot` unchanged, so `peek_entry`'s loop would call `descend`
+    /// again and spin forever instead of failing.
+    fn descend(&mut self) {
+        let child = self.peek_child();
+        debug_assert!(
+            child.is_some(),
+            "DiffCursor::descend: no pending child on a non-leaf frame — \
+             malformed node (children.len() != entries.len() + 1)"
+        );
+        if let Some(child) = child {
+            let last = self.stack.len() - 1;
+            self.stack[last].1 += 1;
+            self.stack.push((child, 0));
+            #[cfg(test)]
+            {
+                self.descends += 1;
+            }
+        }
+    }
+
+    /// Step over the pending child without visiting any of its keys.
+    fn skip_child(&mut self) {
+        if self.peek_child().is_some() {
+            let last = self.stack.len() - 1;
+            self.stack[last].1 += 1;
+        }
+    }
+
+    /// Advance until the top frame's next step is an entry, then return it.
+    ///
+    /// Does not consume the entry; call `bump` to move past it.
+    fn peek_entry(&mut self) -> Option<(&'a K, &'a Arc<V>)> {
+        loop {
+            let (node, slot) = *self.stack.last()?;
+            if node.children.is_empty() {
+                // Leaf: slots are entries directly, no interleaving.
+                if slot < node.entries.len() {
+                    let (k, v) = &node.entries[slot];
+                    return Some((k, v));
+                }
+                self.stack.pop();
+                continue;
+            }
+            if slot % 2 == 0 {
+                self.descend();
+                continue;
+            }
+            let idx = slot / 2;
+            if idx < node.entries.len() {
+                let (k, v) = &node.entries[idx];
+                return Some((k, v));
+            }
+            self.stack.pop();
+        }
+    }
+
+    /// Consume the entry last returned by `peek_entry`.
+    fn bump(&mut self) {
+        if let Some(last) = self.stack.last_mut() {
+            // Leaf frames advance one slot per entry; internal frames advance
+            // from odd slot `2i+1` (the entry just yielded) to the next
+            // pending child at even slot `2i+2`. Same `+= 1`, two different
+            // meanings, so it is spelled out here rather than folded into
+            // `peek_entry`.
+            last.1 += 1;
+        }
+    }
+}
+
+/// Iterator returned by [`BTree::diff`].
+pub struct BTreeDiff<'a, K, V> {
+    new: DiffCursor<'a, K, V>,
+    base: DiffCursor<'a, K, V>,
+}
+
+impl<'a, K: Ord + Clone, V> Iterator for BTreeDiff<'a, K, V> {
+    type Item = Change<'a, K, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Opportunistic skip: when both cursors are poised on the *same*
+            // subtree, every key inside it is unchanged by CoW construction,
+            // so neither side needs to walk it. This is where the O(changed)
+            // behaviour comes from; correctness never depends on it firing.
+            match (self.new.peek_child(), self.base.peek_child()) {
+                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {
+                    self.new.skip_child();
+                    self.base.skip_child();
+                    continue;
+                }
+                _ => {}
+            }
+
+            return match (self.new.peek_entry(), self.base.peek_entry()) {
+                (None, None) => None,
+                (Some((k, v)), None) => {
+                    self.new.bump();
+                    Some(Change::Added(k, v))
+                }
+                (None, Some((k, _))) => {
+                    self.base.bump();
+                    Some(Change::Removed(k))
+                }
+                (Some((nk, nv)), Some((bk, bv))) => match nk.cmp(bk) {
+                    Ordering::Less => {
+                        self.new.bump();
+                        Some(Change::Added(nk, nv))
+                    }
+                    Ordering::Greater => {
+                        self.base.bump();
+                        Some(Change::Removed(bk))
+                    }
+                    Ordering::Equal => {
+                        self.new.bump();
+                        self.base.bump();
+                        if Arc::ptr_eq(nv, bv) {
+                            continue;
+                        }
+                        Some(Change::Updated(nk, nv))
+                    }
+                },
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+impl<K: Ord + Clone, V> BTreeDiff<'_, K, V> {
+    /// Subtrees descended into by either cursor, summed. Test-only: no
+    /// oracle comparing `diff`'s output to a full scan can distinguish an
+    /// implementation that skips shared subtrees from one that walks every
+    /// node and happens to compute the same answer — this counter is the
+    /// only thing that can.
+    pub fn nodes_visited(&self) -> usize {
+        self.new.descends + self.base.descends
     }
 }
 
@@ -1844,6 +2092,7 @@ fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn insert_range(start: u64, end: u64) -> BTree<u64, u64> {
         let mut t = BTree::new();
@@ -3082,6 +3331,244 @@ mod tests {
             let t = BTree::from_sorted(entries);
             assert_eq!(t.len(), n as usize);
             check_invariants(&t);
+        }
+    }
+
+    #[test]
+    fn diff_reports_added_updated_and_removed() {
+        let base = BTree::<u64, String>::new()
+            .insert(1, "one".into())
+            .insert(2, "two".into())
+            .insert(3, "three".into());
+        let new = base
+            .insert(2, "TWO".into())            // update
+            .insert(4, "four".into())           // add
+            .remove(&1)
+            .unwrap();                          // remove
+
+        let changes: Vec<_> = new
+            .diff(&base)
+            .map(|c| match c {
+                Change::Added(k, v) => (*k, Some(v.to_string()), "add"),
+                Change::Updated(k, v) => (*k, Some(v.to_string()), "upd"),
+                Change::Removed(k) => (*k, None, "rem"),
+            })
+            .collect();
+
+        assert_eq!(
+            changes,
+            vec![
+                (1, None, "rem"),
+                (2, Some("TWO".to_string()), "upd"),
+                (4, Some("four".to_string()), "add"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_of_a_tree_against_itself_is_empty() {
+        let t = BTree::<u64, u64>::new().insert(1, 10).insert(2, 20);
+        assert_eq!(t.diff(&t).count(), 0);
+        assert_eq!(t.clone().diff(&t).count(), 0);
+    }
+
+    #[test]
+    fn diff_reports_no_change_when_the_same_value_arc_is_reinserted() {
+        let base = BTree::<u64, u64>::new().insert(1, 10);
+        let arc = base.get_arc(&1).unwrap();
+        let new = base.insert_arc(1, arc);
+        assert_eq!(new.diff(&base).count(), 0);
+    }
+
+    #[test]
+    fn diff_skips_shared_subtrees_instead_of_walking_them() {
+        // Deep enough to be several levels tall under both T=32 (63-key,
+        // 64-way nodes) and T=8 (`fanout-t8`, 15-key, 16-way nodes) — see
+        // `diff_oracle_tree_height` above for why a shallow tree can't
+        // exercise the multi-level skip at all.
+        let mut base = BTree::<u64, u64>::new();
+        for i in 0..20_000u64 {
+            base = base.insert(i, i);
+        }
+        let new = base.insert(10_000, 999_999);
+
+        let mut d = new.diff(&base);
+        let changes: Vec<_> = (&mut d).collect();
+        assert_eq!(changes.len(), 1, "exactly one key changed");
+
+        // A single changed key touches only the root-to-leaf path on each
+        // side (roughly 2 * height descends, one path per cursor). Both
+        // construction and traversal are deterministic (no hashing, no
+        // randomized ops), so the measured counts below are exact, not a
+        // typical case: 6 descends at T=32 (63-key, 64-way nodes, height 3),
+        // 20 at T=8 (`fanout-t8`, 15-key, 16-way nodes, height 5 — narrower
+        // fan-out means a taller tree for the same key count). The ceilings
+        // give ~4x headroom over the measured value on each side — enough
+        // that an incidental one-level height change doesn't trip the test,
+        // nowhere close to the low thousands of descends a full walk of a
+        // 20,000-key tree would cost if the `Arc::ptr_eq` skip in
+        // `BTreeDiff::next` regressed to always-false.
+        let ceiling = if cfg!(feature = "fanout-t8") { 64 } else { 24 };
+        assert!(
+            d.nodes_visited() <= ceiling,
+            "diff visited {} nodes for a single changed key (ceiling {}) — \
+             subtree skip is not firing",
+            d.nodes_visited(),
+            ceiling
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // BTree::diff proptest oracle, deep-tree case.
+    //
+    // `tests/btree_diff_oracle.rs` covers narrow-key, high-collision
+    // histories (small key space, so inserts/removes/updates collide
+    // constantly) — but under the default T=32 (MAX_KEYS=63, 64-way
+    // fan-out) that key space caps the tree at height 2, so it never
+    // builds an internal node whose children are themselves internal:
+    // exactly the case the multi-frame `stack.pop()` chain in
+    // `DiffCursor::peek_entry`/`peek_child` and a non-leaf `Arc::ptr_eq`
+    // subtree skip exist for. This case lives here instead of in the
+    // integration test because proving it actually reached that depth
+    // needs `root`/`children`, which aren't public API.
+    //
+    // Deterministic seed (`DIFF_ORACLE_DEEP_SEED` sequential inserts)
+    // guarantees height >= 3 regardless of what the randomized ops layered
+    // on top do, so update/remove coverage at depth isn't left to chance:
+    // widening the key space alone (without the seed) would make collisions
+    // — and therefore Updated/Removed coverage — vanishingly rare within a
+    // few hundred random ops.
+    // -----------------------------------------------------------------
+
+    /// Levels from root to leaf, inclusive — a single-leaf (empty or small)
+    /// tree is height 1. `height(t) >= 3` means some node's children are
+    /// themselves internal nodes, not leaves.
+    fn diff_oracle_tree_height<K, V>(t: &BTree<K, V>) -> usize {
+        fn go<K, V>(node: &Arc<BTreeNode<K, V>>) -> usize {
+            if node.children.is_empty() {
+                1
+            } else {
+                1 + go(&node.children[0])
+            }
+        }
+        go(&t.root)
+    }
+
+    #[derive(Debug, Clone)]
+    enum DiffOracleOp {
+        Insert(u64, u64),
+        Remove(u64),
+    }
+
+    // 64-way fan-out means a single overflowing child of the root (>63
+    // entries) is already enough to reach height 3; this is a wide margin
+    // over that, so the assertion in the proptest below is not a near thing.
+    const DIFF_ORACLE_DEEP_SEED: u64 = 5_000;
+
+    fn diff_oracle_deep_ops() -> impl Strategy<Value = Vec<DiffOracleOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                (0u64..DIFF_ORACLE_DEEP_SEED, 0u64..1000)
+                    .prop_map(|(k, v)| DiffOracleOp::Insert(k, v)),
+                (0u64..DIFF_ORACLE_DEEP_SEED).prop_map(DiffOracleOp::Remove),
+            ],
+            0..300,
+        )
+    }
+
+    // Same generation-counter trick as the integration test's oracle (see
+    // its `apply` doc comment): `diff` compares `Arc::ptr_eq`, not value
+    // equality, and `BTree::insert` allocates a fresh value `Arc` on every
+    // call, so the model must track per-key identity, not just the value.
+    fn diff_oracle_apply(
+        tree: &BTree<u64, u64>,
+        model: &mut std::collections::BTreeMap<u64, (u64, u64)>,
+        generation: &mut u64,
+        op: &DiffOracleOp,
+    ) -> BTree<u64, u64> {
+        match op {
+            DiffOracleOp::Insert(k, v) => {
+                *generation += 1;
+                model.insert(*k, (*v, *generation));
+                tree.insert(*k, *v)
+            }
+            DiffOracleOp::Remove(k) => {
+                model.remove(k);
+                tree.remove(k).unwrap_or_else(|_| tree.clone())
+            }
+        }
+    }
+
+    fn diff_oracle_expected(
+        new: &std::collections::BTreeMap<u64, (u64, u64)>,
+        base: &std::collections::BTreeMap<u64, (u64, u64)>,
+    ) -> Vec<(u64, Option<u64>, &'static str)> {
+        let mut out = Vec::new();
+        let mut keys: Vec<u64> = new.keys().chain(base.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for k in keys {
+            match (new.get(&k), base.get(&k)) {
+                (Some((_, ng)), Some((_, bg))) if ng == bg => {}
+                (Some((nv, _)), Some(_)) => out.push((k, Some(*nv), "upd")),
+                (Some((nv, _)), None) => out.push((k, Some(*nv), "add")),
+                (None, Some(_)) => out.push((k, None, "rem")),
+                (None, None) => unreachable!("key came from one of the two maps"),
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn diff_matches_full_scan_oracle_deep_tree(
+            rand_base in diff_oracle_deep_ops(),
+            rand_then in diff_oracle_deep_ops(),
+        ) {
+            let mut model = std::collections::BTreeMap::new();
+            let mut generation = 0u64;
+            let mut tree = BTree::<u64, u64>::new();
+
+            // Deterministic seed first: forces height >= 3 no matter what
+            // the randomized ops (which may remove far more than they add)
+            // do afterward.
+            for k in 0..DIFF_ORACLE_DEEP_SEED {
+                tree = diff_oracle_apply(
+                    &tree, &mut model, &mut generation, &DiffOracleOp::Insert(k, k),
+                );
+            }
+            for op in &rand_base {
+                tree = diff_oracle_apply(&tree, &mut model, &mut generation, op);
+            }
+            let base_tree = tree.clone();
+            let base_model = model.clone();
+
+            // Confirm the deep path is actually reached, rather than assume
+            // the seed size is adequate.
+            let base_height = diff_oracle_tree_height(&base_tree);
+            prop_assert!(
+                base_height >= 3,
+                "deep-tree proptest case only reached height {} — \
+                 DIFF_ORACLE_DEEP_SEED needs raising",
+                base_height
+            );
+
+            for op in &rand_then {
+                tree = diff_oracle_apply(&tree, &mut model, &mut generation, op);
+            }
+
+            let got: Vec<(u64, Option<u64>, &'static str)> = tree
+                .diff(&base_tree)
+                .map(|c| match c {
+                    Change::Added(k, v) => (*k, Some(**v), "add"),
+                    Change::Updated(k, v) => (*k, Some(**v), "upd"),
+                    Change::Removed(k) => (*k, None, "rem"),
+                })
+                .collect();
+
+            prop_assert_eq!(got, diff_oracle_expected(&model, &base_model));
         }
     }
 }

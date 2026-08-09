@@ -24,6 +24,52 @@ fn standalone_config(dir: &Path, durability: Durability) -> StoreConfig {
         .build()
 }
 
+/// `standalone_config` plus a chain length. Kept separate so the existing
+/// tests keep exercising the default (`checkpoint_chain_max == 1`).
+fn chained_config(dir: &Path, durability: Durability, chain_max: usize) -> StoreConfig {
+    StoreConfig::builder()
+        .persistence(Persistence::standalone(
+            dir.to_path_buf(),
+            durability,
+            WalWrite::PerEntry,
+        ))
+        .checkpoint_chain_max(chain_max)
+        .build()
+}
+
+fn checkpoint_files(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("checkpoint_") && n.ends_with(".bin"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Assert through the crate's own header reader rather than a byte offset —
+/// an offset silently starts testing the wrong byte the moment the header
+/// layout changes.
+fn assert_full_checkpoint(dir: &Path, version: u64) {
+    let path = dir.join(format!("checkpoint_{version}.bin"));
+    assert!(
+        ultima_db::checkpoint_is_full_for_test(&path).unwrap(),
+        "checkpoint_{version}.bin must be a full checkpoint, not a delta"
+    );
+}
+
+fn insert_user(store: &Store, name: &str) {
+    let mut wtx = store.begin_write(None).unwrap();
+    wtx.open_table::<User>("users")
+        .unwrap()
+        .insert(User {
+            name: name.into(),
+            age: 30,
+        })
+        .unwrap();
+    wtx.commit().unwrap();
+}
+
 fn smr_config(dir: &Path) -> StoreConfig {
     StoreConfig::builder()
         .persistence(Persistence::smr(dir.to_path_buf()))
@@ -1270,14 +1316,25 @@ fn recovery_after_checkpointed_bulk_load_replays_later_commits() {
 /// and verifies all N rows survived.
 #[test]
 fn checkpoint_concurrent_with_commits_loses_no_acknowledged_commit() {
+    checkpoint_race_loses_no_acknowledged_commit(12, 1);
+}
+
+/// The same race with `checkpoint_chain_max(4)`: the checkpointer is now
+/// writing deltas while commits land, and each one still prunes the WAL — so
+/// a chain that cannot be reassembled shows up here as lost commits.
+#[test]
+fn delta_checkpoints_concurrent_with_commits_lose_no_acknowledged_commit() {
+    checkpoint_race_loses_no_acknowledged_commit(6, 4);
+}
+
+fn checkpoint_race_loses_no_acknowledged_commit(rounds: usize, chain_max: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    const ROUNDS: usize = 12;
     const COMMITS: usize = 150;
 
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         let dir = common::test_scratch::scratch_dir();
-        let config = standalone_config(dir.path(), Durability::Consistent);
+        let config = chained_config(dir.path(), Durability::Consistent, chain_max);
 
         {
             let store = open_store(config.clone());
@@ -1955,4 +2012,425 @@ fn registering_before_the_table_exists_still_pins_the_key_type() {
     drop(t);
     wtx.commit().unwrap();
     store.register_table_keyed::<String, String>("t").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Incremental checkpoints: chain_max, base retention, chain-aware cleanup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chain_max_one_writes_only_full_checkpoints() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = open_store(standalone_config(dir.path(), Durability::Consistent));
+    for i in 0..3 {
+        insert_user(&store, &format!("u{i}"));
+        let v = store.checkpoint().unwrap();
+        assert_full_checkpoint(dir.path(), v);
+    }
+    // Default chain_max is 1: every file is a full, so each cleanup collapses
+    // the directory back to the newest one.
+    assert_eq!(checkpoint_files(dir.path()).len(), 1);
+}
+
+#[test]
+fn chain_max_zero_is_rejected() {
+    let dir = common::test_scratch::scratch_dir();
+    let res = Store::new(chained_config(dir.path(), Durability::Consistent, 0));
+    assert!(matches!(res, Err(Error::Persistence(_))), "chain_max 0 must be rejected");
+}
+
+#[test]
+fn a_delta_chain_recovers_every_committed_row() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 4);
+    {
+        let store = open_store(config.clone());
+        for i in 0..10 {
+            insert_user(&store, &format!("u{i}"));
+            store.checkpoint().unwrap();
+        }
+        assert!(
+            checkpoint_files(dir.path()).len() > 1,
+            "chain_max(4) should have left deltas on disk"
+        );
+    }
+
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(rtx.open_table::<User>("users").unwrap().len(), 10);
+    assert_eq!(rtx.version(), 10);
+}
+
+#[test]
+fn the_first_checkpoint_after_recovery_is_full() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 8);
+    {
+        let store = open_store(config.clone());
+        insert_user(&store, "alice");
+        store.checkpoint().unwrap();
+    }
+
+    // recover() leaves no in-memory base, so a delta is impossible here even
+    // though chain_max would otherwise allow one.
+    let store2 = open_store(config);
+    insert_user(&store2, "bob");
+    let v = store2.checkpoint().unwrap();
+    assert_full_checkpoint(dir.path(), v);
+
+    // Same rule for a `recover()` that lands mid-life, on a store that has
+    // already checkpointed and therefore *does* hold a base: recovery
+    // re-derives the in-memory state from disk, so the retained base stops
+    // being something this store can vouch for.
+    insert_user(&store2, "carol");
+    store2.recover().unwrap();
+    let v = store2.checkpoint().unwrap();
+    assert_full_checkpoint(dir.path(), v);
+}
+
+#[test]
+fn a_checkpoint_after_bulk_load_is_full() {
+    use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
+
+    // bulk_load installs a wholly new tree, so a diff would rewrite every row
+    // anyway — going straight to full is cheaper and simpler.
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 8);
+    let store = open_store(config);
+    insert_user(&store, "alice");
+    store.checkpoint().unwrap();
+
+    let rows = vec![(
+        1u64,
+        User {
+            name: "loaded".into(),
+            age: 1,
+        },
+    )];
+    // `checkpoint_after: true` (the default) makes the load itself checkpoint.
+    let v = store
+        .bulk_load::<User>(
+            "users",
+            BulkLoadInput::Replace(BulkSource::sorted_vec(rows)),
+            BulkLoadOptions::default(),
+        )
+        .unwrap();
+    assert_full_checkpoint(dir.path(), v);
+
+    // And the loaded state is what comes back.
+    let store2 = open_store(chained_config(dir.path(), Durability::Consistent, 8));
+    let rtx = store2.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.get(1).unwrap().name, "loaded");
+}
+
+#[test]
+fn cleanup_never_deletes_an_ancestor_of_the_head() {
+    let dir = common::test_scratch::scratch_dir();
+    let store = open_store(chained_config(dir.path(), Durability::Consistent, 4));
+    for i in 0..3 {
+        insert_user(&store, &format!("u{i}"));
+        store.checkpoint().unwrap();
+    }
+    // full@v1 + delta@v2 + delta@v3 — deleting any of the three makes the
+    // head unrecoverable, and the WAL is already pruned past them.
+    assert_eq!(
+        checkpoint_files(dir.path()),
+        vec![
+            "checkpoint_1.bin".to_string(),
+            "checkpoint_2.bin".to_string(),
+            "checkpoint_3.bin".to_string()
+        ]
+    );
+    assert_full_checkpoint(dir.path(), 1);
+}
+
+#[test]
+fn cleanup_drops_a_chain_that_a_later_full_replaced() {
+    let dir = common::test_scratch::scratch_dir();
+    // chain_max 2: full@v1, delta@v2, then full@v3, delta@v4.
+    let store = open_store(chained_config(dir.path(), Durability::Consistent, 2));
+    for i in 0..4 {
+        insert_user(&store, &format!("u{i}"));
+        store.checkpoint().unwrap();
+    }
+    assert_eq!(
+        checkpoint_files(dir.path()),
+        vec!["checkpoint_3.bin".to_string(), "checkpoint_4.bin".to_string()]
+    );
+    assert_full_checkpoint(dir.path(), 3);
+}
+
+#[test]
+fn repeated_checkpoint_at_the_same_version_stays_recoverable() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 8);
+    {
+        let store = open_store(config.clone());
+        insert_user(&store, "alice");
+        let v1 = store.checkpoint().unwrap();
+        // Nothing committed in between: a delta here would name itself as its
+        // own base *and* overwrite that base's file.
+        let v2 = store.checkpoint().unwrap();
+        assert_eq!(v1, v2);
+        assert_full_checkpoint(dir.path(), v2);
+    }
+
+    let store2 = open_store(config);
+    assert_eq!(
+        store2.begin_read(None).unwrap().open_table::<User>("users").unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn a_missing_base_file_forces_a_full_checkpoint() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 8);
+    let store = open_store(config.clone());
+    insert_user(&store, "alice");
+    let base = store.checkpoint().unwrap();
+
+    // Simulate the base going missing behind the store's back. Writing a delta
+    // against it would produce an unrecoverable head.
+    std::fs::remove_file(dir.path().join(format!("checkpoint_{base}.bin"))).unwrap();
+
+    insert_user(&store, "bob");
+    let v = store.checkpoint().unwrap();
+    assert_full_checkpoint(dir.path(), v);
+
+    let store2 = open_store(config);
+    assert_eq!(
+        store2.begin_read(None).unwrap().open_table::<User>("users").unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn a_delta_chain_carries_updates_and_deletes() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 4);
+    {
+        let store = open_store(config.clone());
+        for name in ["alice", "bob", "carol"] {
+            insert_user(&store, name);
+        }
+        store.checkpoint().unwrap();
+
+        // Rows removed and rewritten *after* the base — the changes a delta
+        // has to carry as more than "here are some new rows".
+        let mut wtx = store.begin_write(None).unwrap();
+        {
+            let mut t = wtx.open_table::<User>("users").unwrap();
+            t.delete(2).unwrap();
+            t.update(
+                1,
+                User {
+                    name: "alice2".into(),
+                    age: 99,
+                },
+            )
+            .unwrap();
+        }
+        wtx.commit().unwrap();
+        store.checkpoint().unwrap();
+
+        insert_user(&store, "dave");
+        store.checkpoint().unwrap();
+
+        assert!(
+            checkpoint_files(dir.path()).len() > 1,
+            "expected a chain, got {:?}",
+            checkpoint_files(dir.path())
+        );
+    }
+
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.len(), 3);
+    assert_eq!(
+        t.get(1).unwrap(),
+        &User {
+            name: "alice2".into(),
+            age: 99
+        }
+    );
+    assert!(t.get(2).is_none(), "deleted row came back through the chain");
+    assert_eq!(t.get(3).unwrap().name, "carol");
+    assert_eq!(t.get(4).unwrap().name, "dave");
+}
+
+#[test]
+fn an_unresolvable_chain_does_not_fail_the_checkpoint() {
+    let dir = common::test_scratch::scratch_dir();
+    // Default config: the setting that never opted into deltas at all.
+    let store = open_store(standalone_config(dir.path(), Durability::Consistent));
+    insert_user(&store, "alice");
+    store.checkpoint().unwrap();
+
+    // A foreign file that outranks the head, so chain resolution fails. By the
+    // time that matters the new checkpoint is durable and the WAL is pruned —
+    // the irreversible work has succeeded, and only the opportunistic cleanup
+    // is left. Failing here would report failure for a checkpoint that in fact
+    // happened.
+    std::fs::write(
+        dir.path().join("checkpoint_999.bin"),
+        b"this is not a checkpoint",
+    )
+    .unwrap();
+
+    insert_user(&store, "bob");
+    let v = store.checkpoint().unwrap();
+    assert_eq!(v, 2);
+
+    // A full checkpoint is self-contained, so it is safe to prune behind
+    // however confusing the directory is — the skip that protects a delta must
+    // not become a blanket one.
+    let entries = ultima_db::wal::read_wal(&dir.path().join("wal.bin")).unwrap();
+    assert!(
+        entries.is_empty(),
+        "a full checkpoint must still prune the WAL: {entries:?}"
+    );
+
+    // Cleanup was skipped rather than guessed at: nothing was deleted.
+    let files = checkpoint_files(dir.path());
+    assert!(
+        files.contains(&"checkpoint_1.bin".to_string()),
+        "cleanup should have been skipped, not run blind: {files:?}"
+    );
+    assert!(files.contains(&"checkpoint_2.bin".to_string()), "{files:?}");
+}
+
+/// SMR is checkpoint-only — no WAL, no prune — so the checkpoint chain carries
+/// the entire durability burden there. Same code path as Standalone, which is
+/// exactly why it is worth asserting rather than assuming.
+#[test]
+fn smr_delta_chain_recovers_every_row() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = StoreConfig::builder()
+        .persistence(Persistence::smr(dir.path().to_path_buf()))
+        .checkpoint_chain_max(4)
+        .build();
+    {
+        let store = open_store(config.clone());
+        for i in 0..6 {
+            insert_user(&store, &format!("u{i}"));
+            store.checkpoint().unwrap();
+        }
+        // A delete inside a delta interval too — the chain has to carry
+        // removals, not just new rows.
+        let mut wtx = store.begin_write(None).unwrap();
+        wtx.open_table::<User>("users").unwrap().delete(3).unwrap();
+        wtx.commit().unwrap();
+        store.checkpoint().unwrap();
+
+        assert!(
+            checkpoint_files(dir.path()).len() > 1,
+            "chain_max(4) should have left deltas on disk: {:?}",
+            checkpoint_files(dir.path())
+        );
+    }
+
+    let store2 = open_store(config);
+    assert_eq!(store2.latest_version(), 7);
+    let rtx = store2.begin_read(None).unwrap();
+    let t = rtx.open_table::<User>("users").unwrap();
+    assert_eq!(t.len(), 5);
+    assert!(t.get(3).is_none(), "deleted row came back through the chain");
+    for id in [1u64, 2, 4, 5, 6] {
+        assert_eq!(t.get(id).unwrap().name, format!("u{}", id - 1));
+    }
+}
+
+/// Durable and loadable are different properties, and it is *loadable* that
+/// the WAL prune spends. A delta whose chain is broken is durable but not
+/// loadable — pruning behind it destroys the only remaining copy of the
+/// commits it claims to cover.
+#[test]
+fn a_delta_whose_chain_is_broken_does_not_prune_the_wal() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 4);
+    let store = open_store(config.clone());
+    for i in 0..3 {
+        insert_user(&store, &format!("u{i}"));
+        store.checkpoint().unwrap();
+    }
+    // full@1 <- delta@2 <- delta@3; now the base disappears behind our back.
+    std::fs::remove_file(dir.path().join("checkpoint_1.bin")).unwrap();
+
+    insert_user(&store, "u3");
+    // The write itself succeeds — it is only the chain that is unusable.
+    let v = store.checkpoint().unwrap();
+    assert_eq!(v, 4);
+
+    let entries = ultima_db::wal::read_wal(&dir.path().join("wal.bin")).unwrap();
+    assert!(
+        !entries.is_empty(),
+        "the WAL was pruned behind a delta whose chain does not resolve; \
+         those four commits now exist nowhere"
+    );
+
+    // The directory needs an operator, and says so loudly — the one thing it
+    // must not do is silently come back with fewer rows.
+    drop(store);
+    let store2 = Store::new(config).unwrap();
+    store2.register_table::<User>("users").unwrap();
+    match store2.recover() {
+        Err(Error::CheckpointChainBroken { head, missing }) => {
+            assert_eq!((head, missing), (4, 1));
+        }
+        other => panic!("expected a loud CheckpointChainBroken, got {other:?}"),
+    }
+}
+
+/// `find_head_chain` answers for the highest-versioned file in the directory,
+/// which need not be the file we just wrote. Acting on someone else's chain
+/// means deleting our own chain's ancestors — and unlike the pre-feature
+/// world, the survivor is a delta, so the loss is silent.
+#[test]
+fn a_foreign_newest_file_does_not_get_our_ancestors_deleted() {
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, 4);
+    {
+        let store = open_store(config.clone());
+        for i in 0..2 {
+            insert_user(&store, &format!("u{i}"));
+            store.checkpoint().unwrap();
+        }
+        // full@1 <- delta@2, plus a stray full that outranks everything.
+        std::fs::copy(
+            dir.path().join("checkpoint_1.bin"),
+            dir.path().join("checkpoint_999.bin"),
+        )
+        .unwrap();
+
+        insert_user(&store, "u2");
+        store.checkpoint().unwrap();
+
+        let files = checkpoint_files(dir.path());
+        for name in ["checkpoint_1.bin", "checkpoint_2.bin", "checkpoint_3.bin"] {
+            assert!(
+                files.contains(&name.to_string()),
+                "{name} was deleted on account of a chain that is not ours: {files:?}"
+            );
+        }
+    }
+
+    // The stray file still outranks the real head, so recovery picks it — that
+    // is recovery's "highest version wins" rule, not this call's doing, and no
+    // checkpoint can tell a planted file from a legitimately newer one. What
+    // this guard buys is that the state stays *repairable*: our chain is
+    // intact on disk, so removing the stray file recovers every row. Before
+    // the guard, checkpoint_1 and checkpoint_2 were deleted and no amount of
+    // operator work brought those rows back.
+    std::fs::remove_file(dir.path().join("checkpoint_999.bin")).unwrap();
+    let store2 = open_store(config);
+    let rtx = store2.begin_read(None).unwrap();
+    assert_eq!(
+        rtx.open_table::<User>("users").unwrap().len(),
+        3,
+        "rows went missing permanently"
+    );
 }

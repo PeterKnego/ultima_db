@@ -75,7 +75,7 @@ pub mod wal;
 #[cfg(all(test, feature = "persistence"))]
 mod test_scratch;
 
-pub use btree::BTree;
+pub use btree::{BTree, BTreeDiff, Change};
 pub use bulk_load::{
     AddOptions, BulkDelta, BulkLoadBatch, BulkLoadInput, BulkLoadOptions, BulkSource,
 };
@@ -98,4 +98,14 @@ pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};
 #[doc(hidden)]
 pub fn wal_durable_len_for_test(path: &std::path::Path) -> u64 {
     crate::wal::scan_wal(path, true).unwrap().1
+}
+
+/// Is the checkpoint file at `path` a full checkpoint (`true`) or a delta
+/// (`false`)? Test-only escape hatch so integration tests can assert a file's
+/// kind through the crate's own header reader rather than a hard-coded byte
+/// offset. Not part of the stable public API.
+#[cfg(feature = "persistence")]
+#[doc(hidden)]
+pub fn checkpoint_is_full_for_test(path: &std::path::Path) -> Result<bool> {
+    crate::checkpoint::is_full_checkpoint(path)
 }

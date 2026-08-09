@@ -70,6 +70,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # pprof 0.15 is incompatible with criterion 0.8 (Profiler trait mismatch)
 # pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
 rand = "0.10"
+proptest = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
 tempfile = "3"
@@ -100,6 +101,11 @@ required-features = ["persistence"]
 
 [[bench]]
 name = "checkpoint_impact_bench"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
+name = "checkpoint_delta"
 harness = false
 required-features = ["persistence"]
 

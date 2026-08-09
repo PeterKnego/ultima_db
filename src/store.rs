@@ -35,6 +35,19 @@ pub(crate) struct Snapshot {
     pub(crate) tables: BTreeMap<String, Arc<dyn MergeableTable>>,
 }
 
+// Manual, not derived: `Arc<dyn MergeableTable>` has no `Debug` impl (the
+// trait doesn't require one — it would force every `Record` to be `Debug`
+// too). Printing the table names is enough for what this is for: unwrapping
+// a `Result<Snapshot, _>` in tests without needing the tables' contents.
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("version", &self.version)
+            .field("tables", &self.tables.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl Snapshot {
     /// Returns the names of all tables in this snapshot, in sorted alphabetical order.
     /// (BTreeMap keys are already sorted.)
@@ -150,6 +163,20 @@ pub struct StoreConfig {
     /// Persistence mode. Default: [`Persistence::None`](crate::Persistence::None) (in-memory only).
     #[cfg(feature = "persistence")]
     pub persistence: crate::persistence::Persistence,
+    /// Maximum length of a checkpoint chain: one full checkpoint followed by
+    /// at most `checkpoint_chain_max - 1` deltas. Must be `>= 1`
+    /// ([`Store::new`] rejects `0`).
+    ///
+    /// `1` (the default) means every checkpoint is a full one — the behavior
+    /// from before incremental checkpoints existed, and the only setting that
+    /// retains no base snapshot. Higher values make [`Store::checkpoint`] cost
+    /// track change volume instead of dataset size, paid for in memory and
+    /// recovery time: the last checkpointed snapshot is held alive as the
+    /// diff base, so whichever of its nodes the live tree has since replaced
+    /// cannot be freed, and recovery must fold the whole chain instead of
+    /// loading one file.
+    #[cfg(feature = "persistence")]
+    pub checkpoint_chain_max: usize,
 }
 
 impl Default for StoreConfig {
@@ -162,6 +189,8 @@ impl Default for StoreConfig {
             require_explicit_version: false,
             #[cfg(feature = "persistence")]
             persistence: crate::persistence::Persistence::None,
+            #[cfg(feature = "persistence")]
+            checkpoint_chain_max: 1,
         }
     }
 }
@@ -231,6 +260,12 @@ impl StoreConfigBuilder {
     #[cfg(feature = "persistence")]
     pub fn persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
         self.config.persistence = persistence;
+        self
+    }
+    /// See [`StoreConfig::checkpoint_chain_max`].
+    #[cfg(feature = "persistence")]
+    pub fn checkpoint_chain_max(mut self, n: usize) -> Self {
+        self.config.checkpoint_chain_max = n;
         self
     }
     /// Finalize the configuration.
@@ -418,6 +453,22 @@ pub(crate) struct StoreInner {
     /// Type registry for serialization (persistence feature only).
     #[cfg(feature = "persistence")]
     pub(crate) registry: Arc<crate::registry::TableRegistry>,
+    /// The snapshot the last checkpoint wrote, held so the next checkpoint can
+    /// diff against it. Holding the `Arc` is what keeps it alive: `gc()`
+    /// evicting the version from `snapshots` drops the map's reference, never
+    /// this one — which is exactly what a [`VersionPin`] does, so no wrapper
+    /// is needed here.
+    ///
+    /// `None` means the next checkpoint must be full, because there is
+    /// nothing on disk it could name as a base: at startup, after `recover()`,
+    /// and after a bulk load.
+    #[cfg(feature = "persistence")]
+    checkpoint_base: Option<Arc<Snapshot>>,
+    /// Number of files in the on-disk chain headed by `checkpoint_base`
+    /// (1 = a lone full). Compared against
+    /// [`StoreConfig::checkpoint_chain_max`] to decide when a full is due.
+    #[cfg(feature = "persistence")]
+    checkpoint_chain_len: usize,
     /// Test-only mock WAL for controlled fsync testing.
     #[cfg(all(test, feature = "persistence"))]
     pub(crate) mock_wal: Option<std::sync::Arc<crate::wal::MockWal>>,
@@ -495,6 +546,14 @@ impl Store {
     /// assert!(store.begin_read(None).is_ok());
     /// ```
     pub fn new(config: StoreConfig) -> Result<Self> {
+        // A chain of zero files has no reading — not "always full" (that is 1),
+        // not "unbounded". Reject it here rather than silently picking one.
+        #[cfg(feature = "persistence")]
+        if config.checkpoint_chain_max == 0 {
+            return Err(Error::Persistence(
+                "checkpoint_chain_max must be >= 1".into(),
+            ));
+        }
         #[cfg(feature = "persistence")]
         let wal_poison = Arc::new(crate::wal::WalPoison::new());
         #[cfg(feature = "persistence")]
@@ -600,6 +659,10 @@ impl Store {
                 wal_poison,
                 #[cfg(feature = "persistence")]
                 registry: Arc::new(crate::registry::TableRegistry::default()),
+                #[cfg(feature = "persistence")]
+                checkpoint_base: None,
+                #[cfg(feature = "persistence")]
+                checkpoint_chain_len: 0,
                 #[cfg(all(test, feature = "persistence"))]
                 mock_wal: None,
                 metrics,
@@ -937,14 +1000,26 @@ impl Store {
     /// In `Standalone` mode, the WAL is pruned after the checkpoint is
     /// written. The prune is executed by the WAL background thread between
     /// batches, so it can never race a concurrent commit's append.
+    ///
+    /// A checkpoint is a delta against the previous one whenever
+    /// [`StoreConfig::checkpoint_chain_max`] allows it; with the default of
+    /// `1` every checkpoint is full.
+    ///
     /// Returns the version of the checkpointed snapshot.
     #[cfg(feature = "persistence")]
     pub fn checkpoint(&self) -> Result<u64> {
+        self.checkpoint_impl(false)
+    }
+
+    /// [`Store::checkpoint`], with `force_full` for the callers where a delta
+    /// is impossible or pointless (see [`Store::checkpoint_and_prune_after_bulk`]).
+    #[cfg(feature = "persistence")]
+    fn checkpoint_impl(&self, force_full: bool) -> Result<u64> {
         // Serialize whole checkpoints: an interleaved slower checkpoint
         // could otherwise prune/cleanup state only the faster one covers.
         let _serialize = self.checkpoint_lock.lock();
 
-        let (dir, snap, registry) = {
+        let (dir, snap, registry, base_candidate) = {
             let inner = self.inner.read();
             inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
@@ -958,10 +1033,121 @@ impl Store {
             };
             let snap = inner.snapshots[&inner.latest_version].clone();
             let registry = Arc::clone(&inner.registry);
-            (dir, snap, registry)
+            // The chain may still grow only while it is shorter than the
+            // configured maximum; `checkpoint_chain_max == 1` never yields a
+            // candidate, which is what makes the default byte-for-byte the
+            // pre-incremental behavior.
+            let chain_max = inner.config.checkpoint_chain_max;
+            let base_candidate = if force_full || inner.checkpoint_chain_len >= chain_max {
+                None
+            } else {
+                inner.checkpoint_base.clone()
+            };
+            (dir, snap, registry, base_candidate)
         }; // read lock released here
 
-        let version = crate::checkpoint::write_checkpoint(&dir, &snap, &registry)?;
+        // Two conditions the retained base must still meet, both checked off
+        // the store lock:
+        //
+        // - Strictly older than what we are about to write. At equal versions
+        //   the delta's file *is* its own base's file, so it would name itself
+        //   and overwrite the content it needs — the shape a repeat
+        //   `checkpoint()` with no commit in between takes.
+        // - Still present on disk. A delta whose base file is gone is a head
+        //   that recovery can only answer with `CheckpointChainBroken`, and by
+        //   then the WAL covering those versions is pruned.
+        let base = base_candidate.filter(|b| {
+            b.version < snap.version && crate::checkpoint::checkpoint_file_exists(&dir, b.version)
+        });
+
+        let version = match &base {
+            Some(base) => crate::checkpoint::write_delta_checkpoint(&dir, &snap, base, &registry)?,
+            None => crate::checkpoint::write_checkpoint(&dir, &snap, &registry)?,
+        };
+
+        // Resolve the chain from the directory rather than from the in-memory
+        // counter: this is the state a crash cannot desynchronise, and it is
+        // what cleanup below must be driven by. Resolved unconditionally, not
+        // just when `checkpoint_chain_max > 1` — the knob governs what this
+        // call *writes*, while the head on disk may be a delta with real
+        // ancestors written before the knob was lowered.
+        //
+        // `find_head_chain` answers for the highest-versioned file in the
+        // directory, which is *not* necessarily the file just written — a
+        // stray `checkpoint_999.bin` outranks it. Everything below (pruning
+        // behind a delta, deleting old files) is only sound for the chain that
+        // ends at our own file, so the head is checked against it rather than
+        // assumed. A chain we cannot vouch for is treated exactly like one
+        // that failed to resolve.
+        //
+        // Neither case is a failed checkpoint: the file is written and
+        // durable, and returning an error would report failure for work that
+        // succeeded and send a retrying operator into a checkpoint loop. So
+        // warn and degrade — skip what is unsafe, keep the `Ok`.
+        let our_head = crate::checkpoint::checkpoint_path(&dir, version);
+        let chain = match crate::checkpoint::find_head_chain(&dir) {
+            Ok(chain) if chain.last() == Some(&our_head) => Some(chain),
+            Ok(chain) => {
+                eprintln!(
+                    "ultima_db: the newest checkpoint in {} is {}, not the \
+                     checkpoint {version} just written; {version} is durable, \
+                     but no old checkpoint was deleted — inspect the directory \
+                     by hand",
+                    dir.display(),
+                    chain
+                        .last()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "nothing".into()),
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "ultima_db: cannot resolve the checkpoint chain in {} ({e}); \
+                     checkpoint {version} is written and durable, but no old \
+                     checkpoint was deleted — inspect the directory by hand",
+                    dir.display()
+                );
+                None
+            }
+        };
+        {
+            let mut inner = self.inner.write();
+            match &chain {
+                Some(chain) if inner.config.checkpoint_chain_max > 1 => {
+                    inner.checkpoint_base = Some(Arc::clone(&snap));
+                    inner.checkpoint_chain_len = chain.len();
+                }
+                // Either the chain is unverifiable, or a delta could never use
+                // the base anyway. Retaining one would keep this snapshot's
+                // unshared nodes alive for nothing: at the default the memory
+                // profile stays exactly what it was before incremental
+                // checkpoints existed.
+                _ => {
+                    inner.checkpoint_base = None;
+                    inner.checkpoint_chain_len = 0;
+                }
+            }
+        }
+
+        // Durable is not the same property as loadable, and it is *loadable*
+        // that the prune spends. A full checkpoint is self-contained: it can
+        // be read back on its own, so pruning behind it is safe however
+        // confusing the rest of the directory is — which is why the default
+        // path's prune behaviour is untouched here. A delta is only as good as
+        // its chain, so it may only be pruned behind once that chain has
+        // resolved *and* proven to be ours. Otherwise the WAL is the only
+        // remaining copy of those commits and must stay.
+        let wrote_delta = base.is_some();
+        let prune_is_safe = !wrote_delta || chain.is_some();
+        if !prune_is_safe {
+            eprintln!(
+                "ultima_db: checkpoint {version} is a delta whose chain in {} \
+                 could not be verified; the WAL was NOT pruned, so it still \
+                 covers every committed version — recovery needs it",
+                dir.display()
+            );
+        }
 
         // Prune WAL in Standalone mode — routed through the WAL background
         // thread (serialized with appends). Only the brief request is made
@@ -969,7 +1155,9 @@ impl Store {
         let prune_rx = {
             let inner = self.inner.read();
             match (&inner.config.persistence, &inner.wal_handle) {
-                (crate::persistence::Persistence::Standalone { .. }, Some(wal)) => {
+                (crate::persistence::Persistence::Standalone { .. }, Some(wal))
+                    if prune_is_safe =>
+                {
                     Some(wal.request_prune(version)?)
                 }
                 _ => None,
@@ -989,8 +1177,14 @@ impl Store {
             }
         }
 
-        // Clean up old checkpoints (never deletes newer ones).
-        crate::checkpoint::cleanup_old_checkpoints(&dir, version)?;
+        // Clean up old checkpoints (never deletes newer ones, never deletes an
+        // ancestor of the head — the file just written may be a delta that is
+        // nothing without them). Skipped entirely when the chain would not
+        // resolve: without it there is no way to tell an obsolete file from a
+        // load-bearing one.
+        if let Some(chain) = &chain {
+            crate::checkpoint::cleanup_old_checkpoints(&dir, version, chain);
+        }
 
         Ok(version)
     }
@@ -1045,13 +1239,24 @@ impl Store {
             }
         };
 
-        // Load latest checkpoint if present.
-        if let Some(cp_path) = crate::checkpoint::find_latest_checkpoint(&dir)? {
+        // The first checkpoint after recovery must be a full one. The snapshot
+        // this rebuilds is not the snapshot any file on disk holds — WAL
+        // replay below carries it past the chain head's version — so there is
+        // nothing here a delta could honestly name as its base.
+        {
+            let mut inner = self.inner.write();
+            inner.checkpoint_base = None;
+            inner.checkpoint_chain_len = 0;
+        }
+
+        // Load latest checkpoint (base full + any chained deltas) if present.
+        let chain = crate::checkpoint::find_head_chain(&dir)?;
+        if !chain.is_empty() {
             let registry = {
                 let inner = self.inner.read();
                 Arc::clone(&inner.registry)
             };
-            let snapshot = crate::checkpoint::load_checkpoint(&cp_path, &registry)?;
+            let snapshot = crate::checkpoint::load_chain(&chain, &registry)?;
 
             let mut inner = self.inner.write();
             let v = snapshot.version;
@@ -1328,11 +1533,16 @@ impl Store {
             (dir, registry)
         };
 
-        // Build the path: checkpoint_{version}.bin
-        let path = dir.join(format!("checkpoint_{version}.bin"));
-
-        // Load without installing — reuse the existing checkpoint load path.
-        let snapshot = crate::checkpoint::load_checkpoint(&path, &registry)?;
+        // `version` may itself be a Delta file — resolve the chain headed by
+        // it rather than assuming the file is self-contained, then fold the
+        // chain into the snapshot at that version. `find_chain_for_version`/
+        // `load_chain` return `crate::Error`, which `?` converts to
+        // `SnapshotStreamError::BulkLoad` via its `#[from]` — the same
+        // variant this already returned for a missing/corrupt/undeserializable
+        // single file, so `CheckpointChainBroken` (a missing ancestor) surfaces
+        // through that existing contract rather than a new error case here.
+        let chain = crate::checkpoint::find_chain_for_version(&dir, version)?;
+        let snapshot = crate::checkpoint::load_chain(&chain, &registry)?;
 
         crate::snapshot_stream::build::SnapshotReader::new(std::sync::Arc::new(snapshot), registry)
     }
@@ -1604,6 +1814,11 @@ impl Store {
     /// `Standalone` mode and cleans up older checkpoints, so this is the
     /// single call needed to make the bulk load durable. For
     /// `Persistence::None` this is a no-op (no disk to write to).
+    ///
+    /// The checkpoint is forced full regardless of
+    /// [`StoreConfig::checkpoint_chain_max`]: a bulk load installs a wholly
+    /// new tree, so a diff against the pre-load base would rewrite every row
+    /// anyway — at the price of a longer chain and a slower recovery.
     pub(crate) fn checkpoint_and_prune_after_bulk(&self, _new_version: u64) -> Result<()> {
         #[cfg(feature = "persistence")]
         {
@@ -1616,7 +1831,7 @@ impl Store {
                 )
             };
             if is_persistent {
-                let _ = self.checkpoint()?;
+                let _ = self.checkpoint_impl(true)?;
             }
         }
         Ok(())

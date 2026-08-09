@@ -14,7 +14,7 @@ SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS) 2>/de
 
 SAMPLES ?= 5
 
-.PHONY: init up inventory bench/competitor bench/wal-ab bench/smr-ycsb bench/autobench bench/autobench-median bench/fanout bench/smr-ab bench/fanout-micro bench-oneshot status ssh destroy
+.PHONY: init up inventory bench/competitor bench/wal-ab bench/smr-ycsb bench/autobench bench/autobench-median bench/fanout bench/smr-ab bench/fanout-micro bench/checkpoint-delta bench-oneshot status ssh destroy
 
 init: ## terraform init
 	$(TF) init
@@ -51,8 +51,11 @@ bench/smr-ab: ## SMR-apply/read-p99 fanout (T) A/B — the contended perf-gate w
 bench/fanout-micro: ## Fanout (T) read-vs-write asymmetry — warm+cold get/insert/update/remove @T 8..256
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fanout-micro
 
-bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro) -> destroy (destroy runs even if up/bench fail)
-	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro"; exit 1; fi
+bench/checkpoint-delta: ## Incremental checkpoints — crossover (dirty % vs chain_max) + recovery-vs-chain-length
+	cd ansible && $(ANSIBLE) bench.yml -e bench_target=checkpoint-delta
+
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro|checkpoint-delta) -> destroy (destroy runs even if up/bench fail)
+	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro|checkpoint-delta"; exit 1; fi
 	@rc=0; \
 	( $(MAKE) up && cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET) ) || rc=$$?; \
 	if ! $(MAKE) destroy; then \

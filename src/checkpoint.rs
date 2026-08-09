@@ -6,17 +6,23 @@
 //! A checkpoint is a full serialized snapshot of all tables at a specific version.
 //! Used for fast recovery in both Standalone and SMR modes.
 //!
-//! File format:
+//! File format (v2):
 //! ```text
 //! [magic: 4 bytes "ULDB"]
-//! [format_version: u32]
+//! [format_version: u32]              // 2
+//! [kind: u8]                         // CheckpointKind: Full=0, Delta=1
 //! [snapshot_version: u64]
+//! [base_version: u64]                // Delta only
 //! [num_tables: u32]
 //! for each table:
+//!     [entry_kind: u8]               // TableEntryKind: Unchanged=0, Delta=1, Full=2, Dropped=3
 //!     [name_len: u32][name: bytes]
-//!     [data_len: u64][serialized table data: bytes]
+//!     [data_len: u64][serialized table data: bytes]   // Full/Delta entries only
 //! [crc32: u32]
 //! ```
+//!
+//! Deltas deliberately share the `checkpoint_{version}.bin` filename namespace
+//! with full checkpoints — see [`CheckpointKind`] for why.
 
 #![allow(dead_code)]
 
@@ -30,9 +36,71 @@ use crate::wal::crc32;
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"ULDB";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+/// What a `checkpoint_*.bin` file contains.
+///
+/// Deltas deliberately share the `checkpoint_{version}.bin` namespace with
+/// full checkpoints. An older binary reading a delta-headed directory picks
+/// the delta as "latest" and fails its format check loudly, instead of
+/// silently loading an older full whose WAL tail has already been pruned —
+/// which would lose committed data with no error anywhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum CheckpointKind {
+    Full = 0,
+    Delta = 1,
+}
+
+impl TryFrom<u8> for CheckpointKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(CheckpointKind::Full),
+            1 => Ok(CheckpointKind::Delta),
+            other => Err(Error::CheckpointCorrupted(format!(
+                "unknown checkpoint kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// How one table appears inside a checkpoint file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum TableEntryKind {
+    /// Byte-identical to the base — no payload.
+    Unchanged = 0,
+    /// Changed rows only, as produced by `TableInfo::diff_table`.
+    Delta = 1,
+    /// Whole table inline, as produced by `TableInfo::serialize_table`.
+    Full = 2,
+    /// Present in the base, gone in this version — no payload.
+    Dropped = 3,
+}
+
+impl TryFrom<u8> for TableEntryKind {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(TableEntryKind::Unchanged),
+            1 => Ok(TableEntryKind::Delta),
+            2 => Ok(TableEntryKind::Full),
+            3 => Ok(TableEntryKind::Dropped),
+            other => Err(Error::CheckpointCorrupted(format!(
+                "unknown table entry kind: {other}"
+            ))),
+        }
+    }
+}
 
 /// Serialize a snapshot to bytes using the type registry.
+///
+/// This always writes `CheckpointKind::Full` with every table entry as
+/// `TableEntryKind::Full` — the delta path (task 6) is what will make this
+/// function ever choose otherwise.
 fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     let mut buf = Vec::new();
@@ -40,6 +108,8 @@ fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<V
     // Header
     buf.extend_from_slice(MAGIC);
     bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut buf, config)
         .map_err(|e| Error::Persistence(e.to_string()))?;
     bincode::encode_into_std_write(snapshot.version, &mut buf, config)
         .map_err(|e| Error::Persistence(e.to_string()))?;
@@ -59,6 +129,10 @@ fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<V
         let info = registry
             .get(name)
             .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+
+        // Table entry kind — always Full in this task.
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut buf, config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
 
         // Table name
         bincode::encode_into_std_write(name.as_str(), &mut buf, config)
@@ -80,10 +154,22 @@ fn serialize_snapshot(snapshot: &Snapshot, registry: &TableRegistry) -> Result<V
 }
 
 /// Deserialize a snapshot from bytes using the type registry.
+///
+/// Only `CheckpointKind::Full` is understood in this task — `Delta` is
+/// rejected with a named error rather than silently misparsed; task 6 gives
+/// it real handling.
 fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapshot> {
-    // Minimum: 4 (magic) + 1 (format_version varint) + 1 (version varint)
-    //        + 1 (num_tables varint) + 4 (crc32) = 11 bytes
-    if data.len() < 4 + 1 + 1 + 1 + 4 {
+    // Minimum: 4 (magic) + 1 (format_version varint, smallest encoding) + 4
+    // (crc32) = 9 bytes. That's deliberately just enough to safely check the
+    // magic and read a format version and bail on mismatch — not enough for
+    // a full v2 header (kind/snapshot_version/num_tables). A v1 (or garbage)
+    // file that's shorter than a real v2 header must still be rejected with
+    // the *version* error, not "too short": that's the error message that
+    // names what actually happened (see `a_v1_checkpoint_is_refused_with_a_named_version`).
+    // Every field read past this point is itself bounds-checked, so a file
+    // that passes this gate but is truncated later fails with a specific
+    // error rather than a panic.
+    if data.len() < 4 + 1 + 4 {
         return Err(Error::CheckpointCorrupted("file too short".into()));
     }
 
@@ -111,7 +197,31 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     offset += read;
     if fmt_version != FORMAT_VERSION {
         return Err(Error::CheckpointCorrupted(format!(
-            "unsupported format version: {fmt_version}"
+            "unsupported format version: {fmt_version} (checkpoint; this build reads \
+             v{FORMAT_VERSION}). If this file predates incremental-checkpoint support (v1, \
+             written by 0.3.0 or earlier): there is no in-place upgrade, and once a checkpoint \
+             has pruned the WAL the WAL alone cannot make up the gap — with the old UltimaDB \
+             binary, `Store::recover()` the existing persistence directory, read the rows out \
+             through a `ReadTx`, and load them into this build with `Store::bulk_load` / \
+             `Store::bulk_load_batch`, into a fresh, empty persistence directory, then \
+             `checkpoint()`. If this file is from a newer UltimaDB: upgrade the binary to read \
+             it."
+        )));
+    }
+
+    // Checkpoint kind
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+    if kind != CheckpointKind::Full {
+        // This function is deliberately full-only: it's what `load_checkpoint`
+        // uses to load the *base* of a chain, and a chain's base must be a
+        // `Full` checkpoint by construction (`find_head_chain` walks back to
+        // one). Deltas are real and readable — see `apply_delta_file`/
+        // `registry::apply_delta` — just never through this entry point.
+        return Err(Error::CheckpointCorrupted(format!(
+            "checkpoint kind {kind:?} is not supported by this build"
         )));
     }
 
@@ -128,6 +238,25 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     let mut tables = std::collections::BTreeMap::new();
 
     for _ in 0..num_tables {
+        // Table entry kind
+        let (entry_kind_byte, read): (u8, _) =
+            bincode::decode_from_slice(&payload[offset..], config)
+                .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        offset += read;
+        let entry_kind = TableEntryKind::try_from(entry_kind_byte)?;
+        if entry_kind != TableEntryKind::Full {
+            // Same restriction as the file-level `CheckpointKind` check
+            // above, for the same reason: this is the full-checkpoint-only
+            // reader, and a `Full` checkpoint (by construction — see
+            // `serialize_snapshot`) never contains an `Unchanged`/`Delta`/
+            // `Dropped` entry. Those kinds are real and readable through
+            // `apply_delta_file`, which parses delta files directly rather
+            // than through this function.
+            return Err(Error::CheckpointCorrupted(format!(
+                "table entry kind {entry_kind:?} is not supported by this build"
+            )));
+        }
+
         // Table name
         let (name, read): (String, _) = bincode::decode_from_slice(&payload[offset..], config)
             .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
@@ -170,12 +299,144 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     Ok(Snapshot { version, tables })
 }
 
+/// Serialize `snapshot` as a delta against `base`: unchanged tables cost a
+/// single byte-and-a-name, changed tables carry only their changed rows, and
+/// created/dropped/type-changed tables are called out by an explicit entry
+/// kind rather than left for the loader to infer.
+///
+/// Entries are decided into a `Vec` before anything is written so
+/// `num_tables` can be a true count instead of a reserved-and-backfilled
+/// length — the latter silently desynchronises the moment an entry kind is
+/// added later and one write site forgets to update the placeholder.
+fn serialize_delta(
+    snapshot: &Snapshot,
+    base: &Snapshot,
+    registry: &TableRegistry,
+) -> Result<Vec<u8>> {
+    struct Entry<'a> {
+        name: &'a str,
+        kind: TableEntryKind,
+        payload: Option<Vec<u8>>,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+
+    for (name, table) in snapshot
+        .tables
+        .iter()
+        .filter(|(name, _)| registry.contains(name))
+    {
+        let info = registry
+            .get(name)
+            .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+        match base.tables.get(name) {
+            // Same Arc: the table was not touched since the base checkpoint,
+            // so there is provably nothing to write.
+            Some(base_table) if std::sync::Arc::ptr_eq(table, base_table) => {
+                entries.push(Entry {
+                    name,
+                    kind: TableEntryKind::Unchanged,
+                    payload: None,
+                });
+            }
+            Some(base_table) => {
+                match (info.diff_table)(table.as_ref().as_any(), base_table.as_ref().as_any()) {
+                    Ok(payload) => entries.push(Entry {
+                        name,
+                        kind: TableEntryKind::Delta,
+                        payload: Some(payload),
+                    }),
+                    // Dropped and recreated with a different R or K: the base
+                    // rows are not comparable, so the whole table goes inline.
+                    Err(Error::TableTypeChanged { .. }) => {
+                        let payload = (info.serialize_table)(table.as_ref().as_any())?;
+                        entries.push(Entry {
+                            name,
+                            kind: TableEntryKind::Full,
+                            payload: Some(payload),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            None => {
+                let payload = (info.serialize_table)(table.as_ref().as_any())?;
+                entries.push(Entry {
+                    name,
+                    kind: TableEntryKind::Full,
+                    payload: Some(payload),
+                });
+            }
+        }
+    }
+
+    // Tables in the base that are gone from this snapshot.
+    for name in base.tables.keys() {
+        if !snapshot.tables.contains_key(name) && registry.contains(name) {
+            entries.push(Entry {
+                name,
+                kind: TableEntryKind::Dropped,
+                payload: None,
+            });
+        }
+    }
+
+    let config = bincode::config::standard();
+    let mut buf = Vec::new();
+
+    // Header
+    buf.extend_from_slice(MAGIC);
+    bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(CheckpointKind::Delta as u8, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(snapshot.version, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(base.version, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(entries.len() as u32, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    for entry in &entries {
+        bincode::encode_into_std_write(entry.kind as u8, &mut buf, config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        bincode::encode_into_std_write(entry.name, &mut buf, config)
+            .map_err(|e| Error::Persistence(e.to_string()))?;
+        // Unchanged/Dropped entries carry no payload at all — not even a
+        // zero-length one — so the loader's byte accounting matches what was
+        // actually decided above, not a placeholder for something that was
+        // never computed.
+        if let Some(payload) = &entry.payload {
+            bincode::encode_into_std_write(payload.len() as u64, &mut buf, config)
+                .map_err(|e| Error::Persistence(e.to_string()))?;
+            buf.extend_from_slice(payload);
+        }
+    }
+
+    // Append CRC32 of everything before it — the delta payload itself
+    // carries no CRC or length trailer of its own (it mirrors
+    // `serialize_table`'s framing), so this whole-file checksum is what
+    // protects it.
+    let checksum = crc32(&buf);
+    buf.extend_from_slice(&checksum.to_le_bytes());
+
+    Ok(buf)
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint file management
 // ---------------------------------------------------------------------------
 
 fn checkpoint_filename(version: u64) -> String {
     format!("checkpoint_{version}.bin")
+}
+
+/// The path [`write_checkpoint`]/[`write_delta_checkpoint`] give version
+/// `version`. Callers use it to check that a resolved chain head really is the
+/// file they just wrote — the filename is the trusted half of the pairing that
+/// [`walk_chain_from`] pins headers against.
+pub(crate) fn checkpoint_path(dir: &Path, version: u64) -> PathBuf {
+    dir.join(checkpoint_filename(version))
 }
 
 /// Find the latest checkpoint file in a directory.
@@ -203,6 +464,29 @@ pub(crate) fn find_latest_checkpoint(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(best.map(|(_, path)| path))
 }
 
+/// Write already-serialized checkpoint bytes to `checkpoint_{version}.bin`,
+/// via write-to-temp + `sync_all` + atomic rename + `sync_dir` — the crash
+/// safety dance shared by both the full and delta writers, so a process
+/// crash mid-write never leaves a corrupt or partially-visible checkpoint
+/// file.
+fn write_checkpoint_bytes(dir: &Path, version: u64, data: &[u8]) -> Result<u64> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+
+    let final_path = dir.join(checkpoint_filename(version));
+    let tmp_path = dir.join(format!("{}.tmp", checkpoint_filename(version)));
+
+    let mut file = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    file.write_all(data)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    drop(file);
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    crate::wal::sync_dir(dir)?;
+
+    Ok(version)
+}
+
 /// Write a checkpoint to disk.
 ///
 /// Uses write-to-temp + atomic rename to avoid leaving a corrupt checkpoint
@@ -212,22 +496,23 @@ pub(crate) fn write_checkpoint(
     snapshot: &Snapshot,
     registry: &TableRegistry,
 ) -> Result<u64> {
-    std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
-
     let data = serialize_snapshot(snapshot, registry)?;
-    let final_path = dir.join(checkpoint_filename(snapshot.version));
-    let tmp_path = dir.join(format!("{}.tmp", checkpoint_filename(snapshot.version)));
+    write_checkpoint_bytes(dir, snapshot.version, &data)
+}
 
-    let mut file = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
-    file.write_all(&data)
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    file.sync_all()
-        .map_err(|e| Error::Persistence(e.to_string()))?;
-    drop(file);
-    std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
-    crate::wal::sync_dir(dir)?;
-
-    Ok(snapshot.version)
+/// Write a delta checkpoint — `snapshot` serialized against `base`, so
+/// tables untouched since `base` cost no payload and only genuinely changed
+/// rows are written. Shares the `checkpoint_{version}.bin` namespace and
+/// crash-safety discipline with [`write_checkpoint`]; see [`CheckpointKind`]
+/// for why deltas are not given their own filename pattern.
+pub(crate) fn write_delta_checkpoint(
+    dir: &Path,
+    snapshot: &Snapshot,
+    base: &Snapshot,
+    registry: &TableRegistry,
+) -> Result<u64> {
+    let data = serialize_delta(snapshot, base, registry)?;
+    write_checkpoint_bytes(dir, snapshot.version, &data)
 }
 
 /// Load a checkpoint from a file.
@@ -239,22 +524,446 @@ pub(crate) fn load_checkpoint(path: &Path, registry: &TableRegistry) -> Result<S
     deserialize_snapshot(&data, registry)
 }
 
-/// Delete checkpoint files *older* than `keep_version`.
-///
-/// Newer checkpoints are never deleted: a slower checkpoint finishing after
-/// a faster concurrent one must not remove the newer file — it may be the
-/// only checkpoint covering WAL entries the faster checkpoint already
-/// pruned, and deleting it would make those commits unrecoverable.
-/// Unparseable `checkpoint_*.bin` names are left alone.
-pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
+/// Bytes needed to decode a checkpoint header: magic (4) + `format_version`
+/// varint (bincode caps a u32 varint at 5 bytes) + `kind` (1) +
+/// `snapshot_version` varint (u64 varint, capped at 9 bytes) + `base_version`
+/// varint (9, `Delta` only). Reading this bounded prefix — instead of the
+/// whole file — is what makes a chain walk cost O(chain length) in bytes
+/// read, not O(sum of every checkpoint's full size): a chain can have
+/// arbitrarily many full-table-sized deltas behind the head.
+const HEADER_PREFIX_LEN: usize = 4 + 5 + 1 + 9 + 9;
+
+/// Read just enough of `path` to learn its `CheckpointKind`, snapshot
+/// version, and (for a `Delta`) base version — without reading the table
+/// entries that make up the rest of the file.
+fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
+    let mut file = File::open(path).map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut buf = Vec::with_capacity(HEADER_PREFIX_LEN);
+    (&mut file)
+        .take(HEADER_PREFIX_LEN as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    if buf.len() < 4 || &buf[0..4] != MAGIC {
+        return Err(Error::CheckpointCorrupted("bad magic".into()));
+    }
+    let config = bincode::config::standard();
+    let mut offset = 4;
+
+    let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&buf[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if fmt_version != FORMAT_VERSION {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unsupported format version: {fmt_version} (checkpoint; this build reads \
+             v{FORMAT_VERSION}). If this file predates incremental-checkpoint support (v1, \
+             written by 0.3.0 or earlier): there is no in-place upgrade, and once a checkpoint \
+             has pruned the WAL the WAL alone cannot make up the gap — with the old UltimaDB \
+             binary, `Store::recover()` the existing persistence directory, read the rows out \
+             through a `ReadTx`, and load them into this build with `Store::bulk_load` / \
+             `Store::bulk_load_batch`, into a fresh, empty persistence directory, then \
+             `checkpoint()`. If this file is from a newer UltimaDB: upgrade the binary to read \
+             it."
+        )));
+    }
+
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&buf[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+
+    let (version, read): (u64, _) = bincode::decode_from_slice(&buf[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let base_version = if kind == CheckpointKind::Delta {
+        let (bv, _read): (u64, _) = bincode::decode_from_slice(&buf[offset..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        Some(bv)
+    } else {
+        None
     };
 
+    Ok((kind, version, base_version))
+}
+
+/// Walk backwards from `head_path` to the nearest `Full` ancestor, returning
+/// the chain base-first (so [`load_chain`] can apply it in order). Shared by
+/// [`find_head_chain`] (head = the directory's latest checkpoint) and
+/// [`find_chain_for_version`] (head = a specific, caller-named version) — the
+/// walk itself doesn't care why `head_path` was chosen, only that it is the
+/// file the caller wants resolved to a full chain.
+///
+/// Only headers are read (see [`read_header`]) — the chain walk never reads
+/// a table entry.
+///
+/// A file that is simply absent (deleted by `cleanup_old_checkpoints`, or
+/// never written) is expected once the walk passes the newest surviving
+/// file: tmp+rename makes a checkpoint atomically present or absent, so an
+/// absent file below the walk's starting point just means the head *is*
+/// that file, a complete chain on its own. What must never happen is an
+/// absent file *in the middle* of a chain the walk has already committed to
+/// by reading a `Delta` header that names it as `base_version` — that is
+/// [`Error::CheckpointChainBroken`], and it is not recoverable by falling
+/// back to an older `Full`: the WAL is already pruned to the head version,
+/// so an older full plus the surviving WAL reconstructs less than was
+/// committed, silently.
+///
+/// Termination needs two independent checks, not one. `base_version <
+/// version` alone bounds each file's *own* header fields against each
+/// other, but the hop between files is by filename
+/// (`checkpoint_{base_version}.bin`) — nothing ties the landed file's own
+/// `version` field to the `base_version` used to reach it. Two files whose
+/// headers each individually satisfy `base_version < version` can still
+/// reference each other (e.g. `checkpoint_5.bin` header-claims `version =
+/// 100, base = 3` while `checkpoint_3.bin` header-claims `version = 50, base
+/// = 5`): the walk cycles between them forever, since every step it inspects
+/// passes the per-file check. So every hop also checks that the file it just
+/// opened self-reports the exact `version` its filename was chosen for
+/// (`expected_version` below) — that pins the untrusted header to the
+/// trusted filename, and *that* is what makes the version sequence the walk
+/// actually visits strictly decreasing, not just each file's internal
+/// fields.
+fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
+    let mut chain = vec![head_path.clone()];
+    let mut current_path = head_path;
+    let mut head_version: Option<u64> = None;
+    // `None` for the head (nothing named it, so nothing to check it
+    // against); `Some(v)` once a `Delta` hop has chosen `checkpoint_{v}.bin`
+    // as the next file to open.
+    let mut expected_version: Option<u64> = None;
+
+    loop {
+        let (kind, version, base_version) = read_header(&current_path)?;
+        let head_version = *head_version.get_or_insert(version);
+
+        if let Some(expected) = expected_version
+            && version != expected
+        {
+            return Err(Error::CheckpointCorrupted(format!(
+                "checkpoint file {} claims version {version}, but was opened as base_version {expected}",
+                current_path.display()
+            )));
+        }
+
+        match kind {
+            CheckpointKind::Full => break,
+            CheckpointKind::Delta => {
+                // Written by `serialize_delta`, which always emits a
+                // `base_version` for `CheckpointKind::Delta`. `read_header`
+                // deliberately does not verify the file's CRC (a chain walk
+                // must not have to read a whole checkpoint just to learn its
+                // kind), so a hand-corrupted header can still reach here with
+                // no `base_version` — fail with the same corruption error a
+                // CRC mismatch would produce rather than panicking on the
+                // recovery path.
+                let base_version = base_version.ok_or_else(|| {
+                    Error::CheckpointCorrupted(format!(
+                        "delta checkpoint at {} is missing base_version",
+                        current_path.display()
+                    ))
+                })?;
+                // A delta's base must be strictly older than the delta
+                // itself. On its own this does not guarantee the walk
+                // terminates (see this function's doc comment) — it is the
+                // `expected_version` check above, on the *next* iteration,
+                // that closes the gap — but it is still a real invariant
+                // worth failing on immediately rather than deferring.
+                if base_version >= version {
+                    return Err(Error::CheckpointCorrupted(format!(
+                        "delta checkpoint {version} claims base_version {base_version}, which is \
+                         not older than the delta itself"
+                    )));
+                }
+                let base_path = dir.join(checkpoint_filename(base_version));
+                if !base_path.exists() {
+                    return Err(Error::CheckpointChainBroken {
+                        head: head_version,
+                        missing: base_version,
+                    });
+                }
+                chain.push(base_path.clone());
+                current_path = base_path;
+                expected_version = Some(base_version);
+            }
+        }
+    }
+
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Resolve the chain headed by the highest-versioned `checkpoint_*.bin` file
+/// in `dir`. Empty if no checkpoint exists.
+pub(crate) fn find_head_chain(dir: &Path) -> Result<Vec<PathBuf>> {
+    match find_latest_checkpoint(dir)? {
+        Some(head_path) => walk_chain_from(dir, head_path),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Resolve the chain whose head is exactly `version` — for opening a
+/// specific historical checkpoint (`Store::open_checkpoint_reader`) rather
+/// than the directory's latest. Once `write_delta_checkpoint` is in regular
+/// use, most on-disk versions are `Delta` files that are not self-contained;
+/// this is what makes every checkpointed version openable again, not just
+/// the ones that happened to land on a `Full`.
+///
+/// Unlike [`find_head_chain`], there is no "nothing exists" case: a missing
+/// `checkpoint_{version}.bin` fails the same way it always has for this
+/// caller — `read_header`'s `File::open` errors with `Error::Persistence`,
+/// propagated as-is.
+pub(crate) fn find_chain_for_version(dir: &Path, version: u64) -> Result<Vec<PathBuf>> {
+    walk_chain_from(dir, dir.join(checkpoint_filename(version)))
+}
+
+/// Apply one delta file onto `base`, producing the snapshot at the delta's
+/// own version. `base` must be the snapshot at the delta's recorded
+/// `base_version` — [`load_chain`] enforces this by construction (it walks
+/// `paths` in the order [`find_head_chain`] returned), and this function
+/// double-checks it against the file's own header rather than trusting the
+/// caller silently.
+fn apply_delta_file(path: &Path, base: Snapshot, registry: &TableRegistry) -> Result<Snapshot> {
+    let mut file = File::open(path).map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    if data.len() < 4 + 1 + 4 {
+        return Err(Error::CheckpointCorrupted("file too short".into()));
+    }
+
+    // Whole-file CRC first — a delta's per-table entries carry no CRC of
+    // their own (see the module doc comment), so this is what protects them.
+    let crc_offset = data.len() - 4;
+    let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+    let computed_crc = crc32(&data[..crc_offset]);
+    if stored_crc != computed_crc {
+        return Err(Error::CheckpointCorrupted("CRC mismatch".into()));
+    }
+
+    let payload = &data[..crc_offset];
+    let config = bincode::config::standard();
+    let mut offset = 0;
+
+    if &payload[offset..offset + 4] != MAGIC {
+        return Err(Error::CheckpointCorrupted("bad magic".into()));
+    }
+    offset += 4;
+
+    let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if fmt_version != FORMAT_VERSION {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unsupported format version: {fmt_version}"
+        )));
+    }
+
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+    if kind != CheckpointKind::Delta {
+        return Err(Error::CheckpointCorrupted(format!(
+            "expected a delta checkpoint at {}, found {kind:?}",
+            path.display()
+        )));
+    }
+
+    let (version, read): (u64, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let (base_version, read): (u64, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if base_version != base.version {
+        return Err(Error::CheckpointCorrupted(format!(
+            "delta at {} expects base version {base_version}, but the chain so far is at {}",
+            path.display(),
+            base.version
+        )));
+    }
+
+    let (num_tables, read): (u32, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let mut tables = base.tables;
+
+    for _ in 0..num_tables {
+        let (entry_kind_byte, read): (u8, _) =
+            bincode::decode_from_slice(&payload[offset..], config)
+                .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        offset += read;
+        let entry_kind = TableEntryKind::try_from(entry_kind_byte)?;
+
+        let (name, read): (String, _) = bincode::decode_from_slice(&payload[offset..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        offset += read;
+
+        match entry_kind {
+            // Byte-identical to what the accumulated table already holds —
+            // nothing to read, nothing to change.
+            TableEntryKind::Unchanged => {}
+            // Present in the base, gone as of this version. Every drop is
+            // explicit (see `serialize_delta`'s doc comment / task brief
+            // contract 3), so there is no other place in this loop that
+            // needs to infer a removal from an entry's absence.
+            TableEntryKind::Dropped => {
+                tables.remove(&name);
+            }
+            TableEntryKind::Full | TableEntryKind::Delta => {
+                let (data_len, read): (u64, _) =
+                    bincode::decode_from_slice(&payload[offset..], config)
+                        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+                offset += read;
+                let end = usize::try_from(data_len)
+                    .ok()
+                    .and_then(|l| offset.checked_add(l))
+                    .ok_or_else(|| {
+                        Error::CheckpointCorrupted("table data length overflow".into())
+                    })?;
+                if end > payload.len() {
+                    return Err(Error::CheckpointCorrupted("truncated table data".into()));
+                }
+                let table_bytes = &payload[offset..end];
+                offset = end;
+
+                let info = registry
+                    .get(&name)
+                    .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+
+                if entry_kind == TableEntryKind::Full {
+                    let table_any = (info.deserialize_table)(table_bytes).map_err(|e| match e {
+                        Error::Persistence(msg) => {
+                            Error::Persistence(format!("table '{name}': {msg}"))
+                        }
+                        other => other,
+                    })?;
+                    tables.insert(name, std::sync::Arc::from(table_any));
+                } else {
+                    // A `Delta` entry is only ever emitted for a table
+                    // `serialize_delta` found in *both* base and new (see its
+                    // `Some(base_table)` match arm) — by the time a chain
+                    // reaches here the accumulator mirrors that same base, so
+                    // this table must already be present. Its absence means
+                    // corruption, not a legal chain state.
+                    let existing = tables.get(&name).ok_or_else(|| {
+                        Error::CheckpointCorrupted(format!(
+                            "delta entry for table '{name}' has no base table to apply onto"
+                        ))
+                    })?;
+                    let mut boxed = existing.boxed_clone();
+                    crate::registry::apply_delta(boxed.as_any_mut(), table_bytes, info).map_err(
+                        |e| match e {
+                            Error::Persistence(msg) => {
+                                Error::Persistence(format!("table '{name}': {msg}"))
+                            }
+                            other => other,
+                        },
+                    )?;
+                    tables.insert(name, std::sync::Arc::from(boxed));
+                }
+            }
+        }
+    }
+
+    if offset != payload.len() {
+        return Err(Error::CheckpointCorrupted(format!(
+            "table entries did not exactly consume the checkpoint payload: {} trailing bytes",
+            payload.len() - offset
+        )));
+    }
+
+    Ok(Snapshot { version, tables })
+}
+
+/// Load a checkpoint chain — a base `Full` file plus zero or more `Delta`
+/// files, in the order [`find_head_chain`] returns — into the `Snapshot` at
+/// the chain's head version.
+///
+/// The base is loaded through the existing full-checkpoint path
+/// ([`load_checkpoint`]/`deserialize_snapshot`), which already refuses
+/// anything but `CheckpointKind::Full`. Each subsequent delta is folded onto
+/// the accumulated result by [`apply_delta_file`].
+pub(crate) fn load_chain(paths: &[PathBuf], registry: &TableRegistry) -> Result<Snapshot> {
+    let (base_path, deltas) = paths
+        .split_first()
+        .ok_or_else(|| Error::CheckpointCorrupted("empty checkpoint chain".into()))?;
+
+    let mut snapshot = load_checkpoint(base_path, registry)?;
+    for delta_path in deltas {
+        snapshot = apply_delta_file(delta_path, snapshot, registry)?;
+    }
+    Ok(snapshot)
+}
+
+/// True iff `dir` holds a `checkpoint_{version}.bin` file. Used to confirm a
+/// retained in-memory base is still backed by the file a delta would name as
+/// its `base_version` — writing a delta against a base that is gone produces
+/// a head no recovery can load.
+pub(crate) fn checkpoint_file_exists(dir: &Path, version: u64) -> bool {
+    dir.join(checkpoint_filename(version)).exists()
+}
+
+/// Delete checkpoint files *older* than `keep_version`, except those in
+/// `chain`.
+///
+/// Two files must survive, for different reasons:
+///
+/// - **Newer than `keep_version`.** A slower checkpoint finishing after a
+///   faster concurrent one must not remove the newer file — it may be the
+///   only checkpoint covering WAL entries the faster checkpoint already
+///   pruned, and deleting it would make those commits unrecoverable.
+/// - **Anything in `chain`.** `chain` is the head's ancestry as
+///   [`find_head_chain`] resolved it *from disk*. A delta is not
+///   self-contained: deleting its base (or any file between) leaves the head
+///   loadable only as far as `Error::CheckpointChainBroken`, while the WAL
+///   covering those versions has already been pruned. The ancestors are older
+///   than `keep_version` by construction, so this rule is the only thing
+///   standing between an incremental checkpoint and an unrecoverable database.
+///
+/// Unparseable `checkpoint_*.bin` names are left alone.
+///
+/// Infallible by construction, and deliberately so: by the time this runs the
+/// checkpoint file is durable and the WAL prune has happened, so there is no
+/// failure here worth turning a checkpoint that succeeded into one that
+/// reports failure. Every I/O problem is warned about and skipped.
+pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64, chain: &[PathBuf]) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Match on file name, not full path: `chain`'s entries and `read_dir`'s
+    // are both built from `dir`, but comparing names cannot be defeated by a
+    // path that normalizes differently.
+    let protected: std::collections::HashSet<&std::ffi::OsStr> =
+        chain.iter().filter_map(|p| p.file_name()).collect();
+
     for entry in entries {
-        let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
+        // One unreadable directory entry says nothing about the others, and
+        // cleanup is opportunistic: reclaiming the files we *can* see beats
+        // failing a checkpoint that is already durable. Same reason the
+        // unreadable-directory case above returns `Ok(())` rather than an
+        // error.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "ultima_db: skipping an unreadable entry in {} ({e}); \
+                     old checkpoints there were left in place",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
+        if protected.contains(name.as_os_str()) {
+            continue;
+        }
         let name_str = name.to_string_lossy();
         if let Some(version) = name_str
             .strip_prefix("checkpoint_")
@@ -265,8 +974,15 @@ pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64) -> Result<(
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
 
-    Ok(())
+/// Test-only: is the checkpoint file at `path` a full one (rather than a
+/// delta)? Behind [`crate::checkpoint_is_full_for_test`] so integration tests
+/// can assert a file's kind through the real header reader instead of a
+/// hard-coded byte offset, which would silently start testing the wrong byte
+/// the moment the header layout changes.
+pub(crate) fn is_full_checkpoint(path: &Path) -> Result<bool> {
+    Ok(read_header(path)?.0 == CheckpointKind::Full)
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +999,14 @@ mod tests {
     struct User {
         name: String,
         age: u32,
+    }
+
+    /// A second, unrelated record type — stands in for what a table looked
+    /// like *before* it was dropped and recreated under the same name, in
+    /// `a_table_recreated_with_a_different_type_is_recorded_in_full` below.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Widget {
+        label: String,
     }
 
     fn make_snapshot_with_users() -> (Snapshot, TableRegistry) {
@@ -314,6 +1038,32 @@ mod tests {
             tables,
         };
         (snapshot, reg)
+    }
+
+    #[test]
+    fn v2_full_checkpoint_round_trips() {
+        let (snap, registry) = make_snapshot_with_users();
+        let bytes = serialize_snapshot(&snap, &registry).unwrap();
+        assert_eq!(&bytes[0..4], MAGIC);
+        let restored = deserialize_snapshot(&bytes, &registry).unwrap();
+        assert_eq!(restored.version, snap.version);
+        assert_eq!(restored.tables.len(), snap.tables.len());
+    }
+
+    #[test]
+    fn a_v1_checkpoint_is_refused_with_a_named_version() {
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(1u32, &mut v1, bincode::config::standard()).unwrap();
+        v1.extend_from_slice(&crc32(&v1).to_le_bytes());
+        let registry = TableRegistry::default();
+        let Err(err) = deserialize_snapshot(&v1, &registry) else {
+            panic!("a v1 checkpoint must be rejected");
+        };
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(ref m) if m.contains("unsupported format version: 1")),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -398,7 +1148,7 @@ mod tests {
         write_checkpoint(dir.path(), &snap10, &reg).unwrap();
         write_checkpoint(dir.path(), &snapshot, &reg).unwrap(); // version 42
 
-        cleanup_old_checkpoints(dir.path(), 42).unwrap();
+        cleanup_old_checkpoints(dir.path(), 42, &[]);
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -424,7 +1174,7 @@ mod tests {
             write_checkpoint(dir.path(), &snap, &reg).unwrap();
         }
 
-        cleanup_old_checkpoints(dir.path(), 10).unwrap();
+        cleanup_old_checkpoints(dir.path(), 10, &[]);
 
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -445,6 +1195,55 @@ mod tests {
         );
     }
 
+    /// The head's ancestors are older than `keep_version` by construction —
+    /// the never-delete-newer rule does nothing for them. Deleting one leaves
+    /// a head that only `CheckpointChainBroken` can answer for, so the chain
+    /// must be spared explicitly.
+    #[test]
+    fn cleanup_old_checkpoints_spares_the_head_chain() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (snapshot, reg) = make_snapshot_with_users();
+
+        // full@5 <- delta@6 <- delta@7, plus an unrelated stale full@4.
+        let mut base = snapshot.clone();
+        base.version = 5;
+        write_checkpoint(dir.path(), &base, &reg).unwrap();
+        let mut stale = snapshot.clone();
+        stale.version = 4;
+        write_checkpoint(dir.path(), &stale, &reg).unwrap();
+        for v in [6u64, 7] {
+            let mut snap = snapshot.clone();
+            snap.version = v;
+            let mut prev = snapshot.clone();
+            prev.version = v - 1;
+            write_delta_checkpoint(dir.path(), &snap, &prev, &reg).unwrap();
+        }
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 3, "chain should be full@5 + two deltas");
+
+        cleanup_old_checkpoints(dir.path(), 7, &chain);
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains("checkpoint_4")),
+            "a stale checkpoint outside the chain should still be removed: {files:?}"
+        );
+        for v in [5, 6, 7] {
+            assert!(
+                files.iter().any(|f| f.contains(&format!("checkpoint_{v}"))),
+                "chain member checkpoint_{v} was deleted: {files:?}"
+            );
+        }
+        // And the head still loads.
+        let recovered = load_chain(&find_head_chain(dir.path()).unwrap(), &reg).unwrap();
+        assert_eq!(recovered.version, 7);
+    }
+
     /// A crafted checkpoint with a *valid* whole-file CRC but an absurd
     /// `data_len` must produce `CheckpointCorrupted`, not an arithmetic
     /// overflow panic (debug) or wrapped-slice panic (release). The CRC only
@@ -456,8 +1255,10 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut buf, config).unwrap();
         bincode::encode_into_std_write(7u64, &mut buf, config).unwrap(); // snapshot version
         bincode::encode_into_std_write(1u32, &mut buf, config).unwrap(); // num_tables
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut buf, config).unwrap();
         bincode::encode_into_std_write("users", &mut buf, config).unwrap();
         bincode::encode_into_std_write(u64::MAX, &mut buf, config).unwrap(); // data_len
         let crc = crc32(&buf);
@@ -489,6 +1290,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(b"XXXX"); // bad magic
         bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write(1u64, &mut data, config).unwrap();
         bincode::encode_into_std_write(0u32, &mut data, config).unwrap();
         let checksum = crc32(&data);
@@ -523,9 +1325,12 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC);
         bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // version
         bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // 1 table
 
+        // Table entry kind
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut data, config).unwrap();
         // Table name
         bincode::encode_into_std_write("users", &mut data, config).unwrap();
         // Claim data_len = 9999 but don't write that much data
@@ -568,8 +1373,10 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC);
         bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // snapshot version
         bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // num_tables
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut data, config).unwrap();
         bincode::encode_into_std_write("users", &mut data, config).unwrap();
         bincode::encode_into_std_write(body.len() as u64, &mut data, config).unwrap();
         data.extend_from_slice(&body);
@@ -627,7 +1434,7 @@ mod tests {
     #[test]
     fn cleanup_old_checkpoints_nonexistent_dir() {
         // Should not error on missing directory
-        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1).unwrap();
+        cleanup_old_checkpoints(std::path::Path::new("/nonexistent/dir"), 1, &[]);
     }
 
     #[test]
@@ -762,6 +1569,747 @@ mod tests {
         let tmp_path = dir.path().join("checkpoint_42.bin.tmp");
         assert!(final_path.exists());
         assert!(!tmp_path.exists());
+    }
+
+    /// One decoded table entry: its kind, and its raw payload bytes for
+    /// `Full`/`Delta` (`None` for `Unchanged`/`Dropped`, which carry none).
+    struct ParsedEntry {
+        kind: TableEntryKind,
+        payload: Option<Vec<u8>>,
+    }
+
+    /// Parse a delta (or full) checkpoint file's header and every per-table
+    /// entry — verifying the whole-file CRC and that the entries exactly
+    /// consume the payload with no trailing or overrun bytes. That
+    /// exactly-self-delimiting property is precisely what Task 6's loader
+    /// will depend on to find the next entry, so tests built on this parser
+    /// prove it on every call rather than assuming it.
+    fn parse_checkpoint_entries(raw: &[u8]) -> std::collections::HashMap<String, ParsedEntry> {
+        let config = bincode::config::standard();
+        let crc_offset = raw.len() - 4;
+        let payload = &raw[..crc_offset];
+        let stored_crc = u32::from_le_bytes(raw[crc_offset..].try_into().unwrap());
+        assert_eq!(crc32(payload), stored_crc, "checkpoint file CRC mismatch");
+        let mut offset = 4; // magic
+
+        let (_fmt_version, read): (u32, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+
+        let (kind_byte, read): (u8, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+        let kind = CheckpointKind::try_from(kind_byte).unwrap();
+
+        let (_snapshot_version, read): (u64, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+
+        if kind == CheckpointKind::Delta {
+            let (_base_version, read): (u64, _) =
+                bincode::decode_from_slice(&payload[offset..], config).unwrap();
+            offset += read;
+        }
+
+        let (num_tables, read): (u32, _) =
+            bincode::decode_from_slice(&payload[offset..], config).unwrap();
+        offset += read;
+
+        let mut out = std::collections::HashMap::new();
+        for _ in 0..num_tables {
+            let (entry_kind_byte, read): (u8, _) =
+                bincode::decode_from_slice(&payload[offset..], config).unwrap();
+            offset += read;
+            let entry_kind = TableEntryKind::try_from(entry_kind_byte).unwrap();
+
+            let (name, read): (String, _) =
+                bincode::decode_from_slice(&payload[offset..], config).unwrap();
+            offset += read;
+
+            let is_inline = matches!(entry_kind, TableEntryKind::Full | TableEntryKind::Delta);
+            let table_payload = if is_inline {
+                let (data_len, read): (u64, _) =
+                    bincode::decode_from_slice(&payload[offset..], config).unwrap();
+                offset += read;
+                let end = offset + data_len as usize;
+                let bytes = payload[offset..end].to_vec();
+                offset = end;
+                Some(bytes)
+            } else {
+                None
+            };
+
+            out.insert(
+                name,
+                ParsedEntry {
+                    kind: entry_kind,
+                    payload: table_payload,
+                },
+            );
+        }
+
+        // Entries must exactly consume the payload: no unparsed trailing
+        // bytes (a length that undershot) and no overrun into the CRC (a
+        // length that overshot — `payload[offset..end]` above would already
+        // have panicked, but this also catches a *short* final entry).
+        assert_eq!(
+            offset,
+            payload.len(),
+            "table entries did not exactly consume the checkpoint payload"
+        );
+
+        out
+    }
+
+    /// [`parse_checkpoint_entries`], keeping only the entry kind — enough
+    /// for tests that only care which tables landed as
+    /// `Unchanged`/`Delta`/`Full`/`Dropped`.
+    fn parse_table_entry_kinds(raw: &[u8]) -> std::collections::HashMap<String, TableEntryKind> {
+        parse_checkpoint_entries(raw)
+            .into_iter()
+            .map(|(name, entry)| (name, entry.kind))
+            .collect()
+    }
+
+    /// Build two snapshots sharing table Arcs except where the test wants a
+    /// difference: `base` has "a" and "b"; `new` is `base` with "a" replaced
+    /// by a table with an extra row, so "b"'s `Arc` is byte-identical between
+    /// the two snapshots.
+    fn make_base_and_changed_a() -> (Snapshot, Snapshot, TableRegistry) {
+        let mut reg = TableRegistry::default();
+        reg.register::<User, u64>("a").unwrap();
+        reg.register::<User, u64>("b").unwrap();
+
+        let mut table_a = Table::<User>::new();
+        table_a
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap();
+
+        let mut table_b = Table::<User>::new();
+        table_b
+            .insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap();
+        let table_b: std::sync::Arc<dyn crate::table::MergeableTable> =
+            std::sync::Arc::new(table_b);
+
+        let mut base_tables = std::collections::BTreeMap::new();
+        base_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(table_a.clone()) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        base_tables.insert("b".to_string(), table_b.clone());
+        let base_snap = Snapshot {
+            version: 1,
+            tables: base_tables,
+        };
+
+        table_a
+            .insert(User {
+                name: "Carol".into(),
+                age: 40,
+            })
+            .unwrap();
+        let mut new_tables = std::collections::BTreeMap::new();
+        new_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(table_a) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        // Same Arc as base — "b" was not touched in this interval.
+        new_tables.insert("b".to_string(), table_b);
+        let new_snap = Snapshot {
+            version: 2,
+            tables: new_tables,
+        };
+
+        (base_snap, new_snap, reg)
+    }
+
+    #[test]
+    fn a_delta_records_only_changed_tables() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (base_snap, new_snap, registry) = make_base_and_changed_a();
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap();
+        assert_eq!(v, new_snap.version);
+
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        let entries = parse_table_entry_kinds(&raw);
+        assert_eq!(entries.get("a"), Some(&TableEntryKind::Delta));
+        assert_eq!(entries.get("b"), Some(&TableEntryKind::Unchanged));
+    }
+
+    #[test]
+    fn a_table_absent_from_the_new_snapshot_is_recorded_as_dropped() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (base_snap, mut new_snap, registry) = make_base_and_changed_a();
+        new_snap.tables.remove("b");
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        assert_eq!(
+            parse_table_entry_kinds(&raw).get("b"),
+            Some(&TableEntryKind::Dropped)
+        );
+    }
+
+    #[test]
+    fn a_table_absent_from_the_base_is_recorded_in_full() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (mut base_snap, new_snap, registry) = make_base_and_changed_a();
+        base_snap.tables.remove("b");
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        assert_eq!(
+            parse_table_entry_kinds(&raw).get("b"),
+            Some(&TableEntryKind::Full)
+        );
+    }
+
+    /// `TableRegistry::register` refuses to re-register a name under a
+    /// different concrete type, but a table can still end up recreated with
+    /// a different `R`/`K` between two checkpoints: `WriteTx::delete_table`
+    /// removes a name entirely, and `Store::register_table_keyed`'s guard
+    /// only compares the *key* type against the live table
+    /// (`src/store.rs:917`), not the record type `R`. If the base
+    /// snapshot — kept alive in memory as `Arc<Snapshot>`, never reloaded
+    /// from a file — still holds the table under its old type, `diff_table`'s
+    /// base-side downcast fails with `Error::TableTypeChanged`, and this is
+    /// the fallback that must fire: a `Full` entry carrying the *new* type's
+    /// whole table, not a diff against the incomparable old one.
+    #[test]
+    fn a_table_recreated_with_a_different_type_is_recorded_in_full() {
+        let dir = crate::test_scratch::scratch_dir();
+
+        // Base holds "a" as a `Table<User>` — not registered under this name
+        // at all, standing in for a type the current registry no longer
+        // describes (the old registration is gone once the table was
+        // dropped).
+        let mut old_table = Table::<User>::new();
+        old_table
+            .insert(User {
+                name: "Old".into(),
+                age: 99,
+            })
+            .unwrap();
+        let mut base_tables = std::collections::BTreeMap::new();
+        base_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(old_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let base_snap = Snapshot {
+            version: 1,
+            tables: base_tables,
+        };
+
+        // New snapshot and registry both describe "a" as `Table<Widget>` —
+        // a different concrete record type recreated under the same name.
+        let mut reg = TableRegistry::default();
+        reg.register::<Widget, u64>("a").unwrap();
+        let mut new_table = Table::<Widget>::new();
+        new_table
+            .insert(Widget {
+                label: "fresh".into(),
+            })
+            .unwrap();
+        let mut new_tables = std::collections::BTreeMap::new();
+        new_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(new_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let new_snap = Snapshot {
+            version: 2,
+            tables: new_tables,
+        };
+
+        let v = write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &reg).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("checkpoint_{v}.bin"))).unwrap();
+        let entries = parse_checkpoint_entries(&raw);
+        let entry = entries.get("a").expect("table 'a' must have an entry");
+        assert_eq!(entry.kind, TableEntryKind::Full);
+
+        // The payload round-trips as a whole table of the *new* type, not a
+        // delta against the incomparable old one.
+        let info = reg.get("a").unwrap();
+        let restored = (info.deserialize_table)(entry.payload.as_ref().unwrap()).unwrap();
+        let restored = restored.as_any().downcast_ref::<Table<Widget>>().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.get(&1).unwrap(),
+            &Widget {
+                label: "fresh".into()
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_head_chain / load_chain
+    // -----------------------------------------------------------------------
+
+    /// Write a base(v1) + delta(v2) + delta(v3) chain to `dir`: table "a"
+    /// gains a row at v2 (via `make_base_and_changed_a`) and another at v3,
+    /// "b" is untouched throughout. Returns the registry and the in-memory
+    /// snapshot at v3 (the head), so tests can compare against it directly or
+    /// corrupt/remove one of the three files on disk afterward.
+    fn write_a_three_link_chain(dir: &Path) -> (TableRegistry, Snapshot) {
+        let (base_snap, mid_snap, registry) = make_base_and_changed_a();
+        write_checkpoint(dir, &base_snap, &registry).unwrap(); // v1: full
+        write_delta_checkpoint(dir, &mid_snap, &base_snap, &registry).unwrap(); // v2: delta
+
+        let mut table_a = mid_snap
+            .tables
+            .get("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap()
+            .clone();
+        table_a
+            .insert(User {
+                name: "Dana".into(),
+                age: 22,
+            })
+            .unwrap();
+        let mut head_tables = mid_snap.tables.clone();
+        head_tables.insert(
+            "a".to_string(),
+            std::sync::Arc::new(table_a) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let head_snap = Snapshot {
+            version: 3,
+            tables: head_tables,
+        };
+        write_delta_checkpoint(dir, &head_snap, &mid_snap, &registry).unwrap(); // v3: delta
+
+        (registry, head_snap)
+    }
+
+    #[test]
+    fn a_chain_recovers_to_the_same_state_as_a_full_checkpoint() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (registry, head_snap) = write_a_three_link_chain(dir.path());
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 3, "base + two deltas");
+        let snap = load_chain(&chain, &registry).unwrap();
+        assert_eq!(snap.version, 3);
+
+        let a = snap
+            .tables
+            .get("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        let expected_a = head_snap
+            .tables
+            .get("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(a.len(), expected_a.len());
+        for (k, v) in expected_a.iter() {
+            assert_eq!(a.get(k), Some(v));
+        }
+        // Rows aren't the whole state: `next_id` must also come out right,
+        // or a later auto-assigned insert on the recovered store could
+        // reissue a key that was already used (see
+        // `a_chain_replays_next_id_past_a_row_inserted_and_deleted_within_one_interval`
+        // for the case this actually catches — this chain never inserts and
+        // deletes within one interval, so it only proves the ordinary path
+        // still agrees).
+        assert_eq!(a.next_id_opt(), expected_a.next_id_opt());
+
+        let b = snap
+            .tables
+            .get("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn a_corrupt_mid_chain_delta_fails_loudly() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (registry, _head_snap) = write_a_three_link_chain(dir.path());
+
+        let mut bytes = std::fs::read(dir.path().join("checkpoint_2.bin")).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xFF;
+        std::fs::write(dir.path().join("checkpoint_2.bin"), &bytes).unwrap();
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        let err = load_chain(&chain, &registry).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_mid_chain_delta_fails_loudly_rather_than_recovering_stale_data() {
+        let dir = crate::test_scratch::scratch_dir();
+        write_a_three_link_chain(dir.path());
+
+        std::fs::remove_file(dir.path().join("checkpoint_2.bin")).unwrap();
+        let err = find_head_chain(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointChainBroken { head: 3, missing: 2 }),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// Fix-round-2 regression: a chain walk that only checks "does the file
+    /// named by `base_version` exist" can be sent into an infinite loop by a
+    /// cyclic `base_version` — here v2 claims base 3 while v3 claims base 2,
+    /// so the walk bounces between the two and never reaches a `Full` file.
+    /// Both files below have a *valid* whole-file CRC: this is not testing
+    /// "reject a corrupt file" (`read_header` deliberately never checks the
+    /// CRC — a chain walk must not read a whole checkpoint just to learn its
+    /// kind), it is testing that `walk_chain_from` independently enforces
+    /// `base_version < version` on every hop, which is also what guarantees
+    /// the walk terminates at all. A hang has no error message and no exit,
+    /// strictly worse than any failure this function could return instead.
+    #[test]
+    fn a_cyclic_base_version_fails_loudly_instead_of_hanging() {
+        let dir = crate::test_scratch::scratch_dir();
+
+        // v1: a real Full checkpoint, so a correct implementation has
+        // somewhere to terminate if it weren't for the cycle below.
+        let (mut base_snap, registry) = make_snapshot_with_users();
+        base_snap.version = 1;
+        write_checkpoint(dir.path(), &base_snap, &registry).unwrap();
+
+        // v2 and v3: minimal, well-formed (valid CRC, num_tables = 0 — a
+        // chain walk never reads table entries) Delta headers whose
+        // base_version fields point at each other instead of at v1.
+        let write_minimal_delta_with_cyclic_base = |version: u64, base_version: u64| {
+            let config = bincode::config::standard();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(MAGIC);
+            bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(CheckpointKind::Delta as u8, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(base_version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(0u32, &mut buf, config).unwrap(); // num_tables
+            let crc = crc32(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            write_checkpoint_bytes(dir.path(), version, &buf).unwrap();
+        };
+        write_minimal_delta_with_cyclic_base(2, 3);
+        write_minimal_delta_with_cyclic_base(3, 2);
+
+        let err = find_head_chain(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    /// Fix-round-3 regression: the round-2 `base_version < version` guard is
+    /// necessary but not sufficient — it only compares a file's *own*
+    /// header fields to each other, and the hop between files is by
+    /// filename, not by anything that ties the landed file's `version`
+    /// field back to the `base_version` used to choose it. Two files can
+    /// each individually satisfy `base_version < version` and still cycle:
+    /// `checkpoint_5.bin` header-claims `version = 100, base = 3`;
+    /// `checkpoint_3.bin` header-claims `version = 50, base = 5`. Every hop
+    /// the round-2 guard alone ever inspects passes (100 > 3, 50 > 5), so
+    /// the walk bounces between the two filenames forever. This is what
+    /// `walk_chain_from`'s `expected_version` check exists to catch: the
+    /// file opened as `checkpoint_3.bin` must itself claim `version = 3`,
+    /// not `50`.
+    #[test]
+    fn a_filename_header_version_mismatch_fails_loudly_instead_of_hanging() {
+        let dir = crate::test_scratch::scratch_dir();
+
+        let write_delta_at_filename = |filename_version: u64, header_version: u64, base_version: u64| {
+            let config = bincode::config::standard();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(MAGIC);
+            bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(CheckpointKind::Delta as u8, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(header_version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(base_version, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(0u32, &mut buf, config).unwrap(); // num_tables
+            let crc = crc32(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            write_checkpoint_bytes(dir.path(), filename_version, &buf).unwrap();
+        };
+        // checkpoint_5.bin: header says version=100, base=3 (100 > 3, the
+        // round-2 guard alone is satisfied).
+        write_delta_at_filename(5, 100, 3);
+        // checkpoint_3.bin: header says version=50, base=5 (50 > 5, also
+        // satisfied) — and points straight back at checkpoint_5.bin.
+        write_delta_at_filename(3, 50, 5);
+
+        // `find_latest_checkpoint` picks the highest *filename*: 5.
+        let err = find_head_chain(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_table_does_not_reappear_after_chain_replay() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (base_snap, mut new_snap, registry) = make_base_and_changed_a();
+        new_snap.tables.remove("b");
+        write_checkpoint(dir.path(), &base_snap, &registry).unwrap(); // v1 full, a+b
+        write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap(); // v2 delta, drops b
+
+        let snap = load_chain(&find_head_chain(dir.path()).unwrap(), &registry).unwrap();
+        assert!(!snap.tables.contains_key("b"));
+    }
+
+    /// Fix-round regression test: the upsert path in `registry::apply_delta`
+    /// must recover an *updated* row's new value, not just rows that were
+    /// newly inserted or removed. `make_base_and_changed_a`/
+    /// `write_a_three_link_chain` only ever add rows to table "a" across the
+    /// chain, which happens to never exercise `Change::Updated` (an
+    /// already-present key changing value) — this test targets that case
+    /// directly, since it's exactly the case a naive `replay_insert`-only
+    /// apply (which errors on an existing key) would break.
+    #[test]
+    fn a_chain_replays_an_updated_row_not_just_inserted_and_deleted_ones() {
+        let dir = crate::test_scratch::scratch_dir();
+        let (mut base_snap, registry) = make_snapshot_with_users(); // "users": 1=Alice/30, 2=Bob/25
+        base_snap.version = 1; // make_snapshot_with_users defaults to 42, which
+        // would otherwise sort *after* the delta below and be picked as
+        // "latest" on its own, defeating the chain this test means to build.
+
+        write_checkpoint(dir.path(), &base_snap, &registry).unwrap(); // v1 full
+
+        let mut table = base_snap
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap()
+            .clone();
+        // A genuine in-place update of an already-present key — this is what
+        // `BTree::diff` reports as `Change::Updated`, and what the delta
+        // payload's `op = 0` (indistinguishable from an Added row) must
+        // still replay correctly onto a base that already has this key.
+        table
+            .update(
+                &1,
+                User {
+                    name: "Alice".into(),
+                    age: 31,
+                },
+            )
+            .unwrap();
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let mut new_snap = base_snap.clone();
+        new_snap.version = 2;
+        new_snap.tables = tables;
+
+        write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &registry).unwrap(); // v2 delta
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 2);
+        let snap = load_chain(&chain, &registry).unwrap();
+
+        let users = snap
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(users.len(), 2, "an update must not change the row count");
+        assert_eq!(
+            users.get(&1).unwrap(),
+            &User {
+                name: "Alice".into(),
+                age: 31,
+            },
+            "the updated row must carry the new value, not the base's"
+        );
+        assert_eq!(
+            users.get(&2).unwrap(),
+            &User {
+                name: "Bob".into(),
+                age: 25,
+            }
+        );
+    }
+
+    /// Fix-round-2 regression, reproducing the coordinator's finding
+    /// directly: a row inserted *and* deleted again within a single
+    /// checkpoint interval leaves no trace in a delta's Put/Del stream
+    /// (`BTree::diff` compares two endpoints; a key present at neither is
+    /// invisible to it) but must still advance `next_id`, or recovery hands
+    /// out a primary key that was already used — silently diverging from
+    /// what a full checkpoint at the same version would carry, with no row
+    /// actually lost (so nothing about the row *contents* catches it, which
+    /// is why `a_chain_recovers_to_the_same_state_as_a_full_checkpoint`'s
+    /// row-by-row comparison doesn't).
+    ///
+    /// Base v1 has ids {1, 2} (`next_id` = 3); id 3 is inserted and then
+    /// deleted again within the v1 -> v2 interval. The row set at v2 is
+    /// identical to v1's, but `next_id` must come out as 4 — matching a full
+    /// checkpoint of the same in-memory state — not 3.
+    #[test]
+    fn a_chain_replays_next_id_past_a_row_inserted_and_deleted_within_one_interval() {
+        let dir = crate::test_scratch::scratch_dir();
+        let mut reg = TableRegistry::default();
+        reg.register::<User, u64>("users").unwrap();
+
+        let mut base_table = Table::<User>::new();
+        base_table
+            .insert(User {
+                name: "Alice".into(),
+                age: 30,
+            })
+            .unwrap(); // id 1
+        base_table
+            .insert(User {
+                name: "Bob".into(),
+                age: 25,
+            })
+            .unwrap(); // id 2
+        let mut base_tables = std::collections::BTreeMap::new();
+        base_tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(base_table.clone()) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let base_snap = Snapshot {
+            version: 1,
+            tables: base_tables,
+        };
+        write_checkpoint(dir.path(), &base_snap, &reg).unwrap();
+
+        let mut new_table = base_table.clone();
+        let id3 = new_table
+            .insert(User {
+                name: "Carol".into(),
+                age: 40,
+            })
+            .unwrap(); // id 3, next_id -> 4
+        new_table.delete(&id3).unwrap(); // row gone again; next_id must stay 4
+        assert_eq!(new_table.len(), 2, "row count must be back to base's");
+
+        let mut new_tables = std::collections::BTreeMap::new();
+        new_tables.insert(
+            "users".to_string(),
+            std::sync::Arc::new(new_table) as std::sync::Arc<dyn crate::table::MergeableTable>,
+        );
+        let new_snap = Snapshot {
+            version: 2,
+            tables: new_tables,
+        };
+        write_delta_checkpoint(dir.path(), &new_snap, &base_snap, &reg).unwrap();
+
+        let chain = find_head_chain(dir.path()).unwrap();
+        assert_eq!(chain.len(), 2);
+        let snap = load_chain(&chain, &reg).unwrap();
+        let users = snap
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(users.len(), 2, "no row is lost or gained");
+
+        // What a full checkpoint of the same in-memory v2 state carries —
+        // the ground truth this chain-loaded result must match.
+        let full_bytes = serialize_snapshot(&new_snap, &reg).unwrap();
+        let full = deserialize_snapshot(&full_bytes, &reg).unwrap();
+        let full_users = full
+            .tables
+            .get("users")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Table<User>>()
+            .unwrap();
+        assert_eq!(
+            full_users.next_id_opt(),
+            Some(4),
+            "sanity check on the full-checkpoint path itself"
+        );
+        assert_eq!(
+            users.next_id_opt(),
+            full_users.next_id_opt(),
+            "chain replay must match the full-checkpoint path's next_id, not silently reissue id 3"
+        );
+    }
+
+    /// `Store::open_checkpoint_reader` (public API; the SMR snapshot-
+    /// streaming path uses it to send a specific checkpoint to a follower)
+    /// must resolve a requested version that happens to be a `Delta` file to
+    /// its full chain, rather than assuming the file is self-contained.
+    /// Before chain-aware recovery, every `checkpoint_{v}.bin` was a `Full`
+    /// file and every version was openable; once incremental checkpoints are
+    /// in use, most on-disk versions are deltas, and this is what keeps them
+    /// all openable rather than only the ones that happen to land on a full.
+    #[test]
+    fn open_checkpoint_reader_resolves_a_delta_headed_version() {
+        let dir = crate::test_scratch::scratch_dir();
+        // v1 full, v2 delta, v3 delta — written directly through the
+        // checkpoint module (as `Store::checkpoint()` does not yet choose
+        // deltas on its own; that write-side policy is a later task). This
+        // test only needs the files to exist on disk, not to have been
+        // written by the `Store` instance that reads them back — exactly
+        // the SMR scenario `open_checkpoint_reader` exists for (a checkpoint
+        // written by a previous process/run).
+        write_a_three_link_chain(dir.path());
+
+        let src = crate::Store::new(crate::StoreConfig {
+            persistence: crate::Persistence::Smr {
+                dir: dir.path().to_path_buf(),
+            },
+            ..crate::StoreConfig::default()
+        })
+        .unwrap();
+        src.register_table::<User>("a").unwrap();
+        src.register_table::<User>("b").unwrap();
+
+        // Version 2 is a Delta file on disk (see `write_a_three_link_chain`).
+        // Reading it must succeed and stream table "a"'s *full* state at v2
+        // (Alice from the base plus Carol added in the v2 delta) — not just
+        // the one changed row the delta payload itself carries, and not an
+        // error from trying to parse v2 as a self-contained snapshot.
+        let mut reader = src.open_checkpoint_reader(2).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+
+        let dst = crate::Store::new(crate::StoreConfig::default()).unwrap();
+        dst.register_table::<User>("a").unwrap();
+        dst.register_table::<User>("b").unwrap();
+        dst.install_snapshot_stream(std::io::Cursor::new(&bytes), Default::default())
+            .unwrap();
+
+        let read = dst.begin_read(None).unwrap();
+        let a = read.open_table::<User>("a").unwrap();
+        assert_eq!(
+            a.len(),
+            2,
+            "must stream 'a's full v2 state, not just the delta's one changed row"
+        );
+        assert_eq!(a.get(1u64).unwrap().name, "Alice");
+        assert_eq!(a.get(2u64).unwrap().name, "Carol");
+
+        let b = read.open_table::<User>("b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.get(1u64).unwrap().name, "Bob");
     }
 
     #[test]
