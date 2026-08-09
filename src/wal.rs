@@ -229,13 +229,15 @@ fn check_entry_header(data: &[u8]) -> Result<usize> {
              one — pre-0.3.0 entries carried no marker at all, so this byte alone cannot tell \
              them apart. If the file predates 0.3.0: this build *can* read a pre-0.3.0 \
              checkpoint (`checkpoint_*.bin`) directly — it is only this WAL it cannot make sense \
-             of. Move or delete `wal.bin` from the persistence directory and call \
-             `Store::recover()` again to load the last checkpoint; this discards any row \
-             committed after that checkpoint. To keep those rows too: with the previous \
-             UltimaDB version, `Store::recover()` the old directory, read the rows out through a \
-             `ReadTx`, and load them into this build with `Store::bulk_load` / \
-             `Store::bulk_load_batch`. If the file is corrupt: restore from a checkpoint, or \
-             delete the WAL and checkpoint files in the persistence directory to start fresh.",
+             of, and this check runs at `Store::new`, before `recover()` ever gets a chance to \
+             load that checkpoint. Move or delete `wal.bin` from the persistence directory, then \
+             retry `Store::new` (it will open cleanly) and `recover()` (it will load the last \
+             checkpoint); this discards any row committed after that checkpoint. To keep those \
+             rows too: with the previous UltimaDB version, `Store::recover()` the old directory, \
+             read the rows out through a `ReadTx`, and load them into this build with \
+             `Store::bulk_load` / `Store::bulk_load_batch`. If the file is corrupt: restore from \
+             a checkpoint, or delete the WAL and checkpoint files in the persistence directory to \
+             start fresh.",
             data[0]
         )));
     }

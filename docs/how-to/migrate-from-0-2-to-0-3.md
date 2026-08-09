@@ -13,29 +13,34 @@ directory you have:**
   earlier): this build's checkpoint reader accepts 0.2.x checkpoints too,
   but **not** the 0.2.x WAL — pre-0.3.0 WAL entries carry no version
   marker at all and are byte-ambiguous with corruption, so reading them is
-  deliberately out of scope. This makes `Store::recover()`'s behavior
-  depend on what is actually sitting in `wal.bin`, not just on which rows
-  it holds: `recover()` scans and validates *every* WAL entry before
-  filtering by version, so it hard-errors on a non-empty legacy-format
-  WAL even when every entry in it predates the checkpoint and has nothing
-  left to contribute. Two cases:
+  deliberately out of scope. The check happens earlier than you might
+  expect: it is not `recover()` that rejects a legacy WAL, it is
+  **`Store::new()`** — every `WalWrite` sink inspects the WAL's first
+  record as it opens, in all three durability modes, specifically so a
+  legacy directory fails at construction instead of accepting commits
+  first and only discovering the problem at the next restart. So the
+  store never gets far enough to call `recover()` at all until `wal.bin`
+  stops being a problem. Two cases:
   - **`wal.bin` is empty or absent** (e.g. you checkpointed cleanly right
-    before shutdown, or the file was already pruned to nothing): plain
-    `recover()` succeeds and gives you exactly the last checkpoint's
-    state — check your row counts against what you expect.
-  - **`wal.bin` has any legacy entries in it**: `recover()` errors before
-    it gets a chance to apply the checkpoint — the checkpoint being
-    readable doesn't help until the unreadable WAL is out of the way.
+    before shutdown, or the file was already pruned to nothing): nothing
+    to reject — `Store::new()` succeeds, and `recover()` afterward gives
+    you exactly the last checkpoint's state — check your row counts
+    against what you expect.
+  - **`wal.bin` has any legacy entries in it**: `Store::new()` itself
+    returns `Err` — the checkpoint being readable doesn't help until the
+    unreadable WAL is out of the way, because the store object never
+    comes into existence to call `recover()` on.
     **The actionable step:** move or delete `wal.bin` from the directory,
-    then call `recover()` again; that reduces to the empty/absent case
-    above and loads the last checkpoint. **Do this only after you have
-    decided the rows it discards don't matter** — every row committed
-    *after* the last checkpoint lives only in that WAL, and moving it
-    aside throws those rows away permanently, with no error to warn you
-    (recovery just silently starts from an earlier, valid state). If you
-    need those rows too, do not touch `wal.bin` yet: the rest of this
-    guide is the only way to get them across — export with the old
-    binary, import with the new one.
+    then retry `Store::new()` (it will succeed) followed by `recover()`
+    (it will load the last checkpoint); that reduces to the empty/absent
+    case above. **Do this only after you have decided the rows it
+    discards don't matter** — every row committed *after* the last
+    checkpoint lives only in that WAL, and moving it aside throws those
+    rows away permanently, with no error to warn you (the next
+    `Store::new()` + `recover()` just silently starts from an earlier,
+    valid state). If you need those rows too, do not touch `wal.bin` yet:
+    the rest of this guide is the only way to get them across — export
+    with the old binary, import with the new one.
 
   This only concerns you if you use the `persistence` feature — an
   in-memory store has nothing to migrate.

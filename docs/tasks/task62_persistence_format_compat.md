@@ -114,7 +114,7 @@ level.
 The WAL format also changed in 0.3.0 (task56): v1 addressed rows by a bare `u64` id with no
 format marker at all; v2 prefixes every entry payload with `[magic 0xFF][format 2]`
 (`src/wal.rs:184-210`). Unlike the checkpoint table payload, **v1's absence of a marker is not
-recoverable by inference** — `check_entry_header` (`src/wal.rs:219-249`) says so directly: a
+recoverable by inference** — `check_entry_header` (`src/wal.rs:219-253`) says so directly: a
 leading byte that isn't `0xFF` "is either a pre-0.3.0 WAL or a corrupted one... this byte alone
 cannot tell them apart." Reading a WAL entry has to trust that its length and CRC framing are
 intact before it can even ask "what format is this," and a v1 entry offers nothing upstream of
@@ -124,21 +124,31 @@ judgment — there is no exact dispatch to write, only a heuristic one, and this
 elsewhere (the `0xFF` magic bytes in §3, `formal/tla/wal/`'s existence at all) is that WAL
 correctness does not get heuristics.
 
-**Consequence — the partial-recovery boundary:** `Store::recover()` (`src/store.rs:1231`) loads
-the checkpoint chain first (`src/store.rs:1252-1268`, via `find_head_chain`/`load_chain`,
-`src/checkpoint.rs:772`/`965`) and *then* unconditionally scans the directory's `wal.bin`
-(`src/store.rs:1284`, `crate::wal::scan_wal`) before ever filtering entries by version
-(`src/store.rs:1288-1291`). `scan_wal` validates every entry's format header as it parses
-(`src/wal.rs:713`, `check_entry_header`) — including entries whose version is already covered by
-the checkpoint just loaded. So the practical shape of "recovery reaches the last checkpoint and no
-further" is:
+**Consequence — the partial-recovery boundary:** the operative gate is earlier than `recover()`.
+`Store::new` (`src/store.rs:548`) constructs the store's `WalHandle` inline, for every
+`Persistence::Standalone` config, in every `Durability`/`WalWrite` combination
+(`src/store.rs:560-592`) — and that construction opens the WAL sink (`FileSink`/`BufferedFileSink`/
+`PreallocFileSink`), which calls `reject_unreadable_wal` (`src/wal.rs:1034-1075`) before the store
+object exists at all. `reject_unreadable_wal` inspects the first record's header
+(`check_entry_header`, `src/wal.rs:219-253`) and is deliberately *not* deferred to `recover()`: the
+doc comment on it spells out why — without an open-time check, a store on a legacy directory would
+construct cleanly, accept commits, and return `Ok` from a `Durability::Consistent` `commit()`
+before the next restart's `recover()` ever discovers the WAL is unreadable, by which point the
+only remedy destroys exactly the commits that were just acknowledged as durable. So for a
+non-empty legacy WAL, `Store::new` itself returns `Err` — `recover()` is never reached, and its own
+independent `scan_wal` call (`src/store.rs:1284`, which would *also* reject the same file, since
+`scan_wal` runs every entry through `check_entry_header` before filtering by version,
+`src/store.rs:1288-1291`) never gets the chance to run. Net practical shape of "recovery reaches
+the last checkpoint and no further":
 
-- an **empty or absent** `wal.bin` (freshly checkpointed, no writes since) — `recover()` succeeds
-  with exactly the checkpoint's state;
-- a **non-empty legacy-format** `wal.bin` — `recover()` fails outright, on the WAL's own error
-  (unrelated to this task's checkpoint changes), before the checkpoint's data becomes visible at
-  all. The checkpoint being readable doesn't help until the incompatible WAL is out of the way
-  (moved aside, once its rows are known not to matter, or exported through the old binary first).
+- an **empty or absent** `wal.bin` (freshly checkpointed, no writes since) — `reject_unreadable_wal`
+  accepts it (nothing to misread), `Store::new` succeeds, and `Store::recover()` afterward loads
+  exactly the checkpoint's state;
+- a **non-empty legacy-format** `wal.bin` — `Store::new` fails outright, on the WAL's own error
+  (unrelated to this task's checkpoint changes), before a store object — and so before
+  `recover()` — exists at all. The checkpoint being readable doesn't help until the incompatible
+  WAL is out of the way (moved aside, once its rows are known not to matter, or exported through
+  the old binary first).
 
 This is why the operator-facing guidance (`docs/how-to/migrate-from-0-2-to-0-3.md`) spells out
 both cases rather than asserting a single "recovery stops at the checkpoint" story — the second

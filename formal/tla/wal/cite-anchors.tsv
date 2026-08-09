@@ -49,43 +49,43 @@ src/store.rs	4351	-	if self.version > inner.last_submitted_version {
 src/store.rs	4408	-	let gate = if inner.commit_may_park() {
 src/store.rs	4462	-	gate.wait_turn(*ticket);
 src/store.rs	4479	-	gate.wait_turn(*ticket);
-src/wal.rs	619-623	-	Physically zero-fill
-src/wal.rs	619-667	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
-src/wal.rs	628-667	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
-src/wal.rs	633-657	-	let zeros = [0u8; 64 * 1024];
-src/wal.rs	667	-	file.sync_all().map_err(
-src/wal.rs	677-726	-	pub(crate) fn scan_wal(path: &Path, tail_tolerant: bool) -> Result<(Vec<WalEntry>, u64)> {
-src/wal.rs	690-723	-	while offset + 4 <= all_bytes.len() {
-src/wal.rs	692-697	-	if len == 0 {
-src/wal.rs	703	-	if crc32(data) != stored_crc {
-src/wal.rs	703-710	-	if crc32(data) != stored_crc {
-src/wal.rs	704-706	-	break; // torn write into preallocated space
-src/wal.rs	705-707	-	return Err(Error::WalCorrupted(format!(
-src/wal.rs	746	-	pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<bool> {
-src/wal.rs	788-823	-	fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Option<(u64, u64)>> {
-src/wal.rs	1003	-	struct FileSink {
-src/wal.rs	1003-1006	-	struct FileSink {
-src/wal.rs	1074-1078	-	.write_all(&entry.bytes)
-src/wal.rs	1079-1083	-	fn sync(&mut self) -> Result<()> {
-src/wal.rs	1100	-	struct BufferedFileSink {
-src/wal.rs	1100-1107	-	struct BufferedFileSink {
+src/wal.rs	623-627	-	Physically zero-fill
+src/wal.rs	623-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
+src/wal.rs	632-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
+src/wal.rs	637-661	-	let zeros = [0u8; 64 * 1024];
+src/wal.rs	669	-	file.sync_all().map_err(
+src/wal.rs	681-730	-	pub(crate) fn scan_wal(path: &Path, tail_tolerant: bool) -> Result<(Vec<WalEntry>, u64)> {
+src/wal.rs	694-727	-	while offset + 4 <= all_bytes.len() {
+src/wal.rs	696-701	-	if len == 0 {
+src/wal.rs	705	-	if crc32(data) != stored_crc {
+src/wal.rs	705-712	-	if crc32(data) != stored_crc {
+src/wal.rs	706-708	-	break; // torn write into preallocated space
+src/wal.rs	709-711	-	return Err(Error::WalCorrupted(format!(
+src/wal.rs	748	-	pub(crate) fn prune_wal(path: &Path, up_to_version: u64) -> Result<bool> {
+src/wal.rs	792-827	-	fn prune_wal_prealloc(path: &Path, up_to_version: u64, chunk: u64) -> Result<Option<(u64, u64)>> {
+src/wal.rs	1005	-	struct FileSink {
+src/wal.rs	1005-1008	-	struct FileSink {
+src/wal.rs	1078-1082	-	.write_all(&entry.bytes)
+src/wal.rs	1083-1087	-	fn sync(&mut self) -> Result<()> {
+src/wal.rs	1102	-	struct BufferedFileSink {
+src/wal.rs	1102-1109	-	struct BufferedFileSink {
 src/wal.rs	1119	5df6d23^	scan_wal(&path, true)
-src/wal.rs	1127	-	self.buf.extend_from_slice(&entry.bytes);
-src/wal.rs	1129-1132	-	if !self.buf.is_empty() {
+src/wal.rs	1129	-	self.buf.extend_from_slice(&entry.bytes);
+src/wal.rs	1133-1136	-	if !self.buf.is_empty() {
 src/wal.rs	1130-1136	1e5d2b7^	preallocate_to(&mut self.file, self.capacity, new_cap)?;
-src/wal.rs	1133-1137	-	if self.datasync {
-src/wal.rs	1163-1170	-	struct PreallocFileSink {
-src/wal.rs	1194	-	WalSinkKind::CoalescedPrealloc.tail_tolerant()
-src/wal.rs	1194-1195	-	WalSinkKind::CoalescedPrealloc.tail_tolerant()
-src/wal.rs	1202	-	self.buf.extend_from_slice(&entry.bytes);
-src/wal.rs	1207-1228	-	let need = self.write_head + self.buf.len() as u64;
-src/wal.rs	1212	-	let new_cap = need.div_ceil(self.chunk) * self.chunk;
-src/wal.rs	1213	-	if let Err(e) = preallocate_to(&mut self.file, self.capacity, new_cap) {
-src/wal.rs	1231	-	self.file.seek(SeekFrom::Start(self.write_head))
-src/wal.rs	1231-1248	-	self.file.seek(SeekFrom::Start(self.write_head))
-src/wal.rs	1247	-	self.file.write_all(to_write)
-src/wal.rs	1248	-	self.write_head += self.buf.len() as u64;
-src/wal.rs	1257-1258	-	// Steady-state barrier: size unchanged, so fdatasync suffices.
-src/wal.rs	1258	-	self.file.sync_data().map_err(
-src/wal.rs	1858-1869	-	pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
-src/wal.rs	1885-1889	-	.send(WalMsg::Entry(framed))
+src/wal.rs	1137-1141	-	if self.datasync {
+src/wal.rs	1167-1174	-	struct PreallocFileSink {
+src/wal.rs	1196	-	WalSinkKind::CoalescedPrealloc.tail_tolerant()
+src/wal.rs	1196-1197	-	WalSinkKind::CoalescedPrealloc.tail_tolerant()
+src/wal.rs	1204	-	self.buf.extend_from_slice(&entry.bytes);
+src/wal.rs	1211-1232	-	let need = self.write_head + self.buf.len() as u64;
+src/wal.rs	1214	-	let new_cap = need.div_ceil(self.chunk) * self.chunk;
+src/wal.rs	1215	-	if let Err(e) = preallocate_to(&mut self.file, self.capacity, new_cap) {
+src/wal.rs	1233	-	self.file.seek(SeekFrom::Start(self.write_head))
+src/wal.rs	1233-1250	-	self.file.seek(SeekFrom::Start(self.write_head))
+src/wal.rs	1249	-	self.file.write_all(to_write)
+src/wal.rs	1250	-	self.write_head += self.buf.len() as u64;
+src/wal.rs	1259-1260	-	// Steady-state barrier: size unchanged, so fdatasync suffices.
+src/wal.rs	1260	-	self.file.sync_data().map_err(
+src/wal.rs	1862-1873	-	pub fn write(&self, entry: WalEntry) -> Result<SyncWaiter> {
+src/wal.rs	1887-1891	-	.send(WalMsg::Entry(framed))
