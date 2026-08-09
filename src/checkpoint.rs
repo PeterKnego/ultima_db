@@ -162,10 +162,17 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     // Minimum: 4 (magic) + 1 (format_version varint, smallest encoding) + 4
     // (crc32) = 9 bytes. That's deliberately just enough to safely check the
     // magic and read a format version and bail on mismatch — not enough for
-    // a full v2 header (kind/snapshot_version/num_tables). A v1 (or garbage)
-    // file that's shorter than a real v2 header must still be rejected with
-    // the *version* error, not "too short": that's the error message that
-    // names what actually happened (see `a_v1_checkpoint_is_refused_with_a_named_version`).
+    // a full v2 header (kind/snapshot_version/num_tables), and (since v1
+    // acceptance landed) not enough for a real v1 header either
+    // (snapshot_version/num_tables). A file at exactly this minimum that
+    // claims a version this build doesn't understand must still be rejected
+    // with the *version* error, not "too short": that's the error message
+    // that names what actually happened (see
+    // `a_future_format_version_is_still_refused`). A file that claims v1 or
+    // v2 but is truncated at this minimum instead falls through to that
+    // version's own reader and fails there — still an error, just not this
+    // one; see `deserialize_snapshot_v1`'s and the v2 body's own
+    // bounds-checked field reads.
     // Every field read past this point is itself bounds-checked, so a file
     // that passes this gate but is truncated later fails with a specific
     // error rather than a panic.
@@ -195,18 +202,22 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
     let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&payload[offset..], config)
         .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
     offset += read;
-    if fmt_version != FORMAT_VERSION {
-        return Err(Error::CheckpointCorrupted(format!(
-            "unsupported format version: {fmt_version} (checkpoint; this build reads \
-             v{FORMAT_VERSION}). If this file predates incremental-checkpoint support (v1, \
-             written by 0.3.0 or earlier): there is no in-place upgrade, and once a checkpoint \
-             has pruned the WAL the WAL alone cannot make up the gap — with the old UltimaDB \
-             binary, `Store::recover()` the existing persistence directory, read the rows out \
-             through a `ReadTx`, and load them into this build with `Store::bulk_load` / \
-             `Store::bulk_load_batch`, into a fresh, empty persistence directory, then \
-             `checkpoint()`. If this file is from a newer UltimaDB: upgrade the binary to read \
-             it."
-        )));
+    match fmt_version {
+        1 => return deserialize_snapshot_v1(payload, offset, registry),
+        v if v == FORMAT_VERSION => {}
+        _ => {
+            return Err(Error::CheckpointCorrupted(format!(
+                "unsupported format version: {fmt_version} (checkpoint; this build reads \
+                 v{FORMAT_VERSION}). If this file predates incremental-checkpoint support (v1, \
+                 written by 0.3.0 or earlier): there is no in-place upgrade, and once a \
+                 checkpoint has pruned the WAL the WAL alone cannot make up the gap — with the \
+                 old UltimaDB binary, `Store::recover()` the existing persistence directory, \
+                 read the rows out through a `ReadTx`, and load them into this build with \
+                 `Store::bulk_load` / `Store::bulk_load_batch`, into a fresh, empty persistence \
+                 directory, then `checkpoint()`. If this file is from a newer UltimaDB: upgrade \
+                 the binary to read it."
+            )));
+        }
     }
 
     // Checkpoint kind
@@ -289,6 +300,71 @@ fn deserialize_snapshot(data: &[u8], registry: &TableRegistry) -> Result<Snapsho
         // Only `Persistence` — the variant this file's format errors use — is
         // rewritten; a `UniqueConstraintViolation` from the index rebuild
         // keeps its own variant so callers can still match on it.
+        let table_any = (info.deserialize_table)(table_bytes).map_err(|e| match e {
+            Error::Persistence(msg) => Error::Persistence(format!("table '{name}': {msg}")),
+            other => other,
+        })?;
+        tables.insert(name, std::sync::Arc::from(table_any));
+    }
+
+    Ok(Snapshot { version, tables })
+}
+
+/// Read a pre-task61 checkpoint container.
+///
+/// `payload` is the whole file minus its trailing CRC (already verified by
+/// the caller); `at` points just past `format_version`. v1 has no `kind`
+/// byte and no per-table entry kind — it is always a full checkpoint with
+/// every table inline — so it is converted into exactly that shape here and
+/// nothing downstream needs to know v1 existed.
+fn deserialize_snapshot_v1(
+    payload: &[u8],
+    mut at: usize,
+    registry: &TableRegistry,
+) -> Result<Snapshot> {
+    let config = bincode::config::standard();
+
+    // Snapshot version
+    let (version, read): (u64, _) = bincode::decode_from_slice(&payload[at..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    at += read;
+
+    // Number of tables
+    let (num_tables, read): (u32, _) = bincode::decode_from_slice(&payload[at..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    at += read;
+
+    let mut tables = std::collections::BTreeMap::new();
+
+    for _ in 0..num_tables {
+        // Table name
+        let (name, read): (String, _) = bincode::decode_from_slice(&payload[at..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        at += read;
+
+        // Table data length
+        let (data_len, read): (u64, _) = bincode::decode_from_slice(&payload[at..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        at += read;
+
+        // Checked: the CRC only guards against accidental corruption, so a
+        // crafted/garbled length must not overflow into a panic.
+        let end = usize::try_from(data_len)
+            .ok()
+            .and_then(|l| at.checked_add(l))
+            .ok_or_else(|| Error::CheckpointCorrupted("table data length overflow".into()))?;
+        if end > payload.len() {
+            return Err(Error::CheckpointCorrupted("truncated table data".into()));
+        }
+        let table_bytes = &payload[at..end];
+        at = end;
+
+        let info = registry
+            .get(&name)
+            .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
+        // Same naming-the-table treatment as the v2 loop above: the message
+        // an operator hits on a v1 upgrade is useless without knowing which
+        // table's payload failed to parse.
         let table_any = (info.deserialize_table)(table_bytes).map_err(|e| match e {
             Error::Persistence(msg) => Error::Persistence(format!("table '{name}': {msg}")),
             other => other,
@@ -553,6 +629,16 @@ fn read_header(path: &Path) -> Result<(CheckpointKind, u64, Option<u64>)> {
     let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&buf[offset..], config)
         .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
     offset += read;
+    if fmt_version == 1 {
+        // v1 predates delta checkpoints entirely: no `kind` byte, no
+        // `base_version`, and every file is a complete, self-contained
+        // checkpoint. Reporting it as `Full`/`None` is what makes the chain
+        // walk stop here instead of looking for an ancestor that cannot
+        // exist.
+        let (version, _read): (u64, _) = bincode::decode_from_slice(&buf[offset..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+        return Ok((CheckpointKind::Full, version, None));
+    }
     if fmt_version != FORMAT_VERSION {
         return Err(Error::CheckpointCorrupted(format!(
             "unsupported format version: {fmt_version} (checkpoint; this build reads \
@@ -1050,20 +1136,114 @@ mod tests {
         assert_eq!(restored.tables.len(), snap.tables.len());
     }
 
+    /// Build a v1 container around an already-encoded table payload.
+    fn v1_checkpoint(version: u64, tables: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let config = bincode::config::standard();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(1u32, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(version, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(tables.len() as u32, &mut buf, config).unwrap();
+        for (name, payload) in tables {
+            bincode::encode_into_std_write(*name, &mut buf, config).unwrap();
+            bincode::encode_into_std_write(payload.len() as u64, &mut buf, config).unwrap();
+            buf.extend_from_slice(payload);
+        }
+        let crc = crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
     #[test]
-    fn a_v1_checkpoint_is_refused_with_a_named_version() {
-        let mut v1 = Vec::new();
-        v1.extend_from_slice(MAGIC);
-        bincode::encode_into_std_write(1u32, &mut v1, bincode::config::standard()).unwrap();
-        v1.extend_from_slice(&crc32(&v1).to_le_bytes());
-        let registry = TableRegistry::default();
-        let Err(err) = deserialize_snapshot(&v1, &registry) else {
-            panic!("a v1 checkpoint must be rejected");
+    fn a_v1_container_is_read_as_a_full_checkpoint() {
+        // A v1 *container* may legitimately hold a v2 *payload* — that is the
+        // released-0.3.0 shape, since the two formats were bumped in
+        // different releases. Build exactly that here, from the same
+        // registry/table fixtures the v2 tests above use.
+        let mut registry = TableRegistry::default();
+        registry.register::<User, u64>("users").unwrap();
+        let info = registry.get("users").unwrap();
+
+        let mut t = Table::<User, u64>::new();
+        t.put(
+            1,
+            User {
+                name: "alice".into(),
+                age: 30,
+            },
+        )
+        .unwrap();
+        let payload = (info.serialize_table)(&t as &dyn std::any::Any).unwrap();
+
+        let snap =
+            deserialize_snapshot(&v1_checkpoint(2, &[("users", payload)]), &registry).unwrap();
+        assert_eq!(snap.version, 2);
+        assert!(snap.tables.contains_key("users"));
+    }
+
+    #[test]
+    fn a_v1_container_reports_as_full_with_no_base() {
+        // read_header must classify v1 as Full/None so the chain walk stops.
+        let dir = crate::test_scratch::scratch_dir();
+        let path = dir.path().join("checkpoint_2.bin");
+        std::fs::write(&path, v1_checkpoint(2, &[])).unwrap();
+        let (kind, version, base) = read_header(&path).unwrap();
+        assert_eq!(kind, CheckpointKind::Full);
+        assert_eq!(version, 2);
+        assert_eq!(base, None);
+    }
+
+    #[test]
+    fn a_future_format_version_is_still_refused_by_read_header() {
+        // `deserialize_snapshot`'s forward rejection is covered by
+        // `a_future_format_version_is_still_refused` above, but `read_header`
+        // re-implements the same check independently (it only reads the
+        // bounded prefix, so it can't just delegate) — pin it separately so
+        // a future edit to one arm can't silently leave the other one loose.
+        let config = bincode::config::standard();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(99u32, &mut buf, config).unwrap();
+        let crc = crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        let dir = crate::test_scratch::scratch_dir();
+        let path = dir.path().join("checkpoint_2.bin");
+        std::fs::write(&path, &buf).unwrap();
+        let Err(err) = read_header(&path) else {
+            panic!("a future version must be refused");
         };
         assert!(
-            matches!(err, Error::CheckpointCorrupted(ref m) if m.contains("unsupported format version: 1")),
+            matches!(err, Error::CheckpointCorrupted(ref m) if m.contains("unsupported format version")),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_v1_container_with_a_broken_crc_is_still_refused() {
+        let mut bytes = v1_checkpoint(2, &[]);
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xFF;
+        let registry = TableRegistry::default();
+        let Err(err) = deserialize_snapshot(&bytes, &registry) else {
+            panic!("a CRC-broken v1 file must be refused");
+        };
+        assert!(matches!(err, Error::CheckpointCorrupted(ref m) if m.contains("CRC")));
+    }
+
+    #[test]
+    fn a_future_format_version_is_still_refused() {
+        // Backward compatibility must not weaken forward rejection.
+        let config = bincode::config::standard();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(99u32, &mut buf, config).unwrap();
+        let crc = crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        let registry = TableRegistry::default();
+        let Err(err) = deserialize_snapshot(&buf, &registry) else {
+            panic!("a future version must be refused");
+        };
+        assert!(format!("{err}").contains("unsupported format version"));
     }
 
     #[test]

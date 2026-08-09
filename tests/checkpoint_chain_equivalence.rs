@@ -664,8 +664,8 @@ fn a_delta_headed_directory_is_refused_rather_than_read_as_stale() {
     // independently re-parse and re-validate the header on the same
     // `recover()` call, by design (see `apply_delta_file`'s own doc comment).
     // What this test pins is the pipeline-level guarantee — a
-    // downgraded/corrupted delta head is refused with a format-version
-    // message — not a specific line.
+    // downgraded/corrupted delta head is refused rather than silently
+    // treated as a stale full checkpoint.
     let crc_offset = raw.len() - 4;
     let recomputed = crc32fast::hash(&raw[..crc_offset]);
     raw[crc_offset..].copy_from_slice(&recomputed.to_le_bytes());
@@ -673,14 +673,24 @@ fn a_delta_headed_directory_is_refused_rather_than_read_as_stale() {
 
     let store2 = Store::new(config).unwrap();
     store2.register_table::<User>("users").unwrap();
-    let err = store2.recover().unwrap_err();
-    // Asserting on the message, not just the variant: `CheckpointCorrupted`
-    // is also what a CRC mismatch produces (see the comment above), so
-    // matching the variant alone would pass whether or not a format-version
-    // check ever ran. Mirrors `deserialize_unsupported_format_version_errors`'s
-    // own check at `src/checkpoint.rs:1289` (`msg.contains("unsupported format")`).
-    assert!(
-        matches!(&err, Error::CheckpointCorrupted(msg) if msg.contains("unsupported format version")),
-        "a downgraded read must fail on the format-version check specifically, got {err:?}"
-    );
+    // This only checks that the read is *refused* (`Err`, never `Ok`), not
+    // which error it fails with. It used to also assert the message
+    // contained "unsupported format version" — that stopped being true once
+    // task62/task3 gave `format_version == 1` a real, structural meaning
+    // (src/checkpoint.rs's `deserialize_snapshot_v1`/`read_header`). Patching
+    // byte 4 to `1` no longer reproduces "an old binary sees this file and
+    // refuses it on sight": it manufactures a genuinely malformed file — a
+    // v1 header glued to v2-Delta-shaped bytes (`kind`, `base_version`,
+    // per-entry `entry_kind` — all fields v1 never had) — which the v1
+    // reader dutifully tries to parse as v1's `snapshot_version`/
+    // `num_tables`/table-name/table-data stream and fails on with whatever
+    // nonsense that produces (e.g. `TableNotRegistered` on a garbage table
+    // name), not a format-version message. The underlying guarantee this
+    // test exists for — a real 0.3.0 binary refuses a real v2 delta, because
+    // that binary doesn't understand version 2 — is untouched; it just can't
+    // be reproduced in-process anymore by stamping a version byte, since
+    // version 1 is no longer a version *this* build refuses. Do not restore
+    // the message assertion without first re-deriving a byte pattern that
+    // actually simulates an old-binary read rather than a corrupt v1 file.
+    store2.recover().unwrap_err();
 }
