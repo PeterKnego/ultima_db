@@ -814,6 +814,36 @@ fn deserialize_table_v1<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<
         rows.push((u64_as_key::<K>(id)?, Arc::new(rec)));
     }
 
+    // Same trust-boundary discipline as `deserialize_table_v2`, and for the
+    // same reason: `count` is attacker/corruption-controlled, and an
+    // understated count would otherwise be read as a smaller table —
+    // silently losing rows — while appended junk would be ignored outright.
+    if at != bytes.len() {
+        return Err(Error::Persistence(format!(
+            "table payload has {} trailing bytes after {count} rows",
+            bytes.len() - at
+        )));
+    }
+
+    // `from_bulk` only debug-asserts ascending order — validate it here, at
+    // the trust boundary, exactly as `deserialize_table_v2` does. Without
+    // this, out-of-order or duplicate row ids reach `from_bulk`/`BTree::from_sorted`
+    // silently in a release build: rows past the first inversion become
+    // unreachable by key even though they are counted in `len()` (`from_sorted`
+    // builds strictly off insertion position, not a sort), which is exactly
+    // the "still passes ascent validation" corruption this reader's key-type
+    // check exists to prevent one layer up — this is the other layer.
+    for (i, w) in rows.windows(2).enumerate() {
+        if w[0].0 >= w[1].0 {
+            return Err(Error::Persistence(format!(
+                "table payload rows not strictly ascending: key {} at row {i} >= key {} at row {}",
+                hex(&w[0].0),
+                hex(&w[1].0),
+                i + 1
+            )));
+        }
+    }
+
     Table::from_bulk(rows, Some(u64_as_key::<K>(next_id)?), Vec::new())
 }
 
@@ -830,21 +860,20 @@ fn deserialize_table_v2<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<
     let config = bincode::config::standard();
     let mut at = 0usize;
 
+    // The only caller is `deserialize_table`'s dispatcher, which routes here
+    // exclusively when `bytes[0] == TABLE_MAGIC_V2` — so that byte needs no
+    // re-check (and, as of this reader accepting v1 payloads, no re-check
+    // *could* legitimately fail: every non-v1 leading byte lands here). The
+    // `debug_assert` catches a future direct/misrouted call in debug builds
+    // without risking stale error text — a bare "not the v2 marker" message
+    // would be actively false here, since this function no longer implies
+    // "so this must be v1".
     let header = take(bytes, &mut at, 2)?;
-    if header[0] != TABLE_MAGIC_V2 {
-        return Err(Error::Persistence(format!(
-            "unsupported table format version: leading byte 0x{:02x} is not the v{} marker \
-             (this looks like a pre-0.3.0 v1 table, whose row keys were fixed 8-byte ids). \
-             Table data written before 0.3.0 cannot be read by this build. To migrate: with \
-             the previous UltimaDB version, `Store::recover()` the old directory, read the \
-             rows out through a `ReadTx`, and load them into a 0.3.0+ store with \
-             `Store::bulk_load` / `Store::bulk_load_batch` — into a *fresh* persistence \
-             directory, so no stale higher-versioned checkpoint outranks the migrated one. \
-             To discard the old data instead, delete the checkpoint and WAL files in the \
-             persistence directory.",
-            header[0], TABLE_FORMAT_V2
-        )));
-    }
+    debug_assert_eq!(
+        header[0], TABLE_MAGIC_V2,
+        "deserialize_table_v2 called with a non-v2 leading byte; the dispatcher should have \
+         routed this to deserialize_table_v1"
+    );
     if header[1] != TABLE_FORMAT_V2 {
         return Err(Error::Persistence(format!(
             "unsupported table format version {}: this build reads v{}. The data was written \
@@ -2103,9 +2132,78 @@ mod tests {
     fn a_truncated_v1_payload_errors_rather_than_panicking() {
         let rows = [(1u64, TestRecord { name: "alice".into() })];
         let full = v1_payload(2, &rows);
-        for cut in 1..full.len() {
+        // `0..full.len()` (not `1..`), so this also covers the empty-slice
+        // case, handled by `deserialize_table`'s own dispatcher rather than
+        // the v1 reader (a v1 payload can never be zero bytes: it always
+        // opens with at least a one-byte `next_id` varint).
+        for cut in 0..full.len() {
             let err = deserialize_table::<TestRecord, u64>(&full[..cut]);
             assert!(err.is_err(), "truncation at {cut} must error, not succeed");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // deserialize_table_v1: trust-boundary validation (fix round 1)
+    // -----------------------------------------------------------------------
+
+    /// Without the ascending-order check, out-of-order rows reach
+    /// `Table::from_bulk`/`BTree::from_sorted` uncaught: debug builds hit
+    /// `from_bulk`'s `debug_assert!` and panic; release builds build a tree
+    /// where rows past the first inversion are counted in `len()` but
+    /// unreachable by key. Both are wrong; the reader must refuse the
+    /// payload before either can happen.
+    #[test]
+    fn a_v1_payload_with_out_of_order_rows_errors_rather_than_corrupting_the_tree() {
+        let rows = [
+            (5u64, TestRecord { name: "e".into() }),
+            (1u64, TestRecord { name: "a".into() }),
+        ];
+        let err = deserialize_table::<TestRecord, u64>(&v1_payload(6, &rows)).err().unwrap();
+        assert!(
+            format!("{err}").contains("not strictly ascending"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Duplicate row ids are the boundary case of "not strictly ascending"
+    /// (`>=`, not `>`) — same hazard, same check.
+    #[test]
+    fn a_v1_payload_with_duplicate_row_ids_errors_rather_than_corrupting_the_tree() {
+        let rows = [
+            (1u64, TestRecord { name: "a".into() }),
+            (1u64, TestRecord { name: "a2".into() }),
+        ];
+        let err = deserialize_table::<TestRecord, u64>(&v1_payload(2, &rows)).err().unwrap();
+        assert!(
+            format!("{err}").contains("not strictly ascending"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Bytes appended after the last row must not be silently ignored —
+    /// mirrors `deserialize_rejects_trailing_junk` for the v2 reader.
+    #[test]
+    fn a_v1_payload_with_trailing_junk_errors_rather_than_silently_ignoring_it() {
+        let rows = [(1u64, TestRecord { name: "a".into() })];
+        let mut bytes = v1_payload(2, &rows);
+        bytes.extend_from_slice(&[0xABu8; 8]);
+        let err = deserialize_table::<TestRecord, u64>(&bytes).err().unwrap();
+        assert!(format!("{err}").contains("trailing bytes"), "unexpected error: {err:?}");
+    }
+
+    /// An understated `count` must not be read as a smaller-but-valid table:
+    /// the row bytes are still physically present, so silently accepting
+    /// this loses rows without any error at all. Mirrors
+    /// `deserialize_rejects_understated_row_count` for the v2 reader.
+    #[test]
+    fn a_v1_payload_with_understated_count_errors_rather_than_losing_rows() {
+        let rows = [(1u64, TestRecord { name: "a".into() })];
+        let mut bytes = v1_payload(2, &rows);
+        // `next_id = 2` and `count = 1` both encode as a single varint byte,
+        // so `count` sits at offset 1.
+        assert_eq!(bytes[1], 1, "precondition: count byte at offset 1 encodes 1 row");
+        bytes[1] = 0;
+        let err = deserialize_table::<TestRecord, u64>(&bytes).err().unwrap();
+        assert!(format!("{err}").contains("trailing bytes"), "unexpected error: {err:?}");
     }
 }
