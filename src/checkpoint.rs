@@ -1348,11 +1348,14 @@ mod tests {
     }
 
     /// The upgrade an operator actually performs: a checkpoint written by a
-    /// pre-0.3.0 build, whose table bodies are in table format v1. It must be
-    /// rejected, and the error must name *which* table — `deserialize_table`
-    /// sees only an anonymous byte slice.
+    /// pre-0.3.0 build, whose table bodies are in table format v1. As of
+    /// task62's table-payload compatibility work, `deserialize_table` reads
+    /// v1 bodies directly — so a checkpoint carrying one now loads cleanly
+    /// and its rows come back intact, rather than being rejected. (The
+    /// checkpoint *container* format is a separate version, handled
+    /// elsewhere in this file, and is unaffected by this.)
     #[test]
-    fn deserialize_v1_table_body_errors_and_names_the_table() {
+    fn deserialize_v1_table_body_loads_correctly() {
         let config = bincode::config::standard();
 
         // A real v1 body: [next_id][count][id, record]*, all bincode varint.
@@ -1385,11 +1388,51 @@ mod tests {
 
         let mut reg = TableRegistry::default();
         reg.register::<User, u64>("users").unwrap();
+        let recovered = deserialize_snapshot(&data, &reg).unwrap();
+        let table = recovered.tables.get("users").unwrap().as_any().downcast_ref::<Table<User>>().unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.get(&1).unwrap(),
+            &User {
+                name: "Alice".into(),
+                age: 30
+            }
+        );
+    }
+
+    /// The safety property that outlives the outright v1 rejection: a v1
+    /// table body carries no key type, so reading one into a table
+    /// registered with a non-`u64` key must still fail, and the error must
+    /// name *which* table — `deserialize_table` sees only an anonymous byte
+    /// slice.
+    #[test]
+    fn deserialize_v1_table_body_into_a_non_u64_keyed_table_errors_and_names_the_table() {
+        let config = bincode::config::standard();
+
+        let mut body = Vec::new();
+        bincode::encode_into_std_write(1u64, &mut body, config).unwrap(); // next_id
+        bincode::encode_into_std_write(0u64, &mut body, config).unwrap(); // count
+
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        bincode::encode_into_std_write(FORMAT_VERSION, &mut data, config).unwrap();
+        bincode::encode_into_std_write(CheckpointKind::Full as u8, &mut data, config).unwrap();
+        bincode::encode_into_std_write(1u64, &mut data, config).unwrap(); // snapshot version
+        bincode::encode_into_std_write(1u32, &mut data, config).unwrap(); // num_tables
+        bincode::encode_into_std_write(TableEntryKind::Full as u8, &mut data, config).unwrap();
+        bincode::encode_into_std_write("users", &mut data, config).unwrap();
+        bincode::encode_into_std_write(body.len() as u64, &mut data, config).unwrap();
+        data.extend_from_slice(&body);
+        let crc = crc32(&data);
+        data.extend_from_slice(&crc.to_le_bytes());
+
+        let mut reg = TableRegistry::default();
+        reg.register::<User, String>("users").unwrap();
         let Err(err) = deserialize_snapshot(&data, &reg) else {
-            panic!("a v1 table body must be rejected");
+            panic!("a v1 table body into a non-u64-keyed table must be rejected");
         };
         let msg = format!("{err}");
-        assert!(msg.contains("format version"), "{msg}");
+        assert!(msg.contains("v1 table payloads are u64-keyed"), "{msg}");
         assert!(msg.contains("users"), "the error must name the table: {msg}");
     }
 

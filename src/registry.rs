@@ -750,8 +750,83 @@ fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64> {
     Ok(u64::from_be_bytes(take(bytes, at, 8)?.try_into().unwrap()))
 }
 
-/// Deserialize a `Table<R, K>` from bytes written by [`serialize_table`].
+/// Deserialize a `Table<R, K>` from bytes written by any release.
+///
+/// Dispatch is exact rather than heuristic: `TABLE_MAGIC_V2` (`0xFF`) is not
+/// a legal bincode varint tag, and a v1 payload opens with the varint tag of
+/// its `next_id`, so no v1 payload can begin with it. This is the same
+/// property that made `0xFF` the right magic in the first place.
 fn deserialize_table<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, K>> {
+    match bytes.first() {
+        None => Err(Error::Persistence(
+            "table payload is empty: cannot determine its format version".into(),
+        )),
+        Some(&TABLE_MAGIC_V2) => deserialize_table_v2::<R, K>(bytes),
+        Some(_) => deserialize_table_v1::<R, K>(bytes),
+    }
+}
+
+/// Read a pre-0.3.0 table payload: `[next_id][count][id, rec]*`, all
+/// bincode-varint, row keys fixed `u64` ids.
+///
+/// Three things v1 does not carry, and what is supplied for them:
+/// * **No key type.** v1 predates arbitrary primary keys (task56), so `u64`
+///   is the only key type it could have held — but that is *verified*, not
+///   assumed. Reading a v1 payload into a differently-keyed table would
+///   reinterpret its bytes into garbage keys, and because `PrimaryKey`
+///   encodings are order-preserving the garbage would still pass the
+///   ascending-order validation. This check is what the old outright
+///   rejection was really protecting, and it outlives it.
+/// * **No `has_next_id` flag.** v1 always carried a counter, so the result
+///   is always `Some`.
+/// * **No key encoding.** v1 ids are raw `u64`; they are routed through
+///   `PrimaryKey::encode`/`decode` so the resulting table is
+///   indistinguishable from one built from a v2 payload.
+fn deserialize_table_v1<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, K>> {
+    if K::KEY_TYPE_ID != <u64 as PrimaryKey>::KEY_TYPE_ID {
+        return Err(Error::Persistence(format!(
+            "v1 table payloads are u64-keyed (they predate arbitrary primary keys), but this \
+             table is registered with key type {}. A pre-0.3.0 checkpoint cannot be read into \
+             a differently-keyed table: its 8-byte row ids would be reinterpreted as {} keys.",
+            std::any::type_name::<K>(),
+            std::any::type_name::<K>(),
+        )));
+    }
+
+    let config = bincode::config::standard();
+    let mut at = 0usize;
+
+    let (next_id, read): (u64, _) = bincode::decode_from_slice(&bytes[at..], config)
+        .map_err(|e| Error::Persistence(format!("v1 table payload: next_id: {e}")))?;
+    at += read;
+    let (count, read): (u64, _) = bincode::decode_from_slice(&bytes[at..], config)
+        .map_err(|e| Error::Persistence(format!("v1 table payload: count: {e}")))?;
+    at += read;
+
+    let mut rows: Vec<(K, Arc<R>)> = Vec::new();
+    for i in 0..count {
+        let (id, read): (u64, _) = bincode::decode_from_slice(&bytes[at..], config)
+            .map_err(|e| Error::Persistence(format!("v1 table payload: row {i} key: {e}")))?;
+        at += read;
+        let (rec, read): (R, _) = bincode::serde::decode_from_slice(&bytes[at..], config)
+            .map_err(|e| Error::Persistence(format!("v1 table payload: row {i} record: {e}")))?;
+        at += read;
+        rows.push((u64_as_key::<K>(id)?, Arc::new(rec)));
+    }
+
+    Table::from_bulk(rows, Some(u64_as_key::<K>(next_id)?), Vec::new())
+}
+
+/// Reinterpret a v1 `u64` row id as `K`, which the caller has already
+/// verified *is* `u64` by key-type id. Goes through the encode/decode pair
+/// rather than a transmute so the conversion is the same one every other
+/// persistence path uses.
+fn u64_as_key<K: PrimaryKey>(id: u64) -> Result<K> {
+    K::decode(&id.encode())
+}
+
+/// Deserialize a `Table<R, K>` from bytes written by [`serialize_table`].
+fn deserialize_table_v2<R: Record, K: PrimaryKey>(bytes: &[u8]) -> Result<Table<R, K>> {
     let config = bincode::config::standard();
     let mut at = 0usize;
 
@@ -1339,28 +1414,35 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_rejects_v1_format() {
+    fn deserialize_accepts_v1_format() {
         // A v1 payload began with the bincode varint of `next_id`, whose
-        // leading byte is never the v2 magic (0xFF is not a legal varint tag).
+        // leading byte is never the v2 magic (0xFF is not a legal varint
+        // tag) — so it dispatches to the v1 reader and is read successfully,
+        // not rejected. (Pre-task-2, this leading byte was grounds for an
+        // outright rejection; see `deserialize_table`'s dispatch doc.)
         let mut reg = TableRegistry::default();
         reg.register::<String, u64>("rows").unwrap();
         let info = reg.get("rows").unwrap();
 
-        let v1_bytes = vec![0u8; 24];
-        let Err(err) = (info.deserialize_table)(&v1_bytes) else {
-            panic!("a v1 payload must be rejected");
-        };
-        assert!(
-            format!("{err}").contains("format version"),
-            "expected a format-version error, got: {err}"
-        );
+        let config = bincode::config::standard();
+        let mut v1 = Vec::new();
+        bincode::encode_into_std_write(1u64, &mut v1, config).unwrap(); // next_id
+        bincode::encode_into_std_write(0u64, &mut v1, config).unwrap(); // count
+
+        let restored = (info.deserialize_table)(&v1).unwrap();
+        let restored = restored.as_any().downcast_ref::<Table<String, u64>>().unwrap();
+        assert_eq!(restored.len(), 0);
+        assert_eq!(restored.next_id_opt(), Some(1));
     }
 
     /// The ambiguity a bare `[version: u8 = 2]` header would have had: a real
     /// v1 payload for a table with exactly one insert starts with the byte
-    /// `0x02` (varint of `next_id = 2`). It must still be rejected.
+    /// `0x02` (varint of `next_id = 2`) — the same byte `TABLE_FORMAT_V2`
+    /// holds. Dispatching on the full magic byte (`0xFF`), never a bare
+    /// version number, is what resolves the collision: this payload is read
+    /// correctly as v1, not misread as a v2 header.
     #[test]
-    fn deserialize_rejects_v1_payload_whose_first_byte_is_two() {
+    fn deserialize_reads_a_v1_payload_whose_first_byte_collides_with_the_v2_format_byte() {
         let config = bincode::config::standard();
         let mut v1 = Vec::new();
         bincode::encode_into_std_write(2u64, &mut v1, config).unwrap(); // next_id
@@ -1380,13 +1462,11 @@ mod tests {
         let mut reg = TableRegistry::default();
         reg.register::<TestUser, u64>("users").unwrap();
         let info = reg.get("users").unwrap();
-        let Err(err) = (info.deserialize_table)(&v1) else {
-            panic!("a v1 payload must be rejected");
-        };
-        assert!(
-            format!("{err}").contains("format version"),
-            "expected a format-version error, got: {err}"
-        );
+        let restored = (info.deserialize_table)(&v1).unwrap();
+        let restored = restored.as_any().downcast_ref::<Table<TestUser, u64>>().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.get(&1).unwrap().name, "Alice");
+        assert_eq!(restored.next_id_opt(), Some(2));
     }
 
     #[test]
@@ -1503,18 +1583,27 @@ mod tests {
         );
     }
 
-    /// The rejection message must point at APIs that exist.
+    /// The migration-path message (`Store::recover`, `bulk_load`, ...) that
+    /// used to fire for *every* v1 payload now only applies to the one v1
+    /// case this build still refuses: a v1 payload read into a table keyed
+    /// by something other than `u64`. The message for that case must point
+    /// at APIs that exist and explain the actual hazard, not just say "no".
     #[test]
-    fn v1_rejection_message_names_a_real_migration_path() {
+    fn v1_key_type_rejection_message_explains_the_hazard() {
+        let config = bincode::config::standard();
+        let mut v1 = Vec::new();
+        bincode::encode_into_std_write(1u64, &mut v1, config).unwrap(); // next_id
+        bincode::encode_into_std_write(0u64, &mut v1, config).unwrap(); // count
+
         let mut reg = TableRegistry::default();
-        reg.register::<TestUser, u64>("users").unwrap();
+        reg.register::<TestUser, String>("users").unwrap();
         let info = reg.get("users").unwrap();
 
-        let Err(err) = (info.deserialize_table)(&[0u8; 24]) else {
-            panic!("a v1 payload must be rejected");
+        let Err(err) = (info.deserialize_table)(&v1) else {
+            panic!("a v1 payload into a non-u64-keyed table must be rejected");
         };
         let msg = format!("{err}");
-        for expected in ["format version", "Store::recover", "bulk_load", "delete"] {
+        for expected in ["v1 table payloads are u64-keyed", "String"] {
             assert!(msg.contains(expected), "message missing {expected:?}: {msg}");
         }
     }
@@ -1940,5 +2029,83 @@ mod tests {
         assert_eq!(changes, vec![(1u64, None)], "base's buffered row must be visible to the diff");
 
         assert_eq!(base.overlay_len_for_test(), 2, "diff_table must not flush the caller's table");
+    }
+
+    // -----------------------------------------------------------------------
+    // deserialize_table: v1 payload compatibility
+    // -----------------------------------------------------------------------
+
+    /// Bytes in the v1 table layout: `[next_id][count][id, rec]*`, all
+    /// bincode varint. Mirrors what 0.2.0 actually wrote (see
+    /// tests/fixtures/formats/v0_2_0).
+    fn v1_payload(next_id: u64, rows: &[(u64, TestRecord)]) -> Vec<u8> {
+        let config = bincode::config::standard();
+        let mut buf = Vec::new();
+        bincode::encode_into_std_write(next_id, &mut buf, config).unwrap();
+        bincode::encode_into_std_write(rows.len() as u64, &mut buf, config).unwrap();
+        for (id, rec) in rows {
+            bincode::encode_into_std_write(*id, &mut buf, config).unwrap();
+            buf.extend_from_slice(&bincode::serde::encode_to_vec(rec, config).unwrap());
+        }
+        buf
+    }
+
+    #[test]
+    fn a_v1_table_payload_round_trips_into_the_current_shape() {
+        let rows = [
+            (1u64, TestRecord { name: "alice".into() }),
+            (2u64, TestRecord { name: "bob".into() }),
+        ];
+        let table: Table<TestRecord, u64> = deserialize_table(&v1_payload(3, &rows)).unwrap();
+
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.get(&1).unwrap().name, "alice");
+        assert_eq!(table.get(&2).unwrap().name, "bob");
+        // v1 always carried a counter, so the reconstructed table must too.
+        assert_eq!(table.next_id_opt(), Some(3));
+    }
+
+    #[test]
+    fn an_empty_v1_table_payload_is_read_as_an_empty_table() {
+        let table: Table<TestRecord, u64> = deserialize_table(&v1_payload(1, &[])).unwrap();
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.next_id_opt(), Some(1));
+    }
+
+    /// The safety property the original rejection existed to protect. A v1
+    /// payload carries no key type, so reading it into a non-u64 table would
+    /// reinterpret bytes into garbage keys — and because the encoding is
+    /// order-preserving, the garbage would still pass ascent validation.
+    #[test]
+    fn a_v1_payload_is_refused_for_a_non_u64_keyed_table() {
+        let rows = [(1u64, TestRecord { name: "alice".into() })];
+        // `.err().unwrap()` rather than `.unwrap_err()`: the latter requires
+        // the `Ok` side (`Table<TestRecord, String>`) to implement `Debug`,
+        // which it does not.
+        let err = deserialize_table::<TestRecord, String>(&v1_payload(2, &rows)).err().unwrap();
+        assert!(
+            format!("{err}").contains("v1 table payloads are u64-keyed"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_v2_payload_still_round_trips_unchanged() {
+        let mut t = Table::<TestRecord, u64>::new();
+        t.put(1, TestRecord { name: "alice".into() }).unwrap();
+        let bytes = serialize_table(&t).unwrap();
+        assert_eq!(bytes[0], TABLE_MAGIC_V2, "precondition: this is a v2 payload");
+        let back: Table<TestRecord, u64> = deserialize_table(&bytes).unwrap();
+        assert_eq!(back.get(&1).unwrap().name, "alice");
+    }
+
+    #[test]
+    fn a_truncated_v1_payload_errors_rather_than_panicking() {
+        let rows = [(1u64, TestRecord { name: "alice".into() })];
+        let full = v1_payload(2, &rows);
+        for cut in 1..full.len() {
+            let err = deserialize_table::<TestRecord, u64>(&full[..cut]);
+            assert!(err.is_err(), "truncation at {cut} must error, not succeed");
+        }
     }
 }
