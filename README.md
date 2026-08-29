@@ -114,7 +114,7 @@ the proof inventory is in [`formal/README.md`](formal/README.md).
 ## How this was built
 
 UltimaDB was designed by me and pair-programmed with Claude. The specs that
-drove each feature are in [`docs/superpowers/specs`](docs/superpowers/specs),
+drove each feature are in [`docs/tasks`](docs/tasks),
 so the process is auditable rather than something you have to take my word for.
 
 ## Quick example
