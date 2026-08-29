@@ -77,12 +77,19 @@ Tests catch the bugs someone thought of. A database also has to survive the
 ones nobody did, so UltimaDB adds checks that go beyond a test suite — each
 one lives in this repo and runs in CI:
 
-- **The core data structure is mathematically proven correct.** Every table
-  and index sits on one B-tree. Its insert and delete code is proven (in the
-  Lean 4 proof assistant, from a mechanical translation of the real Rust) to
-  behave exactly like a plain map: what you wrote is what you read back, and
-  nothing else changes. The proof cannot silently go stale — CI fails if the
-  verified source changes without the proof changing too.
+- **The single-threaded B-tree core is proven correct.** Every table and
+  index sits on one B-tree. Its insert and delete code is proven in Lean 4
+  to behave exactly like a plain map — what you wrote is what you read
+  back, and nothing else changes — against a mechanical Rust→Lean
+  translation of the extracted insert/delete kernel, produced by
+  [Aeneas](https://github.com/AeneasVerif/aeneas), so the theorems are about
+  translated algorithm code rather than a hand-written model of it (the
+  kernel is pinned to the shipped code by differential tests). The
+  order-preserving key encoding gets the same treatment. CI rebuilds the
+  proofs and re-checks their axioms whenever the B-tree, key-encoding, or
+  proof sources change on `main` (and weekly regardless); a cheaper drift
+  guard on every PR fails the build if a verified source changes without a
+  matching proof-side change.
 - **Transaction isolation is checked by Elle**, the tool used in the
   published Jepsen analyses of PostgreSQL, MySQL, and CockroachDB. Many
   threads hammer the store concurrently and Elle searches the recorded
@@ -103,6 +110,12 @@ layer's blind spot sits inside another's coverage. The full argument, with
 what is and is not covered, is in
 [How UltimaDB is verified](docs/explanation/how-ultimadb-is-verified.md);
 the proof inventory is in [`formal/README.md`](formal/README.md).
+
+## How this was built
+
+UltimaDB was designed by me and pair-programmed with Claude. The specs that
+drove each feature are in [`docs/superpowers/specs`](docs/superpowers/specs),
+so the process is auditable rather than something you have to take my word for.
 
 ## Quick example
 
