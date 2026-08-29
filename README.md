@@ -10,6 +10,7 @@ point-in-time reads are zero-copy and old versions stay alive for free.
 [how-to guides](docs/how-to/README.md) ·
 [reference](docs/reference/README.md) ·
 [explanation](docs/explanation/README.md) ·
+[how it is verified](docs/explanation/how-ultimadb-is-verified.md) ·
 [API docs](https://docs.rs/ultima-db)
 
 ## Performance
@@ -61,6 +62,39 @@ tiers, all four engines, ms and ops/sec, methodology):
   MVCC-consistent restores.
 - **Fast batch writes** — auto-increment batches take an O(batch + height)
   bulk-append path; full restores build trees O(N) via `Store::bulk_load`.
+
+## Correctness & verification
+
+Tests catch the bugs someone thought of. A database also has to survive the
+ones nobody did, so UltimaDB adds checks that go beyond a test suite — each
+one lives in this repo and runs in CI:
+
+- **The core data structure is mathematically proven correct.** Every table
+  and index sits on one B-tree. Its insert and delete code is proven (in the
+  Lean 4 proof assistant, from a mechanical translation of the real Rust) to
+  behave exactly like a plain map: what you wrote is what you read back, and
+  nothing else changes. The proof cannot silently go stale — CI fails if the
+  verified source changes without the proof changing too.
+- **Transaction isolation is checked by Elle**, the tool used in the
+  published Jepsen analyses of PostgreSQL, MySQL, and CockroachDB. Many
+  threads hammer the store concurrently and Elle searches the recorded
+  history for any result that the promised isolation level forbids.
+- **The checker is proven to be able to fail.** Three real bugs can be
+  deliberately switched on in the commit path, and CI confirms Elle catches
+  every one. A green check that can never go red is worthless. This harness
+  has already found and fixed a real deadlock.
+- **Crash recovery is tested the way disks actually fail.** Logs are torn,
+  zero-filled, bit-flipped, and killed mid-write. A crash restores everything
+  that was acknowledged; data damaged after the fact fails loudly rather
+  than being silently dropped. A TLA+ model of the commit pipeline
+  additionally explores crash interleavings a test could never enumerate.
+
+Each layer has limits — the proofs cover the single-threaded core, not the
+concurrent machinery; Elle samples rather than exhausts — chosen so one
+layer's blind spot sits inside another's coverage. The full argument, with
+what is and is not covered, is in
+[How UltimaDB is verified](docs/explanation/how-ultimadb-is-verified.md);
+the proof inventory is in [`formal/README.md`](formal/README.md).
 
 ## Quick example
 
@@ -122,6 +156,11 @@ MSRV: Rust 1.88. Pre-1.0: minor versions may break API.
 cargo test                       # unit + integration tests
 cargo clippy -- -D warnings      # lint (zero warnings policy)
 cargo bench                      # criterion benchmarks (YCSB, SmallBank, ...)
+make consistency/elle            # Elle isolation check (needs java)
+make consistency/elle-mutation   # prove the Elle check has teeth
+make test/wal-faults             # in-flight WAL fault injection
+make formal/tla-model            # TLA+ WAL crash-safety model (TLC, needs java)
+make test/formal-kernel          # Lean-kernel differential tests
 ```
 
 Documentation lives in [`docs/`](docs/README.md): a [getting-started tutorial](docs/tutorials/getting-started.md), [how-to guides](docs/how-to/README.md), [reference pages](docs/reference/README.md) (configuration, formats, isolation, performance), and [explanations](docs/explanation/README.md) of the architecture and design. The API reference is on [docs.rs](https://docs.rs/ultima-db). Per-feature design records for contributors live in the repo's `docs/tasks/` directory (internal, unlinked from the user docs).
