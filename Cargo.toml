@@ -30,7 +30,13 @@ include = [
 ]
 
 [package.metadata.docs.rs]
+# Not `all-features`: wal-iouring is unreliable on hosted runners (see
+# .github/workflows/ci.yml) and bench-internals / mutation-testing /
+# bench-mimalloc are not public API.
 features = ["persistence", "fulltext", "metrics"]
+# Lets `#![cfg_attr(docsrs, feature(doc_cfg))]` in src/lib.rs render the
+# "Available on crate feature ... only" badges on gated items.
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []

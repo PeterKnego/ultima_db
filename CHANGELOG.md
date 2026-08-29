@@ -43,6 +43,21 @@ path in
   unaffected either way. See `docs/tasks/task61_incremental_checkpoints.md`
   and `docs/tasks/task62_persistence_format_compat.md`.
 
+### Docs
+
+- **docs.rs landing page.** The crate-level doc now opens with a runnable
+  `# Examples` doctest (the README's quick example, so it cannot drift),
+  links `Store::register_table` / `recover` / `checkpoint` / `bulk_load`
+  and `Persistence::Standalone` / `Smr` as real intra-doc links instead of
+  plain code, points readers at the user docs (`docs/`,
+  `docs/explanation/`) rather than the internal `docs/tasks/`, and links
+  [How UltimaDB is verified](docs/explanation/how-ultimadb-is-verified.md).
+  `[package.metadata.docs.rs]` gains `rustdoc-args = ["--cfg", "docsrs"]`
+  and `lib.rs` `#![cfg_attr(docsrs, feature(doc_cfg))]`, so items behind
+  the `persistence` feature render with an "Available on crate feature
+  `persistence` only" badge. None of this reaches docs.rs until the next
+  publish — the metadata is baked into the published tarball.
+
 ## 0.3.0 — 2026-07-31
 
 Arbitrary primary keys: a table can now be keyed by `String`, `Vec<u8>`, any

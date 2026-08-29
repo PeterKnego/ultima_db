@@ -10,21 +10,75 @@
 //! [`WriteTx`] mutates lazily-copied tables and installs atomically on
 //! [`WriteTx::commit`].
 //!
+//! # Examples
+//!
+//! ```
+//! use ultima_db::Store;
+//!
+//! let store = Store::default();
+//!
+//! // Write a snapshot.
+//! let mut wtx = store.begin_write(None).unwrap();
+//! let mut users = wtx.open_table::<String>("users").unwrap();
+//! let id = users.insert("alice".to_string()).unwrap();
+//! let v1 = wtx.commit().unwrap();
+//!
+//! // Read it back — and keep reading it, even as later commits land.
+//! let rtx = store.begin_read(Some(v1)).unwrap();
+//! assert_eq!(rtx.open_table::<String>("users").unwrap().get(id),
+//!            Some(&"alice".to_string()));
+//!
+//! // Or key the table yourself. `put` replaces `insert`, since there is no
+//! // counter for a key the store cannot generate.
+//! let mut wtx = store.begin_write(None).unwrap();
+//! let mut emails = wtx.open_table_keyed::<String, String>("by_email").unwrap();
+//! emails.put("alice@example.com".to_string(), "alice".to_string()).unwrap();
+//! drop(emails);
+//! wtx.commit().unwrap();
+//! ```
+//!
+//! # Where to start
+//!
 //! Start at [`Store`] and [`StoreConfig`]:
 //!
 //! - [`WriterMode::MultiWriter`] enables concurrent writers with key-level
 //!   optimistic concurrency control; [`IsolationLevel::Serializable`] adds
 //!   write-skew prevention (SSI).
 //! - The `persistence` cargo feature adds WAL + checkpoint durability
-//!   (`Persistence::Standalone`) or checkpoint-only SMR mode
-//!   (`Persistence::Smr`) — see `Store::register_table`, `Store::recover`,
-//!   and `Store::checkpoint`.
-//! - Bulk restores and deltas go through `Store::bulk_load` /
-//!   `Store::bulk_load_batch`.
+//!   ([`Persistence::Standalone`]) or checkpoint-only SMR mode
+//!   ([`Persistence::Smr`]) — see [`Store::register_table`],
+//!   [`Store::recover`], and [`Store::checkpoint`]. Items behind the
+//!   feature carry an "Available on crate feature `persistence` only"
+//!   badge on docs.rs.
+//! - Bulk restores and deltas go through [`Store::bulk_load`] /
+//!   [`Store::bulk_load_batch`].
 //!
-//! Design documents for each subsystem live in
-//! [`docs/tasks/`](https://github.com/PeterKnego/ultima_db/tree/main/docs/tasks)
-//! in the repository.
+//! # Correctness
+//!
+//! The engine's correctness case — Elle consistency checking of MultiWriter
+//! histories, machine-checked proofs of the B-tree, the crash-recovery
+//! contract, and what each layer does and does not cover — is laid out in
+//! [How UltimaDB is verified](https://github.com/PeterKnego/ultima_db/blob/main/docs/explanation/how-ultimadb-is-verified.md).
+//!
+//! # Further reading
+//!
+//! Tutorials, how-to guides, reference pages, and design explanations live
+//! in the repository under
+//! [`docs/`](https://github.com/PeterKnego/ultima_db/blob/main/docs/README.md);
+//! the architecture is explained in
+//! [`docs/explanation/architecture.md`](https://github.com/PeterKnego/ultima_db/blob/main/docs/explanation/architecture.md).
+//!
+// Without the `persistence` feature the three `Store` methods linked above
+// do not exist, so the shortcut links would be reported as broken by
+// `rustdoc::broken_intra_doc_links`. Point them at the `persistence` module
+// page instead in that configuration; with the feature on, the shortcut
+// links resolve to the methods and these definitions are not needed. The
+// blank `//!` line above is load-bearing: a CommonMark link reference
+// definition cannot interrupt a paragraph.
+#![cfg_attr(not(feature = "persistence"), doc = "[`Store::register_table`]: persistence")]
+#![cfg_attr(not(feature = "persistence"), doc = "[`Store::recover`]: persistence")]
+#![cfg_attr(not(feature = "persistence"), doc = "[`Store::checkpoint`]: persistence")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #![warn(missing_docs)]
 
@@ -39,9 +93,10 @@ pub(crate) mod checkpoint;
 /// table, and transaction operations.
 pub mod error;
 /// BM25 full-text search over a table's records, gated by the `fulltext`
-/// cargo feature. See
-/// [the task43 design notes](https://github.com/PeterKnego/ultima_db/blob/main/docs/tasks/task43_unicode_tokenizer.md)
-/// for tokenization details.
+/// cargo feature. Tokenization is Unicode-aware (split on
+/// `!char::is_alphanumeric`, lowercased): CJK runs without spaces stay a
+/// single token, and NFC-normalized input is recommended. Usage is covered in
+/// [the indexes how-to](https://github.com/PeterKnego/ultima_db/blob/main/docs/how-to/query-with-indexes.md).
 #[cfg(feature = "fulltext")]
 pub mod fulltext;
 /// Secondary index infrastructure: unique, non-unique, and custom indexes
