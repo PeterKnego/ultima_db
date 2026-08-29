@@ -13,25 +13,6 @@ point-in-time reads are zero-copy and old versions stay alive for free.
 [how it is verified](docs/explanation/how-ultimadb-is-verified.md) ·
 [API docs](https://docs.rs/ultima-db)
 
-## Performance
-
-Durable YCSB on an AWS local-NVMe host (8 vCPU), every operation its own
-fsync-acknowledged transaction. UltimaDB is fastest on all six workloads —
-1.8–5.4× ahead of the best of RocksDB, Fjall, and ReDB:
-
-| Workload | UltimaDB | vs. fastest competitor |
-|---|--:|--:|
-| Read-only | 5.81M ops/s | 4.2× |
-| Read-mostly (95/5) | 397k ops/s | 2.0× |
-| Read-latest | 386k ops/s | 2.2× |
-| Update-heavy (50/50) | 42.4k ops/s | 1.8× |
-| Read-modify-write | 42.0k ops/s | 1.8× |
-
-Single-host criterion medians from our benchmark — absolute numbers vary by
-machine; compare ratios, not raw values. Full results (both durability
-tiers, all four engines, ms and ops/sec, methodology):
-[docs/benchmarks/competitor-nvme-2026-07-13.md](docs/benchmarks/competitor-nvme-2026-07-13.md).
-
 ## Highlights
 
 - **MVCC snapshots** — `begin_read(None)` pins the latest snapshot;
@@ -62,6 +43,33 @@ tiers, all four engines, ms and ops/sec, methodology):
   MVCC-consistent restores.
 - **Fast batch writes** — auto-increment batches take an O(batch + height)
   bulk-append path; full restores build trees O(N) via `Store::bulk_load`.
+
+## Performance
+
+Durable YCSB on an AWS local-NVMe host (8 vCPU): a 10,000-record working
+set, every operation its own fsync-acknowledged transaction. UltimaDB is
+fastest on all six workloads, 1.8–5.4× ahead of the best of RocksDB, Fjall,
+and ReDB:
+
+| Workload | UltimaDB | vs. fastest competitor |
+|---|--:|--:|
+| Read-only | 5.81M ops/s | 4.2× |
+| Read-mostly (95/5) | 397k ops/s | 2.0× |
+| Read-latest | 386k ops/s | 2.2× |
+| Short range scans | 336k ops/s | 5.4× |
+| Update-heavy (50/50) | 42.4k ops/s | 1.8× |
+| Read-modify-write | 42.0k ops/s | 1.8× |
+
+This is a deliberately narrow comparison, and the numbers only mean
+something inside it: working sets that fit in RAM, small transactions,
+one fsync per commit. RocksDB's LSM design is paying for larger-than-memory
+data and compaction-managed write amplification — capabilities UltimaDB
+doesn't offer. If your data outgrows memory, this is the wrong engine and
+the wrong benchmark. Relax durability to the engines' default no-fsync
+paths and Fjall leads the write-heavy mixes; those rows are in the full
+results too. Single-host criterion medians — compare ratios, not absolute
+values: [docs/benchmarks/competitor-nvme-2026-07-13.md](docs/benchmarks/competitor-nvme-2026-07-13.md)
+and [reading our benchmark numbers](docs/explanation/reading-our-benchmarks.md).
 
 ## Correctness & verification
 
