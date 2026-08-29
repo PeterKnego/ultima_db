@@ -18,15 +18,20 @@ point-in-time reads are zero-copy and old versions stay alive for free.
 - **MVCC snapshots** — `begin_read(None)` pins the latest snapshot;
   `begin_read(Some(v))` time-travels. Readers never block writers and vice
   versa.
-- **Typed tables** — `Table<R>` with auto-incrementing ids, secondary
-  indexes (unique, non-unique, and user-defined `CustomIndex`
-  implementations such as the built-in BM25 full-text index), and atomic
-  batch operations.
+- **Typed tables** — `Table<R>` with auto-incrementing ids, unique and
+  non-unique secondary indexes, and atomic batch operations.
 - **Arbitrary primary keys** — `Table<R, K = u64>`: key a table by
   `String`, `Vec<u8>`, any integer width, or a tuple, via
   `open_table_keyed::<R, K>`, instead of stashing the natural key in a
   unique index beside a surrogate id. Key encoding is order-preserving, so
   range scans, bulk loads and WAL replay all see the same order.
+- **Pluggable indexes** — `CustomIndex` is a public trait, not an internal
+  one. Implement it and the store maintains your index transactionally,
+  inside the same MVCC snapshot as the rows it indexes, so there is no
+  second system to keep consistent and no separate crash-recovery story.
+  The built-in [BM25 full-text index](docs/how-to/query-with-indexes.md#full-text-search) is one example implementation.
+  For more see the
+  [custom-index how-to](docs/how-to/query-with-indexes.md#custom-indexes).
 - **Concurrent writers** — opt-in `MultiWriter` mode with key-level
   optimistic concurrency control: writers conflict only when they touch the
   same rows of the same table. Serializable snapshot isolation (write-skew
@@ -38,9 +43,9 @@ point-in-time reads are zero-copy and old versions stay alive for free.
 - **Bulk loads & snapshot streaming** — O(N) sorted rebuilds for restores
   and deltas, multi-table atomic installs, and a streaming wire format for
   replication.
-- **Vector search** (`ultima-vector`) — HNSW with SIMD-accelerated distance
+- **Vector search** (`ultima-vector`) — [HNSW vector index](docs/explanation/vector-search.md#riding-on-mvcc) with SIMD-accelerated distance
   kernels (AVX-512/AVX2/NEON via runtime dispatch), metadata filtering, and
-  MVCC-consistent restores.
+  MVCC-consistent restores. 
 - **Fast batch writes** — auto-increment batches take an O(batch + height)
   bulk-append path; full restores build trees O(N) via `Store::bulk_load`.
 
