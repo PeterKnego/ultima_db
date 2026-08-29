@@ -6,6 +6,17 @@ publish = false
 description = "Competitor baseline benchmarks (RocksDB, Fjall, ReDB) — opt-in tier"
 license = "Apache-2.0"
 
+# Optional regular deps (dev-dependencies cannot be optional); only benches use them.
+[dependencies]
+# turbokv pulls in gxhash, which refuses to compile without `+aes,+sse2`
+# target features — so it is opt-in (`--features turbokv`) and its bench
+# target is built with RUSTFLAGS set; see `make bench/ycsb/turbokv`.
+turbokv = { version = "0.6.0", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[features]
+turbokv = ["dep:turbokv", "dep:tokio"]
+
 [dev-dependencies]
 ultima-db = { path = "..", features = ["persistence"] }
 ultima-bench-workloads = { path = "../bench_workloads" }
@@ -29,6 +40,11 @@ harness = false
 [[bench]]
 name = "ycsb_redb_bench"
 harness = false
+
+[[bench]]
+name = "ycsb_turbokv_bench"
+harness = false
+required-features = ["turbokv"]
 
 [[bench]]
 name = "ycsb_multiwriter_rocksdb_bench"

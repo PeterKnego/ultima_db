@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration test/lifecycle-races test/wal-faults lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
+.PHONY: build test test/unit test/integration test/lifecycle-races test/wal-faults lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/turbokv bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
 
 build:
 	cargo build
@@ -452,6 +452,15 @@ bench/ycsb/rocksdb:
 
 bench/ycsb/redb:
 	cargo bench -p compare-benches --bench ycsb_redb_bench
+
+# turbokv (opt-in feature): its gxhash dep refuses to build without +aes,+sse2,
+# so the bench gets its own RUSTFLAGS and a separate target dir (a RUSTFLAGS
+# change would otherwise invalidate the shared build cache). Tiers follow
+# ULTIMA_BENCH_DURABILITY like the others (durable()/paranoid()); set
+# ULTIMA_BENCH_TURBOKV_NOWAL=1 for the no-WAL fast() arm (non-durable tier only).
+bench/ycsb/turbokv:
+	RUSTFLAGS="-C target-feature=+aes,+sse2" CARGO_TARGET_DIR=$(CURDIR)/target/turbokv \
+	  cargo bench -p compare-benches --features turbokv --bench ycsb_turbokv_bench
 
 # Run all YCSB suites across both durability tiers (non-durable + strict) with
 # named baselines and compare side-by-side per tier.
