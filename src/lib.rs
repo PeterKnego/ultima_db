@@ -87,6 +87,7 @@
 /// original via `Arc`, so old versions stay alive at O(1) clone cost.
 pub mod btree;
 pub mod bulk_load;
+mod child;
 #[cfg(feature = "persistence")]
 pub(crate) mod checkpoint;
 /// Crate-wide [`Error`] and [`Result`] types returned by fallible store,

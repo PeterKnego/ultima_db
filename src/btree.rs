@@ -46,7 +46,7 @@ const MAX_KEYS: usize = 2 * T - 1;
 /// separate scratch buffer) inserts one element before checking for
 /// overflow, so it transiently holds `MAX_KEYS + 1` entries / `MAX_KEYS + 2`
 /// children. Everywhere else `len` stays within the steady-state max.
-struct FixedVec<E, const N: usize> {
+pub(crate) struct FixedVec<E, const N: usize> {
     items: [Option<E>; N],
     len: u8,
 }
@@ -66,7 +66,7 @@ impl<E, const N: usize> FixedVec<E, N> {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len as usize
     }
 
@@ -82,7 +82,7 @@ impl<E, const N: usize> FixedVec<E, N> {
         }
     }
 
-    fn push(&mut self, item: E) {
+    pub(crate) fn push(&mut self, item: E) {
         let i = self.len as usize;
         debug_assert!(i < N, "FixedVec::push: at capacity");
         self.items[i] = Some(item);
@@ -191,6 +191,15 @@ impl<E: Clone, const N: usize> Clone for FixedVec<E, N> {
     }
 }
 
+// An empty `FixedVec` — no bound on `E` needed, `new()` never touches an
+// element. Lets a leaf `BTreeNode` be built with `children: Default::default()`
+// without spelling out the capacity const generic.
+impl<E, const N: usize> Default for FixedVec<E, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<E, const N: usize> std::ops::Index<usize> for FixedVec<E, N> {
     type Output = E;
     fn index(&self, idx: usize) -> &E {
@@ -225,21 +234,21 @@ impl<E, const N: usize> IntoIterator for FixedVec<E, N> {
 /// `BTreeNode::entries` field type. Capacity `MAX_KEYS + 1` — see the
 /// `FixedVec` doc comment above for the transient-overflow headroom
 /// rationale.
-type Entries<K, V> = FixedVec<(K, Arc<V>), { MAX_KEYS + 1 }>;
+pub(crate) type Entries<K, V> = FixedVec<(K, Arc<V>), { MAX_KEYS + 1 }>;
 /// `BTreeNode::children` field type. Capacity `MAX_KEYS + 2`: one more than
 /// `Entries`'s capacity, mirroring the steady-state invariant that an
 /// internal node always carries one more child than entries.
-type Children<K, V> = FixedVec<Arc<BTreeNode<K, V>>, { MAX_KEYS + 2 }>;
+pub(crate) type Children<K, V> = FixedVec<Arc<BTreeNode<K, V>>, { MAX_KEYS + 2 }>;
 
 // ---------------------------------------------------------------------------
 // Internal node type
 // ---------------------------------------------------------------------------
 
-struct BTreeNode<K, V> {
+pub(crate) struct BTreeNode<K, V> {
     /// Key-value pairs stored in sorted order, inline (no heap Vec).
-    entries: Entries<K, V>,
+    pub(crate) entries: Entries<K, V>,
     /// Children; empty for leaf nodes, len == entries.len() + 1 for internal nodes.
-    children: Children<K, V>,
+    pub(crate) children: Children<K, V>,
 }
 
 // Manual `Clone` bounded on `K: Clone` only. A `#[derive(Clone)]` would add a
