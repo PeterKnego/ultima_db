@@ -448,7 +448,7 @@ Apply, in order, each keeping the file compiling before the next:
 
 1. `type Children<K, V> = FixedVec<Child<K, V>, { MAX_KEYS + 2 }>;` and `use crate::child::{Child, NodeSource, PageId, NO_PAGE};`.
 2. `BTree { root: Child<K, V>, len, source: Option<Arc<dyn NodeSource<K, V>>> }`. `BTree::new()` → `root: Child::resident(Arc::new(BTreeNode{..}))`, `source: None`. `Clone for BTree` clones all three (`Arc` clone for source). Add `source()`/`set_source()`.
-3. Every `Arc::make_mut(&mut x)` where `x: &mut Arc<BTreeNode>` becomes `x.make_mut(src)`; every `&node.children[i]` passed to a recursive fn becomes `node.children[i].load(src)` (read paths) or `&mut node.children[i]` (write paths, which then call `.make_mut(src)` inside). Sites: `get_in_node`, `get_arc_in_node`, `insert_into_node` (immutable path builds new `Arc`s → wrap in `Child::resident`), `insert_into_node_mut` (`:1283`), `maybe_split_mut` (`right` → `Child::resident(right)` at the insertion site), `delete_from_node`/`delete_from_node_mut` (`:1586`), `remove_leftmost*`, `fix_underfull_child`, `rotate_left/right` (`:1486,1510`: `left_part[idx-1].make_mut(src)`), `merge_with_left/right`, `absorb(left, right: Child)` → `let right = right.load_arc(src); ... Arc::try_unwrap(right).unwrap_or_else(|a| (*a).clone())`, `freeze_leaf`/`freeze_internal` (`:2071`: return `Child::resident(Arc::new(..))`), `fix_right_spine_tail`, `LevelBuilder.children: Vec<Child<K,V>>`.
+3. Every `Arc::make_mut(&mut x)` where `x: &mut Arc<BTreeNode>` becomes `x.make_mut(src)`; every `&node.children[i]` passed to a recursive fn becomes `node.children[i].load(src)` (read paths) or `&mut node.children[i]` (write paths, which then call `.make_mut(src)` inside). Sites: `get_in_node`, `get_arc_in_node`, `insert_into_node` (immutable path builds new `Arc`s → wrap in `Child::resident`), `insert_into_node_mut` (`:1283`), `maybe_split_mut` (`right` → `Child::resident(right)` at the insertion site), `delete_from_node`/`delete_from_node_mut` (`:1586`), `remove_leftmost*`, `fix_underfull_child`, `rotate_left/right` (`:1486,1510`: `left_part[idx-1].make_mut(src)`), `merge_with_left/right`, `absorb(left, right: Child)` → `let arc = right.load_arc(src); drop(right); /* release the slot's own count first, or try_unwrap can never succeed */ let rn = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());`, `freeze_leaf`/`freeze_internal` (`:2071`: return `Child::resident(Arc::new(..))`), `fix_right_spine_tail`, `LevelBuilder.children: Vec<Child<K,V>>`.
 4. `BTreeRange::descend_*` take `&'a Child<K, V>` and call `.load(src)` — `BTreeRange` gains `src: Option<&'a dyn NodeSource<K, V>>`.
 5. `DiffCursor` stack holds `&'a Child<K, V>`; `Arc::ptr_eq(a, b)` → `Child::same_node(a, b)`; value identity `Arc::ptr_eq(nv, bv)` unchanged (values are still `Arc<V>`).
 6. `BTree::diff` short-circuit `Arc::ptr_eq(&self.root, &base.root)` → `Child::same_node(&self.root, &base.root)`.
@@ -956,6 +956,8 @@ impl TryFrom<u8> for PageKind { type Error = Error; fn try_from(b: u8) -> Result
 
 pub(crate) const PAGE_HEADER_LEN: usize = 12;
 pub(crate) const PAGE_FMT_V1: u8 = 1;
+/// Keys are capped at 64 KiB; a single node beyond this is a corruption signal, not a workload.
+pub(crate) const MAX_PAGE_BYTES: usize = 64 << 20;
 
 struct WriteHead { cursor: u64, capacity: u64 }
 pub(crate) struct PageFile { file: File, w: Mutex<WriteHead>, chunk: u64, prefetch: usize }
@@ -1004,7 +1006,13 @@ impl PageFile {
         let plen = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         let total = PAGE_HEADER_LEN + plen;
-        if total > buf.len() { buf.resize(total, 0); read_fully_at(&self.file, &mut buf[got..total], id + got as u64)?; }
+        // Bound BEFORE allocating: a bit-flipped payload_len can decode to ~4 GiB and
+        // `Vec::resize` would abort the process instead of returning an error.
+        if plen > MAX_PAGE_BYTES || id + total as u64 > self.w.lock().capacity {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: payload_len {plen} exceeds limits")));
+        }
+        if total > buf.len() { buf.resize(total, 0); let more = read_fully_at(&self.file, &mut buf[got..total], id + got as u64)?; if got + more < total { return Err(Error::CheckpointCorrupted(format!("page {id}: short payload"))); } }
+        else if got < total { return Err(Error::CheckpointCorrupted(format!("page {id}: short payload"))); }
         let payload = buf[PAGE_HEADER_LEN..total].to_vec();
         let mut h = crc32fast::Hasher::new(); h.update(&buf[..8]); h.update(&payload);
         if h.finalize() != crc { return Err(Error::CheckpointCorrupted(format!("page {id}: crc mismatch"))); }
