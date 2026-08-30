@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
+use crate::child::{Child, NodeSource};
 use crate::{Error, Result};
 
 // Minimum degree: every non-root node has at least T-1 keys, at most 2T-1 keys.
@@ -237,8 +238,11 @@ impl<E, const N: usize> IntoIterator for FixedVec<E, N> {
 pub(crate) type Entries<K, V> = FixedVec<(K, Arc<V>), { MAX_KEYS + 1 }>;
 /// `BTreeNode::children` field type. Capacity `MAX_KEYS + 2`: one more than
 /// `Entries`'s capacity, mirroring the steady-state invariant that an
-/// internal node always carries one more child than entries.
-pub(crate) type Children<K, V> = FixedVec<Arc<BTreeNode<K, V>>, { MAX_KEYS + 2 }>;
+/// internal node always carries one more child than entries. Holds `Child`
+/// slots rather than `Arc<BTreeNode>` directly, so a node can be cloned
+/// (siblings included) without touching — or even loading — every child;
+/// see `src/child.rs`.
+pub(crate) type Children<K, V> = FixedVec<Child<K, V>, { MAX_KEYS + 2 }>;
 
 // ---------------------------------------------------------------------------
 // Internal node type
@@ -279,8 +283,15 @@ impl<K: Clone, V> Clone for BTreeNode<K, V> {
 /// with the original via `Arc`. `Clone` is O(1).  No `V: Clone` bound is
 /// required.
 pub struct BTree<K, V> {
-    root: Arc<BTreeNode<K, V>>,
+    root: Child<K, V>,
     len: usize,
+    /// Where an on-disk `Child` slot in this tree faults its node in from.
+    /// `None` for every tree built so far — nothing here ever creates an
+    /// `on_disk` slot, so nothing ever needs to fault one in. Paging lands
+    /// in a later task; this field (and `source()`/`set_source()` below)
+    /// exists now so descent/mutation can thread it through unconditionally
+    /// rather than needing a follow-up signature change everywhere.
+    source: Option<Arc<dyn NodeSource<K, V>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,11 +299,11 @@ pub struct BTree<K, V> {
 // ---------------------------------------------------------------------------
 
 enum InsertResult<K, V> {
-    Fit(Arc<BTreeNode<K, V>>, bool),
+    Fit(Child<K, V>, bool),
     Split {
-        left: Arc<BTreeNode<K, V>>,
+        left: Child<K, V>,
         median: (K, Arc<V>),
-        right: Arc<BTreeNode<K, V>>,
+        right: Child<K, V>,
         replaced: bool,
     },
 }
@@ -300,13 +311,13 @@ enum InsertResult<K, V> {
 enum DeleteResult<K, V> {
     NotFound,
     Removed {
-        node: Arc<BTreeNode<K, V>>,
+        node: Child<K, V>,
         underfull: bool,
     },
 }
 
 /// Outcome of an in-place delete into a node (see `delete_from_node_mut`).
-/// The mutated node flows back through the `&mut Arc<BTreeNode>` the caller
+/// The mutated node flows back through the `&mut Child<K, V>` the caller
 /// passed; only the found/underfull flags propagate up.
 enum DeleteOutcome {
     NotFound,
@@ -321,12 +332,33 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Creates a new, empty B-tree.
     pub fn new() -> Self {
         BTree {
-            root: Arc::new(BTreeNode {
+            root: Child::resident(Arc::new(BTreeNode {
                 entries: Entries::new(),
                 children: Children::new(),
-            }),
+            })),
             len: 0,
+            source: None,
         }
+    }
+
+    /// The tree's page source, if one is attached — `None` means every
+    /// `Child` slot in the tree is resident (the only state this task
+    /// produces). Exposed so the recursive descent/mutation helpers can be
+    /// handed `src` without the tree storing it on their behalf.
+    // No production caller yet: this task's internals read `self.source`
+    // directly (it's a private field of the same struct) rather than through
+    // this accessor. A later task's page-store wiring is the intended
+    // external caller; kept now so that wiring is a pure addition.
+    #[allow(dead_code)]
+    pub(crate) fn source(&self) -> Option<&dyn NodeSource<K, V>> {
+        self.source.as_deref()
+    }
+
+    /// Attach (or clear, via `None`) the tree's page source.
+    // No production caller yet — see `source()` above.
+    #[allow(dead_code)]
+    pub(crate) fn set_source(&mut self, s: Option<Arc<dyn NodeSource<K, V>>>) {
+        self.source = s;
     }
 
     /// Build a B-tree from a strictly-ascending iterator of `(K, Arc<V>)`
@@ -379,22 +411,25 @@ impl<K: Ord + Clone, V> BTree<K, V> {
 
     /// Look up a key. Returns a reference tied to the lifetime of `&self`.
     pub fn get(&self, key: &K) -> Option<&V> {
-        get_in_node(&self.root, key)
+        let src = self.source.as_deref();
+        get_in_node(self.root.load(src), key, src)
     }
 
     /// Look up a key and return a shared handle to the value.
     pub fn get_arc(&self, key: &K) -> Option<Arc<V>> {
-        get_arc_in_node(&self.root, key)
+        let src = self.source.as_deref();
+        get_arc_in_node(self.root.load(src), key, src)
     }
 
     /// The largest key in the tree (rightmost leaf's last entry), or `None`
     /// if empty. O(height); used by `Table::insert_batch` to verify the
     /// append invariant before taking the bulk fast path.
     pub(crate) fn max_key(&self) -> Option<&K> {
-        let mut node = &self.root;
+        let src = self.source.as_deref();
+        let mut node = self.root.load(src);
         loop {
             match node.children.last() {
-                Some(c) => node = c,
+                Some(c) => node = c.load(src),
                 None => return node.entries.last().map(|(k, _)| k),
             }
         }
@@ -411,12 +446,13 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// to carry records from one snapshot into another without forcing
     /// `V: Clone`.
     pub fn insert_arc(&self, key: K, val_arc: Arc<V>) -> BTree<K, V> {
-        match insert_into_node(&self.root, key, val_arc) {
+        match insert_into_node(&self.root, key, val_arc, self.source.as_deref()) {
             InsertResult::Fit(new_root, replaced) => {
                 let new_len = if replaced { self.len } else { self.len + 1 };
                 BTree {
                     root: new_root,
                     len: new_len,
+                    source: self.source.clone(),
                 }
             }
             InsertResult::Split {
@@ -431,10 +467,11 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 let mut children = Children::new();
                 children.push(left);
                 children.push(right);
-                let new_root = Arc::new(BTreeNode { entries, children });
+                let new_root = Child::resident(Arc::new(BTreeNode { entries, children }));
                 BTree {
                     root: new_root,
                     len: new_len,
+                    source: self.source.clone(),
                 }
             }
         }
@@ -448,7 +485,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// The immutable `insert` allocates a fresh `Arc<BTreeNode>` for every node
     /// on the root→leaf path on *every* call, because it cannot know whether any
     /// node is shared with another snapshot. `insert_mut` descends with
-    /// [`Arc::make_mut`], which clones a node **only** when it is actually shared
+    /// `Child::make_mut`, which clones a node **only** when it is actually shared
     /// (`strong_count > 1`) and otherwise mutates it in place. Copy-on-write, and
     /// therefore snapshot isolation, is preserved exactly: a node still visible to
     /// an older snapshot is cloned before mutation; a node uniquely owned by this
@@ -464,7 +501,8 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// In-place variant of [`insert_arc`](Self::insert_arc), reusing an existing
     /// `Arc<V>`. See [`insert_mut`](Self::insert_mut) for the rationale.
     pub fn insert_arc_mut(&mut self, key: K, val_arc: Arc<V>) {
-        match insert_into_node_mut(&mut self.root, key, val_arc) {
+        let src = self.source.as_deref();
+        match insert_into_node_mut(&mut self.root, key, val_arc, src) {
             InsertOutcome::Fit { replaced } => {
                 if !replaced {
                     self.len += 1;
@@ -482,17 +520,17 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 // Lift it under a fresh root alongside the promoted median.
                 let left = std::mem::replace(
                     &mut self.root,
-                    Arc::new(BTreeNode {
+                    Child::resident(Arc::new(BTreeNode {
                         entries: Entries::new(),
                         children: Children::new(),
-                    }),
+                    })),
                 );
                 let mut entries = Entries::new();
                 entries.push(median);
                 let mut children = Children::new();
                 children.push(left);
                 children.push(right);
-                self.root = Arc::new(BTreeNode { entries, children });
+                self.root = Child::resident(Arc::new(BTreeNode { entries, children }));
             }
         }
     }
@@ -500,19 +538,22 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Remove a key. Returns a new tree, or `Err(KeyNotFound)` if the key is
     /// absent. `self` is unchanged.
     pub fn remove(&self, key: &K) -> Result<BTree<K, V>> {
-        match delete_from_node(&self.root, key) {
+        let src = self.source.as_deref();
+        match delete_from_node(&self.root, key, src) {
             DeleteResult::NotFound => Err(Error::KeyNotFound),
             DeleteResult::Removed { node: new_root, .. } => {
                 // If the root is now an internal node with no entries but one
                 // child, collapse the tree height by one.
-                let actual_root = if new_root.entries.is_empty() && !new_root.children.is_empty() {
-                    Arc::clone(&new_root.children[0])
+                let new_root_node = new_root.load(src);
+                let actual_root = if new_root_node.entries.is_empty() && !new_root_node.children.is_empty() {
+                    new_root_node.children[0].clone()
                 } else {
                     new_root
                 };
                 Ok(BTree {
                     root: actual_root,
                     len: self.len - 1,
+                    source: self.source.clone(),
                 })
             }
         }
@@ -524,18 +565,17 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// snapshot never observes the deletion. See [`insert_mut`](Self::insert_mut)
     /// for the rationale.
     pub fn remove_mut(&mut self, key: &K) -> bool {
-        match delete_from_node_mut(&mut self.root, key) {
+        let src = self.source.as_deref();
+        match delete_from_node_mut(&mut self.root, key, src) {
             DeleteOutcome::NotFound => false,
             DeleteOutcome::Removed { .. } => {
                 self.len -= 1;
                 // Root collapse: an internal root left with no entries and one
                 // child drops a level. Move that child up (no clone).
-                if self.root.entries.is_empty() && !self.root.children.is_empty() {
-                    let child = {
-                        let root = Arc::make_mut(&mut self.root);
-                        root.children.remove(0)
-                    };
-                    self.root = child;
+                let root = self.root.make_mut(src);
+                if root.entries.is_empty() && !root.children.is_empty() {
+                    let only = root.children.remove(0);
+                    self.root = only;
                 }
                 true
             }
@@ -562,26 +602,28 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// merge) but pointless.
     pub fn diff<'a>(&'a self, base: &'a BTree<K, V>) -> BTreeDiff<'a, K, V> {
         // Common no-op-checkpoint case: nothing changed since `base` at all,
-        // so the roots are still the same `Arc` (no CoW clone ever
+        // so the roots are still the same node (no CoW clone ever
         // happened). Short-circuit to empty cursors instead of walking up to
         // MAX_KEYS root entries just to find every one of them unchanged.
-        if Arc::ptr_eq(&self.root, &base.root) {
+        if Child::same_node(&self.root, &base.root) {
             return BTreeDiff {
                 new: DiffCursor {
                     stack: Vec::new(),
+                    src: self.source.as_deref(),
                     #[cfg(test)]
                     descends: 0,
                 },
                 base: DiffCursor {
                     stack: Vec::new(),
+                    src: base.source.as_deref(),
                     #[cfg(test)]
                     descends: 0,
                 },
             };
         }
         BTreeDiff {
-            new: DiffCursor::new(&self.root),
-            base: DiffCursor::new(&base.root),
+            new: DiffCursor::new(&self.root, self.source.as_deref()),
+            base: DiffCursor::new(&base.root, base.source.as_deref()),
         }
     }
 
@@ -619,6 +661,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             done: false,
             last_forward: None,
             last_backward: None,
+            src: self.source.as_deref(),
         };
         iter.descend_left_from(&self.root);
         iter.descend_right_from(&self.root);
@@ -644,11 +687,13 @@ impl<A: Ord + Clone + Sync, B: Ord + Clone, V> BTree<(A, B), V> {
 }
 
 impl<K, V> Clone for BTree<K, V> {
-    /// O(1): increments the root `Arc` reference count.
+    /// O(1): clones the root `Child` slot (an `Arc` bump if resident, a
+    /// page-id copy if not) and bumps the source `Arc`, if any.
     fn clone(&self) -> Self {
         BTree {
-            root: Arc::clone(&self.root),
+            root: self.root.clone(),
             len: self.len,
+            source: self.source.clone(),
         }
     }
 }
@@ -766,12 +811,15 @@ pub struct BTreeRange<'a, K, V> {
     last_forward: Option<&'a K>,
     /// Last key yielded by `next_back()` — used for overlap detection with `next()`.
     last_backward: Option<&'a K>,
+    /// The source tree's page source, threaded through every `Child::load`
+    /// this scan performs. `None` for every tree built so far.
+    src: Option<&'a dyn NodeSource<K, V>>,
 }
 
 impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     /// Push stack frames for the leftmost path that is not before the range.
-    fn descend_left_from(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
-        let n = node.as_ref();
+    fn descend_left_from(&mut self, node: &'a Child<K, V>) {
+        let n = node.load(self.src);
         let entry_start = {
             let locate = &self.locate;
             n.entries
@@ -784,8 +832,8 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     /// Push stack frames for the leftmost leaf of `node` (no range restriction).
-    fn descend_leftmost(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
-        let n = node.as_ref();
+    fn descend_leftmost(&mut self, node: &'a Child<K, V>) {
+        let n = node.load(self.src);
         self.stack.push((n, 0));
         if !n.children.is_empty() {
             self.descend_leftmost(&n.children[0]);
@@ -797,8 +845,8 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     /// Push back_stack frames for the rightmost path that is not past the range.
-    fn descend_right_from(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
-        let n = node.as_ref();
+    fn descend_right_from(&mut self, node: &'a Child<K, V>) {
+        let n = node.load(self.src);
         // `entry_end` = one past the last valid index for backward iteration.
         let entry_end = {
             let locate = &self.locate;
@@ -812,8 +860,8 @@ impl<'a, K: Ord + Clone, V> BTreeRange<'a, K, V> {
     }
 
     /// Push back_stack frames for the rightmost leaf of `node` (no range restriction).
-    fn descend_rightmost(&mut self, node: &'a Arc<BTreeNode<K, V>>) {
-        let n = node.as_ref();
+    fn descend_rightmost(&mut self, node: &'a Child<K, V>) {
+        let n = node.load(self.src);
         self.back_stack.push((n, n.entries.len()));
         if !n.children.is_empty() {
             self.descend_rightmost(n.children.last().unwrap());
@@ -943,28 +991,36 @@ impl<'a, K: Ord + Clone, V> DoubleEndedIterator for BTreeRange<'a, K, V> {
 // ---------------------------------------------------------------------------
 
 /// Recursively searches for a key in a node. Returns a reference to the value.
-fn get_in_node<'a, K: Ord, V>(node: &'a BTreeNode<K, V>, key: &K) -> Option<&'a V> {
+fn get_in_node<'a, K: Ord, V>(
+    node: &'a BTreeNode<K, V>,
+    key: &K,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> Option<&'a V> {
     match node.entries.binary_search_by(|(k, _)| k.cmp(key)) {
         Ok(pos) => Some(&*node.entries[pos].1),
         Err(pos) => {
             if node.children.is_empty() {
                 None
             } else {
-                get_in_node(&node.children[pos], key)
+                get_in_node(node.children[pos].load(src), key, src)
             }
         }
     }
 }
 
 /// Recursively searches for a key in a node. Returns a shared handle to the value.
-fn get_arc_in_node<K: Ord, V>(node: &BTreeNode<K, V>, key: &K) -> Option<Arc<V>> {
+fn get_arc_in_node<K: Ord, V>(
+    node: &BTreeNode<K, V>,
+    key: &K,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> Option<Arc<V>> {
     match node.entries.binary_search_by(|(k, _)| k.cmp(key)) {
         Ok(pos) => Some(Arc::clone(&node.entries[pos].1)),
         Err(pos) => {
             if node.children.is_empty() {
                 None
             } else {
-                get_arc_in_node(&node.children[pos], key)
+                get_arc_in_node(node.children[pos].load(src), key, src)
             }
         }
     }
@@ -972,10 +1028,12 @@ fn get_arc_in_node<K: Ord, V>(node: &BTreeNode<K, V>, key: &K) -> Option<Arc<V>>
 
 /// Recursively inserts a key-value pair into a node, potentially splitting it.
 fn insert_into_node<K: Ord + Clone, V>(
-    node: &Arc<BTreeNode<K, V>>,
+    node: &Child<K, V>,
     key: K,
     val: Arc<V>,
+    src: Option<&dyn NodeSource<K, V>>,
 ) -> InsertResult<K, V> {
+    let node = node.load(src);
     let mut entries = node.entries.clone();
 
     match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
@@ -983,7 +1041,7 @@ fn insert_into_node<K: Ord + Clone, V>(
             // Replace existing value.
             entries[pos] = (key, val);
             let children = node.children.clone();
-            InsertResult::Fit(Arc::new(BTreeNode { entries, children }), true)
+            InsertResult::Fit(Child::resident(Arc::new(BTreeNode { entries, children })), true)
         }
         Err(pos) => {
             if node.children.is_empty() {
@@ -993,10 +1051,10 @@ fn insert_into_node<K: Ord + Clone, V>(
             } else {
                 // Internal: recurse into child[pos], then merge the result.
                 let mut children = node.children.clone();
-                match insert_into_node(&children[pos], key, val) {
+                match insert_into_node(&children[pos], key, val, src) {
                     InsertResult::Fit(new_child, replaced) => {
                         children[pos] = new_child;
-                        InsertResult::Fit(Arc::new(BTreeNode { entries, children }), replaced)
+                        InsertResult::Fit(Child::resident(Arc::new(BTreeNode { entries, children })), replaced)
                     }
                     InsertResult::Split {
                         left,
@@ -1028,7 +1086,7 @@ fn maybe_split<K: Clone, V>(
     replaced: bool,
 ) -> InsertResult<K, V> {
     if entries.len() <= MAX_KEYS {
-        InsertResult::Fit(Arc::new(BTreeNode { entries, children }), replaced)
+        InsertResult::Fit(Child::resident(Arc::new(BTreeNode { entries, children })), replaced)
     } else {
         // entries.len() == MAX_KEYS + 1; split at mid.
         let mid = entries.len() / 2;
@@ -1042,15 +1100,15 @@ fn maybe_split<K: Clone, V>(
         };
 
         InsertResult::Split {
-            left: Arc::new(BTreeNode {
+            left: Child::resident(Arc::new(BTreeNode {
                 entries,
                 children,
-            }),
+            })),
             median,
-            right: Arc::new(BTreeNode {
+            right: Child::resident(Arc::new(BTreeNode {
                 entries: right_entries,
                 children: right_children,
-            }),
+            })),
             replaced,
         }
     }
@@ -1079,17 +1137,20 @@ pub enum Change<'a, K, V> {
 
 /// In-order cursor over a `BTree` that exposes *subtree* boundaries.
 ///
-/// `BTreeRange` stores `&BTreeNode` frames, which cannot be compared with
-/// `Arc::ptr_eq`; the diff needs the `Arc` itself to detect shared subtrees,
-/// so it gets its own cursor.
+/// `BTreeRange` stores `&BTreeNode` frames, which cannot be compared for
+/// shared identity; the diff needs the `Child` slot itself (via
+/// `Child::same_node`) to detect shared subtrees, so it gets its own cursor.
 ///
 /// A frame's `slot` interleaves children and entries in traversal order:
 /// even `slot` means "child `slot / 2` has not been descended into yet",
 /// odd `slot` means "entry `slot / 2` is the next entry to yield".
 struct DiffCursor<'a, K, V> {
-    stack: Vec<(&'a Arc<BTreeNode<K, V>>, usize)>,
+    stack: Vec<(&'a Child<K, V>, usize)>,
+    /// The tree's page source, threaded through every `Child::load` this
+    /// cursor performs. `None` for every tree built so far.
+    src: Option<&'a dyn NodeSource<K, V>>,
     /// Subtrees this cursor has entered via `descend`. Test-only: it is the
-    /// load-bearing counter for proving the `Arc::ptr_eq` skip in
+    /// load-bearing counter for proving the `Child::same_node` skip in
     /// `BTreeDiff::next` actually fires, rather than just producing correct
     /// output while silently walking every node.
     #[cfg(test)]
@@ -1097,9 +1158,10 @@ struct DiffCursor<'a, K, V> {
 }
 
 impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
-    fn new(root: &'a Arc<BTreeNode<K, V>>) -> Self {
+    fn new(root: &'a Child<K, V>, src: Option<&'a dyn NodeSource<K, V>>) -> Self {
         DiffCursor {
             stack: vec![(root, 0)],
+            src,
             #[cfg(test)]
             descends: 0,
         }
@@ -1110,8 +1172,9 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
     /// `None` for a leaf frame or when the next step is an entry rather than
     /// a child — that is the signal the diff loop uses to fall back to a
     /// key-wise comparison.
-    fn peek_child(&self) -> Option<&'a Arc<BTreeNode<K, V>>> {
+    fn peek_child(&self) -> Option<&'a Child<K, V>> {
         let (node, slot) = *self.stack.last()?;
+        let node = node.load(self.src);
         if node.children.is_empty() || slot % 2 == 1 {
             return None;
         }
@@ -1165,6 +1228,7 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
     fn peek_entry(&mut self) -> Option<(&'a K, &'a Arc<V>)> {
         loop {
             let (node, slot) = *self.stack.last()?;
+            let node = node.load(self.src);
             if node.children.is_empty() {
                 // Leaf: slots are entries directly, no interleaving.
                 if slot < node.entries.len() {
@@ -1216,7 +1280,7 @@ impl<'a, K: Ord + Clone, V> Iterator for BTreeDiff<'a, K, V> {
             // so neither side needs to walk it. This is where the O(changed)
             // behaviour comes from; correctness never depends on it firing.
             match (self.new.peek_child(), self.base.peek_child()) {
-                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {
+                (Some(a), Some(b)) if Child::same_node(a, b) => {
                     self.new.skip_child();
                     self.base.skip_child();
                     continue;
@@ -1272,7 +1336,7 @@ impl<K: Ord + Clone, V> BTreeDiff<'_, K, V> {
 /// Outcome of an in-place insert into a node (see `insert_into_node_mut`).
 ///
 /// Unlike `InsertResult`, this does not carry the mutated node — the node is
-/// updated in place through the `&mut Arc<BTreeNode>` the caller passed. Only the
+/// updated in place through the `&mut Child<K, V>` the caller passed. Only the
 /// promoted median + new right sibling (on split) and the replace/insert flag
 /// need to flow back up.
 enum InsertOutcome<K, V> {
@@ -1281,21 +1345,22 @@ enum InsertOutcome<K, V> {
     },
     Split {
         median: (K, Arc<V>),
-        right: Arc<BTreeNode<K, V>>,
+        right: Child<K, V>,
         replaced: bool,
     },
 }
 
 /// In-place counterpart to `insert_into_node`. Descends through
-/// `Arc::make_mut`, so each node is cloned only if it is still shared with
+/// `Child::make_mut`, so each node is cloned only if it is still shared with
 /// another snapshot (copy-on-write preserved) and otherwise mutated directly.
 fn insert_into_node_mut<K: Ord + Clone, V>(
-    node: &mut Arc<BTreeNode<K, V>>,
+    node: &mut Child<K, V>,
     key: K,
     val: Arc<V>,
+    src: Option<&dyn NodeSource<K, V>>,
 ) -> InsertOutcome<K, V> {
     // The one place CoW happens on this path: clones iff `node` is shared.
-    let n = Arc::make_mut(node);
+    let n = node.make_mut(src);
 
     match n.entries.binary_search_by(|(k, _)| k.cmp(&key)) {
         Ok(pos) => {
@@ -1311,13 +1376,13 @@ fn insert_into_node_mut<K: Ord + Clone, V>(
                     None => InsertOutcome::Fit { replaced: false },
                     Some((median, right)) => InsertOutcome::Split {
                         median,
-                        right,
+                        right: Child::resident(right),
                         replaced: false,
                     },
                 }
             } else {
                 // Internal: recurse into child[pos], then absorb the result.
-                match insert_into_node_mut(&mut n.children[pos], key, val) {
+                match insert_into_node_mut(&mut n.children[pos], key, val, src) {
                     InsertOutcome::Fit { replaced } => InsertOutcome::Fit { replaced },
                     InsertOutcome::Split {
                         median,
@@ -1330,7 +1395,7 @@ fn insert_into_node_mut<K: Ord + Clone, V>(
                             None => InsertOutcome::Fit { replaced },
                             Some((median, right)) => InsertOutcome::Split {
                                 median,
-                                right,
+                                right: Child::resident(right),
                                 replaced,
                             },
                         }
@@ -1372,7 +1437,12 @@ fn maybe_split_mut<K: Clone, V>(
 }
 
 /// Recursively deletes a key from a node, potentially triggering rebalancing.
-fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> DeleteResult<K, V> {
+fn delete_from_node<K: Ord + Clone, V>(
+    node: &Child<K, V>,
+    key: &K,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> DeleteResult<K, V> {
+    let node = node.load(src);
     let pos = node.entries.binary_search_by(|(k, _)| k.cmp(key));
 
     if node.children.is_empty() {
@@ -1384,10 +1454,10 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
                 entries.remove(i);
                 let underfull = entries.len() < MIN_KEYS;
                 DeleteResult::Removed {
-                    node: Arc::new(BTreeNode {
+                    node: Child::resident(Arc::new(BTreeNode {
                         entries,
                         children: Children::new(),
-                    }),
+                    })),
                     underfull,
                 }
             }
@@ -1398,23 +1468,23 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
             Ok(i) => {
                 // Key is in this node: replace it with its in-order successor
                 // (leftmost entry of children[i+1]) and delete that successor.
-                let (succ, new_right, right_underfull) = remove_leftmost(&node.children[i + 1]);
+                let (succ, new_right, right_underfull) = remove_leftmost(&node.children[i + 1], src);
                 let mut entries = node.entries.clone();
                 let mut children = node.children.clone();
                 entries[i] = succ;
                 children[i + 1] = new_right;
                 if right_underfull {
-                    fix_underfull_child(&mut entries, &mut children, i + 1);
+                    fix_underfull_child(&mut entries, &mut children, i + 1, src);
                 }
                 let underfull = entries.len() < MIN_KEYS;
                 DeleteResult::Removed {
-                    node: Arc::new(BTreeNode { entries, children }),
+                    node: Child::resident(Arc::new(BTreeNode { entries, children })),
                     underfull,
                 }
             }
             Err(child_idx) => {
                 // Key is in a subtree.
-                match delete_from_node(&node.children[child_idx], key) {
+                match delete_from_node(&node.children[child_idx], key, src) {
                     DeleteResult::NotFound => DeleteResult::NotFound,
                     DeleteResult::Removed {
                         node: new_child,
@@ -1424,11 +1494,11 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
                         let mut children = node.children.clone();
                         children[child_idx] = new_child;
                         if underfull {
-                            fix_underfull_child(&mut entries, &mut children, child_idx);
+                            fix_underfull_child(&mut entries, &mut children, child_idx, src);
                         }
                         let node_underfull = entries.len() < MIN_KEYS;
                         DeleteResult::Removed {
-                            node: Arc::new(BTreeNode { entries, children }),
+                            node: Child::resident(Arc::new(BTreeNode { entries, children })),
                             underfull: node_underfull,
                         }
                     }
@@ -1442,30 +1512,32 @@ fn delete_from_node<K: Ord + Clone, V>(node: &Arc<BTreeNode<K, V>>, key: &K) -> 
 /// Returns `(entry, new_root, is_underfull)`.
 #[allow(clippy::type_complexity)]
 fn remove_leftmost<K: Ord + Clone, V>(
-    node: &Arc<BTreeNode<K, V>>,
-) -> ((K, Arc<V>), Arc<BTreeNode<K, V>>, bool) {
+    node: &Child<K, V>,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> ((K, Arc<V>), Child<K, V>, bool) {
+    let node = node.load(src);
     if node.children.is_empty() {
         let mut entries = node.entries.clone();
         let first = entries.remove(0);
         let underfull = entries.len() < MIN_KEYS;
         (
             first,
-            Arc::new(BTreeNode {
+            Child::resident(Arc::new(BTreeNode {
                 entries,
                 children: Children::new(),
-            }),
+            })),
             underfull,
         )
     } else {
-        let (entry, new_first_child, child_underfull) = remove_leftmost(&node.children[0]);
+        let (entry, new_first_child, child_underfull) = remove_leftmost(&node.children[0], src);
         let mut entries = node.entries.clone();
         let mut children = node.children.clone();
         children[0] = new_first_child;
         if child_underfull {
-            fix_underfull_child(&mut entries, &mut children, 0);
+            fix_underfull_child(&mut entries, &mut children, 0, src);
         }
         let underfull = entries.len() < MIN_KEYS;
-        (entry, Arc::new(BTreeNode { entries, children }), underfull)
+        (entry, Child::resident(Arc::new(BTreeNode { entries, children })), underfull)
     }
 }
 
@@ -1474,28 +1546,34 @@ fn fix_underfull_child<K: Ord + Clone, V>(
     entries: &mut Entries<K, V>,
     children: &mut Children<K, V>,
     idx: usize,
+    src: Option<&dyn NodeSource<K, V>>,
 ) {
-    if idx > 0 && children[idx - 1].entries.len() > MIN_KEYS {
-        rotate_right(entries, children, idx);
-    } else if idx + 1 < children.len() && children[idx + 1].entries.len() > MIN_KEYS {
-        rotate_left(entries, children, idx);
+    if idx > 0 && children[idx - 1].load(src).entries.len() > MIN_KEYS {
+        rotate_right(entries, children, idx, src);
+    } else if idx + 1 < children.len() && children[idx + 1].load(src).entries.len() > MIN_KEYS {
+        rotate_left(entries, children, idx, src);
     } else if idx > 0 {
-        merge_with_left(entries, children, idx);
+        merge_with_left(entries, children, idx, src);
     } else {
-        merge_with_right(entries, children, idx);
+        merge_with_right(entries, children, idx, src);
     }
 }
 
 /// Rotates an entry from the left sibling into the current child.
 ///
-/// Mutates the two siblings in place via [`Arc::make_mut`]: each is cloned only
-/// if still shared with an older snapshot, otherwise edited directly. `split_at_mut`
-/// (via `as_mut_slice`) yields disjoint `&mut` handles to the two adjacent
-/// children at once.
-fn rotate_right<K: Clone, V>(entries: &mut Entries<K, V>, children: &mut Children<K, V>, idx: usize) {
+/// Mutates the two siblings in place via [`Child::make_mut`]: each is cloned
+/// only if still shared with an older snapshot, otherwise edited directly.
+/// `split_at_mut` (via `as_mut_slice`) yields disjoint `&mut` handles to the
+/// two adjacent children at once.
+fn rotate_right<K: Clone, V>(
+    entries: &mut Entries<K, V>,
+    children: &mut Children<K, V>,
+    idx: usize,
+    src: Option<&dyn NodeSource<K, V>>,
+) {
     let (left_part, right_part) = children.as_mut_slice().split_at_mut(idx);
-    let left = Arc::make_mut(left_part[idx - 1].as_mut().unwrap());
-    let right = Arc::make_mut(right_part[0].as_mut().unwrap());
+    let left = left_part[idx - 1].as_mut().unwrap().make_mut(src);
+    let right = right_part[0].as_mut().unwrap().make_mut(src);
 
     // Steal the last entry (and trailing child) of the left sibling.
     let stolen = left.entries.pop().unwrap();
@@ -1516,10 +1594,15 @@ fn rotate_right<K: Clone, V>(entries: &mut Entries<K, V>, children: &mut Childre
 /// Rotates an entry from the right sibling into the current child.
 ///
 /// In-place counterpart of `rotate_right` — see its docs for the CoW reasoning.
-fn rotate_left<K: Clone, V>(entries: &mut Entries<K, V>, children: &mut Children<K, V>, idx: usize) {
+fn rotate_left<K: Clone, V>(
+    entries: &mut Entries<K, V>,
+    children: &mut Children<K, V>,
+    idx: usize,
+    src: Option<&dyn NodeSource<K, V>>,
+) {
     let (left_part, right_part) = children.as_mut_slice().split_at_mut(idx + 1);
-    let left = Arc::make_mut(left_part[idx].as_mut().unwrap());
-    let right = Arc::make_mut(right_part[0].as_mut().unwrap());
+    let left = left_part[idx].as_mut().unwrap().make_mut(src);
+    let right = right_part[0].as_mut().unwrap().make_mut(src);
 
     // Steal the first entry (and leading child) of the right sibling.
     let stolen = right.entries.remove(0);
@@ -1539,20 +1622,20 @@ fn rotate_left<K: Clone, V>(entries: &mut Entries<K, V>, children: &mut Children
 
 /// Merges an underfull child with its left sibling.
 ///
-/// The absorbing (left) sibling is opened with [`Arc::make_mut`] and edited in
-/// place; the absorbed (right) node's contents are **moved** into it via
-/// [`Arc::try_unwrap`] when it is uniquely owned, falling back to a clone only
-/// when it is still shared with a snapshot.
+/// The absorbing (left) sibling is opened with [`Child::make_mut`] and edited
+/// in place; see [`absorb`] for how the (right) sibling's contents are
+/// moved/cloned into it.
 fn merge_with_left<K: Clone, V>(
     entries: &mut Entries<K, V>,
     children: &mut Children<K, V>,
     idx: usize,
+    src: Option<&dyn NodeSource<K, V>>,
 ) {
     let separator = entries.remove(idx - 1);
     let right = children.remove(idx);
-    let left = Arc::make_mut(&mut children[idx - 1]);
+    let left = children[idx - 1].make_mut(src);
     left.entries.push(separator);
-    absorb(left, right);
+    absorb(left, right, src);
 }
 
 /// Merges an underfull child with its right sibling.
@@ -1562,41 +1645,45 @@ fn merge_with_right<K: Clone, V>(
     entries: &mut Entries<K, V>,
     children: &mut Children<K, V>,
     idx: usize,
+    src: Option<&dyn NodeSource<K, V>>,
 ) {
     let separator = entries.remove(idx);
     let right = children.remove(idx + 1);
-    let left = Arc::make_mut(&mut children[idx]);
+    let left = children[idx].make_mut(src);
     left.entries.push(separator);
-    absorb(left, right);
+    absorb(left, right, src);
 }
 
-/// Appends `right`'s entries and children onto `left`, moving them out of
-/// `right` when it is uniquely owned (no snapshot shares it) and cloning
-/// otherwise. `left` must already carry the descended separator as its last
-/// entry.
-fn absorb<K: Clone, V>(left: &mut BTreeNode<K, V>, right: Arc<BTreeNode<K, V>>) {
-    match Arc::try_unwrap(right) {
-        Ok(rn) => {
-            left.entries.extend(rn.entries);
-            left.children.extend(rn.children);
-        }
-        Err(shared) => {
-            left.entries.extend(shared.entries.iter().cloned());
-            left.children.extend(shared.children.iter().cloned());
-        }
-    }
+/// Appends `right`'s entries and children onto `left`. `left` must already
+/// carry the descended separator as its last entry.
+///
+/// `right` is faulted in (if needed) and moved out via `Arc::try_unwrap`,
+/// falling back to a clone if it is still shared with a snapshot. Note this
+/// always takes the shared/clone branch in practice: the `Child` slot itself
+/// holds one strong count for as long as `right` (the local binding) is
+/// alive, which — since shadowing does not drop the old binding early — is
+/// until this function returns, so `load_arc`'s extra count is never the
+/// sole other owner. A future task that needs the true-move fast path back
+/// would have to consume `right` (e.g. an owning accessor on `Child`) before
+/// calling `try_unwrap`.
+fn absorb<K: Clone, V>(left: &mut BTreeNode<K, V>, right: Child<K, V>, src: Option<&dyn NodeSource<K, V>>) {
+    let right = right.load_arc(src);
+    let right = Arc::try_unwrap(right).unwrap_or_else(|a| (*a).clone());
+    left.entries.extend(right.entries);
+    left.children.extend(right.children);
 }
 
 /// In-place counterpart to `delete_from_node`. Descends through
-/// `Arc::make_mut`, so each node is cloned only if it is still shared with
+/// `Child::make_mut`, so each node is cloned only if it is still shared with
 /// another snapshot (copy-on-write preserved) and otherwise mutated directly.
 /// Reuses the existing rebalance helpers (`fix_underfull_child` et al.),
 /// which already mutate the parent's `entries`/`children` in place.
 fn delete_from_node_mut<K: Ord + Clone, V>(
-    node: &mut Arc<BTreeNode<K, V>>,
+    node: &mut Child<K, V>,
     key: &K,
+    src: Option<&dyn NodeSource<K, V>>,
 ) -> DeleteOutcome {
-    let n = Arc::make_mut(node);
+    let n = node.make_mut(src);
     let pos = n.entries.binary_search_by(|(k, _)| k.cmp(key));
 
     if n.children.is_empty() {
@@ -1614,20 +1701,20 @@ fn delete_from_node_mut<K: Ord + Clone, V>(
         match pos {
             Ok(i) => {
                 // Key here: replace with in-order successor from child[i+1].
-                let (succ, right_underfull) = remove_leftmost_mut(&mut n.children[i + 1]);
+                let (succ, right_underfull) = remove_leftmost_mut(&mut n.children[i + 1], src);
                 n.entries[i] = succ;
                 if right_underfull {
-                    fix_underfull_child(&mut n.entries, &mut n.children, i + 1);
+                    fix_underfull_child(&mut n.entries, &mut n.children, i + 1, src);
                 }
                 DeleteOutcome::Removed {
                     underfull: n.entries.len() < MIN_KEYS,
                 }
             }
-            Err(child_idx) => match delete_from_node_mut(&mut n.children[child_idx], key) {
+            Err(child_idx) => match delete_from_node_mut(&mut n.children[child_idx], key, src) {
                 DeleteOutcome::NotFound => DeleteOutcome::NotFound,
                 DeleteOutcome::Removed { underfull } => {
                     if underfull {
-                        fix_underfull_child(&mut n.entries, &mut n.children, child_idx);
+                        fix_underfull_child(&mut n.entries, &mut n.children, child_idx, src);
                     }
                     DeleteOutcome::Removed {
                         underfull: n.entries.len() < MIN_KEYS,
@@ -1641,16 +1728,17 @@ fn delete_from_node_mut<K: Ord + Clone, V>(
 /// In-place counterpart to `remove_leftmost`: removes and returns the
 /// minimum-key entry from the subtree, mutating shared nodes only via CoW.
 fn remove_leftmost_mut<K: Ord + Clone, V>(
-    node: &mut Arc<BTreeNode<K, V>>,
+    node: &mut Child<K, V>,
+    src: Option<&dyn NodeSource<K, V>>,
 ) -> ((K, Arc<V>), bool) {
-    let n = Arc::make_mut(node);
+    let n = node.make_mut(src);
     if n.children.is_empty() {
         let first = n.entries.remove(0);
         (first, n.entries.len() < MIN_KEYS)
     } else {
-        let (entry, child_underfull) = remove_leftmost_mut(&mut n.children[0]);
+        let (entry, child_underfull) = remove_leftmost_mut(&mut n.children[0], src);
         if child_underfull {
-            fix_underfull_child(&mut n.entries, &mut n.children, 0);
+            fix_underfull_child(&mut n.entries, &mut n.children, 0, src);
         }
         (entry, n.entries.len() < MIN_KEYS)
     }
@@ -1677,7 +1765,7 @@ fn remove_leftmost_mut<K: Ord + Clone, V>(
 
 struct LevelBuilder<K, V> {
     entries: Vec<(K, Arc<V>)>,
-    children: Vec<Arc<BTreeNode<K, V>>>,
+    children: Vec<Child<K, V>>,
 }
 
 impl<K, V> LevelBuilder<K, V> {
@@ -1727,12 +1815,13 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         if tree.is_empty() {
             return Self::new();
         }
-        let mut spine: Vec<&Arc<BTreeNode<K, V>>> = Vec::new();
-        let mut node = &tree.root;
+        let src = tree.source.as_deref();
+        let mut spine: Vec<&BTreeNode<K, V>> = Vec::new();
+        let mut node = tree.root.load(src);
         loop {
             spine.push(node);
             match node.children.last() {
-                Some(c) => node = c,
+                Some(c) => node = c.load(src),
                 None => break,
             }
         }
@@ -1781,7 +1870,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     /// Attach `child` as the next child of `levels[level]`, using `(sep_k, sep_v)`
     /// as the separator placed *after* the previous child. If `levels[level]` is
     /// also at capacity, freeze and recurse to the level above.
-    fn attach_child(&mut self, level: usize, child: Arc<BTreeNode<K, V>>, sep_k: K, sep_v: Arc<V>) {
+    fn attach_child(&mut self, level: usize, child: Child<K, V>, sep_k: K, sep_v: Arc<V>) {
         if level >= self.levels.len() {
             self.levels.push(LevelBuilder::new());
         }
@@ -1806,7 +1895,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         // (partial) node with its left sibling if it would otherwise be
         // underfull, then freeze the partial node and attach it as the
         // rightmost child of the level above.
-        let mut carry: Option<Arc<BTreeNode<K, V>>> = None;
+        let mut carry: Option<Child<K, V>> = None;
         // Entries popped from a level that ended up "unclosed" (see below),
         // to be re-inserted individually once the tree is otherwise valid.
         let mut pending_reinsert: Vec<(K, Arc<V>)> = Vec::new();
@@ -1884,10 +1973,10 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             }
 
             let node = if is_leaf_level {
-                Arc::new(BTreeNode {
+                Child::resident(Arc::new(BTreeNode {
                     entries: std::mem::take(&mut lv.entries).into_iter().collect(),
                     children: Children::new(),
-                })
+                }))
             } else {
                 let mut entries = std::mem::take(&mut lv.entries);
                 let mut children = std::mem::take(&mut lv.children);
@@ -1935,24 +2024,27 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                     debug_assert_eq!(children.len(), 1);
                     children.pop().unwrap()
                 } else {
-                    Arc::new(BTreeNode {
+                    Child::resident(Arc::new(BTreeNode {
                         entries: entries.into_iter().collect(),
                         children: children.into_iter().collect(),
-                    })
+                    }))
                 }
             };
             carry = Some(node);
         }
 
         let mut root = carry.unwrap_or_else(|| {
-            Arc::new(BTreeNode {
+            Child::resident(Arc::new(BTreeNode {
                 entries: Entries::new(),
                 children: Children::new(),
-            })
+            }))
         });
-        fix_right_spine_tail(&mut root);
+        // Bulk builds never seed a page source: `from_sorted` starts fresh
+        // (`None`) and `extend_from_sorted`'s `seed_from_spine` only reads
+        // the input tree, never carries its `source` into the rebuilt one.
+        fix_right_spine_tail(&mut root, None);
         let len = self.len - pending_reinsert.len();
-        let mut tree = BTree { root, len };
+        let mut tree = BTree { root, len, source: None };
         for (k, v) in pending_reinsert {
             tree.insert_arc_mut(k, v);
         }
@@ -1977,25 +2069,28 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
 /// same rotate/merge machinery `remove_mut` uses on real sibling nodes,
 /// independent of how the builder's per-level state got there. No-op if the
 /// tail is already balanced. Safe to mutate in place: every node on this
-/// spine was freshly built by this `finish()` call, so `Arc::make_mut` never
-/// clones.
+/// spine was freshly built by this `finish()` call, so `Child::make_mut`
+/// never clones.
 ///
 /// Returns whether `node` itself is now underfull (ignored by the caller at
 /// the root, which has no `MIN_KEYS` floor).
-fn fix_right_spine_tail<K: Ord + Clone, V>(node: &mut Arc<BTreeNode<K, V>>) -> bool {
-    let n = Arc::make_mut(node);
+fn fix_right_spine_tail<K: Ord + Clone, V>(
+    node: &mut Child<K, V>,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> bool {
+    let n = node.make_mut(src);
     if n.children.is_empty() {
         return n.entries.len() < MIN_KEYS;
     }
     let mut last = n.children.len() - 1;
-    let child_underfull = fix_right_spine_tail(&mut n.children[last]);
+    let child_underfull = fix_right_spine_tail(&mut n.children[last], src);
     // A single-child node (no sibling of its own to rotate/merge with) has
     // no fix available at this level; the underflow just propagates to our
     // own `entries.len() < MIN_KEYS` check below, for our own parent to
     // handle against our (real) sibling.
     if child_underfull {
-        while n.children.len() > 1 && n.children[last].entries.len() < MIN_KEYS {
-            fix_underfull_child(&mut n.entries, &mut n.children, last);
+        while n.children.len() > 1 && n.children[last].load(src).entries.len() < MIN_KEYS {
+            fix_underfull_child(&mut n.entries, &mut n.children, last, src);
             last = n.children.len() - 1;
         }
     }
@@ -2023,16 +2118,21 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
         .entries
         .pop()
         .expect("redistribute_tail: no separator");
+    // `None`: every `Child` a `BulkBuilder` ever holds is one it built itself
+    // (`Child::resident`, always in-memory) or a clone of a spine node from
+    // `seed_from_spine` — and a seed tree only ever has `source: None` too
+    // (see `finish()`'s comment), so this is never an on-disk slot to fault in.
+    let sibling = sibling.load(None);
 
     // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
     let mut merged_entries: Vec<(K, Arc<V>)> = sibling.entries.to_vec();
     merged_entries.push(separator);
     merged_entries.append(&mut lv.entries);
 
-    let merged_children: Vec<Arc<BTreeNode<K, V>>> = if is_leaf_level {
+    let merged_children: Vec<Child<K, V>> = if is_leaf_level {
         vec![]
     } else {
-        let mut c: Vec<Arc<BTreeNode<K, V>>> = sibling.children.to_vec();
+        let mut c: Vec<Child<K, V>> = sibling.children.to_vec();
         c.append(&mut lv.children);
         c
     };
@@ -2066,10 +2166,10 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
         debug_assert_eq!(new_right_children.len(), right_entries.len() + 1);
     }
 
-    let new_left = Arc::new(BTreeNode {
+    let new_left = Child::resident(Arc::new(BTreeNode {
         entries: new_left_entries.into_iter().collect(),
         children: new_left_children.into_iter().collect(),
-    });
+    }));
 
     parent.children.push(new_left);
     parent.entries.push(new_separator);
@@ -2077,21 +2177,21 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     lv.children = new_right_children;
 }
 
-fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
-    Arc::new(BTreeNode {
+fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Child<K, V> {
+    Child::resident(Arc::new(BTreeNode {
         entries: std::mem::take(&mut lv.entries).into_iter().collect(),
         children: Children::new(),
-    })
+    }))
 }
 
-fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Arc<BTreeNode<K, V>> {
+fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Child<K, V> {
     let entries = std::mem::take(&mut lv.entries);
     let children = std::mem::take(&mut lv.children);
     debug_assert_eq!(children.len(), entries.len() + 1);
-    Arc::new(BTreeNode {
+    Child::resident(Arc::new(BTreeNode {
         entries: entries.into_iter().collect(),
         children: children.into_iter().collect(),
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3047,7 +3147,7 @@ mod tests {
                     assert!(!node.entries.is_empty(), "internal root with no entries");
                 }
                 for c in node.children.iter() {
-                    walk(c, false, depth + 1, leaf_depth, count);
+                    walk(c.load(None), false, depth + 1, leaf_depth, count);
                 }
             }
             if !is_root {
@@ -3065,7 +3165,7 @@ mod tests {
         }
         let mut leaf_depth = None;
         let mut count = 0;
-        walk(&t.root, true, 0, &mut leaf_depth, &mut count);
+        walk(t.root.load(None), true, 0, &mut leaf_depth, &mut count);
         assert_eq!(count, t.len(), "len does not match entry count");
         let keys: Vec<&K> = t.range(..).map(|(k, _)| k).collect();
         assert!(
@@ -3453,14 +3553,14 @@ mod tests {
     /// tree is height 1. `height(t) >= 3` means some node's children are
     /// themselves internal nodes, not leaves.
     fn diff_oracle_tree_height<K, V>(t: &BTree<K, V>) -> usize {
-        fn go<K, V>(node: &Arc<BTreeNode<K, V>>) -> usize {
+        fn go<K, V>(node: &BTreeNode<K, V>) -> usize {
             if node.children.is_empty() {
                 1
             } else {
-                1 + go(&node.children[0])
+                1 + go(node.children[0].load(None))
             }
         }
-        go(&t.root)
+        go(t.root.load(None))
     }
 
     #[derive(Debug, Clone)]

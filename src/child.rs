@@ -12,10 +12,6 @@
 //! sibling-refcount cost measured in
 //! `docs/benchmarks/paging-baseline-local-2026-08-29.md`.
 
-// Not wired into `BTree`/`BTreeNode` yet — that's the next task in the
-// paged-btree plan, which is the sole consumer of this module's API.
-#![allow(dead_code)]
-
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -78,6 +74,11 @@ impl<K, V> Child<K, V> {
     }
 
     /// A slot that references a page but has not been faulted in yet.
+    // No production caller yet: this task threads `Child` through `BTree`
+    // with every slot built via `resident` (source is always `None`); a
+    // later task's page store is what will construct `on_disk` slots. Used
+    // today by this module's own unit tests.
+    #[allow(dead_code)]
     pub(crate) fn on_disk(id: PageId) -> Self {
         debug_assert!(id < NO_PAGE);
         Self {
@@ -96,6 +97,9 @@ impl<K, V> Child<K, V> {
     }
 
     /// Whether the node is currently in memory (resident, clean or dirty).
+    // No production caller yet — a page evictor is a later task. Used today
+    // by this module's own unit tests.
+    #[allow(dead_code)]
     pub(crate) fn is_loaded(&self) -> bool {
         !self.node.load(Ordering::Acquire).is_null()
     }
@@ -104,6 +108,9 @@ impl<K, V> Child<K, V> {
     /// Only legal on a dirty slot — going from `NO_PAGE` to a real id; a
     /// slot that already has a page id must go through `make_mut` (which
     /// resets it to `NO_PAGE`) before it can be reassigned.
+    // No production caller yet — recording a checkpoint's page id is a later
+    // task's checkpoint-writer. Used today by this module's own unit tests.
+    #[allow(dead_code)]
     pub(crate) fn set_page_id(&self, id: PageId) {
         debug_assert!(id < NO_PAGE);
         // Preserve the accessed bit; only the id part changes (NO_PAGE -> id).
@@ -125,6 +132,9 @@ impl<K, V> Child<K, V> {
     }
 
     /// Read the second-chance bit and clear it — the evictor's sweep step.
+    // No production caller yet — the page evictor is a later task. Used
+    // today by this module's own unit tests.
+    #[allow(dead_code)]
     pub(crate) fn take_accessed(&self) -> bool {
         self.meta.fetch_and(!ACCESSED, Ordering::Relaxed) & ACCESSED != 0
     }
@@ -192,6 +202,9 @@ impl<K, V> Child<K, V> {
 
     /// `Some(n)` if resident (`n` = the underlying `Arc`'s strong count,
     /// including the slot's own share), `None` if still on-disk.
+    // No production caller yet — a memory-pressure/eviction accounting path
+    // is a later task. Used today by this module's own unit tests.
+    #[allow(dead_code)]
     pub(crate) fn strong_count(&self) -> Option<usize> {
         let p = self.node.load(Ordering::Acquire);
         if p.is_null() {
