@@ -316,6 +316,13 @@ pub(crate) struct PagedStats {
     // No production caller yet — see `resident_leaf_bytes` above.
     #[allow(dead_code)]
     pub leaves_demoted: AtomicU64,
+    /// Dead-page byte ranges actually hole-punched (task11) — counted in
+    /// ranges, not bytes, matching `PagedRoot::dead_pages`'s own unit. Only
+    /// incremented once a range's retention gate clears (the root that
+    /// named it as dead is no longer the newest surviving predecessor —
+    /// see `Store::checkpoint_impl_paged`'s punch step), never at the point
+    /// a range is merely computed and recorded in a root's `dead_pages`.
+    pub dead_pages_punched: AtomicU64,
 }
 
 /// A [`NodeSource`] that reads pages off a [`PageFile`] and decodes them

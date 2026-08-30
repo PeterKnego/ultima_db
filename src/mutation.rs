@@ -38,6 +38,23 @@ pub(crate) enum Mutation {
     /// offset — a torn frame, produced while the sink still believes it wrote
     /// the whole batch.
     TearFrameAt(u64),
+    /// Checkpoint fault (task11): `Store::checkpoint_impl_paged` returns
+    /// `Err` right after `PageFile::sync()` succeeds and before the new root
+    /// record (`checkpoint_{v}.root`) is written — models a crash between
+    /// "the new pages are durable" and "the pointer to them is durable".
+    /// Consumed once per process (see `store.rs`'s
+    /// `CRASH_AFTER_PAGE_SYNC_FIRED`, and its doc for why "once" isn't quite
+    /// "on the very first checkpoint call"), so a store reconstructed after
+    /// the injected error, in the same test binary, checkpoints normally.
+    CrashAfterPageSync,
+    /// Checkpoint fault (task11): `Store::checkpoint_impl_paged` returns
+    /// `Err` after the new root record is durably renamed into place and
+    /// `cleanup_old_roots` has deleted whatever old roots retention no
+    /// longer allows, but before any of the now-punchable dead-page ranges
+    /// are actually punched — models a crash that leaks disk space (an
+    /// unpunched hole) without losing or misplacing any data. Consumed once
+    /// per process, same discipline as `CrashAfterPageSync`.
+    CrashBeforePunch,
 }
 
 /// Pure mapping from the env-var value to a mutation (testable without env).
@@ -57,6 +74,8 @@ fn parse(v: Option<&str>) -> Option<Mutation> {
             .ok()
             .map(Mutation::TearFrameAt)
             .or_else(|| panic!("unknown ULTIMA_MUTATION value: {s}")),
+        Some("crash-after-page-sync") => Some(Mutation::CrashAfterPageSync),
+        Some("crash-before-punch") => Some(Mutation::CrashBeforePunch),
         None | Some("") => None,
         Some(other) => panic!("unknown ULTIMA_MUTATION value: {other}"),
     }
@@ -99,6 +118,12 @@ mod tests {
         assert_eq!(parse(Some("fail-write-after=65536")), Some(Mutation::FailWriteAfter(65536)));
         assert_eq!(parse(Some("fail-sync")), Some(Mutation::FailSync));
         assert_eq!(parse(Some("tear-frame-at=12")), Some(Mutation::TearFrameAt(12)));
+    }
+
+    #[test]
+    fn parses_the_paged_checkpoint_crash_variants() {
+        assert_eq!(parse(Some("crash-after-page-sync")), Some(Mutation::CrashAfterPageSync));
+        assert_eq!(parse(Some("crash-before-punch")), Some(Mutation::CrashBeforePunch));
     }
 
     #[test]

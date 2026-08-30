@@ -501,6 +501,28 @@ pub(crate) struct PagedState {
     /// same way [`StoreInner::checkpoint_base`] keeps a row-format base
     /// alive.
     pub(crate) last_root: Option<(Arc<Snapshot>, u64)>,
+    /// Retention-gated hole-punch schedule (task11). Keyed by the version of
+    /// the root a dead-page range was computed *against* (its predecessor at
+    /// write time), not the root that names the range: `checkpoint()`
+    /// inserts `punch_after[prev_version] = root.dead_pages` right after
+    /// writing `root`, and the punch step removes and punches that entry
+    /// the moment `cleanup_old_roots` reports `prev_version` itself
+    /// deleted — never earlier, so a range is never punched while any
+    /// retained root could still be naming it live (Controller amendment,
+    /// task11). Rebuilt from scratch on every `Store::recover()` by reading
+    /// every surviving `.root` file's own `dead_pages` field (the
+    /// in-memory map does not survive a crash, but each root's own copy
+    /// does) — see `Store::recover`'s paged branch.
+    pub(crate) punch_after: BTreeMap<u64, Vec<(u64, u64)>>,
+    /// Dead-page ranges whose retention gate had *already* cleared before
+    /// this process started — discovered at `Store::recover()` when the
+    /// oldest surviving root's own `dead_pages` is non-empty (its
+    /// predecessor is not among the survivors, so it was deleted by a
+    /// `cleanup_old_roots` call this process never saw finish punching;
+    /// `Mutation::CrashBeforePunch`'s test is exactly this case). Applied
+    /// unconditionally by the very next `checkpoint()`, since recovery only
+    /// rebuilds bookkeeping and never mutates the page file itself.
+    pub(crate) pending_punch: Vec<(u64, u64)>,
     /// When the last successful paged checkpoint finished — the background
     /// checkpointer's (a later task) time-trigger clock.
     pub(crate) last_checkpoint_at: std::time::Instant,
@@ -590,6 +612,11 @@ pub struct PagedStatsSnapshot {
     /// Number of times the background checkpointer has run. Always `0`
     /// until the background checkpointer (a later task) lands.
     pub checkpointer_runs: u64,
+    /// Dead-page ranges actually hole-punched since the store opened (task11)
+    /// — counted in ranges, not bytes. Only ranges whose retention gate has
+    /// cleared count here; a range merely recorded in a root's `dead_pages`
+    /// (predecessor still retained) does not.
+    pub dead_pages_punched: u64,
 }
 
 impl Store {
@@ -703,6 +730,8 @@ impl Store {
                     stats: Arc::new(crate::pagecodec::PagedStats::default()),
                     opts: opts.clone(),
                     last_root: None,
+                    punch_after: BTreeMap::new(),
+                    pending_punch: Vec::new(),
                     last_checkpoint_at: std::time::Instant::now(),
                     installs: std::sync::atomic::AtomicU64::new(0),
                 })
@@ -1330,9 +1359,9 @@ impl Store {
     /// The paged checkpoint path: writes every registered table's dirty
     /// (never-yet-on-disk) B-tree nodes to the page file, then a single
     /// root record (`checkpoint_{version}.root`) naming each table's
-    /// current root page. Phases 1-2 of the paged checkpoint design — no
-    /// leaf demotion, no recovery, no background checkpointer thread (all
-    /// later tasks in this feature's sequence).
+    /// current root page, and finally reclaims disk space CoW replacement
+    /// (or a dropped table/index) made dead, once retention allows it
+    /// (task11 — dead-page lists, hole-punch reclaim, crash points).
     #[cfg(feature = "persistence")]
     fn checkpoint_impl_paged(&self) -> Result<u64> {
         use crate::checkpoint::{
@@ -1340,7 +1369,26 @@ impl Store {
         };
         use crate::table::PagedCtx;
 
-        let (dir, snap, registry, file, stats, opts, needs_recover_first) = {
+        // Mutation-testing crash-point latches (task11): `mutation::active()`
+        // memoises `ULTIMA_MUTATION` for the whole process, so a crash
+        // variant set (as it must be) before `Store::new` stays "active" for
+        // every subsequent `checkpoint()` call in the same test binary, not
+        // just the one call a test means to fail. These statics turn
+        // "active" into "fires once" — the first call whose own
+        // precondition (`last_root_before.is_some()` / `!deleted.is_empty()`,
+        // checked at each use site below) is met consumes the fault; every
+        // call after that — in this store, or a freshly reconstructed one in
+        // the same process — sees the mutation "active" but already fired,
+        // and proceeds normally. See `tests/paged_fault_crash_root.rs` and
+        // `tests/paged_fault_crash_punch.rs`.
+        #[cfg(feature = "mutation-testing")]
+        static CRASH_AFTER_PAGE_SYNC_FIRED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        #[cfg(feature = "mutation-testing")]
+        static CRASH_BEFORE_PUNCH_FIRED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        let (dir, snap, registry, file, stats, opts, needs_recover_first, last_root_before) = {
             let inner = self.inner.read();
             inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
@@ -1371,7 +1419,12 @@ impl Store {
             // two cases are indistinguishable from in-memory state alone,
             // so the directory itself has to be asked, below.
             let needs_recover_first = paged.last_root.is_none();
-            (dir, snap, registry, file, stats, opts, needs_recover_first)
+            // The snapshot+version this store's *previous* successful paged
+            // checkpoint installed — the dead-page diff's "prev" side
+            // (task11). Captured now, before this checkpoint's own
+            // `install_paged_tables` overwrites `paged.last_root` below.
+            let last_root_before = paged.last_root.clone();
+            (dir, snap, registry, file, stats, opts, needs_recover_first, last_root_before)
         }; // read lock released here
 
         // Refuse to write into a directory that already has paged roots
@@ -1473,14 +1526,53 @@ impl Store {
             current = new_snap;
         }
 
+        // Dead-page diff (task11): every page id `last_root_before`'s
+        // tables referenced that `current`'s tables no longer reach — freed
+        // by CoW replacing a node, or by a dropped table/index (contributes
+        // every id it ever referenced — see `paged_dead_page_ids`). `None`
+        // (no prior successful paged checkpoint on this store) means there
+        // is nothing to diff against; an empty `dead_pages` is the correct
+        // root for that case, not an error.
+        let dead: Vec<(u64, u64)> = match &last_root_before {
+            Some((prev_snap, _)) => {
+                let ids = paged_dead_page_ids(&current, prev_snap, &registry);
+                let mut ranges = Vec::with_capacity(ids.len());
+                for id in ids {
+                    ranges.push((id, file.read_len(id)?));
+                }
+                ranges
+            }
+            None => Vec::new(),
+        };
+
         file.sync()?;
+
+        // Mutation-testing crash point (task11): the pages this checkpoint
+        // wrote (including whatever the loop above dirtied) are durable —
+        // `sync()` above succeeded — but the root record naming them is
+        // not written yet. Gated on `last_root_before.is_some()` (there is
+        // a previous root recovery can fall back to) rather than firing on
+        // this store's very first checkpoint: the fault models "crash while
+        // superseding a root", and a fresh store's first checkpoint has
+        // nothing to supersede — see `CRASH_AFTER_PAGE_SYNC_FIRED`'s doc for
+        // why that, not a call counter, is what makes "checkpoint, update,
+        // then inject the crash" reachable despite the mutation being
+        // active (and therefore memoised) from before `Store::new` runs.
+        #[cfg(feature = "mutation-testing")]
+        if matches!(crate::mutation::active(), Some(crate::mutation::Mutation::CrashAfterPageSync))
+            && last_root_before.is_some()
+            && !CRASH_AFTER_PAGE_SYNC_FIRED.swap(true, Ordering::SeqCst)
+        {
+            return Err(Error::Persistence(
+                "injected crash: after page sync, before root record".into(),
+            ));
+        }
 
         let root = PagedRoot {
             version: snap.version,
             file_end: file.file_end(),
             tables: entries,
-            // A later task fills this in from a diff against `last_root`.
-            dead_pages: Vec::new(),
+            dead_pages: dead.clone(),
         };
         write_paged_root(&dir, &root)?;
 
@@ -1489,6 +1581,17 @@ impl Store {
             if let Some(p) = inner.paged.as_mut() {
                 p.last_root = Some((current, snap.version));
                 p.last_checkpoint_at = std::time::Instant::now();
+                // Retention-gated punch schedule (Controller amendment,
+                // task11): `dead` was computed against `last_root_before`'s
+                // version, so it may only be punched once THAT root is
+                // itself deleted — never earlier, even once a later
+                // checkpoint's own diff supersedes it. `None` means this was
+                // the store's first paged checkpoint: no predecessor version
+                // to key the entry on, and `dead` is always empty then
+                // anyway (see the `match` above).
+                if let Some((_, prev_version)) = &last_root_before {
+                    p.punch_after.insert(*prev_version, dead);
+                }
             }
         }
 
@@ -1539,7 +1642,48 @@ impl Store {
             }
         }
 
-        cleanup_old_roots(&dir, opts.retained_checkpoints)?;
+        let deleted = cleanup_old_roots(&dir, opts.retained_checkpoints)?;
+
+        // Mutation-testing crash point (task11): the new root is durably
+        // renamed into place and `cleanup_old_roots` has already deleted
+        // whatever old roots retention no longer allows, but nothing below
+        // has punched a single hole yet. Gated on `!deleted.is_empty()`
+        // (this round actually has something to punch) rather than a bare
+        // first-call check — a checkpoint with nothing pending crashing here
+        // would prove nothing about the punch step at all.
+        #[cfg(feature = "mutation-testing")]
+        if matches!(crate::mutation::active(), Some(crate::mutation::Mutation::CrashBeforePunch))
+            && !deleted.is_empty()
+            && !CRASH_BEFORE_PUNCH_FIRED.swap(true, Ordering::SeqCst)
+        {
+            return Err(Error::Persistence(
+                "injected crash: root record renamed and old roots pruned, before punch".into(),
+            ));
+        }
+
+        // Punch step: whatever `Store::recover()` reconstructed as already
+        // due (`pending_punch` — the predecessor was deleted by a run of
+        // this store that never got to punch it, `CrashBeforePunch`'s own
+        // test is exactly this) plus whatever `cleanup_old_roots` just now
+        // deleted (looked up in `punch_after`, keyed by the deleted
+        // version — see that field's doc for why this is a plain map
+        // lookup rather than a re-read of any file on the common path).
+        let mut to_punch: Vec<(u64, u64)> = Vec::new();
+        {
+            let mut inner = self.inner.write();
+            if let Some(p) = inner.paged.as_mut() {
+                to_punch.append(&mut p.pending_punch);
+                for v in &deleted {
+                    if let Some(ranges) = p.punch_after.remove(v) {
+                        to_punch.extend(ranges);
+                    }
+                }
+            }
+        }
+        if !to_punch.is_empty() {
+            file.punch(&to_punch)?;
+            stats.dead_pages_punched.fetch_add(to_punch.len() as u64, Ordering::Relaxed);
+        }
 
         Ok(snap.version)
     }
@@ -1806,6 +1950,7 @@ impl Store {
             // The background checkpointer (a later task) hasn't landed
             // yet, so this is always 0 until then.
             checkpointer_runs: 0,
+            dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
         })
     }
 
@@ -1976,6 +2121,49 @@ impl Store {
                 // table.
                 let snapshot = Arc::new(Snapshot { version: root.version, tables });
 
+                // Retention-gated punch bookkeeping (task11): the in-memory
+                // `punch_after`/`pending_punch` from any prior process is
+                // gone, so rebuild it from every surviving `.root` file's own
+                // `dead_pages` field — the only record left of what became
+                // dead when a root superseded its predecessor. Roots are
+                // always written in strict version order
+                // (`checkpoint_impl_paged` writes exactly one per call,
+                // whether a no-op or not) and `cleanup_old_roots` only ever
+                // deletes a contiguous oldest prefix, so each surviving
+                // root's immediate predecessor in this ascending list is
+                // genuinely the same one its `dead_pages` was diffed
+                // against when it was written. Pure I/O, done off the store
+                // lock the same way the head root's own read above was.
+                let roots_on_disk = crate::checkpoint::list_paged_roots(&dir)?;
+                let mut punch_after: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+                let mut pending_punch: Vec<(u64, u64)> = Vec::new();
+                let mut prev_version: Option<u64> = None;
+                for (i, (ver, root_path)) in roots_on_disk.iter().enumerate() {
+                    let r = if *ver == root.version {
+                        root.clone()
+                    } else {
+                        crate::checkpoint::read_paged_root(root_path)?
+                    };
+                    if i == 0 && !r.dead_pages.is_empty() {
+                        // The oldest surviving root's own dead list is
+                        // non-empty, so it WAS diffed against a real
+                        // predecessor — one no longer among the survivors,
+                        // meaning a completed `cleanup_old_roots` call
+                        // already deleted it before this root's dead list
+                        // could be punched (`Mutation::CrashBeforePunch`'s
+                        // test is exactly this case). Its retention gate has
+                        // therefore already cleared; queue it for the very
+                        // next checkpoint rather than punching here —
+                        // recovery only rebuilds bookkeeping, it never
+                        // mutates the page file itself.
+                        pending_punch.extend(r.dead_pages.clone());
+                    }
+                    if let Some(pv) = prev_version {
+                        punch_after.insert(pv, r.dead_pages.clone());
+                    }
+                    prev_version = Some(*ver);
+                }
+
                 let mut inner = self.inner.write();
                 inner.snapshots.insert(root.version, Arc::clone(&snapshot));
                 inner.latest_version = root.version;
@@ -1996,6 +2184,8 @@ impl Store {
                 // store succeed instead of refusing.
                 if let Some(p) = inner.paged.as_mut() {
                     p.last_root = Some((snapshot, root.version));
+                    p.punch_after = punch_after;
+                    p.pending_punch = pending_punch;
                 }
             }
         }
@@ -2995,6 +3185,52 @@ impl TableLockGuards {
         let guards = arcs.into_iter().map(|arc| arc.lock_arc()).collect();
         Self { guards }
     }
+}
+
+/// Page ids referenced by `prev`'s tables and no longer reachable from
+/// `current`'s — a paged checkpoint's dead-page list (task11). Diffs only
+/// tables the registry still knows how to construct (mirrors every other
+/// paged-checkpoint reader's `registry.contains` filter, e.g.
+/// `Store::checkpoint_impl_paged`'s own write loop): an unregistered table
+/// was never paged-written in the first place, so there is nothing on
+/// either side to compare.
+///
+/// A table present in both is diffed via
+/// [`MergeableTable::paged_changed_pages`] (self = current, prev = the
+/// same-named table in `prev`). A table present only in `prev` — dropped
+/// since the last checkpoint, via `WriteTx::delete_table` — contributes
+/// every page id it ever referenced: a fresh, unattached empty table of the
+/// same type (`registry`'s `new_empty_table`) has no page ids of its own,
+/// so diffing it against `prev`'s table is the same "empty new side reports
+/// everything" idiom `Table::paged_changed_pages` already uses for a
+/// dropped *index* (see that method's doc). A table present only in
+/// `current` is newly created and contributes nothing — there is no
+/// predecessor state for it to be dead relative to.
+#[cfg(feature = "persistence")]
+fn paged_dead_page_ids(
+    current: &Snapshot,
+    prev: &Snapshot,
+    registry: &crate::registry::TableRegistry,
+) -> Vec<crate::child::PageId> {
+    let mut ids = Vec::new();
+    for (name, table) in &current.tables {
+        if !registry.contains(name) {
+            continue;
+        }
+        if let Some(prev_table) = prev.tables.get(name) {
+            ids.extend(table.paged_changed_pages(prev_table.as_ref()));
+        }
+    }
+    for (name, prev_table) in &prev.tables {
+        if current.tables.contains_key(name) || !registry.contains(name) {
+            continue;
+        }
+        if let Some(info) = registry.get(name) {
+            let empty = (info.new_empty_table)();
+            ids.extend(empty.paged_changed_pages(prev_table.as_ref()));
+        }
+    }
+    ids
 }
 
 /// Remove a base version from the active writer tracking list.

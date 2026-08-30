@@ -175,3 +175,14 @@ pub fn wal_durable_len_for_test(path: &std::path::Path) -> u64 {
 pub fn checkpoint_is_full_for_test(path: &std::path::Path) -> Result<bool> {
     crate::checkpoint::is_full_checkpoint(path)
 }
+
+/// A paged root record's `dead_pages` list, by version. Test-only escape
+/// hatch (task11) so integration tests can assert on the dead-page list a
+/// paged checkpoint recorded without a `pub(crate)` leak of
+/// `checkpoint::PagedRoot` itself. Not part of the stable public API.
+#[cfg(feature = "persistence")]
+#[doc(hidden)]
+pub fn paged_root_dead_pages_for_test(dir: &std::path::Path, version: u64) -> Result<Vec<(u64, u64)>> {
+    let root = crate::checkpoint::read_paged_root(&crate::checkpoint::root_path(dir, version))?;
+    Ok(root.dead_pages)
+}

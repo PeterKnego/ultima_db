@@ -243,6 +243,32 @@ impl PageFile {
         Ok((kind, payload))
     }
 
+    /// Read just `id`'s 12-byte header and return the page's total on-disk
+    /// length (header + payload) — [`Self::page_len`] applied to the
+    /// declared `payload_len`. Used by the dead-page-list writer (task 11):
+    /// punching a hole needs a byte range, and the checkpoint diff that
+    /// produces the dead-page-id list only has ids. Rejects the same
+    /// corruption a full [`Self::read`] would (bad kind byte, wrong format
+    /// byte) without paying for the payload read `read` does.
+    pub(crate) fn read_len(&self, id: PageId) -> Result<u64> {
+        let mut hdr = [0u8; PAGE_HEADER_LEN];
+        let got = read_fully_at(&self.file, &mut hdr, id, id)?;
+        if got < PAGE_HEADER_LEN {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: short header ({got} bytes)")));
+        }
+        PageKind::try_from(hdr[0]).map_err(|_| {
+            Error::CheckpointCorrupted(format!("page {id}: unknown page kind {}", hdr[0]))
+        })?;
+        if hdr[1] != PAGE_FMT_V1 {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: unsupported page format {}", hdr[1])));
+        }
+        let plen = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        if plen > MAX_PAGE_BYTES {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: payload_len {plen} exceeds limits")));
+        }
+        Ok(Self::page_len(plen))
+    }
+
     /// Flush written page bytes to durable storage (`sync_data`, not
     /// `sync_all` — the file's length/allocation metadata was already made
     /// durable by `preallocate_to`'s `sync_all` when the region was grown).
@@ -333,6 +359,13 @@ mod tests {
             let id = pf.append(kind, &payload).unwrap();
             assert_eq!(pf.read(id).unwrap(), (kind, payload));
         }
+    }
+
+    #[test]
+    fn read_len_matches_page_len_without_reading_the_payload() {
+        let (_d, pf) = tmp();
+        let id = pf.append(PageKind::DataLeaf, &[7; 321]).unwrap();
+        assert_eq!(pf.read_len(id).unwrap(), PageFile::page_len(321));
     }
 
     #[test]
