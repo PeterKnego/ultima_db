@@ -154,6 +154,22 @@ impl<K, V> Child<K, V> {
         self.fault_in(src)
     }
 
+    /// Like [`Self::load`], but for an already-resident slot it does not
+    /// mark the accessed bit: a genuine fault still marks it (the page
+    /// really was just brought in), but a maintenance walk that merely
+    /// passes over an already-cached node — checkpointing it in
+    /// `BTree::write_dirty`, or just probing tree shape in `BTree::height`
+    /// — must not reset that node's place in the eviction sweep's clock
+    /// just because it was looked at.
+    pub(crate) fn load_quiet(&self, src: Option<&dyn NodeSource<K, V>>) -> &BTreeNode<K, V> {
+        let p = self.node.load(Ordering::Acquire);
+        if !p.is_null() {
+            // SAFETY: same as `load`'s fast path — set once, never cleared.
+            return unsafe { &*p };
+        }
+        self.fault_in(src)
+    }
+
     #[cold]
     fn fault_in(&self, src: Option<&dyn NodeSource<K, V>>) -> &BTreeNode<K, V> {
         let id = self.page_id().expect("Child: null pointer and NO_PAGE (corrupt slot)");
@@ -240,9 +256,27 @@ impl<K: Clone, V> Child<K, V> {
     /// its contents diverge from the page it was loaded from.
     pub(crate) fn make_mut(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         self.load(src);
+        self.make_mut_after_load(src)
+    }
+
+    /// Like [`Self::make_mut`], but for an already-resident node it does not
+    /// touch the accessed bit — used by internal tree-shape bookkeeping
+    /// (`BulkBuilder`'s right-spine tail fix-up) that CoWs a node while
+    /// *constructing* a tree, not as a real workload access. A genuine
+    /// fault (the node isn't resident yet) still marks accessed, same as
+    /// any other fault — see [`Self::load_quiet`].
+    pub(crate) fn make_mut_quiet(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
+        self.load_quiet(src);
+        self.make_mut_after_load(src)
+    }
+
+    /// Shared tail of [`Self::make_mut`]/[`Self::make_mut_quiet`]: the slot
+    /// is already resident (by whichever load the caller used above); clone
+    /// it on write and mark it dirty.
+    fn make_mut_after_load(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         let was_clean = self.page_id().is_some();
         let p = *self.node.get_mut();
-        // SAFETY: we hold &mut self, so no concurrent CAS can be racing; p is non-null after load.
+        // SAFETY: caller already ensured residency (via `load`/`load_quiet`), so p is non-null.
         let mut arc = unsafe { Arc::from_raw(p) };
         Arc::make_mut(&mut arc); // clones iff shared; no-op (in place) if unique
         let raw = Arc::into_raw(arc) as *mut BTreeNode<K, V>;

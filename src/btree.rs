@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use crate::child::{Child, NodeSource};
+use crate::child::{Child, NO_PAGE, NodeSource, PageId};
 use crate::{Error, Result};
 
 // Minimum degree: every non-root node has at least T-1 keys, at most 2T-1 keys.
@@ -107,7 +107,11 @@ impl<E, const N: usize> FixedVec<E, N> {
 
     pub(crate) fn push(&mut self, item: E) {
         let i = self.len as usize;
-        debug_assert!(i < N, "FixedVec::push: at capacity");
+        // A release-mode capacity check, not just a debug one: `write`
+        // below trusts i < N to stay in bounds — in release that would be a
+        // write past the array (see the `insert`/`remove`/`split_off`
+        // asserts above for the same release-UB class).
+        assert!(i < N, "FixedVec::push: at capacity");
         // SAFETY: i == len < N (checked above), so slot i is the first
         // uninitialized slot; `write` overwrites it without dropping
         // whatever (uninitialized) bytes were there.
@@ -217,6 +221,13 @@ impl<E, const N: usize> FixedVec<E, N> {
     /// Iterate the live prefix.
     fn iter(&self) -> impl Iterator<Item = &E> + '_ {
         self.as_slice().iter()
+    }
+
+    /// Mutably iterate the live prefix — used by the paging primitives to
+    /// flip `Child` slots (e.g. residency in `demote_leaves`) in place
+    /// without a full node rebuild.
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut E> + '_ {
+        self.as_mut_slice().iter_mut()
     }
 
     fn to_vec(&self) -> Vec<E>
@@ -794,6 +805,332 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         iter.descend_left_from(&self.root);
         iter.descend_right_from(&self.root);
         iter
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paging primitives — dirty-walk checkpointing, leaf demotion/eviction, and
+// page-diffing, all exercised against an in-memory mock "disk"
+// (`crate::child::tests::MockDisk`) until the real page store lands in a
+// later task. Every primitive here works purely in terms of `Child` slot
+// state (page id / residency / accessed bit); none of them assume a real
+// page file exists yet.
+// ---------------------------------------------------------------------------
+
+impl<K: Ord + Clone, V> BTree<K, V> {
+    /// Levels below the root; 0 = root is a leaf. Loads only the leftmost
+    /// path, using the accessed-bit-preserving load: a genuine fault (the
+    /// tree isn't fully resident yet) still marks accessed like any other
+    /// fault, but probing the shape of an already-resident tree must not
+    /// perturb which leaf looks "recently used" to the eviction sweep.
+    // No production caller yet — the (future) page evictor and checkpoint
+    // writer are the intended callers. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn height(&self) -> usize {
+        let src = self.source.as_deref();
+        let mut h = 0;
+        let mut n = self.root.load_quiet(src);
+        while !n.children.is_empty() {
+            n = n.children[0].load_quiet(src);
+            h += 1;
+        }
+        h
+    }
+
+    /// Post-order over `NO_PAGE` slots. `write(node, is_leaf)` returns the
+    /// id it stored the node under; children are written before their
+    /// parent so a parent's payload can name them. Returns the root's page
+    /// id (writing it if dirty).
+    ///
+    /// `write` returning [`NO_PAGE`] aborts: descent stops, every slot on
+    /// the aborted path is left dirty (its page id is never set), and
+    /// `NO_PAGE` propagates back up as this call's own result — the
+    /// convention a later task's checkpoint writer uses to signal a write
+    /// failure through a callback that cannot itself return a `Result`.
+    // No production caller yet — the (future) page-file writer is the
+    // intended caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn write_dirty(&self, write: &mut dyn FnMut(&BTreeNode<K, V>, bool) -> PageId) -> PageId {
+        fn go<K, V>(
+            slot: &Child<K, V>,
+            src: Option<&dyn NodeSource<K, V>>,
+            write: &mut dyn FnMut(&BTreeNode<K, V>, bool) -> PageId,
+        ) -> PageId {
+            if let Some(id) = slot.page_id() {
+                return id;
+            }
+            // A dirty slot is always resident (see child.rs's invariant
+            // note), so this never faults; unlike `load`, it must not mark
+            // a node as freshly "accessed" just because a checkpoint pass
+            // walked past it.
+            let node = slot.load_quiet(src);
+            for c in node.children.iter() {
+                let id = go(c, src, write);
+                if id == NO_PAGE {
+                    return NO_PAGE; // abort: leave this path dirty.
+                }
+            }
+            let id = write(node, node.children.is_empty());
+            if id == NO_PAGE {
+                return NO_PAGE; // abort: leave this slot dirty too.
+            }
+            slot.set_page_id(id);
+            id
+        }
+        go(&self.root, self.source.as_deref(), write)
+    }
+
+    /// Build a new version in which leaf slots with a page id and a clear
+    /// accessed bit are on-disk. Processes at most `budget` leaf-parents,
+    /// starting after `cursor` (the max key of the last parent processed).
+    /// Returns (new tree, leaves demoted, next cursor / `None` when done).
+    ///
+    /// Demotion never assigns a *new* page id — a leaf keeps whatever id it
+    /// already had, it just stops being resident — so a demote pass never
+    /// invalidates anything on disk. The walk is conservative about CoW: a
+    /// leaf-parent (and every ancestor above it) is `make_mut`'d as soon as
+    /// it looks like it *might* have something to demote, before the
+    /// per-leaf accessed check runs — so a parent whose leaves all turn out
+    /// to be accessed (nothing demoted under it) is still left dirty by the
+    /// walk. [`restore_unchanged_ids`] undoes that afterward: it walks the
+    /// CoW'd path bottom-up and gives back the old page id to any node whose
+    /// children came out identical to the original's, so a pass that ends
+    /// up (fully or partially) demoting nothing forces no rewrite.
+    // No production caller yet — the (future) page evictor is the intended
+    // caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn demote_leaves(&self, cursor: Option<&K>, budget: usize) -> (BTree<K, V>, usize, Option<K>) {
+        let src = self.source.as_deref();
+        let h = self.height();
+        if h == 0 {
+            return (self.clone(), 0, None);
+        }
+        let mut out = self.clone();
+        let mut demoted = 0usize;
+        let mut left = budget;
+        let mut last: Option<K> = None;
+
+        // depth counts down; at depth 1 a node's children are leaves.
+        // Returns whether the budget was exhausted (there is more to do).
+        fn go<K: Ord + Clone, V>(
+            slot: &mut Child<K, V>,
+            depth: usize,
+            src: Option<&dyn NodeSource<K, V>>,
+            cursor: Option<&K>,
+            left: &mut usize,
+            demoted: &mut usize,
+            last: &mut Option<K>,
+        ) -> bool {
+            if *left == 0 {
+                return true;
+            }
+            if depth == 1 {
+                let node_ref = slot.load(src);
+                if let (Some(c), Some(maxk)) = (cursor, node_ref.entries.last().map(|e| &e.0))
+                    && maxk <= c
+                {
+                    return false; // already processed in an earlier pass
+                }
+                let any = node_ref.children.iter().any(|c| c.is_loaded() && c.page_id().is_some());
+                if !any {
+                    return false;
+                }
+                // Conservative CoW: this parent is dirtied here even if
+                // every child below turns out to be accessed (nothing
+                // demoted). `None` so the CoW isn't reported as new dirty
+                // data — it's bookkeeping, not a write — and
+                // `restore_unchanged_ids` gives the id back afterward if
+                // nothing actually changed.
+                let n = slot.make_mut(None);
+                for c in n.children.iter_mut() {
+                    if let (true, Some(id)) = (c.is_loaded(), c.page_id()) {
+                        if c.take_accessed() {
+                            // second chance: bit cleared, stays resident
+                        } else {
+                            *c = Child::on_disk(id);
+                            *demoted += 1;
+                        }
+                    }
+                }
+                *last = n.entries.last().map(|(k, _)| k.clone());
+                *left -= 1;
+                return *left == 0;
+            }
+            slot.load(src); // ensure resident; may fault a never-visited branch
+            let n = slot.make_mut(None);
+            for c in n.children.iter_mut() {
+                if go(c, depth - 1, src, cursor, left, demoted, last) {
+                    return true;
+                }
+            }
+            false
+        }
+        let exhausted = go(&mut out.root, h, src, cursor, &mut left, &mut demoted, &mut last);
+        restore_unchanged_ids(&out.root, &self.root, h, src);
+        (out, demoted, if exhausted { last } else { None })
+    }
+
+    /// Page ids referenced by `prev` and not by `self`, walking only inner
+    /// subtrees whose page id differs between the two (identical-id
+    /// subtrees are skipped whole).
+    // No production caller yet — the (future) GC/page-reclaim pass is the
+    // intended caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn changed_page_ids(&self, prev: &BTree<K, V>) -> Vec<PageId> {
+        use std::collections::HashSet;
+
+        fn inner_ids<K, V>(t: &BTree<K, V>, out: &mut HashSet<PageId>) {
+            fn go<K, V>(slot: &Child<K, V>, src: Option<&dyn NodeSource<K, V>>, out: &mut HashSet<PageId>) {
+                if !slot.is_loaded() {
+                    return; // an on-disk slot is a leaf (inner levels stay resident)
+                }
+                let n = slot.load(src);
+                if n.children.is_empty() {
+                    return;
+                }
+                if let Some(id) = slot.page_id() {
+                    out.insert(id);
+                }
+                for c in n.children.iter() {
+                    go(c, src, out);
+                }
+            }
+            go(&t.root, t.source.as_deref(), out);
+        }
+
+        let (mut new_inner, mut prev_inner) = (HashSet::new(), HashSet::new());
+        inner_ids(self, &mut new_inner);
+        inner_ids(prev, &mut prev_inner);
+
+        // Ids referenced under changed inner nodes of each side; a slot
+        // whose id is unchanged between the two trees is an identical
+        // subtree and is skipped whole rather than walked.
+        fn collect<K, V>(t: &BTree<K, V>, other_inner: &HashSet<PageId>, out: &mut HashSet<PageId>) {
+            fn go<K, V>(
+                slot: &Child<K, V>,
+                src: Option<&dyn NodeSource<K, V>>,
+                other: &HashSet<PageId>,
+                out: &mut HashSet<PageId>,
+            ) {
+                let id = slot.page_id();
+                if let Some(i) = id
+                    && other.contains(&i)
+                {
+                    return; // identical subtree on both sides
+                }
+                if let Some(i) = id {
+                    out.insert(i);
+                }
+                if !slot.is_loaded() {
+                    return;
+                }
+                let n = slot.load(src);
+                for c in n.children.iter() {
+                    go(c, src, other, out);
+                }
+            }
+            go(&t.root, t.source.as_deref(), other_inner, out);
+        }
+
+        let (mut new_ids, mut prev_ids) = (HashSet::new(), HashSet::new());
+        collect(self, &prev_inner, &mut new_ids);
+        collect(prev, &new_inner, &mut prev_ids);
+        prev_ids.difference(&new_ids).copied().collect()
+    }
+
+    /// A tree whose root is on disk. `len` from the root record.
+    // No production caller yet — the (future) recovery/attach path is the
+    // intended caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn from_root_page(id: PageId, len: usize, source: Arc<dyn NodeSource<K, V>>) -> Self {
+        BTree {
+            root: Child::on_disk(id),
+            len,
+            source: Some(source),
+        }
+    }
+
+    /// Fault in every non-leaf node; leaves stay on disk.
+    // No production caller yet — the (future) startup/attach path is the
+    // intended caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn load_inner_levels(&self) {
+        let src = self.source.as_deref();
+        let h = self.height();
+        fn go<K, V>(slot: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) {
+            if depth == 0 {
+                return; // leaf slot: leave on disk
+            }
+            let n = slot.load(src);
+            for c in n.children.iter() {
+                go(c, depth - 1, src);
+            }
+        }
+        go(&self.root, h, src)
+    }
+
+    /// Bytes of resident leaves, estimated as loaded-leaf-slots × NODE_BYTES.
+    // No production caller yet — the (future) page evictor's budget check is
+    // the intended caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn resident_leaf_estimate(&self) -> usize {
+        let src = self.source.as_deref();
+        let h = self.height();
+        fn go<K, V>(slot: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) -> usize {
+            if depth == 0 {
+                return if slot.is_loaded() { Child::<K, V>::NODE_BYTES } else { 0 };
+            }
+            let n = slot.load(src);
+            n.children.iter().map(|c| go(c, depth - 1, src)).sum()
+        }
+        go(&self.root, h, src)
+    }
+
+    /// Walk resident nodes, reporting every slot's page id — used by tests
+    /// and by a later task's punch (hole-punch reclaim) bookkeeping.
+    // No production caller yet — a later task's punch bookkeeping is the
+    // intended caller. Used today by this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn for_each_page_id(&self, f: &mut dyn FnMut(PageId)) {
+        fn go<K, V>(slot: &Child<K, V>, src: Option<&dyn NodeSource<K, V>>, f: &mut dyn FnMut(PageId)) {
+            if let Some(id) = slot.page_id() {
+                f(id);
+            }
+            if !slot.is_loaded() {
+                return;
+            }
+            for c in slot.load(src).children.iter() {
+                go(c, src, f);
+            }
+        }
+        go(&self.root, self.source.as_deref(), f)
+    }
+}
+
+/// After [`BTree::demote_leaves`] CoWs an inner path — conservatively,
+/// before it knows whether anything under a given parent will actually end
+/// up demoted (see that method's doc comment) — give back a node's old page
+/// id wherever every one of its child slots still matches the corresponding
+/// slot in `orig`, walking both trees in lockstep, bottom-up, down to (but
+/// not including) the leaf level. Demotion never changes a page id (flipping
+/// a leaf resident<->on-disk keeps its id, which is all `Child::same_node`
+/// compares), so in practice this restores the entire touched path whenever
+/// nothing above the leaf level structurally changed.
+fn restore_unchanged_ids<K: Ord + Clone, V>(new: &Child<K, V>, orig: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) {
+    if depth == 0 || new.page_id().is_some() {
+        // Leaf level (demotion never touches a leaf's id), or a node this
+        // pass never `make_mut`'d in the first place — nothing to restore.
+        return;
+    }
+    let nn = new.load(src);
+    let on = orig.load(src);
+    for (nc, oc) in nn.children.iter().zip(on.children.iter()) {
+        restore_unchanged_ids(nc, oc, depth - 1, src);
+    }
+    if nn.children.iter().zip(on.children.iter()).all(|(a, b)| Child::same_node(a, b))
+        && let Some(id) = orig.page_id()
+    {
+        new.set_page_id(id);
     }
 }
 
@@ -1911,6 +2248,15 @@ struct BulkBuilder<K, V> {
     levels: Vec<LevelBuilder<K, V>>,
     len: usize,
     last_key: Option<K>,
+    /// Carried from the tree `extend_from_sorted` is appending to (`None`
+    /// for a fresh `from_sorted` build). `seed_from_spine` clones — without
+    /// faulting — the non-rightmost children at each spine level, so a
+    /// sibling the builder later needs to read (`redistribute_tail`'s
+    /// borrow, `fix_right_spine_tail`'s residual-underflow walk) can be an
+    /// on-disk slot; this is what lets those reads fault instead of
+    /// panicking, and what lets the tree `finish()` produces still fault in
+    /// whatever it didn't touch.
+    source: Option<Arc<dyn NodeSource<K, V>>>,
 }
 
 impl<K: Ord + Clone, V> BulkBuilder<K, V> {
@@ -1919,6 +2265,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             levels: vec![LevelBuilder::new()],
             len: 0,
             last_key: None,
+            source: None,
         }
     }
 
@@ -1977,6 +2324,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             levels,
             len: tree.len,
             last_key,
+            source: tree.source.clone(),
         }
     }
 
@@ -2094,7 +2442,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                         pending_reinsert.push(lv.entries.pop().unwrap());
                     }
                 }
-                redistribute_tail::<K, V>(&mut self.levels, level);
+                redistribute_tail::<K, V>(&mut self.levels, level, self.source.as_deref());
             }
 
             let lv = &mut self.levels[level];
@@ -2169,17 +2517,9 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                 children: Children::new(),
             }))
         });
-        // TODO(task3): must receive the tree's source; a seeded on-disk slot
-        // here would panic in `load`. Today `from_sorted` always starts from
-        // `None` and `extend_from_sorted`'s `seed_from_spine` reads the input
-        // tree's spine but does not carry its `source` into the builder, so
-        // this is a no-op for every tree this task can build — but it is a
-        // real gap for whenever a tree can hold on-disk `Child` slots.
-        fix_right_spine_tail(&mut root, None);
+        fix_right_spine_tail(&mut root, self.source.as_deref());
         let len = self.len - pending_reinsert.len();
-        // TODO(task3): same gap as above — should be `source:
-        // self.source.clone()` once `BulkBuilder` carries one.
-        let mut tree = BTree { root, len, source: None };
+        let mut tree = BTree { root, len, source: self.source.clone() };
         for (k, v) in pending_reinsert {
             tree.insert_arc_mut(k, v);
         }
@@ -2213,7 +2553,13 @@ fn fix_right_spine_tail<K: Ord + Clone, V>(
     node: &mut Child<K, V>,
     src: Option<&dyn NodeSource<K, V>>,
 ) -> bool {
-    let n = node.make_mut(src);
+    // `make_mut_quiet`/`load_quiet`, not the marking variants: this walk is
+    // internal tree-shape bookkeeping run while *constructing* the tree
+    // (from `BulkBuilder::finish`), not a real workload access — it must
+    // not leave the freshly-built right spine (down to and including the
+    // rightmost leaf) looking "recently used" to a later `demote_leaves`
+    // pass just because the builder touched it once at build time.
+    let n = node.make_mut_quiet(src);
     if n.children.is_empty() {
         return n.entries.len() < MIN_KEYS;
     }
@@ -2224,7 +2570,7 @@ fn fix_right_spine_tail<K: Ord + Clone, V>(
     // own `entries.len() < MIN_KEYS` check below, for our own parent to
     // handle against our (real) sibling.
     if child_underfull {
-        while n.children.len() > 1 && n.children[last].load(src).entries.len() < MIN_KEYS {
+        while n.children.len() > 1 && n.children[last].load_quiet(src).entries.len() < MIN_KEYS {
             fix_underfull_child(&mut n.entries, &mut n.children, last, src);
             last = n.children.len() - 1;
         }
@@ -2239,7 +2585,7 @@ fn fix_right_spine_tail<K: Ord + Clone, V>(
 /// in half so both resulting nodes satisfy `MIN_KEYS`. The new left node and
 /// separator go back into the parent; the partial node receives the right
 /// half.
-fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usize) {
+fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usize, src: Option<&dyn NodeSource<K, V>>) {
     let is_leaf_level = level == 0;
     let (lower, upper) = levels.split_at_mut(level + 1);
     let lv = &mut lower[level];
@@ -2253,14 +2599,12 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
         .entries
         .pop()
         .expect("redistribute_tail: no separator");
-    // TODO(task3): must receive the tree's source; a seeded on-disk slot
-    // here would panic in `load`. Today every `Child` a `BulkBuilder` holds
-    // is either one it built itself (`Child::resident`, always in-memory) or
-    // a clone of a spine node from `seed_from_spine` — which does not carry
-    // the input tree's `source` into the builder (see the TODOs in
-    // `finish()`) — so this is a no-op for every tree this task can build,
-    // but it is a real gap once a tree can hold on-disk `Child` slots.
-    let sibling = sibling.load(None);
+    // `sibling` is either one the builder built itself (`Child::resident`,
+    // always in-memory) or a clone of a non-rightmost spine node from
+    // `seed_from_spine` — which, since the builder now carries the input
+    // tree's `source` (see `BulkBuilder::source`), can be an on-disk slot;
+    // `src` is what lets this fault it in instead of panicking.
+    let sibling = sibling.load(src);
 
     // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
     let mut merged_entries: Vec<(K, Arc<V>)> = sibling.entries.to_vec();
@@ -4149,6 +4493,17 @@ mod tests {
         // -------------------------------------------------------------
 
         #[test]
+        #[should_panic(expected = "FixedVec::push: at capacity")]
+        fn push_at_capacity_panics() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..CAP as u32 {
+                v.push(Elem::new(i, &live));
+            }
+            v.push(Elem::new(99, &live)); // len == N == CAP: no room left
+        }
+
+        #[test]
         #[should_panic(expected = "FixedVec::insert: out of bounds or at capacity")]
         fn insert_at_capacity_panics() {
             let live = Arc::new(AtomicUsize::new(0));
@@ -4330,6 +4685,288 @@ mod tests {
                     prop_assert_eq!(fv.to_vec(), model.clone());
                     prop_assert_eq!(fv.len(), model.len());
                 }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Paging primitives: height, write_dirty, demote_leaves,
+    // changed_page_ids, from_root_page, load_inner_levels,
+    // resident_leaf_estimate, for_each_page_id — all exercised against
+    // `crate::child::tests::MockDisk`, an in-memory mock "disk".
+    // -----------------------------------------------------------------
+    mod paged {
+        use super::*;
+        use crate::child::tests::MockDisk;
+        use std::sync::Arc;
+
+        /// Write every dirty node into `disk`, assigning sequential ids
+        /// 4096 apart (page-sized, though `MockDisk` doesn't care). Returns
+        /// the root id.
+        ///
+        /// Stores a *detached* image, not `node.clone()`: `Child::clone`
+        /// preserves an already-resident child's live pointer (that's the
+        /// point of it — a CoW node clone must not evict anything), so a
+        /// plain structural clone of an inner node would carry its whole
+        /// resident subtree into the "page" via shared `Arc`s. A real disk
+        /// page holds only the entries and each child's id (`write_dirty`
+        /// visits post-order, so every child already has one); rebuilding
+        /// `children` as fresh `Child::on_disk` slots is what makes reading
+        /// this page back later actually fault its children instead of
+        /// reusing the writer's own live copies.
+        fn flush(t: &BTree<u64, u64>, disk: &MockDisk<u64, u64>, next: &mut u64) -> u64 {
+            t.write_dirty(&mut |node, _leaf| {
+                *next += 4096;
+                let detached = BTreeNode {
+                    entries: node.entries.clone(),
+                    children: node
+                        .children
+                        .iter()
+                        .map(|c| Child::on_disk(c.page_id().expect("write_dirty: child written before its parent")))
+                        .collect(),
+                };
+                disk.put(*next, Arc::new(detached));
+                *next
+            })
+        }
+        fn tree(n: u64) -> BTree<u64, u64> {
+            BTree::from_sorted((1..=n).map(|k| (k, Arc::new(k))))
+        }
+
+        #[test]
+        fn height_of_bulk_tree() {
+            assert_eq!(tree(10).height(), 0);
+            assert_eq!(tree(10_000).height(), 2, "10k rows at MAX_KEYS=63: leaves, one inner level, root");
+        }
+
+        #[test]
+        fn write_dirty_is_post_order_and_marks_clean() {
+            let disk = MockDisk::new();
+            let t = tree(5_000);
+            let mut next = 0;
+            let mut order = Vec::new();
+            let root = t.write_dirty(&mut |node, leaf| {
+                next += 1;
+                order.push((next, leaf));
+                disk.put(next, Arc::new(node.clone()));
+                next
+            });
+            assert_eq!(order.last().unwrap(), &(root, false), "root written last");
+            assert!(order.iter().take_while(|(_, l)| *l).count() > 0, "leaves before their parent");
+            // Nothing dirty remains: a second walk writes zero pages.
+            let mut writes = 0;
+            t.write_dirty(&mut |_, _| {
+                writes += 1;
+                0
+            });
+            assert_eq!(writes, 0);
+        }
+
+        #[test]
+        fn write_dirty_after_one_insert_writes_exactly_one_path() {
+            let disk = MockDisk::new();
+            let mut t = tree(5_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(Arc::new(MockDisk::<u64, u64>::new())));
+            t.insert_mut(2_500, 1);
+            let mut writes = 0;
+            t.write_dirty(&mut |_, _| {
+                writes += 1;
+                next += 4096;
+                next
+            });
+            assert_eq!(writes, t.height() + 1, "one node per level on the CoW path");
+        }
+
+        #[test]
+        fn demote_then_read_faults_exactly_touched_leaves() {
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(20_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(disk.clone()));
+            let (t2, demoted, cursor) = t.demote_leaves(None, usize::MAX);
+            assert!(cursor.is_none());
+            assert!(demoted > 300, "20k rows ≈ 318 leaves, all quiet");
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 0, "demotion loads nothing");
+            for k in [1u64, 2, 3, 10_000, 19_999] {
+                assert_eq!(t2.get(&k), Some(&k));
+            }
+            // 1,2,3 share a leaf; 10_000 and 19_999 are two more: 3 leaves.
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 3);
+            // Old version untouched and fully resident.
+            assert_eq!(t.resident_leaf_estimate() > t2.resident_leaf_estimate(), true);
+        }
+
+        #[test]
+        fn demote_gives_accessed_leaves_a_second_chance() {
+            // Controller ruling: `get()` marking every resident hit accessed
+            // (including a call made purely to *observe* residency) is the
+            // spec's second-chance semantics working as intended, not a bug
+            // — a page re-touched between sweeps legitimately survives. So
+            // this test observes pass-1 survival via `resident_leaf_estimate`
+            // (`is_loaded()`-based, never marks) instead of a `get()`, which
+            // would itself re-arm the bit it's trying to check.
+            //
+            // Deliberately tracks key 5, in the *leftmost* leaf, not an
+            // arbitrary interior one: `resident_leaf_estimate` calls
+            // `height()` to find its depth, and `height()` walks — and, if
+            // what it finds isn't resident, faults — the leftmost path to do
+            // that (its own doc comment: "Loads only the leftmost path").
+            // With the accessed leaf being anywhere *else*, that leftmost
+            // walk would find the (unrelated, correctly-demoted) leftmost
+            // leaf on disk and fault it back in as a side effect of the
+            // residency check itself — corrupting the very count being
+            // observed with a leaf nobody asked about. Tracking the leftmost
+            // leaf sidesteps that for the pass-1 check: it's exactly the one
+            // leaf still resident, so `height()`'s walk down to it is a
+            // free peek, not a fault.
+            //
+            // That same fact is why there's no analogous `resident_leaf_estimate() == 0`
+            // check after pass 2: once the *tracked* (leftmost) leaf itself
+            // is genuinely on disk, asking "is anything resident" via
+            // `resident_leaf_estimate` would unavoidably fault it straight
+            // back in to answer the question — there is no way to observe
+            // "nothing is resident" through this primitive without
+            // resurrecting the one thing being checked. `get()` + the
+            // read-count below proves the same fact honestly instead: if the
+            // leaf were still resident, `get` would cost zero additional
+            // reads; it costs exactly one, so it wasn't.
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(20_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(disk.clone()));
+            t.get(&5); // marks the leftmost leaf accessed
+            let before = t.resident_leaf_estimate(); // is_loaded()-based, does not mark
+            let (t2, _d1, _) = t.demote_leaves(None, usize::MAX);
+            assert_eq!(
+                t2.resident_leaf_estimate(),
+                Child::<u64, u64>::NODE_BYTES,
+                "exactly the accessed leaf survived pass 1"
+            );
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+            let (t3, d2, _) = t2.demote_leaves(None, usize::MAX);
+            assert_eq!(d2, 1, "second pass takes it");
+            assert_eq!(t3.get(&5), Some(&5));
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 1, "and now it faults");
+            let _ = before;
+        }
+
+        #[test]
+        fn demote_respects_budget_and_resumes_from_cursor() {
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(20_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(disk.clone()));
+            let (t2, d1, c1) = t.demote_leaves(None, 2);
+            assert!(c1.is_some() && d1 <= 2 * 64);
+            let (t3, d2, c2) = t2.demote_leaves(c1.as_ref(), usize::MAX);
+            assert!(c2.is_none());
+            assert!(d1 + d2 > 300);
+            assert_eq!(t3.len(), 20_000);
+        }
+
+        #[test]
+        fn demote_leaves_with_no_quiet_leaves_leaves_write_dirty_with_zero_writes() {
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(5_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(disk.clone()));
+            // Touch every leaf so nothing is quiet when we demote.
+            for k in 1..=5_000u64 {
+                t.get(&k);
+            }
+            let (t2, demoted, _) = t.demote_leaves(None, usize::MAX);
+            assert_eq!(demoted, 0, "every leaf was accessed; none should be demoted");
+            let mut writes = 0;
+            t2.write_dirty(&mut |_, _| {
+                writes += 1;
+                0
+            });
+            assert_eq!(writes, 0, "restore_unchanged_ids must give every parent back its old page id");
+        }
+
+        #[test]
+        fn changed_page_ids_is_the_replaced_path() {
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(20_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            let prev = t.clone();
+            t.set_source(Some(disk.clone()));
+            t.insert_mut(7, 70);
+            flush(&t, &disk, &mut next);
+            let dead = t.changed_page_ids(&prev);
+            assert_eq!(dead.len(), t.height() + 1, "old leaf + old inner path + old root");
+            assert!(dead.iter().all(|id| prev_has(&prev, *id)));
+            fn prev_has(p: &BTree<u64, u64>, id: u64) -> bool {
+                let mut found = false;
+                p.for_each_page_id(&mut |x| found |= x == id);
+                found
+            }
+        }
+
+        #[test]
+        fn from_root_page_and_load_inner_levels() {
+            let disk = Arc::new(MockDisk::new());
+            let t = tree(20_000);
+            let mut next = 0;
+            let root = flush(&t, &disk, &mut next);
+            let t2: BTree<u64, u64> = BTree::from_root_page(root, 20_000, disk.clone());
+            t2.load_inner_levels();
+            let inner = disk.reads.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(inner < 20, "root + one inner level (~6 nodes) + one leaf for height probing");
+            assert_eq!(t2.get(&123), Some(&123));
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), inner + 1);
+        }
+
+        // -------------------------------------------------------------
+        // Controller ruling 1: BulkBuilder's source-threading gap. A tree
+        // with a source and some on-disk leaves, `extend_from_sorted` with
+        // keys beyond its max, then `get` a key in an on-disk leaf that
+        // `extend_from_sorted` never touched (it only ever rewrites the
+        // right spine) — must not panic, and must fault exactly once.
+        // -------------------------------------------------------------
+        #[test]
+        fn bulk_builder_carries_source_through_extend() {
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(1_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(disk.clone()));
+            let (mut t2, demoted, _) = t.demote_leaves(None, usize::MAX);
+            assert!(demoted > 0, "need at least one on-disk leaf for this test to mean anything");
+            t2.extend_from_sorted((1_001..=1_010).map(|k| (k, Arc::new(k))));
+            // Key 1 lives in the leftmost leaf, untouched by
+            // `extend_from_sorted` (which only ever rewrites the right
+            // spine): must fault (not panic), exactly once.
+            let reads_before = disk.reads.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(t2.get(&1), Some(&1));
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), reads_before + 1);
+        }
+
+        proptest! {
+            #[test]
+            fn on_disk_twin_agrees_and_faults_once_per_leaf(ops in proptest::collection::vec((0u64..5_000, 0u8..3), 1..300)) {
+                let disk = Arc::new(MockDisk::new());
+                let mut resident = tree(5_000);
+                let mut next = 0;
+                flush(&resident, &disk, &mut next);
+                let mut paged = { let mut p = resident.clone(); p.set_source(Some(disk.clone())); p.demote_leaves(None, usize::MAX).0 };
+                for (k, op) in ops {
+                    match op {
+                        0 => prop_assert_eq!(resident.get(&k), paged.get(&k)),
+                        1 => { resident.insert_mut(k, k + 1); paged.insert_mut(k, k + 1); }
+                        _ => { resident.remove_mut(&k); paged.remove_mut(&k); }
+                    }
+                }
+                let a: Vec<_> = resident.range(..).map(|(k, v)| (*k, *v)).collect();
+                let b: Vec<_> = paged.range(..).map(|(k, v)| (*k, *v)).collect();
+                prop_assert_eq!(a, b);
             }
         }
     }
