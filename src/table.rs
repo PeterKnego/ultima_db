@@ -156,16 +156,27 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// each *persisted* index's tree, to `ctx.file`, and report the
     /// resulting root/height/len of each as a [`PagedTableEntry`].
     ///
-    /// Operates directly against the live tree's `Child` slots (interior
-    /// mutability — see the impl for `Table`), not a private clone: a
-    /// following [`Self::paged_demote`] on this same table needs to see the
-    /// page ids this call just assigned, and a *second* `paged_write` with
-    /// nothing changed in between must write nothing.
+    /// Two paths, chosen by whether the write overlay is empty:
+    /// - **Empty overlay (the common case):** writes directly against the
+    ///   live tree's `Child` slots (interior mutability — see the impl for
+    ///   `Table`), and returns `(entry, None)`. A following
+    ///   [`Self::paged_demote`] on this same table sees the page ids this
+    ///   call just assigned, and a *second* `paged_write` with nothing
+    ///   changed in between writes nothing.
+    /// - **Non-empty overlay:** `write_dirty` reads the tree directly and
+    ///   cannot see overlay-buffered rows, so this clones the table and
+    ///   flushes the *clone's* overlay first (the `diff_table` precedent in
+    ///   `registry.rs`), then writes that. The pages this writes are
+    ///   reachable only from the flushed clone's tree — `self`'s own tree
+    ///   never had those rows inserted, so `self` cannot reach them and no
+    ///   GC pass ever will either — so the clone comes back as `Some(..)`:
+    ///   the caller (Task 8's `Store`) must install it as a same-version
+    ///   re-publish, or every page just written leaks.
     // No production caller yet — `Store`'s checkpoint writer (Task 8+).
     // Used today by this file's `paged` test module.
     #[cfg(feature = "persistence")]
     #[allow(dead_code)]
-    fn paged_write(&self, ctx: &PagedCtx) -> Result<PagedTableEntry>;
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<(PagedTableEntry, Option<Box<dyn MergeableTable>>)>;
 
     /// Demote up to `budget` leaf-parents' quiet leaves of the data tree
     /// back to on-disk, resuming after `cursor` (an erased `&K`, `None` at
@@ -175,6 +186,13 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// hold the result), the leaf count demoted, and the next cursor
     /// (`None` once the pass reaches the end). A `Residency::Resident`
     /// table always returns `(clone of self, 0, None)`.
+    ///
+    /// `cursor`, once erased to `&dyn Any`, is only ever checked against
+    /// `K` by a fallible downcast: a caller that hands back a cursor from
+    /// a *different* table's `paged_demote` result is a bug, and in a
+    /// debug build that bug panics (`debug_assert!`) rather than silently
+    /// restarting the pass; a release build treats the mismatch as `None`
+    /// (start of pass) and demotes correctly, just not incrementally.
     // No production caller yet — see `paged_write` above.
     #[cfg(feature = "persistence")]
     #[allow(dead_code)]
@@ -327,7 +345,7 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
     }
 
     #[cfg(feature = "persistence")]
-    fn paged_write(&self, ctx: &PagedCtx) -> Result<PagedTableEntry> {
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<(PagedTableEntry, Option<Box<dyn MergeableTable>>)> {
         // `write_dirty` mutates a node's `Child` slot via interior
         // mutability (`set_page_id` takes `&self`), so writing straight
         // against `self.data` — instead of a private clone — is what lets a
@@ -340,15 +358,20 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         // defeat both of those. The one thing `write_dirty` cannot see is
         // the overlay (it reads the tree directly), so the clone-then-flush
         // fallback — the `diff_table` precedent in `registry.rs` — is kept
-        // for the rare case of a live SingleWriter table with a non-empty
-        // overlay; there, this call's page-id bookkeeping is throwaway
-        // anyway, since the buffered rows haven't landed in the tree yet.
+        // for the case of a live SingleWriter table with a non-empty
+        // overlay. There, the pages this writes are reachable *only* from
+        // the flushed clone's tree (its overlay-buffered rows were never
+        // inserted into `self`'s own tree), so the clone is handed back as
+        // `Some(..)` instead of discarded — a caller that drops it would
+        // leak every page just written, unreachable from any root a GC
+        // pass could ever walk.
         if self.overlay_is_empty() {
-            self.paged_write_tree(ctx)
+            Ok((self.paged_write_tree(ctx)?, None))
         } else {
             let mut flushed = self.clone();
             flushed.flush_overlay();
-            flushed.paged_write_tree(ctx)
+            let entry = flushed.paged_write_tree(ctx)?;
+            Ok((entry, Some(Box::new(flushed))))
         }
     }
 
@@ -362,6 +385,12 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
             return (Box::new(self.clone()), 0, None);
         }
         let cursor_k: Option<&K> = cursor.and_then(|c| c.downcast_ref::<K>());
+        debug_assert!(
+            cursor.is_none() || cursor_k.is_some(),
+            "paged_demote: cursor did not downcast to this table's key type (a caller \
+             handed back a cursor from a different table's pass); release builds \
+             silently restart the pass instead of resuming"
+        );
         let (new_data, demoted, next) = self.data.demote_leaves(cursor_k, budget);
         if let Some(stats) = &self.stats {
             stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
@@ -510,9 +539,13 @@ pub struct Table<R, K = u64> {
     stats: Option<Arc<PagedStats>>,
     /// This table's name, set by `attach_paged_source` — carried so
     /// `paged_write` can stamp it on the [`PagedTableEntry`] it returns
-    /// without the caller having to patch the name in afterward.
+    /// without the caller having to patch the name in afterward. `Arc<str>`,
+    /// not `String`: this field rides along on every `Table::clone` (the
+    /// per-`open_table` write path clones the whole table), and an `Arc`
+    /// clone is a refcount bump instead of a fresh heap allocation + copy
+    /// of the name's bytes on every one of those.
     #[cfg(feature = "persistence")]
-    paged_name: Option<String>,
+    paged_name: Option<Arc<str>>,
 }
 
 /// Captured table state for atomic batch rollback.
@@ -1426,7 +1459,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         });
         self.data.set_source(Some(source));
         self.stats = Some(stats.clone());
-        self.paged_name = Some(table_name.to_string());
+        self.paged_name = Some(Arc::from(table_name));
         for idx in self.indexes.values_mut() {
             idx.attach_paged_source(file.clone(), stats.clone(), table_name);
         }
@@ -1439,6 +1472,15 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     #[allow(dead_code)]
     #[cfg(feature = "persistence")]
     fn paged_write_tree(&self, ctx: &PagedCtx) -> Result<PagedTableEntry> {
+        // Every real caller reaches this only after `attach_paged_source`,
+        // which always sets `paged_name`; an unset name would silently
+        // stamp `PagedTableEntry.name` as `""`, indistinguishable from a
+        // legitimately empty-named table (there is none) — catch the
+        // misuse instead of writing a nameless entry into a checkpoint.
+        debug_assert!(
+            self.paged_name.is_some(),
+            "paged_write_tree: called before attach_paged_source (paged_name unset)"
+        );
         // An empty tree has no root page: writing one would just be a
         // wasted, forever-unreferenced page, and there is nothing for a
         // future attach to fault in anyway.
@@ -1479,7 +1521,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         }
 
         Ok(PagedTableEntry {
-            name: self.paged_name.clone().unwrap_or_default(),
+            name: self.paged_name.as_deref().unwrap_or("").to_string(),
             key_type_id: K::KEY_TYPE_ID,
             root_page,
             height,
@@ -4737,32 +4779,37 @@ mod paged {
     use crate::pagecodec::PagedStats;
     use crate::pagefile::{page_file_path, PageFile};
 
+    /// Build a 20,000-row table via the bulk fast path, attach it to a
+    /// fresh page file, and write it once. Shared by every test below that
+    /// needs a populated, already-`paged_write`n table.
+    ///
+    /// Bulk (`insert_batch`), not a `put`-loop: `Table::put`'s per-row path
+    /// descends via `Child::make_mut`, which — unlike `write_dirty`'s
+    /// `load_quiet` — marks every touched leaf "accessed" as a side effect
+    /// of being *built*. `demote_leaves` gives an accessed leaf a second
+    /// chance (see `demote_gives_accessed_leaves_a_second_chance` in
+    /// `btree.rs`), so a put-loop-built tree's *first* demote pass would
+    /// legitimately demote nothing — correct clock-sweep behavior, but not
+    /// what these tests are after. The bulk path builds leaves directly,
+    /// the same way a real paged table would arrive freshly
+    /// bulk-loaded/recovered, with no accessed bits to give a false second
+    /// chance.
+    fn bulk_paged_table(file: Arc<PageFile>, stats: Arc<PagedStats>) -> Table<u64, u64> {
+        let mut t: Table<u64, u64> = Table::new();
+        let ids = t.insert_batch((1..=20_000u64).map(|i| i * 2).collect()).unwrap();
+        assert_eq!(ids, (1..=20_000u64).collect::<Vec<_>>());
+        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        let (_entry, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert!(flushed.is_none(), "a freshly bulk-built table has no overlay to flush");
+        t
+    }
+
     #[test]
     fn table_paged_write_then_demote_then_read_faults_one_leaf() {
         let d = tempfile::tempdir().unwrap();
         let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
         let stats = Arc::new(PagedStats::default());
-        // Built via the bulk fast path (`insert_batch` on a fresh AutoKey
-        // table assigns ids 1..=20_000 in order, landing exactly the same
-        // (key, value) pairs a `put`-loop would) rather than one `put` per
-        // row: `Table::put`'s per-row path descends via `Child::make_mut`,
-        // which — unlike `write_dirty`'s `load_quiet` — marks every touched
-        // leaf "accessed" as a side effect of being *built*. `demote_leaves`
-        // gives an accessed leaf a second chance (see
-        // `demote_gives_accessed_leaves_a_second_chance` in `btree.rs`), so
-        // a put-loop-built tree's *first* demote pass would legitimately
-        // demote nothing — correct clock-sweep behavior, but not what this
-        // test is after. The bulk path builds leaves directly, the same way
-        // a real paged table would arrive freshly bulk-loaded/recovered,
-        // with no accessed bits to give a false second chance.
-        let mut t: Table<u64, u64> = Table::new();
-        let ids = t.insert_batch((1..=20_000u64).map(|i| i * 2).collect()).unwrap();
-        assert_eq!(ids, (1..=20_000u64).collect::<Vec<_>>());
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
-        let entry = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
-        assert_eq!(entry.len, 20_000);
-        assert!(entry.root_page.is_some());
-        assert_eq!(entry.key_type_id, <u64 as PrimaryKey>::KEY_TYPE_ID);
+        let t = bulk_paged_table(file.clone(), stats.clone());
         let written = stats.pages_written.load(Ordering::Relaxed);
         assert!(written > 300, "expected > 300 pages written for 20,000 rows, got {written}");
 
@@ -4775,7 +4822,8 @@ mod paged {
         // A second write after no changes writes nothing (demotion re-marked
         // unchanged parents, and the leaf fault above didn't dirty anything).
         let before = stats.pages_written.load(Ordering::Relaxed);
-        t2.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        let (_entry, flushed) = t2.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert!(flushed.is_none());
         assert_eq!(stats.pages_written.load(Ordering::Relaxed), before);
     }
 
@@ -4788,7 +4836,7 @@ mod paged {
         for i in 1..=1_000u64 {
             t.put(i, i % 10).unwrap();
         }
-        t.define_persisted_index::<u64>("by_mod", IndexKind::NonUnique, IndexDef { generation: 3 }, |r| *r)
+        t.define_persisted_index::<u64>("by_mod", IndexKind::NonUnique, IndexDef::new(3), |r| *r)
             .unwrap();
         // NonUnique, not Unique: the record values here (`i % 10`) repeat
         // 100x each, so a *unique* index over them would hit
@@ -4796,7 +4844,8 @@ mod paged {
         // "plain index is skipped by paged_write" test is checking.
         t.define_index("plain", IndexKind::NonUnique, |r: &u64| *r + 1_000_000).unwrap();
         t.attach_paged_source(file.clone(), stats.clone(), "rows");
-        let e = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        let (e, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert!(flushed.is_none());
         assert_eq!(e.indexes.len(), 1);
         assert_eq!(e.indexes[0].name, "by_mod");
         assert_eq!(e.indexes[0].generation, 3);
@@ -4809,16 +4858,128 @@ mod paged {
         let d = tempfile::tempdir().unwrap();
         let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
         let stats = Arc::new(PagedStats::default());
-        let mut t: Table<u64, u64> = Table::new_keyed();
-        for i in 1..=20_000u64 {
-            t.put(i, i * 2).unwrap();
-        }
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
-        t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        let mut t = bulk_paged_table(file, stats);
 
         t.set_residency(Residency::Resident);
         let (_t2, demoted, done) = t.paged_demote(None, usize::MAX);
         assert_eq!(demoted, 0);
         assert!(done.is_none());
+    }
+
+    /// Same construction as `resident_table_never_demotes`, but left at the
+    /// default `Lazy` residency — proves the `Resident` guard above is
+    /// gating something real: delete it (or break it) and this table would
+    /// *still* demote fine, but so would the "resident" one above, and that
+    /// test would keep passing for the wrong reason.
+    #[test]
+    fn lazy_table_with_same_construction_does_demote() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let t = bulk_paged_table(file, stats);
+        assert_eq!(t.residency(), Residency::Lazy);
+
+        let (_t2, demoted, _done) = t.paged_demote(None, usize::MAX);
+        assert!(demoted > 300, "expected > 300 demoted leaves, got {demoted}");
+    }
+
+    /// A cursor from a `paged_demote` pass that ran out of budget resumes a
+    /// later pass instead of restarting it — proves the erased `&dyn Any`
+    /// cursor round-trips correctly, not just that a `None` cursor works.
+    #[test]
+    fn paged_demote_cursor_round_trip_resumes_the_pass() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let t = bulk_paged_table(file, stats);
+
+        let (t2, demoted1, cursor) = t.paged_demote(None, 2);
+        assert!(demoted1 > 0, "a 2-leaf-parent budget must demote something");
+        let cursor = cursor.expect("a budget of 2 leaf-parents out of ~18 must not finish the pass");
+        let t2 = t2.as_any().downcast_ref::<Table<u64, u64>>().unwrap().clone();
+
+        let cursor_ref: Option<&dyn Any> = Some(cursor.as_ref());
+        let (_t3, demoted2, _done2) = t2.paged_demote(cursor_ref, usize::MAX);
+        assert!(demoted2 > 0, "the second call must resume from the cursor, not restart from nothing");
+        assert!(demoted1 + demoted2 > 300, "demoted1={demoted1} demoted2={demoted2}");
+    }
+
+    /// `IndexMaintainer::empty_clone` (bulk-load's rebuild-from-empty
+    /// primitive) must preserve a persisted index's `persist` marker —
+    /// otherwise a `bulk_load` over a table with a persisted index silently
+    /// de-persists it.
+    #[test]
+    fn empty_clone_of_persisted_index_preserves_persistability() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let mut t: Table<u64, u64> = Table::new_keyed();
+        for i in 1..=100u64 {
+            t.put(i, i % 5).unwrap();
+        }
+        t.define_persisted_index::<u64>("by_mod", IndexKind::NonUnique, IndexDef::new(7), |r| *r)
+            .unwrap();
+
+        let empties = t.empty_index_defs().unwrap();
+        assert_eq!(empties.len(), 1);
+        let mut idx = empties.into_iter().next().unwrap();
+        idx.attach_paged_source(file.clone(), stats.clone(), "rows");
+        let entry = idx
+            .paged_write(&PagedCtx { file: &file, stats: &stats })
+            .unwrap()
+            .expect("empty_clone must preserve the persist marker, not just the shape");
+        assert_eq!(entry.ik_type_id, <u64 as PrimaryKey>::KEY_TYPE_ID);
+        assert_eq!(entry.generation, 7);
+    }
+
+    /// A table with rows buffered in the write overlay (never inserted into
+    /// its own tree) forces `paged_write` onto the clone-and-flush path:
+    /// the entry must reflect the buffered rows, the pages written must be
+    /// durably reachable through the page file (not just through the
+    /// in-memory clone), and the returned flushed table must come back
+    /// `Some` — dropping it would leak every page this call wrote, since
+    /// `self`'s own tree never had the buffered rows inserted into it.
+    #[test]
+    fn paged_write_with_buffered_overlay_returns_the_flushed_table() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let mut t: Table<u64, u64> = Table::new();
+        let ids = t.insert_batch((1..=100u64).map(|i| i * 2).collect()).unwrap();
+        assert_eq!(ids.len(), 100);
+        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        // Buffer one row directly in the overlay (bypassing the tree) so
+        // `paged_write` must take the clone-and-flush path.
+        t.overlay_mut_for_test(8).set_put(9_999, Arc::new(24_998), false);
+        assert_eq!(t.get(&9_999), Some(&24_998), "sanity: overlay row visible before paged_write");
+
+        let (entry, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert_eq!(entry.len, 101);
+        let flushed = flushed.expect("a buffered overlay must force the clone-and-flush path");
+        let flushed = flushed.as_any().downcast_ref::<Table<u64, u64>>().unwrap();
+        assert_eq!(flushed.get(&9_999), Some(&24_998), "flushed table's own tree carries the row");
+
+        // Read the entry's root page back through a *fresh* PagedSource —
+        // proving the row landed durably in the page file, not just in the
+        // in-memory clone's tree.
+        let root_id = entry.root_page.expect("101 rows must have a root page");
+        let read_stats = Arc::new(PagedStats::default());
+        let source: Arc<PagedSource<u64, u64>> = Arc::new(PagedSource {
+            file: file.clone(),
+            codec: NodeCodec::<u64, u64>::records::<u64>(),
+            name: "rows".to_string(),
+            stats: read_stats,
+        });
+        let read_back: BTree<u64, u64> =
+            BTree::from_root_page(root_id, entry.len as usize, entry.height as usize, source);
+        assert_eq!(read_back.get(&9_999), Some(&24_998));
+
+        // The flushed table's own tree slots are clean now (its overlay is
+        // empty): a second `paged_write` on it takes the fast path and
+        // writes nothing more.
+        let before = stats.pages_written.load(Ordering::Relaxed);
+        let (_entry2, flushed2) = flushed.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert!(flushed2.is_none(), "flushed table's overlay is empty — fast path, no second clone");
+        assert_eq!(stats.pages_written.load(Ordering::Relaxed), before);
     }
 }

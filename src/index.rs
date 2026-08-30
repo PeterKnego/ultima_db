@@ -28,15 +28,28 @@ use crate::{Error, Result};
 /// bumped whenever the index's shape (extractor/key type) changes in a way
 /// that would make an on-disk tree from an older generation unsafe to reuse.
 /// `#[non_exhaustive]` so a later field can be added without breaking
-/// existing `IndexDef { generation: n }` callers outside this crate — they
-/// build one via `Default` plus a functional-update, e.g.
-/// `IndexDef { generation: 3, ..Default::default() }`.
+/// source compatibility; build one with [`IndexDef::new`]. (A plain struct
+/// literal — with or without `..Default::default()` — only compiles from
+/// *inside* this crate: `#[non_exhaustive]` blocks struct-literal
+/// construction entirely for external callers, functional-update syntax
+/// included.)
 #[cfg(feature = "persistence")]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndexDef {
     /// The index's shape generation — see the struct doc.
     pub generation: u32,
+}
+
+#[cfg(feature = "persistence")]
+impl IndexDef {
+    /// Builds an `IndexDef` with the given generation — the constructor
+    /// external callers need, since `#[non_exhaustive]` blocks direct
+    /// struct-literal construction from outside this crate (see the
+    /// struct doc).
+    pub fn new(generation: u32) -> Self {
+        Self { generation }
+    }
 }
 
 /// Whether an index enforces uniqueness.
@@ -232,7 +245,12 @@ where
     fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, K>>> {
         Ok(Box::new(Self {
             extractor: Arc::clone(&self.extractor),
-            storage: UniqueStorage::<IK, K>::new(),
+            // `empty_like`, not `UniqueStorage::new()`: bulk-load's
+            // rebuild-from-empty path must not silently drop a
+            // `define_persisted_index` storage's `persist` marker (and the
+            // codec/attach closures it carries) just because it's rebuilding
+            // from zero rows.
+            storage: self.storage.empty_like(),
             name: self.name.clone(),
             kind: self.kind,
         }))
@@ -365,7 +383,9 @@ where
     fn empty_clone(&self) -> Result<Box<dyn IndexMaintainer<R, K>>> {
         Ok(Box::new(Self {
             extractor: Arc::clone(&self.extractor),
-            storage: NonUniqueStorage::<IK, K>::new(),
+            // See the comment in the `UniqueStorage` impl's `empty_clone`
+            // above — same reasoning, `empty_like` over `::new()`.
+            storage: self.storage.empty_like(),
             name: self.name.clone(),
             kind: self.kind,
         }))
@@ -571,6 +591,21 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
         }
     }
 
+    /// An empty storage preserving this one's paged-persistence marker (if
+    /// any) — used by `empty_clone` (bulk-load's rebuild-from-empty path)
+    /// so a `define_persisted_index` storage doesn't silently lose its
+    /// `persist` marker (and the codec/attach closures it carries) just
+    /// because it's being rebuilt from zero rows. Not itself feature-gated
+    /// (`empty_clone` needs it unconditionally); only the field it copies
+    /// is.
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            tree: BTree::new(),
+            #[cfg(feature = "persistence")]
+            persist: self.persist.clone(),
+        }
+    }
+
     /// The row key indexed under `key`, if present.
     pub fn get(&self, key: &IK) -> Option<K> {
         self.tree.get(key).cloned()
@@ -653,6 +688,15 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
                     tree.set_source(Some(source));
                 }),
             }),
+        }
+    }
+
+    /// See the `empty_like` doc on `UniqueStorage` — same contract.
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            tree: BTree::new(),
+            #[cfg(feature = "persistence")]
+            persist: self.persist.clone(),
         }
     }
 
