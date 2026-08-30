@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 use crate::intents::CommitWaiter;
@@ -200,6 +202,20 @@ pub enum Error {
     /// writer for that table instead.
     #[error("table '{0}' opened more than once in one open_tables call")]
     DuplicateTableOpen(String),
+    /// `Store::new` found that the newest checkpoint in the configured
+    /// persistence directory is a paged root (`checkpoint_{v}.root`), but
+    /// this store's `Persistence` was not built with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged). A
+    /// row-format store has no page file to fault leaves in from and no
+    /// closure that reads a `PagedTableEntry` into anything but a paged
+    /// table, so opening it would either fail deep inside `recover()` or —
+    /// worse — silently see an empty store. Refused up front instead, at
+    /// construction time.
+    #[error("newest checkpoint in {} is paged; configure Persistence::..paged(..)", dir.display())]
+    PagedFormatRequired {
+        /// The persistence directory that holds the paged checkpoint.
+        dir: PathBuf,
+    },
 }
 
 /// Crate-wide result alias: `std::result::Result<T, Error>`.

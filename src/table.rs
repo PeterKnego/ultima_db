@@ -1548,6 +1548,80 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         })
     }
 
+    /// Rebuild a `Table<R, K>` from one [`PagedTableEntry`] out of a recovered
+    /// [`PagedRoot`](crate::checkpoint::PagedRoot) — the paged counterpart of
+    /// `registry::deserialize_table`. Unlike a row-format table load, this
+    /// does no I/O for the data tree itself: `BTree::from_root_page` just
+    /// remembers the root page id, and [`BTree::load_inner_levels`] faults in
+    /// exactly the non-leaf levels (the root record's cached `height` says
+    /// where those stop), leaving every leaf on disk until something actually
+    /// reads it. An empty table (`root_page: None`) needs neither: `BTree::new()`
+    /// is already fully resident (there is nothing to fault in).
+    ///
+    /// The key-type guard mirrors WAL replay's `check_replay_key_type` and
+    /// `apply_delta`'s: `e.key_type_id` is the *persisted* code
+    /// (`PrimaryKey::KEY_TYPE_ID`), checked before a single page is touched,
+    /// because several key types decode each other's bytes without
+    /// complaint (order-preserving encodings survive reinterpretation) —
+    /// catching the mismatch here is the only chance before rows come back
+    /// silently wrong.
+    ///
+    /// Secondary index trees are not attached here: `pending_indexes` just
+    /// carries their root pages forward so a later attach pass (or a
+    /// `define_persisted_index` call that recognizes a matching pending
+    /// entry) can pick them up — this method only ever reconstructs the data
+    /// tree. `indexes` therefore starts empty, exactly like every other
+    /// `Table` constructor in this file.
+    #[cfg(feature = "persistence")]
+    pub(crate) fn from_paged_entry(
+        e: &PagedTableEntry,
+        file: Arc<PageFile>,
+        stats: Arc<PagedStats>,
+    ) -> Result<Self> {
+        if e.key_type_id != K::KEY_TYPE_ID {
+            return Err(Error::Persistence(
+                crate::primary_key::key_type_mismatch_msg::<K>(e.key_type_id),
+            ));
+        }
+
+        let data: BTree<K, R> = match e.root_page {
+            Some(root_page) => {
+                let codec = NodeCodec::<K, R>::records::<R>();
+                let source: Arc<PagedSource<K, R>> = Arc::new(PagedSource {
+                    file,
+                    codec,
+                    name: e.name.clone(),
+                    stats: stats.clone(),
+                });
+                let tree =
+                    BTree::from_root_page(root_page, e.len as usize, e.height as usize, source);
+                // Inner levels only — leaves fault in lazily on first read,
+                // which is the whole point of a paged root: recovery must not
+                // cost O(rows).
+                tree.load_inner_levels();
+                tree
+            }
+            None => BTree::new(),
+        };
+
+        let next_id = e
+            .next_id
+            .as_ref()
+            .map(|bytes| K::decode(bytes))
+            .transpose()?;
+
+        Ok(Self {
+            data,
+            next_id,
+            indexes: BTreeMap::new(),
+            overlay: Overlay::new(0),
+            residency: Residency::default(),
+            pending_indexes: e.indexes.clone(),
+            stats: Some(stats),
+            paged_name: Some(Arc::from(e.name.as_str())),
+        })
+    }
+
     /// Define a secondary index whose tree is written to the page file
     /// alongside the table's data tree. Mirrors [`Table::define_index`]
     /// (flush overlay, idempotency and kind checks), but stamps the

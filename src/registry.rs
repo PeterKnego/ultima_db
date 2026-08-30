@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::btree::Change;
+use crate::checkpoint::PagedTableEntry;
 use crate::pagecodec::PagedStats;
 use crate::pagefile::PageFile;
 use crate::persistence::Record;
@@ -77,6 +78,20 @@ type BuildFromRawRowsFn = Box<
 /// live snapshot doesn't already have.
 type AttachPagedFn =
     Box<dyn Fn(&mut dyn Any, Arc<PageFile>, Arc<PagedStats>, &str) -> Result<bool> + Send + Sync>;
+/// Rebuild a fresh `Table<R, K>` from a recovered [`PagedTableEntry`],
+/// delegating to `Table::from_paged_entry`. This is `attach_paged`'s
+/// recovery-time sibling, not a rename of it: `attach_paged` mutates a
+/// table that already exists in memory (a live checkpoint clone), while
+/// this builds one from nothing but the root record — there is no `&mut
+/// dyn Any` to attach onto during `Store::recover()`, only bytes read off
+/// disk. Returns `Box<dyn MergeableTable>` (not `bool`) because the caller
+/// — `Store::recover`'s paged branch — has nowhere else to get the table
+/// from.
+type AttachPagedEntryFn = Box<
+    dyn Fn(&PagedTableEntry, Arc<PageFile>, Arc<PagedStats>) -> Result<Box<dyn MergeableTable>>
+        + Send
+        + Sync,
+>;
 
 /// Type-erased serialization functions for a single table type.
 pub(crate) struct TableTypeInfo {
@@ -156,6 +171,8 @@ pub(crate) struct TableTypeInfo {
     pub build_from_raw_rows: BuildFromRawRowsFn,
     /// See [`AttachPagedFn`].
     pub attach_paged: AttachPagedFn,
+    /// See [`AttachPagedEntryFn`].
+    pub attach_paged_entry: AttachPagedEntryFn,
 }
 
 /// Registry mapping table names to their type-erased serializers.
@@ -378,6 +395,10 @@ impl TableRegistry {
                         let was_attached = table.is_paged_attached();
                         table.attach_paged_source(file, stats, name);
                         Ok(!was_attached)
+                    }),
+                    attach_paged_entry: Box::new(|entry, file, stats| {
+                        let table = Table::<R, K>::from_paged_entry(entry, file, stats)?;
+                        Ok(Box::new(table) as Box<dyn MergeableTable>)
                     }),
                 });
                 Ok(())

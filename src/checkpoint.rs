@@ -2946,6 +2946,46 @@ mod tests {
         ));
     }
 
+    /// Controller amendment (Task 6 review): on a version tie between the
+    /// two namespaces, `.root` must win regardless of which file was
+    /// written first — `find_latest_checkpoint_any`'s doc says the tie can
+    /// only mean a stale `.bin` shares a version with the paged writer's
+    /// output, never a newer commit that should take precedence. Covered
+    /// end-to-end (a real recover-then-first-paged-checkpoint sequence with
+    /// no intervening commit) by
+    /// `tests/paged_recovery.rs`'s `legacy_directory_upgrades_on_first_paged_checkpoint`.
+    #[test]
+    fn same_version_tie_prefers_paged_root_in_both_write_orders() {
+        let root = PagedRoot {
+            version: 9,
+            file_end: 0,
+            tables: vec![],
+            dead_pages: vec![],
+        };
+        let snap = Snapshot {
+            version: 9,
+            tables: Default::default(),
+        };
+
+        // Rows written first, then the paged root.
+        let d1 = crate::test_scratch::scratch_dir();
+        write_checkpoint(d1.path(), &snap, &TableRegistry::default()).unwrap();
+        write_paged_root(d1.path(), &root).unwrap();
+        assert!(matches!(
+            find_latest_checkpoint_any(d1.path()).unwrap(),
+            Some(LatestCheckpoint::Paged(_))
+        ));
+
+        // Paged root written first, then rows.
+        let d2 = crate::test_scratch::scratch_dir();
+        write_paged_root(d2.path(), &root).unwrap();
+        write_checkpoint(d2.path(), &snap, &TableRegistry::default()).unwrap();
+        assert!(matches!(
+            find_latest_checkpoint_any(d2.path()).unwrap(),
+            Some(LatestCheckpoint::Paged(_))
+        ));
+    }
+
     #[test]
     fn old_reader_rejects_paged_kind_cleanly() {
         let d = crate::test_scratch::scratch_dir();

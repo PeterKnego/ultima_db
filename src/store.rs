@@ -707,7 +707,31 @@ impl Store {
                     installs: std::sync::atomic::AtomicU64::new(0),
                 })
             }
-            None => None,
+            None => {
+                // A row-format config has no page file and no closure that
+                // reads a `PagedTableEntry` into anything but a paged table
+                // (see `Error::PagedFormatRequired`'s doc). If the directory's
+                // newest checkpoint is already paged, opening this store
+                // "successfully" would mean `recover()` either fails deep
+                // inside the row-format loader (which cannot parse a `.root`
+                // file) or — for a caller who never calls `recover()` at all
+                // — silently starts from an empty store. Refuse up front
+                // instead, before any of that can happen.
+                let dir = match &config.persistence {
+                    crate::persistence::Persistence::Standalone { dir, .. }
+                    | crate::persistence::Persistence::Smr { dir, .. } => Some(dir.clone()),
+                    crate::persistence::Persistence::None => None,
+                };
+                if let Some(dir) = dir
+                    && matches!(
+                        crate::checkpoint::find_latest_checkpoint_any(&dir)?,
+                        Some(crate::checkpoint::LatestCheckpoint::Paged(_))
+                    )
+                {
+                    return Err(Error::PagedFormatRequired { dir });
+                }
+                None
+            }
         };
 
         // Read once per store, not per open_table: the overlay is a
@@ -1663,21 +1687,122 @@ impl Store {
             inner.checkpoint_chain_len = 0;
         }
 
-        // Load latest checkpoint (base full + any chained deltas) if present.
-        let chain = crate::checkpoint::find_head_chain(&dir)?;
-        if !chain.is_empty() {
-            let registry = {
-                let inner = self.inner.read();
-                Arc::clone(&inner.registry)
-            };
-            let snapshot = crate::checkpoint::load_chain(&chain, &registry)?;
+        // Load latest checkpoint (base full + any chained deltas, or a paged
+        // root) if present. `find_latest_checkpoint_any` picks strictly by
+        // version across both namespaces (`.bin` and `.root`), `.root`
+        // winning a tie — see its doc for why a tie can only mean the paged
+        // writer landed on the same version a stale `.bin` already occupied.
+        match crate::checkpoint::find_latest_checkpoint_any(&dir)? {
+            None => {}
+            Some(crate::checkpoint::LatestCheckpoint::Rows(_)) => {
+                let chain = crate::checkpoint::find_head_chain(&dir)?;
+                if !chain.is_empty() {
+                    let registry = {
+                        let inner = self.inner.read();
+                        Arc::clone(&inner.registry)
+                    };
+                    let snapshot = crate::checkpoint::load_chain(&chain, &registry)?;
 
-            let mut inner = self.inner.write();
-            let v = snapshot.version;
-            inner.snapshots.insert(v, Arc::new(snapshot));
-            inner.latest_version = v;
-            if v >= inner.next_version {
-                inner.next_version = v + 1;
+                    let mut inner = self.inner.write();
+                    let v = snapshot.version;
+                    inner.snapshots.insert(v, Arc::new(snapshot));
+                    inner.latest_version = v;
+                    if v >= inner.next_version {
+                        inner.next_version = v + 1;
+                    }
+                }
+            }
+            Some(crate::checkpoint::LatestCheckpoint::Paged(path)) => {
+                let root = crate::checkpoint::read_paged_root(&path)?;
+
+                // The body's version is authoritative (Controller amendment,
+                // Task 6 review): a renamed/relinked `.root` file would
+                // otherwise let a filename lie about which root it holds.
+                // Corruption here is refused outright rather than trusted
+                // either way, naming both versions so an operator can tell
+                // which file to inspect.
+                let filename_version = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("checkpoint_"))
+                    .and_then(|n| n.strip_suffix(".root"))
+                    .and_then(|n| n.parse::<u64>().ok());
+                if filename_version != Some(root.version) {
+                    return Err(Error::CheckpointCorrupted(format!(
+                        "paged root {} names version {:?} in its filename, but its body's \
+                         version field is {}",
+                        path.display(),
+                        filename_version,
+                        root.version
+                    )));
+                }
+
+                let (registry, file, stats) = {
+                    let inner = self.inner.read();
+                    let paged = inner.paged.as_ref().ok_or_else(|| {
+                        // `Store::new`'s guard refuses a row-format config
+                        // over a directory whose newest checkpoint is
+                        // already paged (`Error::PagedFormatRequired`), so
+                        // this only fires if that guard's own
+                        // `find_latest_checkpoint_any` read and this one
+                        // observed different directory states — a directory
+                        // mutated out from under the store between `new`
+                        // and `recover`.
+                        Error::Persistence(
+                            "recover(): found a paged root but this store has no paged state; \
+                             was the directory modified between Store::new and recover()?"
+                                .into(),
+                        )
+                    })?;
+                    (
+                        Arc::clone(&inner.registry),
+                        Arc::clone(&paged.file),
+                        Arc::clone(&paged.stats),
+                    )
+                };
+
+                let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
+                for entry in &root.tables {
+                    // Same behavior as the row path's `deserialize_snapshot`
+                    // (`src/checkpoint.rs:304`): a table the root record
+                    // names but this build never registered cannot be
+                    // reconstructed — there is no closure to downcast with.
+                    let info = registry
+                        .get(&entry.name)
+                        .ok_or_else(|| Error::TableNotRegistered(entry.name.clone()))?;
+                    let table =
+                        (info.attach_paged_entry)(entry, Arc::clone(&file), Arc::clone(&stats))?;
+                    tables.insert(entry.name.clone(), Arc::from(table));
+                }
+                // A table this build has registered but the root record does
+                // not name simply gets no entry here — same as a row-format
+                // recovery of a table that was never written to (see
+                // `load_chain`/`deserialize_snapshot`): `open_table` on it
+                // returns `Error::TableNotFound`, not an empty-but-present
+                // table.
+                let snapshot = Arc::new(Snapshot { version: root.version, tables });
+
+                let mut inner = self.inner.write();
+                inner.snapshots.insert(root.version, Arc::clone(&snapshot));
+                inner.latest_version = root.version;
+                if root.version >= inner.next_version {
+                    inner.next_version = root.version + 1;
+                }
+                // Reposition the page file's write cursor past every live
+                // page this root named — anything physically past it is
+                // either garbage from a torn write or a page only an even
+                // newer (unreferenced-by-this-root) checkpoint would have
+                // written, and either way the next `checkpoint()` must
+                // overwrite it, not preserve it.
+                file.set_cursor(root.file_end);
+                // Lifts `checkpoint_impl_paged`'s "recover before writing
+                // into a rooted directory" refusal (Task 8 I1 ruling): that
+                // check is exactly `paged.last_root.is_none()`, so setting
+                // it here is what makes the very next `checkpoint()` on this
+                // store succeed instead of refusing.
+                if let Some(p) = inner.paged.as_mut() {
+                    p.last_root = Some((snapshot, root.version));
+                }
             }
         }
 
@@ -1707,16 +1832,27 @@ impl Store {
                 if !to_replay.is_empty() {
                     let mut inner = self.inner.write();
                     // Build a new table map with sole ownership of each Arc.
-                    // We re-wrap each table in a fresh Arc so Arc::get_mut succeeds during replay.
+                    // We re-wrap each table in a fresh Arc so Arc::get_mut
+                    // succeeds during replay. `boxed_clone()` (an O(1) CoW
+                    // clone — Arc bumps on the tree root and index
+                    // internals) gives that same fresh-Arc property a
+                    // round trip through `serialize_table`/
+                    // `deserialize_table` used to: the old bytes-and-back
+                    // path was never about the *bytes*, only about ending
+                    // up with sole ownership, and for a paged table a row
+                    // serialize/deserialize round trip is actively wrong —
+                    // it would force every leaf resident and throw away the
+                    // page-file attachment `attach_paged_entry` (or, before
+                    // recovery, `attach_paged`) set up. `boxed_clone`
+                    // carries the paging source (and every unfaulted leaf's
+                    // on-disk-only state) forward untouched.
                     let base_snap = &inner.snapshots[&inner.latest_version];
                     let mut tables: BTreeMap<String, Arc<dyn MergeableTable>> = BTreeMap::new();
                     for (name, arc) in &base_snap.tables {
-                        let info = inner
-                            .registry
-                            .get(name)
-                            .ok_or_else(|| Error::TableNotRegistered(name.clone()))?;
-                        let bytes = (info.serialize_table)(arc.as_ref().as_any())?;
-                        let new_table = (info.deserialize_table)(&bytes)?;
+                        if !inner.registry.contains(name) {
+                            return Err(Error::TableNotRegistered(name.clone()));
+                        }
+                        let new_table = arc.as_ref().boxed_clone();
                         tables.insert(name.clone(), Arc::from(new_table));
                     }
                     let mut latest_version = inner.latest_version;

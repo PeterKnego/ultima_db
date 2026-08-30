@@ -103,7 +103,9 @@ use std::path::Path;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use ultima_db::{Durability, Error, IndexKind, Persistence, Store, StoreConfig, WalWrite};
+use ultima_db::{
+    Durability, Error, IndexKind, PagedOptions, Persistence, Store, StoreConfig, WalWrite,
+};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct User {
@@ -124,6 +126,18 @@ fn chained_config(dir: &Path, durability: Durability, chain_max: usize) -> Store
         ))
         .checkpoint_chain_max(chain_max)
         .build()
+}
+
+/// The third store variant in this file's equivalence matrix (task 9): a
+/// paged-checkpoint config. `checkpoint_chain_max` has no paged counterpart
+/// (a paged root is always self-contained — see `PagedRoot`'s doc in
+/// `src/checkpoint.rs`), so there is nothing to parameterize here beyond the
+/// directory and durability.
+fn paged_config(dir: &Path, durability: Durability) -> StoreConfig {
+    let persistence = Persistence::standalone(dir.to_path_buf(), durability, WalWrite::PerEntry)
+        .paged(PagedOptions::builder().build())
+        .unwrap();
+    StoreConfig::builder().persistence(persistence).build()
 }
 
 /// Helper: create store, register the `users` table, recover from disk.
@@ -270,15 +284,18 @@ fn open_workload_store(config: StoreConfig) -> Store {
     store
 }
 
-/// Builds a store in a fresh scratch dir, applies `ops` (translated to
-/// concrete events via `build_events`), checkpointing every
-/// `checkpoint_every` executed events at chain length `chain_max`, drops the
-/// store, recovers into a new one, and returns rows + a next_id probe +
-/// version. See the module doc for why those three and not just rows.
-fn run_workload(ops: &[Op], chain_max: usize, checkpoint_every: usize) -> WorkloadResult {
-    let events = build_events(ops);
-    let dir = common::test_scratch::scratch_dir();
-    let config = chained_config(dir.path(), Durability::Consistent, chain_max);
+/// The shared body of `run_workload`/`run_workload_paged`: applies `events`
+/// (checkpointing every `checkpoint_every` executed events) against a store
+/// built from `config`, drops it, recovers into a new one, and returns rows +
+/// a next_id probe + version. See the module doc for why those three and not
+/// just rows. Split out so the three store variants in this file's matrix
+/// (rows-only, chained, paged) differ only in how `config` is built, not in
+/// this logic.
+fn run_workload_with_config(
+    events: &[Event],
+    checkpoint_every: usize,
+    config: StoreConfig,
+) -> WorkloadResult {
     {
         let store = open_workload_store(config.clone());
         for (j, ev) in events.iter().enumerate() {
@@ -363,6 +380,30 @@ fn run_workload(ops: &[Op], chain_max: usize, checkpoint_every: usize) -> Worklo
     }
 }
 
+/// Builds a store in a fresh scratch dir, applies `ops` (translated to
+/// concrete events via `build_events`), checkpointing every
+/// `checkpoint_every` executed events at chain length `chain_max`, drops the
+/// store, recovers into a new one, and returns rows + a next_id probe +
+/// version. See the module doc for why those three and not just rows.
+fn run_workload(ops: &[Op], chain_max: usize, checkpoint_every: usize) -> WorkloadResult {
+    let events = build_events(ops);
+    let dir = common::test_scratch::scratch_dir();
+    let config = chained_config(dir.path(), Durability::Consistent, chain_max);
+    run_workload_with_config(&events, checkpoint_every, config)
+}
+
+/// The paged-checkpoint arm of this file's equivalence matrix (task 9): same
+/// op script, same checkpoint schedule, run against a `Persistence::paged`
+/// store instead of a row-format one. `Store::recover()`'s paged branch is
+/// exactly what makes the post-drop reopen below produce the same rows +
+/// next_id + version a row-format recovery would.
+fn run_workload_paged(ops: &[Op], checkpoint_every: usize) -> WorkloadResult {
+    let events = build_events(ops);
+    let dir = common::test_scratch::scratch_dir();
+    let config = paged_config(dir.path(), Durability::Consistent);
+    run_workload_with_config(&events, checkpoint_every, config)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -380,9 +421,17 @@ proptest! {
     ) {
         let chained = run_workload(&ops, chain_max, checkpoint_every);
         let full = run_workload(&ops, 1, checkpoint_every);
-        prop_assert_eq!(chained.rows, full.rows);
+        let paged = run_workload_paged(&ops, checkpoint_every);
+        // `prop_assert_eq!` binds both operands by value (see proptest's
+        // `sugar.rs`), so `full.rows` — the one non-`Copy` field reused
+        // below — is cloned on its first use rather than compared twice in
+        // place.
+        prop_assert_eq!(chained.rows, full.rows.clone());
         prop_assert_eq!(chained.next_id_probe, full.next_id_probe);
         prop_assert_eq!(chained.version, full.version);
+        prop_assert_eq!(paged.rows, full.rows);
+        prop_assert_eq!(paged.next_id_probe, full.next_id_probe);
+        prop_assert_eq!(paged.version, full.version);
     }
 }
 
