@@ -504,6 +504,13 @@ pub(crate) struct PagedState {
     /// When the last successful paged checkpoint finished — the background
     /// checkpointer's (a later task) time-trigger clock.
     pub(crate) last_checkpoint_at: std::time::Instant,
+    /// Number of times [`Store::install_paged_tables`] has actually
+    /// re-published a snapshot (i.e., `to_install` was non-empty) — a test
+    /// hook proving a no-op checkpoint installs nothing, exposed via
+    /// [`Store::paged_install_count_for_test`]. Not part of
+    /// [`PagedStatsSnapshot`]: it counts checkpoint-side installs, not a
+    /// per-table-tree page/fault metric.
+    pub(crate) installs: std::sync::atomic::AtomicU64,
 }
 
 impl StoreInner {
@@ -697,6 +704,7 @@ impl Store {
                     opts: opts.clone(),
                     last_root: None,
                     last_checkpoint_at: std::time::Instant::now(),
+                    installs: std::sync::atomic::AtomicU64::new(0),
                 })
             }
             None => None,
@@ -1303,10 +1311,12 @@ impl Store {
     /// later tasks in this feature's sequence).
     #[cfg(feature = "persistence")]
     fn checkpoint_impl_paged(&self) -> Result<u64> {
-        use crate::checkpoint::{PagedRoot, PagedTableEntry, cleanup_old_roots, write_paged_root};
+        use crate::checkpoint::{
+            PagedRoot, PagedTableEntry, cleanup_old_roots, list_paged_roots, write_paged_root,
+        };
         use crate::table::PagedCtx;
 
-        let (dir, snap, registry, file, stats, opts) = {
+        let (dir, snap, registry, file, stats, opts, needs_recover_first) = {
             let inner = self.inner.read();
             inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
@@ -1327,19 +1337,44 @@ impl Store {
             let file = Arc::clone(&paged.file);
             let stats = Arc::clone(&paged.stats);
             let opts = paged.opts.clone();
-            (dir, snap, registry, file, stats, opts)
+            // `last_root.is_none()` means *this store* has never
+            // successfully paged-checkpointed — either it just opened
+            // `PageFile` fresh (cursor 0, nothing written yet: the normal
+            // case), or it reopened an existing `pages.bin` without first
+            // calling `Store::recover()` (task 9 sets `last_root` and
+            // repositions the file cursor during recovery; until then,
+            // `Store::new` always opens the page file at cursor 0). The
+            // two cases are indistinguishable from in-memory state alone,
+            // so the directory itself has to be asked, below.
+            let needs_recover_first = paged.last_root.is_none();
+            (dir, snap, registry, file, stats, opts, needs_recover_first)
         }; // read lock released here
+
+        // Refuse to write into a directory that already has paged roots
+        // when this store hasn't recovered: appending at cursor 0 would
+        // overwrite pages the newest root on disk names, and by the time a
+        // caller notices, the WAL covering them may already be pruned.
+        // Lifted once task 9's `Store::recover()` reads the latest root,
+        // sets `PagedState::last_root`, and repositions the page file's
+        // write cursor past every live page.
+        if needs_recover_first && !list_paged_roots(&dir)?.is_empty() {
+            return Err(Error::Persistence(
+                "paged checkpoint refused: directory contains paged roots but the store has not recovered; call Store::recover() first"
+                    .into(),
+            ));
+        }
 
         let ctx = PagedCtx {
             file: &file,
             stats: &stats,
         };
         let mut entries: Vec<PagedTableEntry> = Vec::new();
-        // Tracks the most recently published `Arc<Snapshot>` at
-        // `snap.version` across the loop below, so `PagedState::last_root`
-        // ends up naming the fully-attached/fully-written state rather
-        // than the pre-loop snapshot this function started from.
-        let mut current: Arc<Snapshot> = Arc::clone(&snap);
+        // Only tables whose clone actually diverged from what's already
+        // published get installed — see the loop body for what "diverged"
+        // means here. Collected instead of installed one at a time so the
+        // whole checkpoint's changes land in a single `inner.write()`
+        // critical section (`install_paged_tables`), not one per table.
+        let mut to_install: Vec<(String, Box<dyn MergeableTable>)> = Vec::new();
 
         for name in snap.table_names() {
             // Only registered tables can be paged-written: `paged_write`
@@ -1355,42 +1390,52 @@ impl Store {
                 continue;
             };
 
-            // Always clone, then (re-)attach, then write: `paged_write`
-            // assigns page ids to `Child` slots via interior mutability on
-            // nodes shared below the tree's root (unchanged subtrees are
-            // the same `Arc<BTreeNode>` across a `Table::clone` — see
+            // Clone, then (re-)attach, then write: `paged_write` assigns
+            // page ids to `Child` slots via interior mutability on nodes
+            // shared below the tree's root (unchanged subtrees are the
+            // same `Arc<BTreeNode>` across a `Table::clone` — see
             // `BTree::clone`'s doc), but the *root* `Child`'s own id is
             // only ever visible on whichever `Table` value `paged_write`
             // was actually called on, because `BTree::clone` deep-clones
             // just the root wrapper. `Store` never holds `&mut` on a live
             // snapshot's `Arc<dyn MergeableTable>` — every call here
-            // necessarily runs against a fresh clone — so that clone (with
-            // its root id now set, and, on the overlay path, every
-            // buffered row) must be re-published via `install_table_clone`
-            // below or everything `paged_write` just wrote is reachable
-            // only from a value nothing keeps alive.
+            // necessarily runs against a fresh clone.
             //
-            // Re-attaching unconditionally (rather than only for a table
-            // that has never been attached) is correct, not just
-            // convenient: `attach_paged_source`'s replaces only the tree's
-            // fault-in pointer, never a node's own dirty/page-id state
-            // (see `BTree::set_source`'s doc), so redoing it is a no-op
-            // for an already-attached table. It is also necessary: a
-            // table's attach state does not survive a `WriteTx` commit
-            // that touched it (the committed table is the writer's own
-            // dirty clone, taken from whatever `latest` looked like at
-            // `open_table` time — which may predate the last checkpoint's
-            // attach), so whether a table "already has a source" cannot be
-            // decided once and cached here.
+            // That clone only needs to be re-published when it actually
+            // diverged from what's already live — `newly_attached` (this
+            // call transitioned the table from unattached to attached, via
+            // `Table::is_paged_attached`) or `flushed.is_some()` (an
+            // overlay was cloned-and-flushed; see
+            // `MergeableTable::paged_write`'s doc). An already-attached
+            // table whose `paged_write` took the fast (no-overlay) path
+            // and returned `None` learned nothing durable the live
+            // snapshot doesn't already have: the fast path writes directly
+            // against `self.data`'s `Child` slots, so on a table that was
+            // already attached and already clean, nothing was dirty to
+            // write and the clone's tree is byte-for-byte what `live`
+            // already publishes.
             let mut boxed = live.boxed_clone();
-            (info.attach_paged)(boxed.as_any_mut(), Arc::clone(&file), Arc::clone(&stats), &name)?;
+            let newly_attached =
+                (info.attach_paged)(boxed.as_any_mut(), Arc::clone(&file), Arc::clone(&stats), &name)?;
             let (entry, flushed) = boxed.paged_write(&ctx)?;
+            let needs_install = newly_attached || flushed.is_some();
             let final_table = flushed.unwrap_or(boxed);
-
-            if let Some(new_snap) = self.install_table_clone(snap.version, &name, final_table) {
-                current = new_snap;
+            if needs_install {
+                to_install.push((name.clone(), final_table));
             }
             entries.push(entry);
+        }
+
+        // Tracks the fully-attached/fully-written state this checkpoint
+        // produced, so `PagedState::last_root` names it rather than the
+        // pre-loop snapshot this function started from. Stays the
+        // pre-loop `snap` when `to_install` is empty (a true no-op
+        // checkpoint) — there is nothing newer to name.
+        let mut current: Arc<Snapshot> = Arc::clone(&snap);
+        if !to_install.is_empty()
+            && let Some(new_snap) = self.install_paged_tables(snap.version, to_install)
+        {
+            current = new_snap;
         }
 
         file.sync()?;
@@ -1445,20 +1490,23 @@ impl Store {
         Ok(snap.version)
     }
 
-    /// Re-publish `table` as the table named `name` at `version` — the
-    /// SAME version number, not a new commit: no WAL entry, no write-set
-    /// bookkeeping, no version bump. Used by [`Store::checkpoint_impl_paged`]
-    /// after `attach_paged_source`/`paged_write` produce a table clone that
-    /// supersedes what is currently published at `version` (the live table
-    /// itself is never mutated in place — `Store` only ever holds it
-    /// behind a shared `Arc`).
+    /// Re-publish every `(name, table)` in `replacements` into the table
+    /// named `version` — the SAME version number, not a new commit: no WAL
+    /// entry, no write-set bookkeeping, no version bump. Used by
+    /// [`Store::checkpoint_impl_paged`] after `attach_paged_source`/
+    /// `paged_write` produce table clones that supersede what is currently
+    /// published at `version` (the live tables are never mutated in place
+    /// — `Store` only ever holds them behind a shared `Arc`). All of a
+    /// checkpoint's replacements land in one critical section here, not
+    /// one `inner.write()` per table — a no-op checkpoint (nothing to
+    /// replace) never calls this at all, since its caller only builds
+    /// `replacements` for tables that actually diverged.
     ///
     /// Targets `version` explicitly rather than reading
-    /// `inner.latest_version` fresh: the paged checkpoint's per-table loop
-    /// can run across several calls to this function while concurrent
-    /// commits land, each of which advances `latest_version` past the
-    /// version this checkpoint captured — reading `latest_version` afresh
-    /// here would install into the wrong snapshot.
+    /// `inner.latest_version` fresh: the paged checkpoint's own snapshot
+    /// capture happens before this call, and a concurrent commit can
+    /// advance `latest_version` in between — reading `latest_version`
+    /// afresh here would install into the wrong snapshot.
     ///
     /// Safe to interleave with [`WriteTx::commit`]: every commit path
     /// (`commit_single_writer`, and `commit_multi_writer`'s promotion step)
@@ -1475,22 +1523,40 @@ impl Store {
     /// live snapshot; nothing here claims them as live, so a later task's
     /// dead-page tracking is unaffected.
     #[cfg(feature = "persistence")]
-    fn install_table_clone(
+    fn install_paged_tables(
         &self,
         version: u64,
-        name: &str,
-        table: Box<dyn MergeableTable>,
+        replacements: Vec<(String, Box<dyn MergeableTable>)>,
     ) -> Option<Arc<Snapshot>> {
         let mut inner = self.inner.write();
         let existing = inner.snapshots.get(&version)?;
         let mut tables = existing.tables.clone();
-        tables.insert(name.to_string(), Arc::from(table));
-        let snapshot = Arc::new(Snapshot {
-            version,
-            tables,
-        });
+        for (name, table) in replacements {
+            tables.insert(name, Arc::from(table));
+        }
+        let snapshot = Arc::new(Snapshot { version, tables });
         inner.snapshots.insert(version, Arc::clone(&snapshot));
+        if let Some(p) = inner.paged.as_ref() {
+            p.installs.fetch_add(1, Ordering::Relaxed);
+        }
         Some(snapshot)
+    }
+
+    /// Number of times a paged checkpoint has actually re-published a
+    /// snapshot (see [`PagedState::installs`]), or `None` if this store
+    /// was not configured with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged).
+    ///
+    /// Test-only escape hatch proving a no-op paged checkpoint installs
+    /// nothing; not part of the stable public API.
+    #[cfg(feature = "persistence")]
+    #[doc(hidden)]
+    pub fn paged_install_count_for_test(&self) -> Option<u64> {
+        self.inner
+            .read()
+            .paged
+            .as_ref()
+            .map(|p| p.installs.load(Ordering::Relaxed))
     }
 
     /// Snapshot of this store's paged-checkpoint counters, or `None` if it

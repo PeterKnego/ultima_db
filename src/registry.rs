@@ -67,8 +67,16 @@ type BuildFromRawRowsFn = Box<
 /// for — `Store::checkpoint`'s paged branch (task 8) is the first
 /// production caller; a later task's recovery path reuses it to attach a
 /// table rebuilt from a checkpoint's `PagedRoot` before its first read.
+///
+/// Returns whether this call transitioned the table from unattached to
+/// attached (`true`) or it was already attached (`false`) —
+/// `Table::is_paged_attached` read *before* the `attach_paged_source`
+/// call. The paged checkpoint path uses this to decide whether the
+/// attached clone needs to be re-published: an already-attached table
+/// that produced no flushed overlay clone learned nothing durable the
+/// live snapshot doesn't already have.
 type AttachPagedFn =
-    Box<dyn Fn(&mut dyn Any, Arc<PageFile>, Arc<PagedStats>, &str) -> Result<()> + Send + Sync>;
+    Box<dyn Fn(&mut dyn Any, Arc<PageFile>, Arc<PagedStats>, &str) -> Result<bool> + Send + Sync>;
 
 /// Type-erased serialization functions for a single table type.
 pub(crate) struct TableTypeInfo {
@@ -367,8 +375,9 @@ impl TableRegistry {
                         let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
                             Error::TypeMismatch("attach_paged downcast failed".into())
                         })?;
+                        let was_attached = table.is_paged_attached();
                         table.attach_paged_source(file, stats, name);
-                        Ok(())
+                        Ok(!was_attached)
                     }),
                 });
                 Ok(())

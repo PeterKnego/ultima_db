@@ -1436,13 +1436,30 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     // lands.
     // -----------------------------------------------------------------------
 
+    /// Whether [`Self::attach_paged_source`] has ever been called on this
+    /// table (directly, or inherited via `Table::clone` — the field is a
+    /// plain struct member nothing ever resets to `None`, so this is
+    /// correct across every derived clone: a `WriteTx`'s dirty clone, a
+    /// checkpoint's `boxed_clone`, and so on). A cheap `Option::is_some`
+    /// read.
+    ///
+    /// Used by `Store::checkpoint`'s paged branch to decide whether an
+    /// `attach_paged_source` call on a fresh clone actually transitioned
+    /// the table from unattached to attached — which, together with
+    /// `MergeableTable::paged_write` returning a flushed clone, is exactly
+    /// when that clone must be re-published (see `install_paged_tables`'s
+    /// doc). A table that was already attached and produced no flushed
+    /// clone needs no re-publish: nothing durable was learned that the
+    /// live snapshot didn't already reflect.
+    #[cfg(feature = "persistence")]
+    pub(crate) fn is_paged_attached(&self) -> bool {
+        self.stats.is_some()
+    }
+
     /// Attach this table's data tree — and every *persisted* index's tree —
     /// to a page file for paged checkpoint write/read. Building the codec
     /// here (rather than storing one) is cheap: [`NodeCodec::records`] is
     /// just a pair of function pointers, no allocation.
-    // No production caller yet — `Store`'s attach path (Task 8+). Used
-    // today by this file's `paged` test module.
-    #[allow(dead_code)]
     #[cfg(feature = "persistence")]
     pub(crate) fn attach_paged_source(
         &mut self,
