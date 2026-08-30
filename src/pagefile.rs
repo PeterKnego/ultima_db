@@ -53,6 +53,14 @@ pub(crate) const PAGE_HEADER_LEN: usize = 12;
 #[allow(dead_code)]
 pub(crate) const PAGE_FMT_V1: u8 = 1;
 
+/// Upper bound on a page's payload, checked in `read` before trusting a
+/// decoded `payload_len` enough to allocate for it. Keys are capped at 64
+/// KiB by `check_encoded_key_len`; a node beyond 64 MiB is a corruption
+/// signal, not a workload — one constant, one place to change.
+// No production caller yet — see the `PageKind` note above.
+#[allow(dead_code)]
+pub(crate) const MAX_PAGE_BYTES: usize = 64 << 20;
+
 /// The mutable append state, behind one `Mutex` so concurrent `append`s
 /// serialize on the single write cursor (reads never take this lock).
 // No production caller yet — see the `PageKind` note above.
@@ -192,7 +200,19 @@ impl PageFile {
         }
         let plen = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        // Bound-check the decoded length against a hard ceiling and the
+        // file's known physical extent *before* it drives an allocation —
+        // a bit-flipped `payload_len` can decode to ~4 GiB, and an
+        // unchecked `Vec::resize` to that size hits the global alloc-error
+        // handler and aborts the process instead of returning an `Err`.
+        if plen > MAX_PAGE_BYTES {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: payload_len {plen} exceeds limits")));
+        }
         let total = PAGE_HEADER_LEN + plen;
+        let capacity = self.w.lock().capacity;
+        if id + total as u64 > capacity {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: payload_len {plen} exceeds limits")));
+        }
         if total > buf.len() {
             buf.resize(total, 0);
             let more = read_fully_at(&self.file, &mut buf[got..total], id + got as u64, id)?;
@@ -202,6 +222,16 @@ impl PageFile {
                     got + more - PAGE_HEADER_LEN
                 )));
             }
+        } else if got < total {
+            // Symmetric with the second-read path above: a page torn right
+            // after its header (declared payload never landed, but the
+            // first read's buffer was already big enough to have held it)
+            // must report "short payload", not fall through to a
+            // misleading "crc mismatch" against zero-filled bytes.
+            return Err(Error::CheckpointCorrupted(format!(
+                "page {id}: short payload (wanted {plen}, got {})",
+                got - PAGE_HEADER_LEN
+            )));
         }
         let payload = buf[PAGE_HEADER_LEN..total].to_vec();
         let mut h = crc32fast::Hasher::new();
@@ -356,6 +386,53 @@ mod tests {
         }
         let e = pf.read(id).unwrap_err();
         assert!(matches!(e, crate::Error::CheckpointCorrupted(_)), "{e:?}");
+    }
+
+    #[test]
+    fn corrupted_payload_len_rejected_not_aborted() {
+        // A bit-flipped payload_len (bytes 4-7 of the header) can decode to
+        // ~4 GiB. Before the MAX_PAGE_BYTES guard, this drove an unchecked
+        // `Vec::resize` straight into the global alloc-error handler, which
+        // aborts the whole process — not a `Result` a caller can catch.
+        let (d, pf) = tmp();
+        let id = pf.append(PageKind::DataLeaf, &[1; 20]).unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(page_file_path(d.path())).unwrap();
+            f.write_at(&0xFFFF_FFFFu32.to_le_bytes(), id + 4).unwrap();
+        }
+        let e = pf.read(id).unwrap_err();
+        assert!(matches!(e, crate::Error::CheckpointCorrupted(_)), "{e:?}");
+    }
+
+    #[test]
+    fn payload_len_past_file_extent_rejected() {
+        // plen well under MAX_PAGE_BYTES but large enough that id + total
+        // lands past the file's known physical extent (`capacity`) — a page
+        // cannot legitimately end past what was ever zero-filled.
+        let (d, pf) = tmp(); // chunk = 1 << 20, so capacity is exactly 1 MiB after this append
+        let id = pf.append(PageKind::DataLeaf, &[1; 20]).unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(page_file_path(d.path())).unwrap();
+            let bogus_len = 1u32 << 20; // == capacity; id + PAGE_HEADER_LEN + bogus_len overshoots it
+            f.write_at(&bogus_len.to_le_bytes(), id + 4).unwrap();
+        }
+        let e = pf.read(id).unwrap_err();
+        assert!(matches!(e, crate::Error::CheckpointCorrupted(_)), "{e:?}");
+    }
+
+    #[test]
+    fn torn_page_right_after_header_reports_short_payload() {
+        let (d, pf) = tmp();
+        let id = pf.append(PageKind::DataLeaf, &[1; 50]).unwrap();
+        pf.sync().unwrap();
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(page_file_path(d.path())).unwrap();
+            f.set_len(id + PAGE_HEADER_LEN as u64).unwrap(); // torn right after the header
+        }
+        let e = pf.read(id).unwrap_err();
+        assert!(format!("{e}").contains("short payload"), "{e}");
     }
 
     #[test]
