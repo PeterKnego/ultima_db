@@ -1658,19 +1658,21 @@ fn merge_with_right<K: Clone, V>(
 /// carry the descended separator as its last entry.
 ///
 /// `right` is faulted in (if needed) and moved out via `Arc::try_unwrap`,
-/// falling back to a clone if it is still shared with a snapshot. Note this
-/// always takes the shared/clone branch in practice: the `Child` slot itself
-/// holds one strong count for as long as `right` (the local binding) is
-/// alive, which — since shadowing does not drop the old binding early — is
-/// until this function returns, so `load_arc`'s extra count is never the
-/// sole other owner. A future task that needs the true-move fast path back
-/// would have to consume `right` (e.g. an owning accessor on `Child`) before
-/// calling `try_unwrap`.
+/// falling back to a clone if it is still shared with a snapshot. The
+/// `Child` slot itself owns one strong count on the loaded `Arc`, so it must
+/// be dropped *before* `try_unwrap` — `load_arc` bumps the count to hand
+/// back an owned `Arc`, and if the slot's own count is still live at that
+/// point, `try_unwrap` always sees `strong_count >= 2` and always takes the
+/// clone branch, even when no snapshot shares the node. `drop(right)` below
+/// releases that count first, so the fast (move) path actually fires
+/// whenever nothing else holds the node — see
+/// `merge_moves_unshared_sibling_instead_of_cloning` for a regression test.
 fn absorb<K: Clone, V>(left: &mut BTreeNode<K, V>, right: Child<K, V>, src: Option<&dyn NodeSource<K, V>>) {
-    let right = right.load_arc(src);
-    let right = Arc::try_unwrap(right).unwrap_or_else(|a| (*a).clone());
-    left.entries.extend(right.entries);
-    left.children.extend(right.children);
+    let arc = right.load_arc(src);
+    drop(right); // release the slot's own count first, so try_unwrap can succeed
+    let rn = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
+    left.entries.extend(rn.entries);
+    left.children.extend(rn.children);
 }
 
 /// In-place counterpart to `delete_from_node`. Descends through
@@ -2039,11 +2041,16 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                 children: Children::new(),
             }))
         });
-        // Bulk builds never seed a page source: `from_sorted` starts fresh
-        // (`None`) and `extend_from_sorted`'s `seed_from_spine` only reads
-        // the input tree, never carries its `source` into the rebuilt one.
+        // TODO(task3): must receive the tree's source; a seeded on-disk slot
+        // here would panic in `load`. Today `from_sorted` always starts from
+        // `None` and `extend_from_sorted`'s `seed_from_spine` reads the input
+        // tree's spine but does not carry its `source` into the builder, so
+        // this is a no-op for every tree this task can build — but it is a
+        // real gap for whenever a tree can hold on-disk `Child` slots.
         fix_right_spine_tail(&mut root, None);
         let len = self.len - pending_reinsert.len();
+        // TODO(task3): same gap as above — should be `source:
+        // self.source.clone()` once `BulkBuilder` carries one.
         let mut tree = BTree { root, len, source: None };
         for (k, v) in pending_reinsert {
             tree.insert_arc_mut(k, v);
@@ -2118,10 +2125,13 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
         .entries
         .pop()
         .expect("redistribute_tail: no separator");
-    // `None`: every `Child` a `BulkBuilder` ever holds is one it built itself
-    // (`Child::resident`, always in-memory) or a clone of a spine node from
-    // `seed_from_spine` — and a seed tree only ever has `source: None` too
-    // (see `finish()`'s comment), so this is never an on-disk slot to fault in.
+    // TODO(task3): must receive the tree's source; a seeded on-disk slot
+    // here would panic in `load`. Today every `Child` a `BulkBuilder` holds
+    // is either one it built itself (`Child::resident`, always in-memory) or
+    // a clone of a spine node from `seed_from_spine` — which does not carry
+    // the input tree's `source` into the builder (see the TODOs in
+    // `finish()`) — so this is a no-op for every tree this task can build,
+    // but it is a real gap once a tree can hold on-disk `Child` slots.
     let sibling = sibling.load(None);
 
     // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
@@ -3085,11 +3095,12 @@ mod tests {
     }
 
     /// In-place rebalancing (rotate/merge) opens sibling nodes via
-    /// `Arc::make_mut` / `Arc::try_unwrap`. When a sibling is still shared with
-    /// an older snapshot it MUST be cloned, never mutated/moved in place —
-    /// otherwise a merge would corrupt the snapshot. Deleting a long contiguous
-    /// run from the low end forces repeated merges and rotations at every level
-    /// while a snapshot holds those very siblings.
+    /// `Child::make_mut` / `absorb`'s `Arc::try_unwrap`. When a sibling is
+    /// still shared with an older snapshot it MUST be cloned, never
+    /// mutated/moved in place — otherwise a merge would corrupt the
+    /// snapshot. Deleting a long contiguous run from the low end forces
+    /// repeated merges and rotations at every level while a snapshot holds
+    /// those very siblings.
     #[test]
     fn remove_mut_merge_under_snapshot_preserves_isolation() {
         use std::collections::BTreeMap;
@@ -3117,6 +3128,93 @@ mod tests {
         // Live tree exactly tracks the model after all the merges.
         assert_eq!(t.len(), model.len());
         assert_eq!(dump(&t), model.into_iter().collect::<Vec<_>>());
+    }
+
+    /// A key type that counts every `Clone::clone` call, so a test can prove
+    /// a code path took the zero-clone move branch rather than the
+    /// deep-clone fallback branch, without any access to `absorb`'s private
+    /// locals.
+    struct CountedKey {
+        v: u64,
+        clones: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Clone for CountedKey {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            CountedKey {
+                v: self.v,
+                clones: std::sync::Arc::clone(&self.clones),
+            }
+        }
+    }
+    impl PartialEq for CountedKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.v == other.v
+        }
+    }
+    impl Eq for CountedKey {}
+    impl PartialOrd for CountedKey {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for CountedKey {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.v.cmp(&other.v)
+        }
+    }
+
+    /// Regression test for the `absorb` fix: `right.load_arc(src)` bumps the
+    /// node's strong count to hand back an owned `Arc`, and the `Child`
+    /// slot itself still owns a count on top of that — `Arc::try_unwrap`
+    /// only succeeds once the slot's own count is released first
+    /// (`drop(right)`). Without that `drop`, `try_unwrap` always observes
+    /// `strong_count >= 2` and *always* takes the clone fallback, even for a
+    /// sibling nothing else references.
+    ///
+    /// Proof, not inference: build a tree that is never cloned and never
+    /// shares a snapshot (so every `Child::make_mut` on its way is an
+    /// in-place edit, and the *only* place a key could possibly get cloned
+    /// during the whole build+delete run is `absorb`'s fallback branch), use
+    /// a key type that counts its own `Clone::clone` calls, force the same
+    /// merge-heavy contiguous-prefix delete used by
+    /// `remove_mut_merge_under_snapshot_preserves_isolation` (minus the
+    /// snapshot), and assert the clone count is still zero afterward. If
+    /// `drop(right)` is removed from `absorb`, every merge clones every
+    /// entry of the absorbed sibling and this count goes strictly positive.
+    #[test]
+    fn merge_moves_unshared_sibling_instead_of_cloning() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtoOrd};
+
+        let clones = Arc::new(AtomicUsize::new(0));
+        let key = |v: u64| CountedKey {
+            v,
+            clones: Arc::clone(&clones),
+        };
+
+        let mut t: BTree<CountedKey, u64> = BTree::new();
+        for i in 0..4000u64 {
+            t.insert_mut(key(i), i);
+        }
+        // `insert_mut` on a never-cloned tree should also be clone-free (every
+        // node is uniquely owned, so `Child::make_mut` never CoW-clones), but
+        // reset here anyway so the assertion below measures only the deletes.
+        clones.store(0, AtoOrd::Relaxed);
+
+        // Same shape as remove_mut_merge_under_snapshot_preserves_isolation's
+        // delete, but with no snapshot ever taken — nothing shares any node.
+        for i in 0..3000u64 {
+            assert!(t.remove_mut(&key(i)));
+        }
+
+        assert_eq!(
+            clones.load(AtoOrd::Relaxed),
+            0,
+            "absorb cloned an unshared sibling instead of moving it -- \
+             the Child slot's own strong count must be dropped before \
+             Arc::try_unwrap, or try_unwrap can never see strong_count == 1"
+        );
     }
 
     /// Structural invariant check: arity bounds (root exempt from MIN_KEYS),
