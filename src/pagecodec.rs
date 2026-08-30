@@ -190,11 +190,10 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
         // method this module cannot call.
         #[allow(clippy::len_zero)]
         let is_inner = node.children.len() != 0;
-        // n is bounded by the tree's own MAX_KEYS invariant (well under
-        // u16::MAX even during the transient one-past-capacity window), so
-        // this cast never truncates a value this crate produced itself.
         let mut buf = Vec::with_capacity(2 + n * 16);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
+        let n16 = u16::try_from(n)
+            .map_err(|_| Error::Persistence(format!("page payload: {n} entries, over u16 range")))?;
+        buf.extend_from_slice(&n16.to_le_bytes());
         for i in 0..n {
             let (k, v) = &node.entries[i];
             let kb = k.encode();
@@ -232,8 +231,11 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
     /// means this payload was read with the wrong table's codec).
     ///
     /// Never panics on malformed bytes: every length read is bounds-checked
-    /// against the remaining payload before being trusted, and a short read
-    /// anywhere returns `Err(Error::CheckpointCorrupted)` naming the offset.
+    /// against the remaining payload before being trusted, a short read
+    /// anywhere returns `Err(Error::CheckpointCorrupted)` naming the offset,
+    /// and trailing bytes left over after a structurally well-formed parse
+    /// (garbage appended past a valid payload) are rejected the same way —
+    /// a well-formed prefix is not a well-formed payload.
     pub(crate) fn decode(&self, kind: PageKind, payload: &[u8]) -> Result<BTreeNode<K, V>> {
         let is_index_kind = matches!(kind, PageKind::IndexLeaf | PageKind::IndexInner);
         if is_index_kind != self.index {
@@ -260,6 +262,12 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
                 let id = read_u64(payload, &mut at)?;
                 children.push(Child::on_disk(id));
             }
+        }
+        if at != payload.len() {
+            return Err(Error::CheckpointCorrupted(format!(
+                "page payload: {} trailing byte(s) after offset {at}",
+                payload.len() - at
+            )));
         }
         Ok(BTreeNode { entries: entries.into_iter().collect(), children: children.into_iter().collect() })
     }
@@ -453,6 +461,49 @@ mod tests {
             let prefix = &bytes[..len];
             let result = c.decode(kind, prefix);
             assert!(result.is_err(), "truncation at {len}/{} bytes must be Err, decode of a short payload succeeded", bytes.len());
+        }
+    }
+
+    /// `decode` must reject trailing garbage appended after a structurally
+    /// well-formed payload — a valid prefix is not a valid payload.
+    /// Regression for the missing "fully consumed" check: covers both a
+    /// leaf (no child ids) and an inner node (child ids present) payload,
+    /// with both 1 and 7 extra bytes, and confirms the untouched payload
+    /// still decodes fine either way.
+    #[test]
+    fn decode_rejects_trailing_bytes_leaf_and_inner() {
+        let leaf_codec = NodeCodec::<u64, Row>::records::<Row>();
+        let leaf_node = leaf(vec![(1, Row { a: 1, s: "x".into() }), (2, Row { a: 2, s: "yy".into() })]);
+        let (leaf_kind, leaf_bytes) = leaf_codec.encode(&leaf_node).unwrap();
+        assert!(leaf_codec.decode(leaf_kind, &leaf_bytes).is_ok(), "sanity: untouched leaf payload decodes");
+
+        let inner_codec = NodeCodec::<String, Row>::records::<Row>();
+        let mut inner_node = leaf(vec![("m".to_string(), Row { a: 9, s: "".into() })]);
+        inner_node.children.push(Child::on_disk(100));
+        inner_node.children.push(Child::on_disk(200));
+        let (inner_kind, inner_bytes) = inner_codec.encode(&inner_node).unwrap();
+        assert!(inner_codec.decode(inner_kind, &inner_bytes).is_ok(), "sanity: untouched inner payload decodes");
+
+        for extra in [1usize, 7] {
+            let mut with_garbage = leaf_bytes.clone();
+            with_garbage.extend(std::iter::repeat_n(0xABu8, extra));
+            match leaf_codec.decode(leaf_kind, &with_garbage) {
+                Err(Error::CheckpointCorrupted(_)) => {}
+                other => panic!("leaf +{extra} trailing byte(s): expected CheckpointCorrupted, got {}", match other {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => format!("{e}"),
+                }),
+            }
+
+            let mut with_garbage = inner_bytes.clone();
+            with_garbage.extend(std::iter::repeat_n(0xCDu8, extra));
+            match inner_codec.decode(inner_kind, &with_garbage) {
+                Err(Error::CheckpointCorrupted(_)) => {}
+                other => panic!("inner +{extra} trailing byte(s): expected CheckpointCorrupted, got {}", match other {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => format!("{e}"),
+                }),
+            }
         }
     }
 }
