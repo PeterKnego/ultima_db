@@ -130,10 +130,15 @@ impl<E, const N: usize> FixedVec<E, N> {
     /// Shift `[idx, len)` right by one slot and insert `item` at `idx`.
     fn insert(&mut self, idx: usize, item: E) {
         let n = self.len as usize;
-        debug_assert!(idx <= n && n < N, "FixedVec::insert: out of bounds or at capacity");
+        // A release-mode bounds/capacity check, not just a debug one: the
+        // `ptr::copy`/`write` below trust `idx <= n < N` to stay in bounds
+        // and to never read an uninitialized slot into the live range, so
+        // this must actually hold outside debug builds too.
+        assert!(idx <= n && n < N, "FixedVec::insert: out of bounds or at capacity");
         if idx < n {
-            // SAFETY: [idx, n) are initialized and n < N, so [idx+1, n+1) is
-            // in bounds; `ptr::copy` moves them as raw bytes (valid for
+            // SAFETY: the assert above establishes idx <= n < N. [idx, n)
+            // are initialized and n < N, so [idx+1, n+1) is in bounds;
+            // `ptr::copy` moves them as raw bytes (valid for
             // `MaybeUninit<E>`, which permits overlapping/uninitialized
             // regions) without invoking `E`'s `Clone`/`Drop`. The source and
             // destination ranges overlap by construction, hence `copy` (not
@@ -143,7 +148,8 @@ impl<E, const N: usize> FixedVec<E, N> {
                 std::ptr::copy(base.add(idx), base.add(idx + 1), n - idx);
             }
         }
-        // SAFETY: slot idx now holds either the old (already-relocated,
+        // SAFETY: the assert above establishes idx <= n < N, so slot idx is
+        // in bounds. It now holds either the old (already-relocated,
         // logically vacated) bytes of the shifted range or was already the
         // first uninitialized slot; `write` installs `item` there without
         // dropping either.
@@ -154,14 +160,19 @@ impl<E, const N: usize> FixedVec<E, N> {
     /// Remove and return the element at `idx`, shifting `(idx, len)` left by one.
     fn remove(&mut self, idx: usize) -> E {
         let n = self.len as usize;
-        debug_assert!(idx < n, "FixedVec::remove: out of bounds");
-        // SAFETY: idx < n, so slot idx is initialized; read it out before
-        // the shift below overwrites its bytes.
+        // A release-mode bounds check, not just a debug one: `assume_init_read`
+        // below trusts idx < n to be reading an initialized slot, and the
+        // `ptr::copy` after it trusts the same bound to stay in range.
+        assert!(idx < n, "FixedVec::remove: out of bounds");
+        // SAFETY: the assert above establishes idx < n, so slot idx is
+        // initialized; read it out before the shift below overwrites its
+        // bytes.
         let removed = unsafe { self.data[idx].assume_init_read() };
         if idx + 1 < n {
-            // SAFETY: [idx+1, n) are initialized; shifting them left over
-            // the now-logically-vacated slot idx is a raw-byte move (valid
-            // for `MaybeUninit<E>`) that neither clones nor drops.
+            // SAFETY: idx < n (asserted above), so [idx+1, n) are
+            // initialized; shifting them left over the now-logically-vacated
+            // slot idx is a raw-byte move (valid for `MaybeUninit<E>`) that
+            // neither clones nor drops.
             unsafe {
                 let base = self.data.as_mut_ptr();
                 std::ptr::copy(base.add(idx + 1), base.add(idx), n - idx - 1);
@@ -176,10 +187,14 @@ impl<E, const N: usize> FixedVec<E, N> {
     /// of the immutable path's old `to_vec()`-based split.
     fn split_off(&mut self, at: usize) -> Self {
         let n = self.len as usize;
-        debug_assert!(at <= n);
+        // A release-mode bound, not just a debug one: `count = n - at` below
+        // wraps (usize underflow) if at > n, which would then feed a huge
+        // length into `copy_nonoverlapping`.
+        assert!(at <= n, "FixedVec::split_off: out of bounds");
         let mut out = Self::new();
         let count = n - at;
-        // SAFETY: [at, n) are initialized in `self`; `out.data[0, count)` is
+        // SAFETY: the assert above establishes at <= n, so `count` cannot
+        // wrap. [at, n) are initialized in `self`; `out.data[0, count)` is
         // freshly allocated and uninitialized, and `self`/`out` are distinct
         // allocations (disjoint), so `copy_nonoverlapping` is valid. This
         // moves the elements' bytes into `out` without invoking `Clone`;
@@ -4126,6 +4141,114 @@ mod tests {
         }
 
         // -------------------------------------------------------------
+        // Release-mode preconditions on insert/remove/split_off: the checks
+        // guarding the raw ptr::copy/assume_init calls must be real `assert!`s
+        // (not `debug_assert!`), since in release a violated precondition
+        // there is a write past the array, a read of uninitialized memory, or
+        // a wrapped `usize` length fed straight into a memcpy.
+        // -------------------------------------------------------------
+
+        #[test]
+        #[should_panic(expected = "FixedVec::insert: out of bounds or at capacity")]
+        fn insert_at_capacity_panics() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..CAP as u32 {
+                v.push(Elem::new(i, &live));
+            }
+            v.insert(0, Elem::new(99, &live)); // len == N == CAP: no room left
+        }
+
+        #[test]
+        #[should_panic(expected = "FixedVec::remove: out of bounds")]
+        fn remove_at_len_panics() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            v.push(Elem::new(0, &live));
+            v.remove(1); // idx == len: within capacity, nothing live there
+        }
+
+        #[test]
+        #[should_panic(expected = "FixedVec::split_off: out of bounds")]
+        fn split_off_past_len_panics() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            v.push(Elem::new(0, &live));
+            let _ = v.split_off(2); // at == len + 1
+        }
+
+        // -------------------------------------------------------------
+        // A real, non-`Freeze`, refcount-releasing element type (`Child`,
+        // the whole reason this task exists) moved through every FixedVec
+        // path, with `Arc::strong_count` checked before/after each step.
+        // Deterministic, no proptest — cheap enough to run under Miri too
+        // (unlike `matches_vec_oracle` below).
+        // -------------------------------------------------------------
+
+        #[test]
+        fn child_moves_through_every_fixedvec_path_with_correct_refcount() {
+            use crate::child::Child;
+
+            let mut leaf_entries: Entries<u64, u64> = FixedVec::new();
+            leaf_entries.push((1u64, Arc::new(10u64)));
+            let leaf: Arc<BTreeNode<u64, u64>> = Arc::new(BTreeNode { entries: leaf_entries, children: Default::default() });
+            assert_eq!(Arc::strong_count(&leaf), 1);
+
+            // push (x3)
+            let mut v: FixedVec<Child<u64, u64>, 8> = FixedVec::new();
+            for _ in 0..3 {
+                v.push(Child::resident(Arc::clone(&leaf)));
+            }
+            assert_eq!(v.len(), 3);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 3, "push must bump the refcount exactly once per element");
+
+            // insert
+            v.insert(1, Child::resident(Arc::clone(&leaf)));
+            assert_eq!(v.len(), 4);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 4, "insert must shift by raw copy, not clone the shifted elements");
+
+            // remove
+            let removed = v.remove(0);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 4, "removed Child is still owned by the caller, not yet dropped");
+            drop(removed);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 3, "dropping the removed Child releases exactly its one share");
+            assert_eq!(v.len(), 3);
+
+            // split_off (moves the tail, no clone/drop)
+            let tail = v.split_off(1);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 3, "split_off moves Children, it must not clone or drop any");
+            assert_eq!(v.len(), 1);
+            assert_eq!(tail.len(), 2);
+
+            // pop
+            let popped = v.pop().unwrap();
+            assert_eq!(Arc::strong_count(&leaf), 1 + 3, "popped Child is still owned by the caller");
+            drop(popped);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 2);
+            assert_eq!(v.len(), 0);
+
+            // Clone (bumps refcount per live element, same as Child::clone would)
+            let tail2 = tail.clone();
+            assert_eq!(Arc::strong_count(&leaf), 1 + 2 + 2, "FixedVec::clone must clone every live Child, bumping the refcount");
+            drop(tail2);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 2);
+
+            // into_iter, partially consumed: yielded element stays alive in
+            // the caller's hand; dropping the iterator must drop exactly the
+            // un-yielded remainder, not double-drop or leak.
+            let mut it = tail.into_iter();
+            let first = it.next().unwrap();
+            assert_eq!(Arc::strong_count(&leaf), 1 + 2, "yielded Child still alive, owned by the caller");
+            drop(first);
+            assert_eq!(Arc::strong_count(&leaf), 1 + 1);
+            drop(it); // must drop the one un-yielded remaining Child
+            assert_eq!(Arc::strong_count(&leaf), 1, "IntoIterator's Drop must release exactly the un-yielded tail");
+
+            drop(v); // already empty; must not touch the refcount
+            assert_eq!(Arc::strong_count(&leaf), 1);
+        }
+
+        // -------------------------------------------------------------
         // Vec<u32> oracle proptest over random op sequences (N = 8).
         // -------------------------------------------------------------
 
@@ -4151,7 +4274,12 @@ mod tests {
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(200))]
+            // Full case count normally; Miri interprets every op (including
+            // the ptr::copy/assume_init_* calls), so 200 cases here cost
+            // ~53 minutes per borrow model. 8 cases is still a meaningful
+            // Miri smoke check, and the real proptest+op-mix coverage still
+            // runs at full strength under `cargo test`.
+            #![proptest_config(ProptestConfig { cases: if cfg!(miri) { 8 } else { 200 }, ..ProptestConfig::default() })]
             #[test]
             fn matches_vec_oracle(ops in prop::collection::vec(op_strategy(), 0..60)) {
                 let mut fv: FixedVec<u32, CAP> = FixedVec::new();
