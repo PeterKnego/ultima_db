@@ -31,13 +31,21 @@ const MAX_KEYS: usize = 2 * T - 1;
 // ---------------------------------------------------------------------------
 
 /// Fixed-capacity, inline vector-like container: the backing storage
-/// `[Option<E>; N]` lives directly in the struct, so cloning/dropping one
-/// never touches the heap on its own — no separate allocation the way a
-/// `Vec<E>` field would need. `Option<Arc<_>>` (and, transitively,
-/// `Option<(K, Arc<V>)>`, since rustc finds the `Arc`'s non-null niche inside
-/// the tuple) is niche-packed, so this costs no more space than a raw
-/// `[E; N]` for the element types used here. Invariant: slots `[0, len)` are
-/// always `Some`, slots `[len, N)` are always `None`.
+/// `[MaybeUninit<E>; N]` lives directly in the struct, so cloning/dropping
+/// one never touches the heap on its own — no separate allocation the way a
+/// `Vec<E>` field would need. Storing `MaybeUninit<E>` instead of `Option<E>`
+/// matters for element types with no spare-bit niche: `Child<K, V>`
+/// (`AtomicU64` + `AtomicPtr`, see `src/child.rs`) has none — `AtomicPtr`
+/// wraps an `UnsafeCell`, so `Option<Child<K, V>>` costs a whole extra word
+/// (24 B instead of 16 B) per slot, tripling the size of every inner node's
+/// `children` array. `(K, Arc<V>)` already had a niche via `Arc`'s non-null
+/// pointer, so this change costs that element type nothing.
+///
+/// Invariant, load-bearing for every method below: slots `[0, len)` are
+/// always initialized `E`; slots `[len, N)` are always uninitialized and
+/// must never be read (`assume_init*`) or dropped. Because `MaybeUninit`
+/// itself has no `Drop` glue, `FixedVec` now needs a manual `Drop` impl (the
+/// `Option` layout got this for free from `Option<E>: Drop`).
 ///
 /// `N` carries one slot of headroom beyond the node's steady-state max
 /// (`MAX_KEYS` entries / `MAX_KEYS + 1` children — see `Entries`/`Children`
@@ -48,7 +56,7 @@ const MAX_KEYS: usize = 2 * T - 1;
 /// overflow, so it transiently holds `MAX_KEYS + 1` entries / `MAX_KEYS + 2`
 /// children. Everywhere else `len` stays within the steady-state max.
 pub(crate) struct FixedVec<E, const N: usize> {
-    items: [Option<E>; N],
+    data: [std::mem::MaybeUninit<E>; N],
     len: u8,
 }
 
@@ -62,7 +70,7 @@ impl<E, const N: usize> FixedVec<E, N> {
         #[allow(clippy::let_unit_value)]
         let _ = Self::_CAP_FITS_U8;
         FixedVec {
-            items: [const { None }; N],
+            data: [const { std::mem::MaybeUninit::uninit() }; N],
             len: 0,
         }
     }
@@ -75,18 +83,35 @@ impl<E, const N: usize> FixedVec<E, N> {
         self.len == 0
     }
 
+    /// The live prefix `[0, len)` as an initialized slice.
+    fn as_slice(&self) -> &[E] {
+        // SAFETY: invariant — [0, len) are always initialized `E`. A
+        // `MaybeUninit<E>` slice prefix that is fully initialized may be
+        // reinterpreted as `&[E]` (same layout, `MaybeUninit<E>` is
+        // `#[repr(transparent)]`-equivalent to `E` for this purpose).
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr().cast::<E>(), self.len as usize) }
+    }
+
+    /// Mutable view of the live prefix, for `split_at_mut`-based disjoint
+    /// access to two elements at once (see `rotate_right`/`rotate_left`,
+    /// which need two adjacent sibling children mutably at the same time).
+    fn as_mut_slice(&mut self) -> &mut [E] {
+        // SAFETY: same invariant as `as_slice`; `&mut self` gives unique
+        // access, so no aliasing with any other view of these slots.
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr().cast::<E>(), self.len as usize) }
+    }
+
     fn last(&self) -> Option<&E> {
-        if self.len == 0 {
-            None
-        } else {
-            self.items[self.len as usize - 1].as_ref()
-        }
+        self.as_slice().last()
     }
 
     pub(crate) fn push(&mut self, item: E) {
         let i = self.len as usize;
         debug_assert!(i < N, "FixedVec::push: at capacity");
-        self.items[i] = Some(item);
+        // SAFETY: i == len < N (checked above), so slot i is the first
+        // uninitialized slot; `write` overwrites it without dropping
+        // whatever (uninitialized) bytes were there.
+        self.data[i].write(item);
         self.len += 1;
     }
 
@@ -95,19 +120,34 @@ impl<E, const N: usize> FixedVec<E, N> {
             return None;
         }
         self.len -= 1;
-        self.items[self.len as usize].take()
+        let i = self.len as usize;
+        // SAFETY: slot i was live (i < old len) and `len` no longer covers
+        // it, so it is read out exactly once here and never read or dropped
+        // again.
+        Some(unsafe { self.data[i].assume_init_read() })
     }
 
     /// Shift `[idx, len)` right by one slot and insert `item` at `idx`.
     fn insert(&mut self, idx: usize, item: E) {
         let n = self.len as usize;
         debug_assert!(idx <= n && n < N, "FixedVec::insert: out of bounds or at capacity");
-        let mut i = n;
-        while i > idx {
-            self.items[i] = self.items[i - 1].take();
-            i -= 1;
+        if idx < n {
+            // SAFETY: [idx, n) are initialized and n < N, so [idx+1, n+1) is
+            // in bounds; `ptr::copy` moves them as raw bytes (valid for
+            // `MaybeUninit<E>`, which permits overlapping/uninitialized
+            // regions) without invoking `E`'s `Clone`/`Drop`. The source and
+            // destination ranges overlap by construction, hence `copy` (not
+            // `copy_nonoverlapping`).
+            unsafe {
+                let base = self.data.as_mut_ptr();
+                std::ptr::copy(base.add(idx), base.add(idx + 1), n - idx);
+            }
         }
-        self.items[idx] = Some(item);
+        // SAFETY: slot idx now holds either the old (already-relocated,
+        // logically vacated) bytes of the shifted range or was already the
+        // first uninitialized slot; `write` installs `item` there without
+        // dropping either.
+        self.data[idx].write(item);
         self.len += 1;
     }
 
@@ -115,9 +155,17 @@ impl<E, const N: usize> FixedVec<E, N> {
     fn remove(&mut self, idx: usize) -> E {
         let n = self.len as usize;
         debug_assert!(idx < n, "FixedVec::remove: out of bounds");
-        let removed = self.items[idx].take().expect("FixedVec::remove: hole in live range");
-        for i in idx..n - 1 {
-            self.items[i] = self.items[i + 1].take();
+        // SAFETY: idx < n, so slot idx is initialized; read it out before
+        // the shift below overwrites its bytes.
+        let removed = unsafe { self.data[idx].assume_init_read() };
+        if idx + 1 < n {
+            // SAFETY: [idx+1, n) are initialized; shifting them left over
+            // the now-logically-vacated slot idx is a raw-byte move (valid
+            // for `MaybeUninit<E>`) that neither clones nor drops.
+            unsafe {
+                let base = self.data.as_mut_ptr();
+                std::ptr::copy(base.add(idx + 1), base.add(idx), n - idx - 1);
+            }
         }
         self.len -= 1;
         removed
@@ -130,9 +178,17 @@ impl<E, const N: usize> FixedVec<E, N> {
         let n = self.len as usize;
         debug_assert!(at <= n);
         let mut out = Self::new();
-        for i in at..n {
-            out.push(self.items[i].take().unwrap());
+        let count = n - at;
+        // SAFETY: [at, n) are initialized in `self`; `out.data[0, count)` is
+        // freshly allocated and uninitialized, and `self`/`out` are distinct
+        // allocations (disjoint), so `copy_nonoverlapping` is valid. This
+        // moves the elements' bytes into `out` without invoking `Clone`;
+        // `self.len` is shrunk to `at` right after so `[at, n)` in `self` is
+        // never read or dropped again (ownership transferred to `out`).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.as_ptr().add(at).cast::<E>(), out.data.as_mut_ptr().cast::<E>(), count);
         }
+        out.len = count as u8;
         self.len = at as u8;
         out
     }
@@ -143,11 +199,9 @@ impl<E, const N: usize> FixedVec<E, N> {
         }
     }
 
-    /// Iterate the live prefix. Relies on the tail-is-`None` invariant:
-    /// `flatten()` drops `None`s, so this yields exactly `[0, len)` without
-    /// needing to consult `len` itself.
+    /// Iterate the live prefix.
     fn iter(&self) -> impl Iterator<Item = &E> + '_ {
-        self.items.iter().flatten()
+        self.as_slice().iter()
     }
 
     fn to_vec(&self) -> Vec<E>
@@ -157,38 +211,34 @@ impl<E, const N: usize> FixedVec<E, N> {
         self.iter().cloned().collect()
     }
 
-    fn binary_search_by<F>(&self, mut f: F) -> std::result::Result<usize, usize>
+    fn binary_search_by<F>(&self, f: F) -> std::result::Result<usize, usize>
     where
         F: FnMut(&E) -> std::cmp::Ordering,
     {
-        self.items[..self.len as usize].binary_search_by(|slot| f(slot.as_ref().unwrap()))
+        self.as_slice().binary_search_by(f)
     }
 
-    fn partition_point<F>(&self, mut pred: F) -> usize
+    fn partition_point<F>(&self, pred: F) -> usize
     where
         F: FnMut(&E) -> bool,
     {
-        self.items[..self.len as usize].partition_point(|slot| pred(slot.as_ref().unwrap()))
-    }
-
-    /// Mutable view of the live prefix, for `split_at_mut`-based disjoint
-    /// access to two elements at once (see `rotate_right`/`rotate_left`,
-    /// which need two adjacent sibling children mutably at the same time).
-    fn as_mut_slice(&mut self) -> &mut [Option<E>] {
-        &mut self.items[..self.len as usize]
+        self.as_slice().partition_point(pred)
     }
 }
 
 // Bounded on `E: Clone` only (same shape as `BTreeNode`'s own manual `Clone`
-// below) — a plain array clone, so `None` tail slots clone for free and
-// initialized slots clone element-wise (bumping `Arc` refcounts, no heap
-// traffic of `FixedVec`'s own).
+// below). Built via a fresh `FixedVec` and `push` rather than a bulk array
+// clone: if some element's `Clone` panics partway through, the partial
+// `out` built so far is a well-formed `FixedVec` whose own `Drop` cleans up
+// exactly the elements already cloned — no leak, no double-drop of `self`'s
+// originals (which `clone` never touched).
 impl<E: Clone, const N: usize> Clone for FixedVec<E, N> {
     fn clone(&self) -> Self {
-        FixedVec {
-            items: self.items.clone(),
-            len: self.len,
+        let mut out = Self::new();
+        for item in self.as_slice() {
+            out.push(item.clone());
         }
+        out
     }
 }
 
@@ -201,16 +251,30 @@ impl<E, const N: usize> Default for FixedVec<E, N> {
     }
 }
 
+impl<E, const N: usize> Drop for FixedVec<E, N> {
+    fn drop(&mut self) {
+        // SAFETY: invariant — exactly [0, len) are initialized; each is
+        // dropped in place exactly once here. [len, N) is never touched.
+        for slot in &mut self.data[..self.len as usize] {
+            unsafe { std::ptr::drop_in_place(slot.as_mut_ptr()) };
+        }
+    }
+}
+
 impl<E, const N: usize> std::ops::Index<usize> for FixedVec<E, N> {
     type Output = E;
     fn index(&self, idx: usize) -> &E {
-        self.items[idx].as_ref().expect("FixedVec: index out of live range")
+        assert!(idx < self.len as usize, "FixedVec: index out of live range");
+        // SAFETY: idx < len, just asserted, so slot idx is initialized.
+        unsafe { self.data[idx].assume_init_ref() }
     }
 }
 
 impl<E, const N: usize> std::ops::IndexMut<usize> for FixedVec<E, N> {
     fn index_mut(&mut self, idx: usize) -> &mut E {
-        self.items[idx].as_mut().expect("FixedVec: index out of live range")
+        assert!(idx < self.len as usize, "FixedVec: index out of live range");
+        // SAFETY: idx < len, just asserted, so slot idx is initialized.
+        unsafe { self.data[idx].assume_init_mut() }
     }
 }
 
@@ -222,13 +286,62 @@ impl<E, const N: usize> FromIterator<E> for FixedVec<E, N> {
     }
 }
 
+/// Owns a `FixedVec`'s storage and yields `[0, len)` by value; any elements
+/// not yet yielded when this is dropped are dropped by `Drop` below (e.g. a
+/// caller that does `.into_iter().next()` and drops the rest).
+pub(crate) struct FixedVecIntoIter<E, const N: usize> {
+    data: [std::mem::MaybeUninit<E>; N],
+    idx: usize,
+    len: usize,
+}
+
+impl<E, const N: usize> Iterator for FixedVecIntoIter<E, N> {
+    type Item = E;
+    fn next(&mut self) -> Option<E> {
+        if self.idx >= self.len {
+            return None;
+        }
+        let i = self.idx;
+        self.idx += 1;
+        // SAFETY: i < len <= N and [0, len) were initialized when this
+        // iterator was built (see `IntoIterator::into_iter` below); `idx`
+        // only increases, so each index is read out exactly once.
+        Some(unsafe { self.data[i].assume_init_read() })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.len - self.idx;
+        (rem, Some(rem))
+    }
+}
+
+impl<E, const N: usize> Drop for FixedVecIntoIter<E, N> {
+    fn drop(&mut self) {
+        // SAFETY: [idx, len) are exactly the not-yet-yielded initialized
+        // elements — [0, idx) were already moved out by `next` (and must
+        // not be dropped again), [len, N) were never initialized.
+        for slot in &mut self.data[self.idx..self.len] {
+            unsafe { std::ptr::drop_in_place(slot.as_mut_ptr()) };
+        }
+    }
+}
+
 impl<E, const N: usize> IntoIterator for FixedVec<E, N> {
     type Item = E;
-    type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<E>, N>>;
+    type IntoIter = FixedVecIntoIter<E, N>;
     fn into_iter(self) -> Self::IntoIter {
-        // Same tail-is-`None` invariant as `iter()`: flatten alone yields
-        // exactly the live prefix.
-        self.items.into_iter().flatten()
+        let len = self.len as usize;
+        // `self` implements `Drop`, so its `data` field can't be moved out
+        // by destructuring; suppress that `Drop` and move `data` out by raw
+        // read instead.
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is a `ManuallyDrop`, so `self`'s `Drop` impl (which
+        // would drop `[0, len)` in `data`) never runs for this value;
+        // reading `data` out bitwise-moves ownership of the whole array —
+        // including the live `[0, len)` prefix — to the returned iterator,
+        // which becomes solely responsible for dropping what it doesn't
+        // yield.
+        let data = unsafe { std::ptr::read(&this.data) };
+        FixedVecIntoIter { data, idx: 0, len }
     }
 }
 
@@ -1572,8 +1685,8 @@ fn rotate_right<K: Clone, V>(
     src: Option<&dyn NodeSource<K, V>>,
 ) {
     let (left_part, right_part) = children.as_mut_slice().split_at_mut(idx);
-    let left = left_part[idx - 1].as_mut().unwrap().make_mut(src);
-    let right = right_part[0].as_mut().unwrap().make_mut(src);
+    let left = left_part[idx - 1].make_mut(src);
+    let right = right_part[0].make_mut(src);
 
     // Steal the last entry (and trailing child) of the left sibling.
     let stolen = left.entries.pop().unwrap();
@@ -1601,8 +1714,8 @@ fn rotate_left<K: Clone, V>(
     src: Option<&dyn NodeSource<K, V>>,
 ) {
     let (left_part, right_part) = children.as_mut_slice().split_at_mut(idx + 1);
-    let left = left_part[idx].as_mut().unwrap().make_mut(src);
-    let right = right_part[0].as_mut().unwrap().make_mut(src);
+    let left = left_part[idx].make_mut(src);
+    let right = right_part[0].make_mut(src);
 
     // Steal the first entry (and leading child) of the right sibling.
     let stolen = right.entries.remove(0);
@@ -3776,6 +3889,320 @@ mod tests {
                 .collect();
 
             prop_assert_eq!(got, diff_oracle_expected(&model, &base_model));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // task-2b: FixedVec storage without the Option discriminant
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn child_slots_are_sixteen_bytes() {
+        use crate::child::Child;
+        assert_eq!(std::mem::size_of::<Child<u64, u64>>(), 16);
+        // 65 slots + len (padded to alignment). Must not regress to the Option layout (1560 + 8).
+        assert!(std::mem::size_of::<Children<u64, u64>>() <= 65 * 16 + 8, "{}", std::mem::size_of::<Children<u64, u64>>());
+    }
+
+    mod fixed_vec {
+        use super::super::*;
+        use proptest::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAP: usize = 8;
+        type FV = FixedVec<Elem, CAP>;
+
+        /// Drop-counting element. `live` is a per-test counter shared (via
+        /// `Arc`) by every clone/copy of this value; `Clone` bumps it,
+        /// `Drop` decrements it, so at any point `live.load()` is exactly
+        /// the number of `Elem` instances currently alive — including ones
+        /// still sitting inside a `FixedVec` and ones already moved out of
+        /// one (e.g. by `pop`/`remove`/`into_iter`).
+        struct Elem {
+            val: u32,
+            live: Arc<AtomicUsize>,
+        }
+        impl Elem {
+            fn new(val: u32, live: &Arc<AtomicUsize>) -> Self {
+                live.fetch_add(1, Ordering::SeqCst);
+                Elem { val, live: live.clone() }
+            }
+        }
+        impl Clone for Elem {
+            fn clone(&self) -> Self {
+                self.live.fetch_add(1, Ordering::SeqCst);
+                Elem { val: self.val, live: self.live.clone() }
+            }
+        }
+        impl Drop for Elem {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl PartialEq for Elem {
+            fn eq(&self, other: &Self) -> bool {
+                self.val == other.val
+            }
+        }
+        impl std::fmt::Debug for Elem {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "Elem({})", self.val)
+            }
+        }
+
+        #[test]
+        fn drop_releases_exactly_the_live_prefix() {
+            let live = Arc::new(AtomicUsize::new(0));
+            {
+                let mut v: FV = FixedVec::new();
+                for i in 0..5 {
+                    v.push(Elem::new(i, &live));
+                }
+                assert_eq!(live.load(Ordering::SeqCst), 5);
+            }
+            assert_eq!(live.load(Ordering::SeqCst), 0, "Drop must release exactly [0, len)");
+        }
+
+        #[test]
+        fn clone_duplicates_live_prefix_only() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..4 {
+                v.push(Elem::new(i, &live));
+            }
+            assert_eq!(live.load(Ordering::SeqCst), 4);
+            let v2 = v.clone();
+            assert_eq!(live.load(Ordering::SeqCst), 8, "clone duplicates the live prefix");
+            assert_eq!(v2.len(), 4);
+            drop(v2);
+            assert_eq!(live.load(Ordering::SeqCst), 4);
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn clone_panic_mid_clone_drops_only_what_was_already_cloned() {
+            // A `Clone` that panics on a specific value, so we can see that
+            // FixedVec::clone doesn't leak or double-drop the partial result.
+            struct PanicOnThird {
+                val: u32,
+                live: Arc<AtomicUsize>,
+            }
+            impl Clone for PanicOnThird {
+                fn clone(&self) -> Self {
+                    if self.val == 2 {
+                        panic!("intentional clone panic");
+                    }
+                    self.live.fetch_add(1, Ordering::SeqCst);
+                    PanicOnThird { val: self.val, live: self.live.clone() }
+                }
+            }
+            impl Drop for PanicOnThird {
+                fn drop(&mut self) {
+                    self.live.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FixedVec<PanicOnThird, CAP> = FixedVec::new();
+            for val in 0..4u32 {
+                live.fetch_add(1, Ordering::SeqCst);
+                v.push(PanicOnThird { val, live: live.clone() });
+            }
+            assert_eq!(live.load(Ordering::SeqCst), 4);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.clone()));
+            assert!(result.is_err(), "clone of element index 2 must panic");
+            // The two already-cloned elements (index 0, 1) must have been
+            // dropped along with the aborted partial FixedVec, not leaked.
+            assert_eq!(live.load(Ordering::SeqCst), 4, "only the original 4 elements remain live");
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn into_iter_partial_consumption_drops_remainder() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..6 {
+                v.push(Elem::new(i, &live));
+            }
+            let mut it = v.into_iter();
+            let first = it.next().unwrap();
+            assert_eq!(first.val, 0);
+            assert_eq!(live.load(Ordering::SeqCst), 6, "yielded element still alive, owned by caller");
+            drop(first);
+            assert_eq!(live.load(Ordering::SeqCst), 5);
+            drop(it); // must drop the remaining 5 (indices 1..6)
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn remove_drops_only_the_removed_element() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..5 {
+                v.push(Elem::new(i, &live));
+            }
+            let removed = v.remove(2);
+            assert_eq!(removed.val, 2);
+            assert_eq!(live.load(Ordering::SeqCst), 5, "removed value still owned by the caller");
+            drop(removed);
+            assert_eq!(live.load(Ordering::SeqCst), 4);
+            let vals: Vec<u32> = v.iter().map(|e| e.val).collect();
+            assert_eq!(vals, vec![0, 1, 3, 4]);
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn pop_drops_nothing_extra_and_returns_owned() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..3 {
+                v.push(Elem::new(i, &live));
+            }
+            let popped = v.pop().unwrap();
+            assert_eq!(popped.val, 2);
+            assert_eq!(live.load(Ordering::SeqCst), 3);
+            drop(popped);
+            assert_eq!(live.load(Ordering::SeqCst), 2);
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn split_off_moves_the_tail_without_dropping_or_cloning() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in 0..6 {
+                v.push(Elem::new(i, &live));
+            }
+            assert_eq!(live.load(Ordering::SeqCst), 6);
+            let tail = v.split_off(2);
+            assert_eq!(live.load(Ordering::SeqCst), 6, "moved, not cloned or dropped");
+            assert_eq!(v.len(), 2);
+            assert_eq!(tail.len(), 4);
+            assert_eq!(v.iter().map(|e| e.val).collect::<Vec<_>>(), vec![0, 1]);
+            assert_eq!(tail.iter().map(|e| e.val).collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 4);
+            drop(tail);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn insert_shifts_without_dropping_or_cloning() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            for i in [0, 1, 3, 4] {
+                v.push(Elem::new(i, &live));
+            }
+            v.insert(2, Elem::new(2, &live));
+            assert_eq!(live.load(Ordering::SeqCst), 5);
+            assert_eq!(v.iter().map(|e| e.val).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn extend_pushes_all_without_dropping_existing() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            v.push(Elem::new(0, &live));
+            v.extend([Elem::new(1, &live), Elem::new(2, &live)]);
+            assert_eq!(live.load(Ordering::SeqCst), 3);
+            assert_eq!(v.iter().map(|e| e.val).collect::<Vec<_>>(), vec![0, 1, 2]);
+            drop(v);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[should_panic(expected = "index out of live range")]
+        fn index_out_of_live_range_panics() {
+            let live = Arc::new(AtomicUsize::new(0));
+            let mut v: FV = FixedVec::new();
+            v.push(Elem::new(0, &live));
+            let _ = &v[5]; // len == 1, 5 < N == CAP == 8: within capacity, outside live range
+        }
+
+        // -------------------------------------------------------------
+        // Vec<u32> oracle proptest over random op sequences (N = 8).
+        // -------------------------------------------------------------
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Push(u32),
+            Pop,
+            Insert(usize, u32),
+            Remove(usize),
+            SplitOffRejoin(usize),
+            Extend(Vec<u32>),
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                any::<u32>().prop_map(Op::Push),
+                Just(Op::Pop),
+                (0..=CAP, any::<u32>()).prop_map(|(idx, v)| Op::Insert(idx, v)),
+                (0..CAP).prop_map(Op::Remove),
+                (0..=CAP).prop_map(Op::SplitOffRejoin),
+                prop::collection::vec(any::<u32>(), 0..4).prop_map(Op::Extend),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+            #[test]
+            fn matches_vec_oracle(ops in prop::collection::vec(op_strategy(), 0..60)) {
+                let mut fv: FixedVec<u32, CAP> = FixedVec::new();
+                let mut model: Vec<u32> = Vec::new();
+                for op in ops {
+                    match op {
+                        Op::Push(v) => {
+                            if model.len() < CAP {
+                                fv.push(v);
+                                model.push(v);
+                            }
+                        }
+                        Op::Pop => {
+                            let a = fv.pop();
+                            let b = model.pop();
+                            prop_assert_eq!(a, b);
+                        }
+                        Op::Insert(idx, v) => {
+                            if model.len() < CAP {
+                                let idx = idx.min(model.len());
+                                fv.insert(idx, v);
+                                model.insert(idx, v);
+                            }
+                        }
+                        Op::Remove(idx) => {
+                            if !model.is_empty() {
+                                let idx = idx % model.len();
+                                let a = fv.remove(idx);
+                                let b = model.remove(idx);
+                                prop_assert_eq!(a, b);
+                            }
+                        }
+                        Op::SplitOffRejoin(at) => {
+                            let at = at.min(model.len());
+                            let tail_fv = fv.split_off(at);
+                            let tail_model = model.split_off(at);
+                            prop_assert_eq!(tail_fv.to_vec(), tail_model.clone());
+                            fv.extend(tail_fv);
+                            model.extend(tail_model);
+                        }
+                        Op::Extend(vals) => {
+                            let room = CAP - model.len();
+                            let vals: Vec<u32> = vals.into_iter().take(room).collect();
+                            fv.extend(vals.clone());
+                            model.extend(vals);
+                        }
+                    }
+                    prop_assert_eq!(fv.to_vec(), model.clone());
+                    prop_assert_eq!(fv.len(), model.len());
+                }
+            }
         }
     }
 }
