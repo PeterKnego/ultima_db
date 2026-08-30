@@ -424,6 +424,12 @@ impl<K: Clone, V> Clone for BTreeNode<K, V> {
 pub struct BTree<K, V> {
     root: Child<K, V>,
     len: usize,
+    /// Levels below the root; 0 = root is a leaf. Kept up to date by every
+    /// mutation (root split/collapse is the only thing that ever changes
+    /// it) rather than recomputed by descent, so `height()` never needs to
+    /// touch — let alone fault — a single node, even on a tree that is
+    /// otherwise entirely on disk.
+    height: usize,
     /// Where an on-disk `Child` slot in this tree faults its node in from.
     /// `None` for every tree built so far — nothing here ever creates an
     /// `on_disk` slot, so nothing ever needs to fault one in. Paging lands
@@ -476,6 +482,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 children: Children::new(),
             })),
             len: 0,
+            height: 0,
             source: None,
         }
     }
@@ -591,6 +598,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 BTree {
                     root: new_root,
                     len: new_len,
+                    height: self.height,
                     source: self.source.clone(),
                 }
             }
@@ -610,6 +618,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 BTree {
                     root: new_root,
                     len: new_len,
+                    height: self.height + 1,
                     source: self.source.clone(),
                 }
             }
@@ -670,6 +679,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 children.push(left);
                 children.push(right);
                 self.root = Child::resident(Arc::new(BTreeNode { entries, children }));
+                self.height += 1;
             }
         }
     }
@@ -684,14 +694,12 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 // If the root is now an internal node with no entries but one
                 // child, collapse the tree height by one.
                 let new_root_node = new_root.load(src);
-                let actual_root = if new_root_node.entries.is_empty() && !new_root_node.children.is_empty() {
-                    new_root_node.children[0].clone()
-                } else {
-                    new_root
-                };
+                let collapsed = new_root_node.entries.is_empty() && !new_root_node.children.is_empty();
+                let actual_root = if collapsed { new_root_node.children[0].clone() } else { new_root };
                 Ok(BTree {
                     root: actual_root,
                     len: self.len - 1,
+                    height: if collapsed { self.height - 1 } else { self.height },
                     source: self.source.clone(),
                 })
             }
@@ -715,6 +723,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 if root.entries.is_empty() && !root.children.is_empty() {
                     let only = root.children.remove(0);
                     self.root = only;
+                    self.height -= 1;
                 }
                 true
             }
@@ -818,23 +827,14 @@ impl<K: Ord + Clone, V> BTree<K, V> {
 // ---------------------------------------------------------------------------
 
 impl<K: Ord + Clone, V> BTree<K, V> {
-    /// Levels below the root; 0 = root is a leaf. Loads only the leftmost
-    /// path, using the accessed-bit-preserving load: a genuine fault (the
-    /// tree isn't fully resident yet) still marks accessed like any other
-    /// fault, but probing the shape of an already-resident tree must not
-    /// perturb which leaf looks "recently used" to the eviction sweep.
-    // No production caller yet — the (future) page evictor and checkpoint
-    // writer are the intended callers. Used today by this task's tests.
-    #[allow(dead_code)]
+    /// Levels below the root; 0 = root is a leaf. A plain field read — no
+    /// I/O, ever, not even on a tree that is otherwise entirely on disk
+    /// (`from_root_page`'s caller supplies it, since a fresh attach has no
+    /// other way to know). Every mutation that can change it (root
+    /// split/collapse) keeps it in sync; see the field's doc comment on
+    /// `BTree` for why this replaced descending the leftmost path.
     pub(crate) fn height(&self) -> usize {
-        let src = self.source.as_deref();
-        let mut h = 0;
-        let mut n = self.root.load_quiet(src);
-        while !n.children.is_empty() {
-            n = n.children[0].load_quiet(src);
-            h += 1;
-        }
-        h
+        self.height
     }
 
     /// Post-order over `NO_PAGE` slots. `write(node, is_leaf)` returns the
@@ -973,18 +973,39 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Page ids referenced by `prev` and not by `self`, walking only inner
     /// subtrees whose page id differs between the two (identical-id
     /// subtrees are skipped whole).
+    ///
+    /// # Precondition
+    ///
+    /// Both trees' inner levels must be resident — `inner_ids`'s own walk
+    /// below treats a not-yet-loaded slot as a leaf, since a *leaf* is the
+    /// only thing this task ever leaves on disk. A tree fresh off
+    /// `from_root_page` violates that (its whole spine may still be on
+    /// disk), and calling this without the fix below would report every
+    /// page of two otherwise-identical trees as dead. So this calls
+    /// `load_inner_levels` on both trees first — a no-op once they already
+    /// are resident, so callers that already loaded them (or built them
+    /// in-memory) pay nothing extra.
+    ///
+    /// Read-only otherwise: uses [`Child::load_quiet`] throughout, so a
+    /// checkpoint-diff or GC walk never marks a leaf "recently used" just
+    /// by looking at it — only a real workload touch (`get`, `insert_mut`,
+    /// ...) should be able to give a leaf a second chance in
+    /// [`BTree::demote_leaves`].
     // No production caller yet — the (future) GC/page-reclaim pass is the
     // intended caller. Used today by this task's tests.
     #[allow(dead_code)]
     pub(crate) fn changed_page_ids(&self, prev: &BTree<K, V>) -> Vec<PageId> {
         use std::collections::HashSet;
 
+        self.load_inner_levels();
+        prev.load_inner_levels();
+
         fn inner_ids<K, V>(t: &BTree<K, V>, out: &mut HashSet<PageId>) {
             fn go<K, V>(slot: &Child<K, V>, src: Option<&dyn NodeSource<K, V>>, out: &mut HashSet<PageId>) {
                 if !slot.is_loaded() {
-                    return; // an on-disk slot is a leaf (inner levels stay resident)
+                    return; // an on-disk slot is a leaf (inner levels are resident — see the precondition above)
                 }
-                let n = slot.load(src);
+                let n = slot.load_quiet(src);
                 if n.children.is_empty() {
                     return;
                 }
@@ -1024,7 +1045,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 if !slot.is_loaded() {
                     return;
                 }
-                let n = slot.load(src);
+                let n = slot.load_quiet(src);
                 for c in n.children.iter() {
                     go(c, src, other, out);
                 }
@@ -1038,14 +1059,19 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         prev_ids.difference(&new_ids).copied().collect()
     }
 
-    /// A tree whose root is on disk. `len` from the root record.
+    /// A tree whose root is on disk. `len` and `height` come from the root
+    /// record (the caller — the checkpoint/root format a later task adds —
+    /// is expected to have persisted both alongside the root id; there is
+    /// no way to discover `height` from an on-disk root without faulting
+    /// something, which is exactly what caching it on `BTree` avoids).
     // No production caller yet — the (future) recovery/attach path is the
     // intended caller. Used today by this task's tests.
     #[allow(dead_code)]
-    pub(crate) fn from_root_page(id: PageId, len: usize, source: Arc<dyn NodeSource<K, V>>) -> Self {
+    pub(crate) fn from_root_page(id: PageId, len: usize, height: usize, source: Arc<dyn NodeSource<K, V>>) -> Self {
         BTree {
             root: Child::on_disk(id),
             len,
+            height,
             source: Some(source),
         }
     }
@@ -1070,6 +1096,9 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     }
 
     /// Bytes of resident leaves, estimated as loaded-leaf-slots × NODE_BYTES.
+    /// Read-only: uses [`Child::load_quiet`], so measuring residency never
+    /// marks anything "recently used" — see the same note on
+    /// [`Self::changed_page_ids`].
     // No production caller yet — the (future) page evictor's budget check is
     // the intended caller. Used today by this task's tests.
     #[allow(dead_code)]
@@ -1080,7 +1109,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             if depth == 0 {
                 return if slot.is_loaded() { Child::<K, V>::NODE_BYTES } else { 0 };
             }
-            let n = slot.load(src);
+            let n = slot.load_quiet(src);
             n.children.iter().map(|c| go(c, depth - 1, src)).sum()
         }
         go(&self.root, h, src)
@@ -1088,6 +1117,9 @@ impl<K: Ord + Clone, V> BTree<K, V> {
 
     /// Walk resident nodes, reporting every slot's page id — used by tests
     /// and by a later task's punch (hole-punch reclaim) bookkeeping.
+    /// Read-only: uses [`Child::load_quiet`], so a punch-bookkeeping pass
+    /// never marks a leaf "recently used" just by visiting it — see the
+    /// same note on [`Self::changed_page_ids`].
     // No production caller yet — a later task's punch bookkeeping is the
     // intended caller. Used today by this task's tests.
     #[allow(dead_code)]
@@ -1099,7 +1131,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             if !slot.is_loaded() {
                 return;
             }
-            for c in slot.load(src).children.iter() {
+            for c in slot.load_quiet(src).children.iter() {
                 go(c, src, f);
             }
         }
@@ -1122,8 +1154,11 @@ fn restore_unchanged_ids<K: Ord + Clone, V>(new: &Child<K, V>, orig: &Child<K, V
         // pass never `make_mut`'d in the first place — nothing to restore.
         return;
     }
-    let nn = new.load(src);
-    let on = orig.load(src);
+    // `load_quiet`: this is bookkeeping that runs after every demote_leaves
+    // pass, not a workload read — it must not leave `orig` (the untouched
+    // original tree) or `new`'s inner nodes looking freshly "recently used".
+    let nn = new.load_quiet(src);
+    let on = orig.load_quiet(src);
     for (nc, oc) in nn.children.iter().zip(on.children.iter()) {
         restore_unchanged_ids(nc, oc, depth - 1, src);
     }
@@ -1158,6 +1193,7 @@ impl<K, V> Clone for BTree<K, V> {
         BTree {
             root: self.root.clone(),
             len: self.len,
+            height: self.height,
             source: self.source.clone(),
         }
     }
@@ -2290,7 +2326,14 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
     /// MAX_KEYS, which also keeps its `total > 2 * MIN_KEYS` split sound.
     fn seed_from_spine(tree: &BTree<K, V>) -> Self {
         if tree.is_empty() {
-            return Self::new();
+            // No spine to unzip, but the empty tree can still carry a
+            // source (e.g. delete-all on a paged tree) — `Self::new()`
+            // alone would silently drop it, leaving the tree `finish()`
+            // produces unable to fault anything it doesn't itself build.
+            return Self {
+                source: tree.source.clone(),
+                ..Self::new()
+            };
         }
         let src = tree.source.as_deref();
         let mut spine: Vec<&BTreeNode<K, V>> = Vec::new();
@@ -2377,6 +2420,14 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         // Entries popped from a level that ended up "unclosed" (see below),
         // to be re-inserted individually once the tree is otherwise valid.
         let mut pending_reinsert: Vec<(K, Arc<V>)> = Vec::new();
+        // Tracks the height of whatever `carry` currently holds: 0 the
+        // moment the leaf level produces its node, +1 every time a level
+        // above genuinely *wraps* what it carried in a new node. The
+        // "collapse" branch below (an unclosed topmost level popping down
+        // to its one child) deliberately does *not* bump this — it forwards
+        // a lower level's node without adding a level, exactly like the
+        // root-collapse case `remove`/`remove_mut` track the same way.
+        let mut computed_height: usize = 0;
 
         for level in 0..self.levels.len() {
             let is_leaf_level = level == 0;
@@ -2451,6 +2502,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
             }
 
             let node = if is_leaf_level {
+                computed_height = 0;
                 Child::resident(Arc::new(BTreeNode {
                     entries: std::mem::take(&mut lv.entries).into_iter().collect(),
                     children: Children::new(),
@@ -2502,6 +2554,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                     debug_assert_eq!(children.len(), 1);
                     children.pop().unwrap()
                 } else {
+                    computed_height += 1;
                     Child::resident(Arc::new(BTreeNode {
                         entries: entries.into_iter().collect(),
                         children: children.into_iter().collect(),
@@ -2519,7 +2572,12 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         });
         fix_right_spine_tail(&mut root, self.source.as_deref());
         let len = self.len - pending_reinsert.len();
-        let mut tree = BTree { root, len, source: self.source.clone() };
+        let mut tree = BTree {
+            root,
+            len,
+            height: computed_height,
+            source: self.source.clone(),
+        };
         for (k, v) in pending_reinsert {
             tree.insert_arc_mut(k, v);
         }
@@ -4916,12 +4974,129 @@ mod tests {
             let t = tree(20_000);
             let mut next = 0;
             let root = flush(&t, &disk, &mut next);
-            let t2: BTree<u64, u64> = BTree::from_root_page(root, 20_000, disk.clone());
+            // `height` comes from the fully-resident source tree — exactly
+            // what a real root record would have persisted alongside the
+            // root id, and what lets `from_root_page` skip the (now-gone)
+            // leftmost-leaf fault to learn it.
+            let t2: BTree<u64, u64> = BTree::from_root_page(root, 20_000, t.height(), disk.clone());
+            assert_eq!(t2.height(), t.height());
+            assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 0, "height is a cached field: attaching a cold tree costs nothing");
             t2.load_inner_levels();
             let inner = disk.reads.load(std::sync::atomic::Ordering::Relaxed);
-            assert!(inner < 20, "root + one inner level (~6 nodes) + one leaf for height probing");
+            assert!(inner < 20, "root + one inner level (~6 nodes); no leaf fault to learn depth any more");
             assert_eq!(t2.get(&123), Some(&123));
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), inner + 1);
+        }
+
+        #[test]
+        fn load_inner_levels_stops_exactly_at_leaves() {
+            // Ruling (b): every slot `load_inner_levels` stops descending
+            // at (depth 0, relative to the root) must actually be a leaf —
+            // faulting it here, in the test only, to check `children.is_empty()`
+            // is how we verify that without teaching production code to
+            // fault leaves just to assert about them.
+            let disk = Arc::new(MockDisk::new());
+            let t = tree(20_000);
+            let mut next = 0;
+            let root = flush(&t, &disk, &mut next);
+            let t2: BTree<u64, u64> = BTree::from_root_page(root, 20_000, t.height(), disk.clone());
+            t2.load_inner_levels();
+
+            fn check(slot: &Child<u64, u64>, depth: usize, src: Option<&dyn NodeSource<u64, u64>>) {
+                if depth == 0 {
+                    assert!(!slot.is_loaded(), "load_inner_levels must leave every leaf on disk");
+                    let n = slot.load(src); // test-only fault: verify it's a real leaf
+                    assert!(n.children.is_empty(), "the slot load_inner_levels stopped at must actually be a leaf");
+                    return;
+                }
+                assert!(slot.is_loaded(), "every inner level must be resident after load_inner_levels");
+                let n = slot.load(src);
+                for c in n.children.iter() {
+                    check(c, depth - 1, src);
+                }
+            }
+            check(&t2.root, t2.height(), t2.source.as_deref());
+        }
+
+        // -------------------------------------------------------------
+        // Review findings, fix round 1.
+        //
+        // IMPORTANT #1: `changed_page_ids`/`for_each_page_id` used the
+        // marking `Child::load`, so a checkpoint diff or punch-bookkeeping
+        // walk could mark a leaf "recently used" purely by looking at it —
+        // giving it an undeserved second chance the next `demote_leaves`
+        // pass. `load_quiet` everywhere in those two functions (and
+        // `restore_unchanged_ids`/`resident_leaf_estimate`, for the same
+        // reason) fixes it; this test is built to fail against the old
+        // marking `load`.
+        // -------------------------------------------------------------
+        #[test]
+        fn changed_page_ids_and_for_each_page_id_do_not_re_arm_accessed() {
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(20_000);
+            let mut next = 0;
+            flush(&t, &disk, &mut next);
+            t.set_source(Some(disk.clone()));
+            // Two leaves get a *real* workload touch.
+            t.get(&1);
+            t.get(&19_999);
+            // Pass A: everything else (never touched) demotes; the two
+            // touched leaves survive on their second chance — which clears
+            // their accessed bit. The tree is now effectively fully
+            // demoted except those two survivors.
+            let (t2, da, _) = t.demote_leaves(None, usize::MAX);
+            assert!(da > 300, "everything but the two touched leaves demotes");
+            // Walk it exactly the way a checkpoint diff / punch pass would:
+            // compare against a deliberately unrelated tree (so
+            // `changed_page_ids` can't skip via matching ids and is forced
+            // to walk what it reaches) and separately via `for_each_page_id`.
+            // Neither may re-arm the two leaves' just-cleared accessed bit.
+            // `prev` is deliberately unrelated (empty): `changed_page_ids`
+            // reports "referenced by prev, not by self" (dead-page GC
+            // candidates), and an empty `prev` never references anything —
+            // so the returned list is legitimately empty here. What matters
+            // for this test is the *side effect*: comparing against an
+            // empty `prev` means no id anywhere can match via the
+            // "identical subtree, skip whole" optimization, forcing
+            // `collect` to actually walk every node it can reach in `t2`
+            // (exactly the shape a checkpoint diff or GC pass takes in
+            // practice, where a lot has changed).
+            let prev: BTree<u64, u64> = BTree::new();
+            let _dead = t2.changed_page_ids(&prev);
+            let mut count = 0;
+            t2.for_each_page_id(&mut |_| count += 1);
+            assert!(count > 0);
+            // Pass B, the pass following the walks: with nothing having
+            // re-armed them, the two leaves' second chance is used up and
+            // they demote now — and only they, since everything else was
+            // already on disk (free `!any` skip, nothing left to consider).
+            let (t3, db, _) = t2.demote_leaves(None, usize::MAX);
+            assert_eq!(db, 2, "exactly the two leaves the walks must not have re-armed");
+            let _ = t3;
+        }
+
+        // -------------------------------------------------------------
+        // IMPORTANT #2: `changed_page_ids` assumed inner levels are
+        // resident on both sides ("an on-disk slot is a leaf"). A tree
+        // fresh off `from_root_page` violates that — its whole spine can
+        // still be on disk — and the old implementation would then treat
+        // every inner id as a leaf id, never match anything, and report
+        // every page of an otherwise-identical tree as dead (a live-page
+        // hole-punch, for a later task's GC). Calling `load_inner_levels`
+        // on both trees at entry fixes it.
+        // -------------------------------------------------------------
+        #[test]
+        fn changed_page_ids_loads_inner_levels_for_a_cold_tree() {
+            let disk = Arc::new(MockDisk::new());
+            let t = tree(20_000);
+            let mut next = 0;
+            let root = flush(&t, &disk, &mut next);
+            // Cold: only the root id is known, nothing faulted yet.
+            let cold: BTree<u64, u64> = BTree::from_root_page(root, 20_000, t.height(), disk.clone());
+            // Warm twin: `t` itself, still fully resident, referencing the
+            // exact same pages (it's what got flushed).
+            let dead = cold.changed_page_ids(&t);
+            assert!(dead.is_empty(), "same pages, only residency differs — nothing is actually dead");
         }
 
         // -------------------------------------------------------------
@@ -4949,6 +5124,41 @@ mod tests {
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), reads_before + 1);
         }
 
+        #[test]
+        fn seed_from_spine_empty_tree_keeps_source() {
+            // Ruling 1, fourth site: `seed_from_spine`'s empty-tree branch
+            // returned `Self::new()`, silently dropping the tree's source.
+            // Delete everything, then extend — the rebuilt tree must still
+            // be able to fault.
+            let disk = Arc::new(MockDisk::new());
+            let mut t = tree(10);
+            t.set_source(Some(disk.clone()));
+            for k in 1..=10u64 {
+                t.remove_mut(&k);
+            }
+            assert!(t.is_empty());
+            t.extend_from_sorted((1..=5u64).map(|k| (k, Arc::new(k))));
+            assert!(t.source().is_some());
+        }
+
+        /// Independent height oracle: descends the leftmost path counting
+        /// levels — the technique `BTree::height()` itself used before the
+        /// cached-`height`-field ruling replaced it. Test-only, used to
+        /// catch a stale cached height after a random insert/remove
+        /// sequence (splits and merges are exactly what could desync a
+        /// cache like this) — `resident` never carries a source, so this
+        /// never faults.
+        fn walk_height(t: &BTree<u64, u64>) -> usize {
+            let src = t.source.as_deref();
+            let mut h = 0;
+            let mut n = t.root.load(src);
+            while !n.children.is_empty() {
+                n = n.children[0].load(src);
+                h += 1;
+            }
+            h
+        }
+
         proptest! {
             #[test]
             fn on_disk_twin_agrees_and_faults_once_per_leaf(ops in proptest::collection::vec((0u64..5_000, 0u8..3), 1..300)) {
@@ -4964,6 +5174,7 @@ mod tests {
                         _ => { resident.remove_mut(&k); paged.remove_mut(&k); }
                     }
                 }
+                prop_assert_eq!(resident.height(), walk_height(&resident), "cached height must track real splits/merges");
                 let a: Vec<_> = resident.range(..).map(|(k, v)| (*k, *v)).collect();
                 let b: Vec<_> = paged.range(..).map(|(k, v)| (*k, *v)).collect();
                 prop_assert_eq!(a, b);
