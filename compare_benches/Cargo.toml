@@ -6,17 +6,32 @@ publish = false
 description = "Competitor baseline benchmarks (RocksDB, Fjall, ReDB) — opt-in tier"
 license = "Apache-2.0"
 
-[dev-dependencies]
+# Regular deps (not dev-deps) because the `paging_matrix` bin needs them; the
+# [[bench]] targets see them too.
+[dependencies]
 ultima-db = { path = "..", features = ["persistence"] }
 ultima-bench-workloads = { path = "../bench_workloads" }
-criterion = { version = "0.8", features = ["html_reports"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 tempfile = "3"
 fjall = "3"
 rocksdb = "0.24.0"
 redb = "4.0.0"
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[features]
+# Swap the global allocator to mimalloc in the `paging_matrix` bin only —
+# the A/B discriminator for heap page locality under OS paging.
+bench-mimalloc = ["dep:mimalloc"]
+
+[[bin]]
+name = "paging_matrix"
+path = "src/bin/paging_matrix.rs"
 
 [[bench]]
 name = "ycsb_fjall_bench"
