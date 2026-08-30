@@ -9,7 +9,7 @@
 (* ("Three-phase commit protocol", "Why this is safe", "Promotion ordering  *)
 (* (lost-update fix)"), the commit path in src/store.rs                     *)
 (* (commit_single_writer ~3737, commit_multi_writer phase 3 ~3977), and for *)
-(* Task 2 the recovery path Store::recover (src/store.rs:1803-2108) plus    *)
+(* Task 2 the recovery path Store::recover (src/store.rs:1863-2168) plus    *)
 (* wal::scan_wal (src/wal.rs:681-730).                                      *)
 (*                                                                         *)
 (* The protocol, as modelled:                                              *)
@@ -53,15 +53,15 @@
 (*              already covered by a durability barrier survives intact;    *)
 (*              every merely-buffered frame independently survives, TEARS   *)
 (*              (present-but-CRC-bad), or is absent.                        *)
-(*   Recover -- Store::recover (src/store.rs:1803): load the checkpoint     *)
+(*   Recover -- Store::recover (src/store.rs:1863): load the checkpoint     *)
 (*              chain (base + any deltas) and install the resulting         *)
 (*              snapshot, then in Standalone mode scan_wal and replay       *)
 (*              entries whose version exceeds it. tail_tolerant is passed   *)
-(*              TRUE only for CoalescedPrealloc (src/store.rs:1951-1956).   *)
+(*              TRUE only for CoalescedPrealloc (src/store.rs:2011-2016).   *)
 (*                                                                         *)
 (* CAUTION for later tasks -- the post-Recover value of `promoted` is the   *)
 (* REPLAY SEQUENCE, not the Rust's snapshot chain. Recovery installs        *)
-(* exactly ONE snapshot, at latest_version (src/store.rs:2094-2100);        *)
+(* exactly ONE snapshot, at latest_version (src/store.rs:2155-2161);        *)
 (* intermediate replayed versions never enter inner.snapshots. Reusing      *)
 (* `promoted` for the replay makes all four RecoverySound clauses           *)
 (* expressible and is harmless for them, but do NOT build a property like   *)
@@ -155,7 +155,7 @@
 (*     outcome on Fsync, not a crash. L1 (liveness) stays inexpressible     *)
 (*     until then. S2 work; deliberately NOT added here.                    *)
 (*   Checkpointing -- `checkpointVersion` is carried (Recover honours it as *)
-(*     the replay floor, src/store.rs:1963-1966) but no action moves it off *)
+(*     the replay floor, src/store.rs:2021-2024) but no action moves it off *)
 (*     0, so no committed config exercises a non-zero floor. A Checkpoint   *)
 (*     action also drags in WAL pruning (src/wal.rs:748 prune_wal), which   *)
 (*     is where checkpoint/prune/crash interleavings would actually bite.   *)
@@ -285,11 +285,11 @@ SubIndex(c) == CHOOSE i \in 1..Len(submitted) : submitted[i].cid = c
 (* Which protection applies to which writer mode -- this asymmetry is the   *)
 (* whole reason M1 is a distinct calibration bug from M2/M3.                *)
 (*                                                                         *)
-(* commit_multi_writer (src/store.rs:4844) has BOTH the version bump        *)
-(* (:5029) and the PromoteGate FIFO (:5092 take, :5146/:5163 wait).         *)
-(* commit_single_writer (src/store.rs:4737-4839) has NEITHER. Its only      *)
+(* commit_multi_writer (src/store.rs:4904) has BOTH the version bump        *)
+(* (:5089) and the PromoteGate FIFO (:5152 take, :5206/:5223 wait).         *)
+(* commit_single_writer (src/store.rs:4797-4899) has NEITHER. Its only      *)
 (* protection is holding the writer slot through the fsync wait             *)
-(* (:4789-4805, and begin_write's active_writer_count check at              *)
+(* (:4849-4865, and begin_write's active_writer_count check at              *)
 (* src/store.rs:911).                                                       *)
 (*                                                                         *)
 (* Modelling the bump and the gate unconditionally would hand SingleWriter  *)
@@ -358,7 +358,7 @@ Begin(c, t) ==
     /\ UNCHANGED <<walBuffered, walDurable, submitted, parked, promoted,
                    latestVersion, lastSubmitted, acked, crashVars, sinkVars>>
 
-(* Phase 1 PREPARE (src/store.rs:5015 ff). Under the write lock: finalize   *)
+(* Phase 1 PREPARE (src/store.rs:5075 ff). Under the write lock: finalize   *)
 (* the version against max(last_submitted, latest) allocating from          *)
 (* next_version, submit the WAL entry (no fsync), take a ticket.            *)
 (* Under Eventual / no-WAL the lock is never released, so phases 2-3        *)
@@ -396,7 +396,7 @@ Submit(r) ==
                               ELSE IF M3 THEN Max2(nextVersion, v + 1)
                               ELSE nextVersion + 1
           \* `last_submitted_version` is maintained only by commit_multi_writer
-          \* (src/store.rs:5035). Kept unconditional here because it is read
+          \* (src/store.rs:5095). Kept unconditional here because it is read
           \* only by the bump, which BumpApplies already gates off.
           /\ lastSubmitted' = Max2(lastSubmitted, v)
           /\ begun'         = begun \ {r}
@@ -650,7 +650,7 @@ CrashLog(dur, buf, outcome) ==
                     ELSE outcome[i - Len(dur)]]]
 
 (* Store::recover passes tail_tolerant = TRUE exactly for CoalescedPrealloc *)
-(* (src/store.rs:1951-1956).                                                *)
+(* (src/store.rs:2011-2016).                                                *)
 (*                                                                         *)
 (* NAMED ScanIsTolerant, not TailTolerant, and the rename is defensive: the *)
 (* PROPERTY below is TailTolerance, and a one-character difference between  *)
@@ -667,7 +667,7 @@ CrashLog(dur, buf, outcome) ==
 (* recovery for a torn tail that is actually harmless." The mutation is one *)
 (* conjunct on the sink-selection predicate and touches nothing else: it is *)
 (* the `wal_write == CoalescedPrealloc` arm of the tolerance selection at   *)
-(* src/store.rs:1951-1956 going away, which is precisely the state the      *)
+(* src/store.rs:2011-2016 going away, which is precisely the state the      *)
 (* codebase was in before scan_wal grew its `tail_tolerant` parameter.      *)
 ScanIsTolerant(sk) == sk = "CoalescedPrealloc" /\ MUTATION # "M4"
 
@@ -706,7 +706,7 @@ ScanLen(log) ==
 (* end-of-log in BOTH modes (src/wal.rs:696-701, unconditional `break`).    *)
 (* A TORN record is end-of-log only when tail_tolerant (src/wal.rs:706-708);*)
 (* strict mode returns Error::WalCorrupted (:709-711), which Store::recover *)
-(* propagates with `?` (src/store.rs:1957) -- so NOTHING is replayed, not   *)
+(* propagates with `?` (src/store.rs:2017) -- so NOTHING is replayed, not   *)
 (* even the frames the scan had already accepted.                           *)
 ScanFails(log, tolerant) ==
     /\ ~tolerant
@@ -714,7 +714,7 @@ ScanFails(log, tolerant) ==
     /\ log[ScanLen(log) + 1].st = "torn"
 
 (* The replay: the accepted prefix, filtered to entries whose version       *)
-(* exceeds the checkpoint floor (src/store.rs:1963-1966), applied in order. *)
+(* exceeds the checkpoint floor (src/store.rs:2021-2024), applied in order. *)
 (* Each replayed entry is built on the state left by its predecessor, hence *)
 (* the forkedFrom chain; `sub` is looked up in the submission history so    *)
 (* that "replay order = submission order" stays a CHECKED property rather   *)
@@ -725,7 +725,7 @@ ScanFails(log, tolerant) ==
 (* ORDER, matched position by position on cid, version AND table. The real  *)
 (* replay gets that identity from the frame itself: scan_wal hands back     *)
 (* records in offset order and Store::recover applies each one to the table *)
-(* its own entry names (src/store.rs:1963-1966 -> the per-entry apply),     *)
+(* its own entry names (src/store.rs:2021-2024 -> the per-entry apply),     *)
 (* so position i of the recovered chain carries submission i's row.         *)
 (*                                                                         *)
 (* M7 SWAPS the (cid, tbl) identity of chain positions 1 and 2 and CHANGES  *)
@@ -797,11 +797,11 @@ Crash ==
     /\ UNCHANGED <<capacity, syncedCapacity, metaDurable>>
     /\ UNCHANGED <<submitted, acked, recovered, recoverErr, checkpointVersion>>
 
-(* Store::recover (src/store.rs:1803): load the checkpoint chain,           *)
+(* Store::recover (src/store.rs:1863): load the checkpoint chain,           *)
 (* then in Standalone mode scan the WAL and replay past the                 *)
 (* checkpoint version. On a strict-mode scan error the checkpoint           *)
-(* chain has ALREADY been installed (src/store.rs:1840-1846 runs            *)
-(* before the scan at :1957) but recover() returns Err and no WAL           *)
+(* chain has ALREADY been installed (src/store.rs:1900-1906 runs            *)
+(* before the scan at :2017) but recover() returns Err and no WAL           *)
 (* entry is applied.                                                        *)
 Recover ==
     /\ crashed /\ ~recovered
@@ -814,7 +814,7 @@ Recover ==
                  /\ latestVersion' = checkpointVersion
             ELSE /\ recoverErr'    = FALSE
                  /\ promoted'      = chain
-                 \* src/store.rs:2091-2103: latest_version is the version of
+                 \* src/store.rs:2151-2163: latest_version is the version of
                  \* the last entry replayed, or the checkpoint's if none.
                  /\ latestVersion' = IF chain = <<>>
                                        THEN checkpointVersion
@@ -1254,7 +1254,7 @@ NoTornTailTruncation ==
 (* anywhere in the log costs the WHOLE log, including durable commits the   *)
 (* scan had ALREADY ACCEPTED and whose commit() returned Ok under           *)
 (* Consistent. src/wal.rs:709-711 returns Err(WalCorrupted); Store::recover *)
-(* propagates it with `?` at src/store.rs:1957, before any entry is         *)
+(* propagates it with `?` at src/store.rs:2017, before any entry is         *)
 (* applied. A full-length-but-CRC-bad tail is physically ordinary on an     *)
 (* appending sink, so this is not an exotic state.                          *)
 (*                                                                         *)

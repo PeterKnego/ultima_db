@@ -197,12 +197,28 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// (start of pass) and demotes correctly, just not incrementally.
     ///
     /// Production caller: [`crate::Store::demote_pass`].
+    ///
+    /// Does **not** touch `PagedStats` itself — the caller (`demote_pass`)
+    /// owns that, and only applies the delta this call reports once its own
+    /// `install_paged_tables` of the returned table actually lands. A
+    /// concurrent `gc()` can evict the version this call's caller captured
+    /// before the install runs, in which case the demotion this returns is
+    /// never reachable from any live snapshot; mutating shared counters
+    /// here unconditionally would record a demotion nothing reflects.
     #[cfg(feature = "persistence")]
     fn paged_demote(
         &self,
         cursor: Option<&dyn Any>,
         budget: usize,
     ) -> (Box<dyn MergeableTable>, usize, Option<Box<dyn Any + Send>>);
+
+    /// Bytes reported per demoted leaf: [`Child::NODE_BYTES`] for this
+    /// table's own `(K, R)`. Type-erased callers (`Store::demote_pass`)
+    /// cannot compute this themselves — `K`/`R` don't appear in
+    /// `MergeableTable`'s signature — so it is exposed as a cheap
+    /// (`size_of`-only, no I/O) accessor instead.
+    #[cfg(feature = "persistence")]
+    fn paged_node_bytes(&self) -> usize;
 
     /// Page ids referenced by `prev`'s data tree and every persisted index
     /// and not by `self`'s — the ids a checkpoint GC pass can reclaim once
@@ -396,24 +412,19 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
              handed back a cursor from a different table's pass); release builds \
              silently restart the pass instead of resuming"
         );
+        // No `PagedStats` mutation here — see the trait doc: the counters
+        // are only meaningful once `demote_pass`'s `install_paged_tables`
+        // of the table this returns has actually landed.
         let (new_data, demoted, next) = self.data.demote_leaves(cursor_k, budget);
-        if let Some(stats) = &self.stats {
-            stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
-            // Mirror of the `+= NODE_BYTES` on fault-in in
-            // `PagedSource::read_node`. Not symmetric: a leaf written
-            // straight from an in-memory insert (never faulted in) is
-            // demotable and counted here on the way out, but never
-            // contributed on the way in — see `PagedStats::resident_leaf_bytes`'s
-            // doc for why the running total can and does go negative, and
-            // why `Store::paged_stats` clamps rather than this fetch_sub.
-            stats
-                .resident_leaf_bytes
-                .fetch_sub(demoted as i64 * Child::<K, R>::NODE_BYTES as i64, Ordering::Relaxed);
-        }
         let mut out = self.clone();
         out.data = new_data;
         let next_boxed: Option<Box<dyn Any + Send>> = next.map(|k| Box::new(k) as Box<dyn Any + Send>);
         (Box::new(out), demoted, next_boxed)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_node_bytes(&self) -> usize {
+        Child::<K, R>::NODE_BYTES
     }
 
     #[cfg(feature = "persistence")]
@@ -4987,6 +4998,47 @@ mod paged {
 
         let (_t2, demoted, _done) = t.paged_demote(None, usize::MAX);
         assert!(demoted > 300, "expected > 300 demoted leaves, got {demoted}");
+    }
+
+    /// `Table::paged_demote` reports the demoted count in its return tuple
+    /// but must not touch `PagedStats` itself — `Store::demote_pass` (the
+    /// only production caller) only applies the delta once its own
+    /// `install_paged_tables` of the returned table has actually landed
+    /// (see the trait doc on `MergeableTable::paged_demote`). A direct call
+    /// here, bypassing `Store` entirely, must leave `leaves_demoted` and
+    /// `resident_leaf_bytes` exactly where they started.
+    #[test]
+    fn paged_demote_does_not_mutate_paged_stats_itself() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let t = bulk_paged_table(file, stats.clone());
+        let leaves_before = stats.leaves_demoted.load(Ordering::Relaxed);
+        let resident_before = stats.resident_leaf_bytes.load(Ordering::Relaxed);
+
+        let (_t2, demoted, _done) = t.paged_demote(None, usize::MAX);
+        assert!(demoted > 300, "expected > 300 demoted leaves, got {demoted}");
+
+        assert_eq!(
+            stats.leaves_demoted.load(Ordering::Relaxed),
+            leaves_before,
+            "paged_demote must not touch PagedStats::leaves_demoted directly"
+        );
+        assert_eq!(
+            stats.resident_leaf_bytes.load(Ordering::Relaxed),
+            resident_before,
+            "paged_demote must not touch PagedStats::resident_leaf_bytes directly"
+        );
+    }
+
+    /// `paged_node_bytes` is the type-erased accessor `Store::demote_pass`
+    /// uses to compute the `resident_leaf_bytes` delta it applies itself —
+    /// must agree with the constant `Table::paged_demote`'s doc says it
+    /// mirrors.
+    #[test]
+    fn paged_node_bytes_matches_child_node_bytes() {
+        let t: Table<u64, u64> = Table::new();
+        assert_eq!(t.paged_node_bytes(), Child::<u64, u64>::NODE_BYTES);
     }
 
     /// A cursor from a `paged_demote` pass that ran out of budget resumes a

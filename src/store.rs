@@ -1627,15 +1627,39 @@ impl Store {
     /// batch reads `latest_version` fresh and demotes the commit's newer
     /// table instead, so the pass converges regardless.
     ///
-    /// Returns the total number of leaves demoted across every table.
+    /// Returns the total number of leaves demoted across every table —
+    /// counting only batches whose [`Store::install_paged_tables`] call
+    /// actually landed (see below for why that matters).
     #[cfg(feature = "persistence")]
     pub(crate) fn demote_pass(&self) -> Result<usize> {
-        let (registry, opts) = {
+        self.demote_pass_inner(
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// [`Store::demote_pass`]'s real body. Split out so tests can pass a
+    /// `race_hook` — invoked once per batch, right after that batch's
+    /// `(version, tbl)` is captured but before `paged_demote`/
+    /// `install_paged_tables` run — that deterministically forces the
+    /// window IMPORTANT-#1's fix closes: a `gc()` evicting `version` in
+    /// between the read above and the install below, which a plain
+    /// multi-threaded race test cannot reliably hit. `race_hook` is always
+    /// `None` in production (the `demote_pass` wrapper above never passes
+    /// one); see `demote_pass_race_hook_dropped_install_does_not_bump_stats`
+    /// in this module's test suite for the one caller that does.
+    #[cfg(feature = "persistence")]
+    fn demote_pass_inner(&self, #[cfg(test)] race_hook: Option<&dyn Fn()>) -> Result<usize> {
+        let (registry, opts, stats) = {
             let inner = self.inner.read();
             let paged = inner.paged.as_ref().ok_or_else(|| {
                 Error::Persistence("demote_pass requires a paged store".into())
             })?;
-            (Arc::clone(&inner.registry), paged.opts.clone())
+            (
+                Arc::clone(&inner.registry),
+                paged.opts.clone(),
+                Arc::clone(&paged.stats),
+            )
         };
 
         // Only registered tables are ever paged-attached (mirrors
@@ -1672,11 +1696,34 @@ impl Store {
                 if tbl.residency() == crate::table::Residency::Resident {
                     break;
                 }
+                #[cfg(test)]
+                if let Some(hook) = race_hook {
+                    hook();
+                }
                 let cursor_ref: Option<&dyn std::any::Any> =
                     cursor.as_deref().map(|c| c as &dyn std::any::Any);
+                let node_bytes = tbl.paged_node_bytes();
                 let (new_tbl, demoted, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
-                total_demoted += demoted;
-                self.install_paged_tables(version, vec![(name.clone(), new_tbl)]);
+                // `MergeableTable::paged_demote` deliberately does not touch
+                // `PagedStats` itself (see its doc): a concurrent `gc()` can
+                // evict `version` between the read above and this install,
+                // in which case `install_paged_tables` returns `None` and
+                // the demoted table this batch built is unreachable from
+                // any live snapshot. Applying the counters only when the
+                // install actually lands keeps `leaves_demoted`/
+                // `resident_leaf_bytes` in sync with what a reader can
+                // actually observe, instead of recording eviction work that
+                // never took effect.
+                if self
+                    .install_paged_tables(version, vec![(name.clone(), new_tbl)])
+                    .is_some()
+                {
+                    total_demoted += demoted;
+                    stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
+                    stats
+                        .resident_leaf_bytes
+                        .fetch_sub(demoted as i64 * node_bytes as i64, Ordering::Relaxed);
+                }
                 match next {
                     Some(c) => cursor = Some(c),
                     None => break,
@@ -1688,15 +1735,28 @@ impl Store {
 
     /// Sets `table`'s residency policy (see [`Residency`](crate::table::Residency))
     /// and re-publishes `latest_version` with the change, via
-    /// [`Store::install_paged_tables`] — the same same-version re-publish
-    /// [`Store::demote_pass`] and [`Store::checkpoint_impl_paged`] use, so a
-    /// concurrent commit or checkpoint install races this exactly the way
-    /// they race each other (see that method's doc).
+    /// `Store::install_paged_tables` — the same same-version re-publish
+    /// `Store::demote_pass` and `Store::checkpoint_impl_paged` use.
+    ///
+    /// Blocks while a checkpoint is in flight: this holds
+    /// `Store::checkpoint_lock` for its whole body, the same lock
+    /// `Store::checkpoint_impl` holds across phases 1-3 (including
+    /// `demote_pass`). Without that, a `Resident` request racing an
+    /// in-flight demote batch could be silently undone — the batch reads
+    /// `latest_version`'s table *before* this call's install lands, demotes
+    /// off that still-`Lazy` clone, and its own install then re-publishes a
+    /// table whose residency flag reverts to `Lazy`, even though this call
+    /// returned `Ok`. Serializing against the checkpoint lock makes that
+    /// interleaving impossible: `set_residency` either runs to completion
+    /// entirely before a checkpoint's demote pass starts, or entirely after
+    /// it finishes, so a `Resident` request can never be undone by a
+    /// concurrent demote batch.
     ///
     /// Errors with [`Error::TableNotFound`] if `table` is absent from the
     /// latest snapshot.
     #[cfg(feature = "persistence")]
     pub fn set_residency(&self, table: &str, r: crate::table::Residency) -> Result<()> {
+        let _serialize = self.checkpoint_lock.lock();
         let (version, mut boxed) = {
             let inner = self.inner.read();
             let latest = inner.latest_version;
@@ -9044,6 +9104,112 @@ mod tests {
         assert_eq!(t.get(1), None);
         assert_eq!(t.get(2).map(String::as_str), Some("b"));
         assert_eq!(t.len(), 1);
+    }
+
+    /// IMPORTANT #1 fix: a `demote_pass` batch whose `install_paged_tables`
+    /// call lands on a version `gc()` has since evicted must not bump
+    /// `PagedStats::leaves_demoted`/`resident_leaf_bytes` — the demotion it
+    /// computed is unreachable from any live snapshot, so counting it would
+    /// record eviction work nothing reflects. The real race (a `gc()`
+    /// landing in the few-instruction window between `demote_pass`'s
+    /// per-batch read and its install) is not reliably reproducible with
+    /// real threads, so this drives `demote_pass_inner`'s test-only
+    /// `race_hook`: the hook fires after the batch's `(version, tbl)` is
+    /// captured but before `paged_demote`/`install_paged_tables` run, and
+    /// forces exactly that eviction — commit a trivial write (advancing
+    /// `latest_version` past the captured version) then `gc()` with
+    /// `num_snapshots_retained(0)`, so the captured version is neither
+    /// `latest_version` nor within retention and gc drops it.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn demote_pass_race_hook_dropped_install_does_not_bump_stats() {
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+            .paged(PagedOptions::builder().build())
+            .unwrap();
+        let store = Store::new(
+            StoreConfig::builder()
+                .persistence(p)
+                .num_snapshots_retained(0)
+                .build(),
+        )
+        .unwrap();
+        store.register_table::<String>("rows").unwrap();
+
+        // Bulk insert (not a loop of single inserts — see
+        // `tests/paged_demotion.rs`'s `write_rows` doc for why: a put-loop
+        // marks every leaf "accessed" as a side effect of being built,
+        // which would make `paged_demote` find nothing to demote and this
+        // test vacuous) so the checkpoint below has real, never-read leaves
+        // to write and this pass has real, never-read leaves to demote.
+        {
+            let mut w = store.begin_write(None).unwrap();
+            let mut t = w.open_table::<String>("rows").unwrap();
+            t.insert_batch((0..5_000u64).map(|i| i.to_string()).collect())
+                .unwrap();
+            w.commit().unwrap();
+        }
+        // Phase 1-2 only: writes every leaf and assigns page ids, but with
+        // no `memory_budget_bytes` configured this checkpoint does not call
+        // `demote_pass` itself (see `checkpoint_impl_paged`'s phase-3 gate)
+        // — this test calls `demote_pass_inner` directly instead, so the
+        // race hook actually gets to run before any leaf is demoted.
+        store.checkpoint().unwrap();
+
+        let before = store.paged_stats().unwrap();
+
+        let evicted_version = store.latest_version();
+        let hook = || {
+            let mut w = store.begin_write(None).unwrap();
+            let mut t = w.open_table::<String>("rows").unwrap();
+            t.insert("advance latest_version past the captured version".to_string())
+                .unwrap();
+            w.commit().unwrap();
+            assert!(
+                store.latest_version() > evicted_version,
+                "the hook's own commit must move latest_version past what demote_pass captured"
+            );
+            // A plain commit alone is not enough: `PagedState::last_root`
+            // (retained across the earlier `checkpoint()` call above, for a
+            // later task's dead-page diff) holds its own `Arc<Snapshot>` on
+            // `evicted_version`, so `gc_inner`'s `Arc::strong_count == 1`
+            // check would refuse to collect it even once it is no longer
+            // `latest_version`. A second checkpoint reassigns `last_root`
+            // to the new latest, dropping that extra reference, so `gc()`
+            // below can actually evict `evicted_version`.
+            store.checkpoint().unwrap();
+            store.gc();
+        };
+
+        let demoted = store.demote_pass_inner(Some(&hook)).unwrap();
+
+        assert_eq!(
+            demoted, 0,
+            "the only batch's install must have been dropped (its version was evicted mid-batch)"
+        );
+        let after = store.paged_stats().unwrap();
+        assert_eq!(
+            after.leaves_demoted, before.leaves_demoted,
+            "a dropped install must not bump leaves_demoted"
+        );
+        assert_eq!(
+            after.resident_leaf_bytes_est, before.resident_leaf_bytes_est,
+            "a dropped install must not shrink resident_leaf_bytes_est"
+        );
+
+        // Sanity check that the hook really did force a real eviction, not
+        // a no-op: the captured version is gone from `inner.snapshots`, so
+        // a direct `install_paged_tables` targeting it (the exact call
+        // `demote_pass_inner`'s dropped batch made) returns `None` too.
+        assert!(
+            store
+                .install_paged_tables(evicted_version, Vec::new())
+                .is_none(),
+            "the evicted version must no longer be installable"
+        );
     }
 
     /// A checkpoint taken while rows are still buffered must contain them.

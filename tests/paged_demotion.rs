@@ -220,6 +220,71 @@ fn resident_table_is_never_demoted() {
     assert_eq!(s.paged_stats().unwrap().page_faults, f0);
 }
 
+/// IMPORTANT #2 fix: `Store::set_residency` serializes against an
+/// in-flight `checkpoint()` (both hold `checkpoint_lock` for their whole
+/// body), so a `Resident` request can never be silently undone by a demote
+/// batch that read the table as `Lazy` before the request landed.
+///
+/// Best effort, not deterministic: the window this closes (between a
+/// demote batch reading the table as `Lazy` and that same batch's own
+/// install) is only a few instructions wide, so `set_residency` is hammered
+/// in a loop for the checkpoint's entire duration rather than called once
+/// at a guessed delay — `demote_batch(1)` makes the checkpoint's own demote
+/// pass do one `install_paged_tables` call per leaf-parent (dozens, for
+/// 20,000 rows), so many attempts spread across all of them give a real
+/// chance of landing inside the window on whichever side of the fix is
+/// running. Whichever order actually happens, the assertion below must
+/// hold — that is the entire point of serializing on the lock: if
+/// `set_residency` wins a given race, that checkpoint batch sees `Resident`
+/// before demoting; if it loses, it simply waits and then flips a (by then
+/// possibly already fully demoted) table to `Resident` — either way, no
+/// checkpoint from this point on may demote another leaf.
+#[test]
+fn set_residency_serialized_against_an_in_flight_checkpoint() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let d = tempfile::tempdir().unwrap();
+    let s = store_with(
+        d.path(),
+        PagedOptions::builder().memory_budget_bytes(1).demote_batch(1).build(),
+    );
+    write_rows(&s, 20_000);
+
+    let done = Arc::new(AtomicBool::new(false));
+
+    let s2 = s.clone();
+    let done2 = Arc::clone(&done);
+    let checkpoint_thread = std::thread::spawn(move || {
+        let v = s2.checkpoint().unwrap();
+        done2.store(true, Ordering::Relaxed);
+        v
+    });
+
+    let s3 = s.clone();
+    let done3 = Arc::clone(&done);
+    let racer = std::thread::spawn(move || {
+        while !done3.load(Ordering::Relaxed) {
+            let _ = s3.set_residency("rows", Residency::Resident);
+        }
+    });
+
+    checkpoint_thread.join().unwrap();
+    racer.join().unwrap();
+    // One more call after both threads have settled: the assertion below
+    // must hold regardless of which order the race above actually resolved
+    // in.
+    s.set_residency("rows", Residency::Resident).unwrap();
+
+    let before = s.paged_stats().unwrap().leaves_demoted;
+    s.checkpoint().unwrap();
+    assert_eq!(
+        s.paged_stats().unwrap().leaves_demoted,
+        before,
+        "a Resident table must not lose leaves to a checkpoint that starts after set_residency has returned, regardless of how the race above resolved"
+    );
+}
+
 /// `set_residency` on an absent table is `Error::TableNotFound`, not a
 /// silent no-op.
 #[test]
