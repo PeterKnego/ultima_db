@@ -50,6 +50,14 @@ const FORMAT_VERSION: u32 = 2;
 enum CheckpointKind {
     Full = 0,
     Delta = 1,
+    /// A paged root record (`checkpoint_{v}.root`) — the commit point of a
+    /// paged checkpoint. Shares this byte's namespace (rather than getting
+    /// its own container-format version) so a pre-paged binary that somehow
+    /// sees byte `2` — e.g. a `.bin` written by a build that mixed up the
+    /// two file kinds — fails with the same named "unknown checkpoint kind"
+    /// error a totally invalid byte would give, instead of misparsing it as
+    /// `Full` or `Delta`.
+    Paged = 2,
 }
 
 impl TryFrom<u8> for CheckpointKind {
@@ -59,6 +67,7 @@ impl TryFrom<u8> for CheckpointKind {
         match value {
             0 => Ok(CheckpointKind::Full),
             1 => Ok(CheckpointKind::Delta),
+            2 => Ok(CheckpointKind::Paged),
             other => Err(Error::CheckpointCorrupted(format!(
                 "unknown checkpoint kind: {other}"
             ))),
@@ -776,6 +785,23 @@ fn walk_chain_from(dir: &Path, head_path: PathBuf) -> Result<Vec<PathBuf>> {
                 current_path = base_path;
                 expected_version = Some(base_version);
             }
+            CheckpointKind::Paged => {
+                // Unreachable through any legitimate write path: this walk
+                // only ever starts from `find_latest_checkpoint`, which
+                // scans `.bin` files, and `write_checkpoint`/
+                // `write_delta_checkpoint` never write kind byte 2 into one
+                // — only `write_paged_root` does, always to a `.root` path.
+                // A `.bin` that somehow carries `Paged`'s kind byte is
+                // corrupt (or misnamed), not a chain member this walk knows
+                // how to continue past.
+                return Err(Error::CheckpointCorrupted(format!(
+                    "checkpoint file {} has kind byte {} (Paged) but a `.bin` file must be \
+                     Full or Delta — a paged checkpoint's commit point is a `.root` file, \
+                     never `.bin`",
+                    current_path.display(),
+                    CheckpointKind::Paged as u8
+                )));
+            }
         }
     }
 
@@ -1073,6 +1099,318 @@ pub(crate) fn cleanup_old_checkpoints(dir: &Path, keep_version: u64, chain: &[Pa
 /// the moment the header layout changes.
 pub(crate) fn is_full_checkpoint(path: &Path) -> Result<bool> {
     Ok(read_header(path)?.0 == CheckpointKind::Full)
+}
+
+// ---------------------------------------------------------------------------
+// Paged root record (CheckpointKind::Paged)
+//
+// The commit point of a paged checkpoint: rows live in the page file
+// (`pages.bin`, task 5), and this small record is what atomically publishes
+// which page is the current root of each table's and each index's tree.
+// Written to its own `checkpoint_{v}.root` namespace (not `.bin`) because a
+// paged checkpoint carries no inline table data — naming the difference in
+// the filename lets a directory listing answer "is this checkpoint paged or
+// row-format" without opening anything, and keeps the two writers from ever
+// racing on the same path for the same version.
+// ---------------------------------------------------------------------------
+
+/// One persisted index tree named by a [`PagedRoot`]. Mirrors the
+/// `IndexKind`/generation bookkeeping `ManagedIndex` already carries, plus
+/// `height` (Controller amendment, task 6): `BTree` caches its height and
+/// `BTree::from_root_page` needs it up front, so it has to ride along in the
+/// root record rather than be re-derived by walking the tree after attach.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PagedIndexEntry {
+    pub name: String,
+    pub ik_type_id: u32,
+    /// 0 = unique, 1 = nonunique — mirrors `IndexKind` without pulling
+    /// `index.rs` into this file's (de)serialization surface.
+    pub kind: u8,
+    pub generation: u32,
+    /// `None` for an empty index (no root page allocated yet).
+    pub root_page: Option<u64>,
+    /// Height of the tree at `root_page`; meaningless when `root_page` is
+    /// `None`, and not read in that case.
+    pub height: u32,
+    pub len: u64,
+}
+
+/// One persisted table tree named by a [`PagedRoot`], plus every index
+/// defined on it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PagedTableEntry {
+    pub name: String,
+    pub key_type_id: u32,
+    /// `None` for an empty table (no root page allocated yet).
+    pub root_page: Option<u64>,
+    /// Height of the tree at `root_page`; meaningless when `root_page` is
+    /// `None`, and not read in that case.
+    pub height: u32,
+    pub len: u64,
+    /// The table's auto-increment cursor, `PrimaryKey`-encoded (`AutoKey`'s
+    /// wire form) so a non-`u64`-keyed table's entry — always `None` here,
+    /// since only `u64` implements `AutoKey` — costs nothing extra to
+    /// represent.
+    pub next_id: Option<Vec<u8>>,
+    pub indexes: Vec<PagedIndexEntry>,
+}
+
+/// The commit point of a paged checkpoint: every table's and index's current
+/// root page, atomically published as `checkpoint_{version}.root`. Analogous
+/// to a row-format checkpoint's `Snapshot`, but tiny — the actual row data
+/// already lives in `pages.bin`; this just says which pages are live.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PagedRoot {
+    pub version: u64,
+    /// The page-file write cursor immediately after this checkpoint —
+    /// where the next checkpoint's writer resumes appending.
+    pub file_end: u64,
+    pub tables: Vec<PagedTableEntry>,
+    /// `(offset, len)` byte ranges that were live in the previous root but
+    /// are not reachable from this one — freed by CoW replacing a node, or
+    /// by a dropped table/index. Task 11 hole-punches these once this root
+    /// (and any root older than it that is still being kept) is durable;
+    /// keeping the list here rather than punching eagerly means a crash
+    /// between "wrote this root" and "punched the holes" loses only free
+    /// space, never data.
+    pub dead_pages: Vec<(u64, u64)>,
+}
+
+fn root_filename(version: u64) -> String {
+    format!("checkpoint_{version}.root")
+}
+
+/// The path [`write_paged_root`] gives version `version` — the paged sibling
+/// of [`checkpoint_path`], in its own `.root` namespace.
+pub(crate) fn root_path(dir: &Path, version: u64) -> PathBuf {
+    dir.join(root_filename(version))
+}
+
+/// Write a paged root record to disk, using the same container framing as a
+/// row-format checkpoint (`MAGIC | FORMAT_VERSION varint | kind byte | version
+/// varint`, then a bincode body, then a trailing whole-file CRC32) so a single
+/// `read_header` implementation handles both file kinds. `PagedRoot`'s own
+/// fields carry `serde::Serialize`/`Deserialize` (rather than a separate
+/// mirror type) because this crate's `bincode` dependency does not enable
+/// bincode's own `derive` feature — every body in this file goes through
+/// `bincode::serde::*` instead, and the root record follows that convention.
+/// Crash-safe via the same write-to-temp + `sync_all` + rename + `sync_dir`
+/// dance as [`write_checkpoint_bytes`].
+pub(crate) fn write_paged_root(dir: &Path, root: &PagedRoot) -> Result<()> {
+    let config = bincode::config::standard();
+    let mut buf = Vec::new();
+
+    buf.extend_from_slice(MAGIC);
+    bincode::encode_into_std_write(FORMAT_VERSION, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(CheckpointKind::Paged as u8, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    bincode::encode_into_std_write(root.version, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    bincode::serde::encode_into_std_write(root, &mut buf, config)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    // Trailing whole-file CRC32, same convention as `serialize_snapshot`.
+    let checksum = crc32(&buf);
+    buf.extend_from_slice(&checksum.to_le_bytes());
+
+    std::fs::create_dir_all(dir).map_err(|e| Error::Persistence(e.to_string()))?;
+    let final_path = root_path(dir, root.version);
+    let tmp_path = dir.join(format!("{}.tmp", root_filename(root.version)));
+
+    let mut file = File::create(&tmp_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    file.write_all(&buf)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+    drop(file);
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| Error::Persistence(e.to_string()))?;
+    crate::wal::sync_dir(dir)?;
+
+    Ok(())
+}
+
+/// Read and verify a paged root record written by [`write_paged_root`].
+/// Corruption (bad magic, CRC mismatch, unparseable body, or a container
+/// whose kind byte isn't `Paged`) always comes back as
+/// `Error::CheckpointCorrupted`, never a panic.
+pub(crate) fn read_paged_root(path: &Path) -> Result<PagedRoot> {
+    let mut file = File::open(path).map_err(|e| Error::Persistence(e.to_string()))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|e| Error::Persistence(e.to_string()))?;
+
+    // Same minimum-length gate as `deserialize_snapshot`: magic (4) + a
+    // format_version varint (1 byte minimum) + trailing crc32 (4).
+    if data.len() < 4 + 1 + 4 {
+        return Err(Error::CheckpointCorrupted("file too short".into()));
+    }
+
+    let crc_offset = data.len() - 4;
+    let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+    let computed_crc = crc32(&data[..crc_offset]);
+    if stored_crc != computed_crc {
+        return Err(Error::CheckpointCorrupted("CRC mismatch".into()));
+    }
+
+    let payload = &data[..crc_offset];
+    let config = bincode::config::standard();
+
+    if payload.len() < 4 || &payload[0..4] != MAGIC {
+        return Err(Error::CheckpointCorrupted("bad magic".into()));
+    }
+    let mut offset = 4;
+
+    let (fmt_version, read): (u32, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    if fmt_version != FORMAT_VERSION {
+        return Err(Error::CheckpointCorrupted(format!(
+            "unsupported format version: {fmt_version} (paged root; this build writes \
+             v{FORMAT_VERSION})"
+        )));
+    }
+
+    let (kind_byte, read): (u8, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+    let kind = CheckpointKind::try_from(kind_byte)?;
+    if kind != CheckpointKind::Paged {
+        return Err(Error::CheckpointCorrupted(format!(
+            "expected a paged root record (kind byte {}), found kind {kind:?}",
+            CheckpointKind::Paged as u8
+        )));
+    }
+
+    // The header's own version varint is redundant with `PagedRoot::version`
+    // in the body (same relationship a row checkpoint's header version has
+    // to its `Snapshot::version`) — read past it rather than trusting it, so
+    // the body's copy stays the single source of truth callers compare
+    // against.
+    let (_version, read): (u64, _) = bincode::decode_from_slice(&payload[offset..], config)
+        .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+    offset += read;
+
+    let (root, _read): (PagedRoot, _) =
+        bincode::serde::decode_from_slice(&payload[offset..], config)
+            .map_err(|e| Error::CheckpointCorrupted(e.to_string()))?;
+
+    Ok(root)
+}
+
+/// The result of scanning a directory for the latest checkpoint across both
+/// the row-format (`.bin`) and paged (`.root`) namespaces — tagged so a
+/// caller knows which loader to hand the path to without re-deriving it from
+/// the extension.
+pub(crate) enum LatestCheckpoint {
+    Rows(PathBuf),
+    Paged(PathBuf),
+}
+
+/// Find the latest checkpoint in `dir` across both `checkpoint_{v}.bin` and
+/// `checkpoint_{v}.root`, choosing strictly by version — never by kind, so a
+/// paged store that falls back to row-format checkpoints (or vice versa)
+/// always resumes from whichever is actually newest. On a version tie
+/// between the two namespaces, `.root` wins: the paged writer ([`write_paged_root`])
+/// only ever produces `.root` files, so a `.bin` at the same version as an
+/// existing `.root` can only be a leftover from before the store switched to
+/// paged checkpoints (or from a wiped-and-restarted paged writer that
+/// happened to land on the same version) — never a newer commit that should
+/// take precedence.
+pub(crate) fn find_latest_checkpoint_any(dir: &Path) -> Result<Option<LatestCheckpoint>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Persistence(e.to_string())),
+    };
+
+    // (version, is_root, path) — ties broken in favor of is_root, see doc above.
+    let mut best: Option<(u64, bool, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(rest) = name_str.strip_prefix("checkpoint_") else {
+            continue;
+        };
+        let parsed = if let Some(v) = rest.strip_suffix(".bin") {
+            v.parse::<u64>().ok().map(|v| (v, false))
+        } else if let Some(v) = rest.strip_suffix(".root") {
+            v.parse::<u64>().ok().map(|v| (v, true))
+        } else {
+            None
+        };
+        let Some((ver, is_root)) = parsed else {
+            continue;
+        };
+
+        let better = match &best {
+            None => true,
+            Some((bv, b_is_root, _)) => ver > *bv || (ver == *bv && is_root && !*b_is_root),
+        };
+        if better {
+            best = Some((ver, is_root, entry.path()));
+        }
+    }
+
+    Ok(best.map(|(_, is_root, path)| {
+        if is_root {
+            LatestCheckpoint::Paged(path)
+        } else {
+            LatestCheckpoint::Rows(path)
+        }
+    }))
+}
+
+/// List every `checkpoint_{v}.root` in `dir`, ascending by version.
+/// Unparseable names are skipped, same as [`find_latest_checkpoint`].
+pub(crate) fn list_paged_roots(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Persistence(e.to_string())),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Persistence(e.to_string()))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Some(rest) = name_str.strip_prefix("checkpoint_")
+            && let Some(ver_str) = rest.strip_suffix(".root")
+            && let Ok(ver) = ver_str.parse::<u64>()
+        {
+            out.push((ver, entry.path()));
+        }
+    }
+    out.sort_by_key(|(v, _)| *v);
+    Ok(out)
+}
+
+/// Delete all but the newest `keep` paged root records in `dir`, returning
+/// the deleted versions ascending — task 11 hole-punches the page ranges a
+/// deleted root's `dead_pages` named, once the root that superseded it (and
+/// everything newer) is confirmed durable.
+///
+/// Unlike [`cleanup_old_checkpoints`], this needs no chain/ancestor
+/// protection: every `.root` file is fully self-contained (the tree it
+/// describes lives entirely in the page file, not spread across a delta
+/// chain of `.root` files), so any root outside the newest `keep` is safe to
+/// remove outright. Never touches `.bin` files — row-format checkpoint
+/// cleanup stays [`cleanup_old_checkpoints`]'s job.
+pub(crate) fn cleanup_old_roots(dir: &Path, keep: usize) -> Result<Vec<u64>> {
+    let mut roots = list_paged_roots(dir)?; // ascending
+    if roots.len() <= keep {
+        return Ok(Vec::new());
+    }
+    let cut = roots.len() - keep;
+    let mut deleted = Vec::with_capacity(cut);
+    for (ver, path) in roots.drain(..cut) {
+        std::fs::remove_file(&path).map_err(|e| Error::Persistence(e.to_string()))?;
+        deleted.push(ver);
+    }
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -2557,5 +2895,143 @@ mod tests {
         }
         let v = store.checkpoint().unwrap();
         assert!(dir.path().join(format!("checkpoint_{v}.bin")).exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Paged root record (CheckpointKind::Paged) — task 6
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn paged_root_roundtrip_and_discovery() {
+        let d = crate::test_scratch::scratch_dir();
+        let root = PagedRoot {
+            version: 42,
+            file_end: 8192,
+            tables: vec![PagedTableEntry {
+                name: "t".into(),
+                key_type_id: 3,
+                root_page: Some(4096),
+                height: 2,
+                len: 10,
+                next_id: Some(vec![0, 0, 0, 0, 0, 0, 0, 11]),
+                indexes: vec![PagedIndexEntry {
+                    name: "by_x".into(),
+                    ik_type_id: 11,
+                    kind: 1,
+                    generation: 0,
+                    root_page: None,
+                    height: 0,
+                    len: 0,
+                }],
+            }],
+            dead_pages: vec![(0, 4096)],
+        };
+        write_paged_root(d.path(), &root).unwrap();
+        assert_eq!(read_paged_root(&root_path(d.path(), 42)).unwrap(), root);
+        assert!(matches!(
+            find_latest_checkpoint_any(d.path()).unwrap(),
+            Some(LatestCheckpoint::Paged(_))
+        ));
+        // An older rows checkpoint with a higher version wins discovery (version rules, not kind).
+        let snap = Snapshot {
+            version: 43,
+            tables: Default::default(),
+        };
+        write_checkpoint(d.path(), &snap, &TableRegistry::default()).unwrap();
+        assert!(matches!(
+            find_latest_checkpoint_any(d.path()).unwrap(),
+            Some(LatestCheckpoint::Rows(_))
+        ));
+    }
+
+    #[test]
+    fn old_reader_rejects_paged_kind_cleanly() {
+        let d = crate::test_scratch::scratch_dir();
+        write_paged_root(
+            d.path(),
+            &PagedRoot {
+                version: 1,
+                file_end: 0,
+                tables: vec![],
+                dead_pages: vec![],
+            },
+        )
+        .unwrap();
+        // Simulate the pre-paged reader: `read_header` on a `.root` must not misparse; and a `.bin`
+        // with kind byte 2 must be rejected by TryFrom in a build that lacks Paged (assert the error text here).
+        let e = read_header(&root_path(d.path(), 1)).unwrap();
+        assert_eq!(e.0, CheckpointKind::Paged);
+    }
+
+    #[test]
+    fn unknown_checkpoint_kind_byte_still_errors() {
+        // `CheckpointKind::try_from(3)` must still error — exercises the
+        // "unknown kind" path now that byte 2 (`Paged`) is a recognized kind
+        // rather than falling into it.
+        let e = CheckpointKind::try_from(3u8).unwrap_err();
+        assert!(matches!(e, Error::CheckpointCorrupted(ref msg) if msg.contains('3')));
+    }
+
+    #[test]
+    fn root_crc_detects_corruption() {
+        let d = crate::test_scratch::scratch_dir();
+        write_paged_root(
+            d.path(),
+            &PagedRoot {
+                version: 7,
+                file_end: 0,
+                tables: vec![],
+                dead_pages: vec![],
+            },
+        )
+        .unwrap();
+        let p = root_path(d.path(), 7);
+        let mut b = std::fs::read(&p).unwrap();
+        let i = b.len() / 2;
+        b[i] ^= 1;
+        std::fs::write(&p, b).unwrap();
+        assert!(matches!(
+            read_paged_root(&p),
+            Err(Error::CheckpointCorrupted(_))
+        ));
+    }
+
+    #[test]
+    fn list_paged_roots_is_ascending_and_cleanup_keeps_newest() {
+        let d = crate::test_scratch::scratch_dir();
+        for v in [1u64, 3, 2, 5, 4] {
+            write_paged_root(
+                d.path(),
+                &PagedRoot {
+                    version: v,
+                    file_end: 0,
+                    tables: vec![],
+                    dead_pages: vec![],
+                },
+            )
+            .unwrap();
+        }
+        let listed = list_paged_roots(d.path()).unwrap();
+        assert_eq!(
+            listed.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+
+        let deleted = cleanup_old_roots(d.path(), 2).unwrap();
+        assert_eq!(deleted, vec![1, 2, 3]);
+        let remaining = list_paged_roots(d.path()).unwrap();
+        assert_eq!(
+            remaining.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        // Never touches `.bin` files.
+        let snap = Snapshot {
+            version: 100,
+            tables: Default::default(),
+        };
+        write_checkpoint(d.path(), &snap, &TableRegistry::default()).unwrap();
+        let deleted2 = cleanup_old_roots(d.path(), 0).unwrap();
+        assert_eq!(deleted2, vec![4, 5]);
+        assert!(d.path().join("checkpoint_100.bin").exists());
     }
 }

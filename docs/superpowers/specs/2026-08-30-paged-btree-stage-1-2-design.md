@@ -69,7 +69,9 @@ page header (12 B): kind u8 | fmt u8 | flags u8 (bit0 = compressed, reserved) | 
                     | payload_len u32 | crc32 u32 (crc32fast, over header + payload)
 kind ∈ { DataLeaf, DataInner, IndexLeaf, IndexInner }
 
-inner payload:  n u16 | keys[n]            (PrimaryKey::encode — order-preserving, self-delimiting)
+inner payload:  n u16 | (key, value)[n]     (values are stored in every node, not just leaves —
+                                            this is a B-tree, not a B+-tree, so an inner node's
+                                            own keys carry their values directly)
                        | child_ids[n+1] u64
 leaf payload:   n u16 | (key, value)[n]     (key as above; value = bincode via the Record bounds;
                                             index non-unique value `()` = zero bytes)
@@ -87,10 +89,15 @@ reads all older kinds. Contents:
 
 ```
 version u64 | file_end u64 (write cursor after this checkpoint)
-| tables: [{ name, key_type_id u32, root_page, len, next_id,
-             indexes: [{ name, ik_type_id u32, kind, generation u32, root_page }] }]
+| tables: [{ name, key_type_id u32, root_page, height u32, len, next_id,
+             indexes: [{ name, ik_type_id u32, kind, generation u32, root_page, height u32, len }] }]
 | dead_pages: [(offset, len)]   — pages the previous root referenced and this one does not
 ```
+
+Each tree's `height` rides along with its `root_page` because `BTree` caches its
+height and `BTree::from_root_page(id, len, height, source)` needs it up front —
+without it, attaching a paged tree would require an extra read (or a
+height-discovery walk) before the first operation.
 
 One root file per checkpoint keeps `cleanup_old_checkpoints`, chain
 bookkeeping and the WAL-prune trigger on their existing file-per-checkpoint
