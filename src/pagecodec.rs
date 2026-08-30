@@ -296,10 +296,17 @@ pub(crate) struct PagedStats {
     // No production caller yet — see `PagedSource`'s note below.
     #[allow(dead_code)]
     pub dirty_bytes: AtomicU64,
-    /// Signed running total of resident leaf bytes (grows on fault-in,
-    /// shrinks on demotion) — a later task's eviction trigger.
-    // No production caller yet — the page evictor is a later task.
-    #[allow(dead_code)]
+    /// Signed running total of resident leaf bytes (grows on fault-in via
+    /// [`PagedSource::read_node`], shrinks on demotion via
+    /// [`crate::table::MergeableTable::paged_demote`]) — the memory-budget
+    /// trigger's input (task12) and the estimate `Store::paged_stats`
+    /// reports. An estimate, not an exact count: a leaf built and written
+    /// directly (never faulted in through `read_node`, e.g. a freshly
+    /// inserted-then-checkpointed row) contributes nothing on the way in
+    /// but is still decremented on the way out if later demoted, so this
+    /// can and does run negative — `Store::paged_stats` clamps to `0` on
+    /// read rather than reporting the raw (nonsensical, wrapped-looking)
+    /// negative as a `u64`.
     pub resident_leaf_bytes: AtomicI64,
     /// Pages written by a later task's checkpoint writer.
     // No production caller yet — see `resident_leaf_bytes` above.
@@ -336,6 +343,17 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
             PageKind::IndexLeaf | PageKind::IndexInner => {
                 self.stats.index_page_faults.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // Only a *data leaf* fault-in grows `resident_leaf_bytes`: that
+        // counter tracks the data tree's demotable leaves specifically
+        // (`BTree::demote_leaves`/`resident_leaf_estimate` never touch
+        // inner nodes or index trees), so counting inner/index fault-ins
+        // here would inflate the estimate against a demote pass that can
+        // never claim those bytes back.
+        if kind == PageKind::DataLeaf {
+            self.stats
+                .resident_leaf_bytes
+                .fetch_add(Child::<K, V>::NODE_BYTES as i64, Ordering::Relaxed);
         }
         Ok(Arc::new(self.codec.decode(kind, &bytes)?))
     }

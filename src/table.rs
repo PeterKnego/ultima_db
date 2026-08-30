@@ -15,7 +15,7 @@ use crate::btree::{BTree, BTreeRange};
 #[cfg(feature = "persistence")]
 use crate::checkpoint::{PagedIndexEntry, PagedTableEntry};
 #[cfg(feature = "persistence")]
-use crate::child::{NO_PAGE, PageId};
+use crate::child::{Child, NO_PAGE, PageId};
 use crate::index::{
     CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage,
     UniqueStorage,
@@ -66,14 +66,16 @@ pub(crate) struct PagedCtx<'a> {
 /// hasn't been touched since the last demote pass goes back to disk under
 /// memory pressure. `Resident` opts a table out of demotion entirely — every
 /// leaf stays in memory once faulted in — for small, hot, always-wanted
-/// tables where the fault-in cost would never be worth paying twice.
-// No production caller yet — `Store`'s residency policy wiring is Task 8+.
-// Used today by this file's `paged` test module.
-#[allow(dead_code)]
+/// tables where the fault-in cost would never be worth paying twice. Set via
+/// [`crate::Store::set_residency`].
 #[cfg(feature = "persistence")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Residency {
+pub enum Residency {
+    /// Every leaf stays in memory once faulted in; the demote pass skips
+    /// this table entirely.
     Resident,
+    /// The default: quiet (not recently accessed) resident-clean leaves are
+    /// demoted back to on-disk by the demote pass.
     #[default]
     Lazy,
 }
@@ -193,9 +195,9 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// debug build that bug panics (`debug_assert!`) rather than silently
     /// restarting the pass; a release build treats the mismatch as `None`
     /// (start of pass) and demotes correctly, just not incrementally.
-    // No production caller yet — see `paged_write` above.
+    ///
+    /// Production caller: [`crate::Store::demote_pass`].
     #[cfg(feature = "persistence")]
-    #[allow(dead_code)]
     fn paged_demote(
         &self,
         cursor: Option<&dyn Any>,
@@ -212,21 +214,24 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     fn paged_changed_pages(&self, prev: &dyn MergeableTable) -> Vec<PageId>;
 
     /// Estimated resident (not-yet-demoted) leaf bytes of the data tree.
-    // No production caller yet — see `paged_write` above.
+    // No production caller yet — `PagedStats::resident_leaf_bytes` (a
+    // running counter maintained on fault-in/demote) is what `Store`
+    // actually reports and budgets against; this per-call tree walk is
+    // exercised only by this file's `paged` test module.
     #[cfg(feature = "persistence")]
     #[allow(dead_code)]
     fn paged_resident_leaf_bytes(&self) -> usize;
 
     /// Current residency policy — see [`Residency`].
-    // No production caller yet — see `paged_write` above.
+    ///
+    /// Production caller: [`crate::Store::demote_pass`].
     #[cfg(feature = "persistence")]
-    #[allow(dead_code)]
     fn residency(&self) -> Residency;
 
     /// Set the residency policy.
-    // No production caller yet — see `paged_write` above.
+    ///
+    /// Production caller: [`crate::Store::set_residency`].
     #[cfg(feature = "persistence")]
-    #[allow(dead_code)]
     fn set_residency(&mut self, r: Residency);
 }
 
@@ -394,6 +399,16 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         let (new_data, demoted, next) = self.data.demote_leaves(cursor_k, budget);
         if let Some(stats) = &self.stats {
             stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
+            // Mirror of the `+= NODE_BYTES` on fault-in in
+            // `PagedSource::read_node`. Not symmetric: a leaf written
+            // straight from an in-memory insert (never faulted in) is
+            // demotable and counted here on the way out, but never
+            // contributed on the way in — see `PagedStats::resident_leaf_bytes`'s
+            // doc for why the running total can and does go negative, and
+            // why `Store::paged_stats` clamps rather than this fetch_sub.
+            stats
+                .resident_leaf_bytes
+                .fetch_sub(demoted as i64 * Child::<K, R>::NODE_BYTES as i64, Ordering::Relaxed);
         }
         let mut out = self.clone();
         out.data = new_data;

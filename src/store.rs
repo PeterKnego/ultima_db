@@ -1492,6 +1492,25 @@ impl Store {
             }
         }
 
+        // Phase 3 — demotion. Runs only when this store is configured with
+        // a memory budget: `None` (the default) means every leaf, once
+        // faulted in, stays resident forever (spec §8), and an explicit
+        // `checkpoint()` with no budget set must stay a pure write-and-root
+        // operation, not silently start evicting. The resident-bytes
+        // trigger that would call `demote_pass` on its own schedule,
+        // independent of `memory_budget_bytes` being set at all, is task12.
+        //
+        // Every leaf this checkpoint just wrote in phases 1-2 is exactly
+        // what makes this pass productive: those leaves went from dirty
+        // (not demotable — `paged_demote` only ever touches a slot that is
+        // both loaded *and* has a page id) to resident-clean the moment
+        // `write_dirty` assigned them ids above, so a demote pass run right
+        // after a checkpoint is the point at which the largest possible
+        // batch of newly-quiet leaves is demotable at once.
+        if opts.memory_budget_bytes.is_some() {
+            self.demote_pass()?;
+        }
+
         // WAL prune — same call path as the row-format branch above,
         // simplified: a paged root is always self-contained (never part of
         // a delta chain, unlike a row-format checkpoint — see `PagedRoot`'s
@@ -1575,6 +1594,121 @@ impl Store {
             p.installs.fetch_add(1, Ordering::Relaxed);
         }
         Some(snapshot)
+    }
+
+    /// Phase 3 of the paged checkpoint: demote every non-[`Residency::Resident`]
+    /// table's quiet (resident-clean, not recently accessed) leaves back to
+    /// on-disk, [`PagedOptions::demote_batch`](crate::persistence::PagedOptions::demote_batch)
+    /// leaf-parents at a time. Called by [`Store::checkpoint_impl_paged`]
+    /// after the root record is written and only when
+    /// [`PagedOptions::memory_budget_bytes`](crate::persistence::PagedOptions::memory_budget_bytes)
+    /// is `Some` — see that call site.
+    ///
+    /// Each batch is one [`Store::install_paged_tables`] call: this reads
+    /// `latest_version`'s table under a brief `inner.read()`, calls
+    /// [`MergeableTable::paged_demote`] on it *off* the store lock (the CoW
+    /// walk it performs can be large), then hands the demoted clone to
+    /// `install_paged_tables` for its own single-`inner.write()` swap. No
+    /// lock is held across the walk itself, and none is held between
+    /// batches — deliberately, so a demote pass never blocks commits (or a
+    /// checkpoint's own phase-1/2 writers) for its whole duration, only for
+    /// each swap.
+    ///
+    /// That gap is also why `latest_version` is re-read every batch instead
+    /// of once: a commit can land between this batch's read and its
+    /// install, forking the store's `latest_version` past the version this
+    /// batch demoted. `install_paged_tables` still installs into the
+    /// version it captured (never silently redirecting to a new
+    /// `latest_version` — see its own doc), so that batch's demotion
+    /// becomes unreachable from any live snapshot the moment the commit
+    /// promotes past it: nothing is lost (the commit's fork carries the
+    /// pre-demotion, fully-resident table forward, which is simply
+    /// correct), only that batch's eviction work goes to waste. The next
+    /// batch reads `latest_version` fresh and demotes the commit's newer
+    /// table instead, so the pass converges regardless.
+    ///
+    /// Returns the total number of leaves demoted across every table.
+    #[cfg(feature = "persistence")]
+    pub(crate) fn demote_pass(&self) -> Result<usize> {
+        let (registry, opts) = {
+            let inner = self.inner.read();
+            let paged = inner.paged.as_ref().ok_or_else(|| {
+                Error::Persistence("demote_pass requires a paged store".into())
+            })?;
+            (Arc::clone(&inner.registry), paged.opts.clone())
+        };
+
+        // Only registered tables are ever paged-attached (mirrors
+        // `checkpoint_impl_paged`'s own filter) — an unregistered table's
+        // `paged_demote` would be a genuine no-op every time (never
+        // attached, so `paged_demote`'s `is_loaded() && page_id().is_some()`
+        // check on every child never holds), so skipping it here just
+        // avoids the wasted per-table lock round trip.
+        let names: Vec<String> = {
+            let inner = self.inner.read();
+            let latest = inner.latest_version;
+            inner.snapshots[&latest]
+                .table_names()
+                .into_iter()
+                .filter(|n| registry.contains(n))
+                .collect()
+        };
+
+        let mut total_demoted = 0usize;
+        for name in names {
+            let mut cursor: Option<Box<dyn std::any::Any + Send>> = None;
+            loop {
+                let found = {
+                    let inner = self.inner.read();
+                    let latest = inner.latest_version;
+                    inner.snapshots[&latest]
+                        .tables
+                        .get(&name)
+                        .map(|t| (latest, Arc::clone(t)))
+                };
+                let Some((version, tbl)) = found else {
+                    break; // table no longer present at latest — nothing to demote
+                };
+                if tbl.residency() == crate::table::Residency::Resident {
+                    break;
+                }
+                let cursor_ref: Option<&dyn std::any::Any> =
+                    cursor.as_deref().map(|c| c as &dyn std::any::Any);
+                let (new_tbl, demoted, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
+                total_demoted += demoted;
+                self.install_paged_tables(version, vec![(name.clone(), new_tbl)]);
+                match next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+        }
+        Ok(total_demoted)
+    }
+
+    /// Sets `table`'s residency policy (see [`Residency`](crate::table::Residency))
+    /// and re-publishes `latest_version` with the change, via
+    /// [`Store::install_paged_tables`] — the same same-version re-publish
+    /// [`Store::demote_pass`] and [`Store::checkpoint_impl_paged`] use, so a
+    /// concurrent commit or checkpoint install races this exactly the way
+    /// they race each other (see that method's doc).
+    ///
+    /// Errors with [`Error::TableNotFound`] if `table` is absent from the
+    /// latest snapshot.
+    #[cfg(feature = "persistence")]
+    pub fn set_residency(&self, table: &str, r: crate::table::Residency) -> Result<()> {
+        let (version, mut boxed) = {
+            let inner = self.inner.read();
+            let latest = inner.latest_version;
+            let existing = inner.snapshots[&latest]
+                .tables
+                .get(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+            (latest, existing.boxed_clone())
+        };
+        boxed.set_residency(r);
+        self.install_paged_tables(version, vec![(table.to_string(), boxed)]);
+        Ok(())
     }
 
     /// Number of times a paged checkpoint has actually re-published a

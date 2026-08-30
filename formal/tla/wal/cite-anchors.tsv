@@ -30,25 +30,25 @@ src/store.rs	526	-	fn commit_may_park(&self) -> bool {
 src/store.rs	898	-	pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
 src/store.rs	911	-	if inner.active_writer_count > 0 {
 src/store.rs	720	22baf49	if inner.active_writer_count > 0 {
-src/store.rs	1669	-	pub fn recover(&self) -> Result<()> {
-src/store.rs	1669-1974	-	pub fn recover(&self) -> Result<()> {
-src/store.rs	1706-1712	-	inner.snapshots.insert(v, Arc::new(snapshot));
-src/store.rs	1817-1822	-	let tolerant = match inner.config.persistence {
-src/store.rs	1823	-	scan_wal(&wal_path_buf, tolerant)?
-src/store.rs	1829-1832	-	.filter(|e| e.version > base_version)
-src/store.rs	1957-1969	-	latest_version = entry.version;
-src/store.rs	1960-1966	-	version: latest_version,
+src/store.rs	1803	-	pub fn recover(&self) -> Result<()> {
+src/store.rs	1803-2108	-	pub fn recover(&self) -> Result<()> {
+src/store.rs	1840-1846	-	inner.snapshots.insert(v, Arc::new(snapshot));
+src/store.rs	1951-1956	-	let tolerant = match inner.config.persistence {
+src/store.rs	1957	-	scan_wal(&wal_path_buf, tolerant)?
+src/store.rs	1963-1966	-	.filter(|e| e.version > base_version)
+src/store.rs	2091-2103	-	latest_version = entry.version;
+src/store.rs	2094-2100	-	version: latest_version,
 src/store.rs	2253	e60f8ce^	fn commit_multi_writer(mut self) -> Result<u64> {
 src/store.rs	2361-2366	e60f8ce^	self.version = inner.latest_version + 1;
-src/store.rs	4603-4705	-	fn commit_single_writer(mut self) -> Result<u64> {
-src/store.rs	4655-4671	-	let mut inner = if needs_wal_wait {
-src/store.rs	4710	-	fn commit_multi_writer(mut self) -> Result<u64> {
-src/store.rs	4881	-	Phase 3: WAL submission + bookkeeping under brief write lock
-src/store.rs	4895	-	if !self.explicit_version
-src/store.rs	4901	-	if self.version > inner.last_submitted_version {
-src/store.rs	4958	-	let gate = if inner.commit_may_park() {
-src/store.rs	5012	-	gate.wait_turn(*ticket);
-src/store.rs	5029	-	gate.wait_turn(*ticket);
+src/store.rs	4737-4839	-	fn commit_single_writer(mut self) -> Result<u64> {
+src/store.rs	4789-4805	-	let mut inner = if needs_wal_wait {
+src/store.rs	4844	-	fn commit_multi_writer(mut self) -> Result<u64> {
+src/store.rs	5015	-	Phase 3: WAL submission + bookkeeping under brief write lock
+src/store.rs	5029	-	if !self.explicit_version
+src/store.rs	5035	-	if self.version > inner.last_submitted_version {
+src/store.rs	5092	-	let gate = if inner.commit_may_park() {
+src/store.rs	5146	-	gate.wait_turn(*ticket);
+src/store.rs	5163	-	gate.wait_turn(*ticket);
 src/wal.rs	623-627	-	Physically zero-fill
 src/wal.rs	623-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
 src/wal.rs	632-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {

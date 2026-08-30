@@ -155,6 +155,8 @@ pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamErro
 #[cfg(feature = "persistence")]
 pub use store::PagedStatsSnapshot;
 pub use store::{IsolationLevel, Readable, Store, StoreConfig, VersionPin, WriterMode};
+#[cfg(feature = "persistence")]
+pub use table::Residency;
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};
 
