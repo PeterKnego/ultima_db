@@ -8,13 +8,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
+#[cfg(feature = "persistence")]
+use std::sync::atomic::Ordering;
 
 use crate::btree::{BTree, BTreeRange};
+#[cfg(feature = "persistence")]
+use crate::checkpoint::{PagedIndexEntry, PagedTableEntry};
+#[cfg(feature = "persistence")]
+use crate::child::{NO_PAGE, PageId};
 use crate::index::{
     CustomIndex, CustomIndexAdapter, IndexKind, IndexMaintainer, ManagedIndex, NonUniqueStorage,
     UniqueStorage,
 };
+#[cfg(feature = "persistence")]
+use crate::index::IndexDef;
 use crate::overlay::{MergedIter, Overlay, OverlayOp, TableIter};
+#[cfg(feature = "persistence")]
+use crate::pagecodec::{NodeCodec, PagedSource, PagedStats};
+#[cfg(feature = "persistence")]
+use crate::pagefile::PageFile;
 use crate::persistence::Record;
 use crate::primary_key::{AutoKey, PrimaryKey};
 use crate::{Error, Result};
@@ -35,6 +47,36 @@ use crate::{Error, Result};
 // erased terms instead — `merge_keys_from` takes a `&dyn Any` that the impl
 // downcasts to `&BTreeSet<K>`, and `collect_serialized_rows` hands back
 // order-preserving encoded key bytes.
+
+/// The file/stats a paged write pass runs against — bundled so
+/// `MergeableTable::paged_write` and `IndexMaintainer::paged_write` take one
+/// borrow instead of two, and so a caller building a checkpoint pass owns
+/// exactly one `PageFile`/`PagedStats` pair for the whole table+index walk.
+// No production caller yet — `Store`'s checkpoint writer (Task 8+). Used
+// today by this file's `paged` test module.
+#[allow(dead_code)]
+#[cfg(feature = "persistence")]
+pub(crate) struct PagedCtx<'a> {
+    pub file: &'a PageFile,
+    pub stats: &'a PagedStats,
+}
+
+/// Whether a table's data tree ever demotes quiet leaves back to on-disk.
+/// `Lazy` (the default) is the normal paged-checkpoint table: a leaf that
+/// hasn't been touched since the last demote pass goes back to disk under
+/// memory pressure. `Resident` opts a table out of demotion entirely — every
+/// leaf stays in memory once faulted in — for small, hot, always-wanted
+/// tables where the fault-in cost would never be worth paying twice.
+// No production caller yet — `Store`'s residency policy wiring is Task 8+.
+// Used today by this file's `paged` test module.
+#[allow(dead_code)]
+#[cfg(feature = "persistence")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Residency {
+    Resident,
+    #[default]
+    Lazy,
+}
 
 pub(crate) trait MergeableTable: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
@@ -109,6 +151,65 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
         &self,
         serialize_record: &(dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync),
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// Write every dirty (`NO_PAGE`) node of this table's data tree, and of
+    /// each *persisted* index's tree, to `ctx.file`, and report the
+    /// resulting root/height/len of each as a [`PagedTableEntry`].
+    ///
+    /// Operates directly against the live tree's `Child` slots (interior
+    /// mutability — see the impl for `Table`), not a private clone: a
+    /// following [`Self::paged_demote`] on this same table needs to see the
+    /// page ids this call just assigned, and a *second* `paged_write` with
+    /// nothing changed in between must write nothing.
+    // No production caller yet — `Store`'s checkpoint writer (Task 8+).
+    // Used today by this file's `paged` test module.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<PagedTableEntry>;
+
+    /// Demote up to `budget` leaf-parents' quiet leaves of the data tree
+    /// back to on-disk, resuming after `cursor` (an erased `&K`, `None` at
+    /// the start of a pass — see [`Self::merge_keys_from`] for why the key
+    /// type can't appear in this signature). Returns the demoted table (as
+    /// a fresh `MergeableTable` so callers never need to downcast just to
+    /// hold the result), the leaf count demoted, and the next cursor
+    /// (`None` once the pass reaches the end). A `Residency::Resident`
+    /// table always returns `(clone of self, 0, None)`.
+    // No production caller yet — see `paged_write` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_demote(
+        &self,
+        cursor: Option<&dyn Any>,
+        budget: usize,
+    ) -> (Box<dyn MergeableTable>, usize, Option<Box<dyn Any + Send>>);
+
+    /// Page ids referenced by `prev`'s data tree and every persisted index
+    /// and not by `self`'s — the ids a checkpoint GC pass can reclaim once
+    /// `prev`'s root is no longer needed. An index present in `prev` but
+    /// dropped in `self` contributes every page id it ever referenced.
+    // No production caller yet — see `paged_write` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_changed_pages(&self, prev: &dyn MergeableTable) -> Vec<PageId>;
+
+    /// Estimated resident (not-yet-demoted) leaf bytes of the data tree.
+    // No production caller yet — see `paged_write` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_resident_leaf_bytes(&self) -> usize;
+
+    /// Current residency policy — see [`Residency`].
+    // No production caller yet — see `paged_write` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn residency(&self) -> Residency;
+
+    /// Set the residency policy.
+    // No production caller yet — see `paged_write` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn set_residency(&mut self, r: Residency);
 }
 
 impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
@@ -224,6 +325,94 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         }
         Ok(out)
     }
+
+    #[cfg(feature = "persistence")]
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<PagedTableEntry> {
+        // `write_dirty` mutates a node's `Child` slot via interior
+        // mutability (`set_page_id` takes `&self`), so writing straight
+        // against `self.data` — instead of a private clone — is what lets a
+        // following `paged_demote` on this same table see the ids just
+        // assigned, and a second `paged_write` write nothing when nothing
+        // changed in between. `BTree::clone` only deep-clones the *root*
+        // `Child`'s own bookkeeping (every node below it is the same shared
+        // `Arc<BTreeNode>`, per its doc); operating on a clone would strand
+        // the root's freshly-assigned id on the throwaway clone alone and
+        // defeat both of those. The one thing `write_dirty` cannot see is
+        // the overlay (it reads the tree directly), so the clone-then-flush
+        // fallback — the `diff_table` precedent in `registry.rs` — is kept
+        // for the rare case of a live SingleWriter table with a non-empty
+        // overlay; there, this call's page-id bookkeeping is throwaway
+        // anyway, since the buffered rows haven't landed in the tree yet.
+        if self.overlay_is_empty() {
+            self.paged_write_tree(ctx)
+        } else {
+            let mut flushed = self.clone();
+            flushed.flush_overlay();
+            flushed.paged_write_tree(ctx)
+        }
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_demote(
+        &self,
+        cursor: Option<&dyn Any>,
+        budget: usize,
+    ) -> (Box<dyn MergeableTable>, usize, Option<Box<dyn Any + Send>>) {
+        if self.residency == Residency::Resident {
+            return (Box::new(self.clone()), 0, None);
+        }
+        let cursor_k: Option<&K> = cursor.and_then(|c| c.downcast_ref::<K>());
+        let (new_data, demoted, next) = self.data.demote_leaves(cursor_k, budget);
+        if let Some(stats) = &self.stats {
+            stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
+        }
+        let mut out = self.clone();
+        out.data = new_data;
+        let next_boxed: Option<Box<dyn Any + Send>> = next.map(|k| Box::new(k) as Box<dyn Any + Send>);
+        (Box::new(out), demoted, next_boxed)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_changed_pages(&self, prev: &dyn MergeableTable) -> Vec<PageId> {
+        let Some(prev) = prev.as_any().downcast_ref::<Table<R, K>>() else {
+            // Shape mismatch (a bug elsewhere) — nothing comparable, so
+            // nothing reclaimable through this path.
+            return Vec::new();
+        };
+        let mut out = self.data.changed_page_ids(&prev.data);
+        for (name, idx) in &self.indexes {
+            if let Some(prev_idx) = prev.indexes.get(name) {
+                out.extend(idx.paged_changed_pages(prev_idx.as_ref()));
+            }
+        }
+        // An index dropped between `prev` and `self` contributes every page
+        // id it ever referenced: diffing an empty index of the same shape
+        // against `prev_idx` is exactly that (nothing on the "new" side to
+        // skip, so every reachable id on `prev_idx`'s side is reported).
+        for (name, prev_idx) in &prev.indexes {
+            if !self.indexes.contains_key(name)
+                && let Ok(empty) = prev_idx.empty_clone()
+            {
+                out.extend(empty.paged_changed_pages(prev_idx.as_ref()));
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_resident_leaf_bytes(&self) -> usize {
+        self.data.resident_leaf_estimate()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn residency(&self) -> Residency {
+        self.residency
+    }
+
+    #[cfg(feature = "persistence")]
+    fn set_residency(&mut self, r: Residency) {
+        self.residency = r;
+    }
 }
 
 /// A compile-time table definition binding a name to a record type.
@@ -301,6 +490,29 @@ pub struct Table<R, K = u64> {
     /// enables it per table via [`Table::set_overlay_cap`] (SingleWriter
     /// only). See `src/overlay.rs`.
     overlay: Overlay<R, K>,
+    /// Whether this table's data tree ever demotes quiet leaves — see
+    /// [`Residency`]. Defaults to `Lazy`; a table paged via
+    /// `attach_paged_source` opts into `Resident` explicitly.
+    #[cfg(feature = "persistence")]
+    residency: Residency,
+    /// Index roots to install on the next attach/recovery pass — filled by
+    /// Task 9's attach path. This task only ever initializes it empty and
+    /// never reads it; kept on the struct now so the field itself isn't
+    /// part of that later task's diff.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    pending_indexes: Vec<PagedIndexEntry>,
+    /// The shared paging counters, set by `attach_paged_source`. Retained
+    /// (rather than only threaded through a per-call [`PagedCtx`]) because
+    /// [`MergeableTable::paged_demote`]'s signature carries no `ctx`
+    /// parameter — it still needs somewhere to report `leaves_demoted`.
+    #[cfg(feature = "persistence")]
+    stats: Option<Arc<PagedStats>>,
+    /// This table's name, set by `attach_paged_source` — carried so
+    /// `paged_write` can stamp it on the [`PagedTableEntry`] it returns
+    /// without the caller having to patch the name in afterward.
+    #[cfg(feature = "persistence")]
+    paged_name: Option<String>,
 }
 
 /// Captured table state for atomic batch rollback.
@@ -321,6 +533,14 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             next_id: None,
             indexes: BTreeMap::new(),
             overlay: Overlay::new(0),
+            #[cfg(feature = "persistence")]
+            residency: Residency::default(),
+            #[cfg(feature = "persistence")]
+            pending_indexes: Vec::new(),
+            #[cfg(feature = "persistence")]
+            stats: None,
+            #[cfg(feature = "persistence")]
+            paged_name: None,
         }
     }
 
@@ -354,6 +574,14 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             next_id,
             indexes,
             overlay: Overlay::new(0),
+            #[cfg(feature = "persistence")]
+            residency: Residency::default(),
+            #[cfg(feature = "persistence")]
+            pending_indexes: Vec::new(),
+            #[cfg(feature = "persistence")]
+            stats: None,
+            #[cfg(feature = "persistence")]
+            paged_name: None,
         })
     }
 
@@ -422,6 +650,14 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             next_id,
             indexes: BTreeMap::new(),
             overlay: Overlay::new(0),
+            #[cfg(feature = "persistence")]
+            residency: Residency::default(),
+            #[cfg(feature = "persistence")]
+            pending_indexes: Vec::new(),
+            #[cfg(feature = "persistence")]
+            stats: None,
+            #[cfg(feature = "persistence")]
+            paged_name: None,
         }
     }
 
@@ -1159,6 +1395,153 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             .ok_or_else(|| Error::IndexTypeMismatch(name.to_string()))?;
         Ok(adapter.inner())
     }
+
+    // -----------------------------------------------------------------------
+    // Paging (Task 7): page-file-backed writes, demotion, and persisted
+    // indexes. Not yet wired into `Store`/the registry/checkpointing — that
+    // is Task 8+. See `docs/tasks` for the paged B-tree design once it
+    // lands.
+    // -----------------------------------------------------------------------
+
+    /// Attach this table's data tree — and every *persisted* index's tree —
+    /// to a page file for paged checkpoint write/read. Building the codec
+    /// here (rather than storing one) is cheap: [`NodeCodec::records`] is
+    /// just a pair of function pointers, no allocation.
+    // No production caller yet — `Store`'s attach path (Task 8+). Used
+    // today by this file's `paged` test module.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    pub(crate) fn attach_paged_source(
+        &mut self,
+        file: Arc<PageFile>,
+        stats: Arc<PagedStats>,
+        table_name: &str,
+    ) {
+        let codec = NodeCodec::<K, R>::records::<R>();
+        let source: Arc<PagedSource<K, R>> = Arc::new(PagedSource {
+            file: file.clone(),
+            codec,
+            name: table_name.to_string(),
+            stats: stats.clone(),
+        });
+        self.data.set_source(Some(source));
+        self.stats = Some(stats.clone());
+        self.paged_name = Some(table_name.to_string());
+        for idx in self.indexes.values_mut() {
+            idx.attach_paged_source(file.clone(), stats.clone(), table_name);
+        }
+    }
+
+    /// The `paged_write` body, operating on whichever tree/indexes the
+    /// caller hands in (`self`'s own, or a flushed clone's — see
+    /// `MergeableTable::paged_write`'s doc for why the choice matters).
+    // No production caller yet — see `attach_paged_source` above.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    fn paged_write_tree(&self, ctx: &PagedCtx) -> Result<PagedTableEntry> {
+        // An empty tree has no root page: writing one would just be a
+        // wasted, forever-unreferenced page, and there is nothing for a
+        // future attach to fault in anyway.
+        let (root_page, height) = if self.data.is_empty() {
+            (None, 0u32)
+        } else {
+            let codec = NodeCodec::<K, R>::records::<R>();
+            let mut first_err: Option<Error> = None;
+            let root_id = self.data.write_dirty(&mut |node, _is_leaf| {
+                match codec
+                    .encode(node)
+                    .and_then(|(kind, bytes)| ctx.file.append(kind, &bytes))
+                {
+                    Ok(id) => {
+                        ctx.stats.pages_written.fetch_add(1, Ordering::Relaxed);
+                        id
+                    }
+                    Err(e) => {
+                        // `write_dirty`'s callback can't return `Result`;
+                        // NO_PAGE aborts the walk (leaving the failed path
+                        // dirty) and this carries the error out.
+                        first_err.get_or_insert(e);
+                        NO_PAGE
+                    }
+                }
+            });
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            (Some(root_id), self.data.height() as u32)
+        };
+
+        let mut indexes = Vec::with_capacity(self.indexes.len());
+        for idx in self.indexes.values() {
+            if let Some(entry) = idx.paged_write(ctx)? {
+                indexes.push(entry);
+            }
+        }
+
+        Ok(PagedTableEntry {
+            name: self.paged_name.clone().unwrap_or_default(),
+            key_type_id: K::KEY_TYPE_ID,
+            root_page,
+            height,
+            len: self.len() as u64,
+            next_id: self.next_id.as_ref().map(|id| id.encode()),
+            indexes,
+        })
+    }
+
+    /// Define a secondary index whose tree is written to the page file
+    /// alongside the table's data tree. Mirrors [`Table::define_index`]
+    /// (flush overlay, idempotency and kind checks), but stamps the
+    /// storage with a codec and a `persist: Some((IK::KEY_TYPE_ID,
+    /// generation))` marker so `paged_write`/`attach_paged_source` know to
+    /// carry it through the paged path. A plain [`Table::define_index`]
+    /// index never gets that marker and stays purely in-memory even once
+    /// the table itself is paged. `IndexKind::Custom` is rejected: a custom
+    /// index's storage is opaque to this generic maintainer, so there is no
+    /// tree to page. Task 13 adds the attach path and richer error
+    /// variants; this is the minimal signature Task 13 builds on.
+    // No production caller yet — see `attach_paged_source` above.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    pub(crate) fn define_persisted_index<IK: PrimaryKey>(
+        &mut self,
+        name: &str,
+        kind: IndexKind,
+        def: IndexDef,
+        extractor: impl Fn(&R) -> IK + Send + Sync + 'static,
+    ) -> Result<()> {
+        // Same discipline as `define_index` — see the comment there.
+        self.flush_overlay();
+        self.overlay = Overlay::new(0);
+        if let Some(existing) = self.indexes.get(name) {
+            if existing.kind() == IndexKind::Custom || existing.kind() != kind {
+                return Err(Error::IndexTypeMismatch(name.to_string()));
+            }
+            return Ok(());
+        }
+        let extractor = Arc::new(extractor);
+        let persist = (IK::KEY_TYPE_ID, def.generation);
+        let mut index: Box<dyn IndexMaintainer<R, K>> = match kind {
+            IndexKind::Unique => Box::new(ManagedIndex::<R, IK, UniqueStorage<IK, K>>::new(
+                name.to_string(),
+                kind,
+                extractor,
+                UniqueStorage::new_persisted(persist),
+            )),
+            IndexKind::NonUnique => Box::new(ManagedIndex::<R, IK, NonUniqueStorage<IK, K>>::new(
+                name.to_string(),
+                kind,
+                extractor,
+                NonUniqueStorage::new_persisted(persist),
+            )),
+            IndexKind::Custom => {
+                return Err(Error::IndexTypeMismatch(name.to_string()));
+            }
+        };
+        index.rebuild_from_sorted_data(&self.data)?;
+        self.indexes.insert(name.to_string(), index);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,6 +1556,14 @@ impl<R: Record, K: AutoKey> Table<R, K> {
             next_id: Some(K::first()),
             indexes: BTreeMap::new(),
             overlay: Overlay::new(0),
+            #[cfg(feature = "persistence")]
+            residency: Residency::default(),
+            #[cfg(feature = "persistence")]
+            pending_indexes: Vec::new(),
+            #[cfg(feature = "persistence")]
+            stats: None,
+            #[cfg(feature = "persistence")]
+            paged_name: None,
         }
     }
 
@@ -1387,6 +1778,14 @@ impl<R, K: PrimaryKey> Clone for Table<R, K> {
             next_id: self.next_id.clone(),
             indexes,
             overlay: self.overlay.clone(),
+            #[cfg(feature = "persistence")]
+            residency: self.residency,
+            #[cfg(feature = "persistence")]
+            pending_indexes: self.pending_indexes.clone(),
+            #[cfg(feature = "persistence")]
+            stats: self.stats.clone(),
+            #[cfg(feature = "persistence")]
+            paged_name: self.paged_name.clone(),
         }
     }
 }
@@ -4318,5 +4717,108 @@ mod tests {
                 assert_eq!(a, b);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paging (Task 7): `attach_paged_source`, `paged_write`, `paged_demote`,
+// `define_persisted_index`. `PageFile` is crate-private, so — per the task
+// brief — these live as a unit test module here rather than an integration
+// test under `tests/`.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "persistence"))]
+mod paged {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::index::IndexDef;
+    use crate::pagecodec::PagedStats;
+    use crate::pagefile::{page_file_path, PageFile};
+
+    #[test]
+    fn table_paged_write_then_demote_then_read_faults_one_leaf() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        // Built via the bulk fast path (`insert_batch` on a fresh AutoKey
+        // table assigns ids 1..=20_000 in order, landing exactly the same
+        // (key, value) pairs a `put`-loop would) rather than one `put` per
+        // row: `Table::put`'s per-row path descends via `Child::make_mut`,
+        // which — unlike `write_dirty`'s `load_quiet` — marks every touched
+        // leaf "accessed" as a side effect of being *built*. `demote_leaves`
+        // gives an accessed leaf a second chance (see
+        // `demote_gives_accessed_leaves_a_second_chance` in `btree.rs`), so
+        // a put-loop-built tree's *first* demote pass would legitimately
+        // demote nothing — correct clock-sweep behavior, but not what this
+        // test is after. The bulk path builds leaves directly, the same way
+        // a real paged table would arrive freshly bulk-loaded/recovered,
+        // with no accessed bits to give a false second chance.
+        let mut t: Table<u64, u64> = Table::new();
+        let ids = t.insert_batch((1..=20_000u64).map(|i| i * 2).collect()).unwrap();
+        assert_eq!(ids, (1..=20_000u64).collect::<Vec<_>>());
+        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        let entry = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert_eq!(entry.len, 20_000);
+        assert!(entry.root_page.is_some());
+        assert_eq!(entry.key_type_id, <u64 as PrimaryKey>::KEY_TYPE_ID);
+        let written = stats.pages_written.load(Ordering::Relaxed);
+        assert!(written > 300, "expected > 300 pages written for 20,000 rows, got {written}");
+
+        let (t2, demoted, done) = t.paged_demote(None, usize::MAX);
+        assert!(done.is_none() && demoted > 300, "demoted={demoted}, done={done:?}");
+        let t2 = t2.as_any().downcast_ref::<Table<u64, u64>>().unwrap();
+        assert_eq!(t2.get(&777), Some(&1554));
+        assert_eq!(stats.page_faults.load(Ordering::Relaxed), 1);
+
+        // A second write after no changes writes nothing (demotion re-marked
+        // unchanged parents, and the leaf fault above didn't dirty anything).
+        let before = stats.pages_written.load(Ordering::Relaxed);
+        t2.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert_eq!(stats.pages_written.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn persisted_index_is_written_and_unpersisted_index_is_not() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let mut t: Table<u64, u64> = Table::new_keyed();
+        for i in 1..=1_000u64 {
+            t.put(i, i % 10).unwrap();
+        }
+        t.define_persisted_index::<u64>("by_mod", IndexKind::NonUnique, IndexDef { generation: 3 }, |r| *r)
+            .unwrap();
+        // NonUnique, not Unique: the record values here (`i % 10`) repeat
+        // 100x each, so a *unique* index over them would hit
+        // `Error::DuplicateKey` while backfilling — irrelevant to what this
+        // "plain index is skipped by paged_write" test is checking.
+        t.define_index("plain", IndexKind::NonUnique, |r: &u64| *r + 1_000_000).unwrap();
+        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        let e = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+        assert_eq!(e.indexes.len(), 1);
+        assert_eq!(e.indexes[0].name, "by_mod");
+        assert_eq!(e.indexes[0].generation, 3);
+        assert_eq!(e.indexes[0].kind, 1);
+        assert_eq!(e.indexes[0].len, 1_000);
+    }
+
+    #[test]
+    fn resident_table_never_demotes() {
+        let d = tempfile::tempdir().unwrap();
+        let file = Arc::new(PageFile::open(&page_file_path(d.path()), 0, 1 << 20, 4096).unwrap());
+        let stats = Arc::new(PagedStats::default());
+        let mut t: Table<u64, u64> = Table::new_keyed();
+        for i in 1..=20_000u64 {
+            t.put(i, i * 2).unwrap();
+        }
+        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
+
+        t.set_residency(Residency::Resident);
+        let (_t2, demoted, done) = t.paged_demote(None, usize::MAX);
+        assert_eq!(demoted, 0);
+        assert!(done.is_none());
     }
 }

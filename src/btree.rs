@@ -4854,7 +4854,7 @@ mod tests {
             // 1,2,3 share a leaf; 10_000 and 19_999 are two more: 3 leaves.
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 3);
             // Old version untouched and fully resident.
-            assert_eq!(t.resident_leaf_estimate() > t2.resident_leaf_estimate(), true);
+            assert!(t.resident_leaf_estimate() > t2.resident_leaf_estimate());
         }
 
         #[test]

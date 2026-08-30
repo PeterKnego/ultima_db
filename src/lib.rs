@@ -143,6 +143,8 @@ pub use error::{Error, Result};
 #[cfg(feature = "fulltext")]
 pub use fulltext::{FullTextIndex, SearchResult};
 pub use index::{CustomIndex, IndexKind};
+#[cfg(feature = "persistence")]
+pub use index::IndexDef;
 pub use intents::CommitWaiter;
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
 pub use persistence::{Durability, Persistence, Record, WalWrite};

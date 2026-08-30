@@ -3,11 +3,41 @@
 
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(feature = "persistence")]
+use std::sync::atomic::Ordering;
 
 use crate::btree::BTree;
+#[cfg(feature = "persistence")]
+use crate::btree::BTreeNode;
+#[cfg(feature = "persistence")]
+use crate::checkpoint::PagedIndexEntry;
+#[cfg(feature = "persistence")]
+use crate::child::{NO_PAGE, PageId};
+#[cfg(feature = "persistence")]
+use crate::pagecodec::{NodeCodec, PagedSource, PagedStats};
+#[cfg(feature = "persistence")]
+use crate::pagefile::{PageFile, PageKind};
 use crate::persistence::Record;
 use crate::primary_key::PrimaryKey;
+#[cfg(feature = "persistence")]
+use crate::table::PagedCtx;
 use crate::{Error, Result};
+
+/// Config for [`crate::table::Table::define_persisted_index`] — currently
+/// just the generation number stamped into the index's [`PagedIndexEntry`],
+/// bumped whenever the index's shape (extractor/key type) changes in a way
+/// that would make an on-disk tree from an older generation unsafe to reuse.
+/// `#[non_exhaustive]` so a later field can be added without breaking
+/// existing `IndexDef { generation: n }` callers outside this crate — they
+/// build one via `Default` plus a functional-update, e.g.
+/// `IndexDef { generation: 3, ..Default::default() }`.
+#[cfg(feature = "persistence")]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexDef {
+    /// The index's shape generation — see the struct doc.
+    pub generation: u32,
+}
 
 /// Whether an index enforces uniqueness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +88,40 @@ pub(crate) trait IndexMaintainer<R, K: PrimaryKey>: Send + Sync {
         }
         Ok(())
     }
+
+    /// Attach this index's storage to a page file for paged checkpoint
+    /// write/read. A no-op unless the storage already carries a `persist`
+    /// marker from `Table::define_persisted_index` — a plain
+    /// (`Table::define_index`) index stays purely in-memory even once its
+    /// table is paged.
+    // No production caller yet — `Table::attach_paged_source` (Task 8+
+    // wires it into `Store`). Used today by `table.rs`'s `paged` test
+    // module.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn attach_paged_source(&mut self, file: Arc<PageFile>, stats: Arc<PagedStats>, table_name: &str);
+
+    /// Write this index's dirty pages, if it is persisted. `None` when this
+    /// index carries no `persist` marker.
+    // No production caller yet — see `attach_paged_source` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<Option<PagedIndexEntry>>;
+
+    /// Page ids referenced by `prev`'s tree and not by `self`'s. `&[]` for
+    /// an index that isn't persisted, or when `prev`'s concrete shape
+    /// doesn't match `self`'s.
+    // No production caller yet — see `attach_paged_source` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_changed_pages(&self, prev: &dyn IndexMaintainer<R, K>) -> Vec<PageId>;
+
+    /// The generation recorded by `Table::define_persisted_index`, or `0`
+    /// for an index with no `persist` marker.
+    // No production caller yet — see `attach_paged_source` above.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_generation(&self) -> u32;
 }
 
 /// Extracts an index key of type `IK` from a record of type `R`. Implemented
@@ -194,8 +258,62 @@ where
         // 3. Bulk-build the index B-tree.
         let arc_pairs = pairs.into_iter().map(|(ik, key)| (ik, Arc::new(key)));
         let new_tree: BTree<IK, K> = BTree::from_sorted(arc_pairs);
-        self.storage = UniqueStorage::from_btree(new_tree);
+        // Assign the tree field directly (same module, private field) rather
+        // than replacing the whole `storage` value — a full replace would
+        // silently drop any `codec`/`persist` marker `define_persisted_index`
+        // already stamped on this storage.
+        self.storage.tree = new_tree;
         Ok(())
+    }
+
+    #[cfg(feature = "persistence")]
+    fn attach_paged_source(&mut self, file: Arc<PageFile>, stats: Arc<PagedStats>, table_name: &str) {
+        let Some(p) = self.storage.persist.clone() else {
+            return; // not a persisted index — stays purely in-memory
+        };
+        let name = format!("{table_name}.{}", self.name);
+        (p.attach)(&mut self.storage.tree, file, stats, name);
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<Option<PagedIndexEntry>> {
+        let Some(p) = &self.storage.persist else {
+            return Ok(None);
+        };
+        if self.storage.tree.is_empty() {
+            return Ok(Some(PagedIndexEntry {
+                name: self.name.clone(),
+                ik_type_id: p.ik_type_id,
+                kind: 0,
+                generation: p.generation,
+                root_page: None,
+                height: 0,
+                len: 0,
+            }));
+        }
+        let root_id = p.write(&self.storage.tree, ctx)?;
+        Ok(Some(PagedIndexEntry {
+            name: self.name.clone(),
+            ik_type_id: p.ik_type_id,
+            kind: 0,
+            generation: p.generation,
+            root_page: Some(root_id),
+            height: self.storage.tree.height() as u32,
+            len: self.storage.tree.len() as u64,
+        }))
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_changed_pages(&self, prev: &dyn IndexMaintainer<R, K>) -> Vec<PageId> {
+        let Some(prev) = prev.as_any().downcast_ref::<ManagedIndex<R, IK, UniqueStorage<IK, K>>>() else {
+            return Vec::new();
+        };
+        self.storage.tree.changed_page_ids(&prev.storage.tree)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_generation(&self) -> u32 {
+        self.storage.persist.as_ref().map(|p| p.generation).unwrap_or(0)
     }
 }
 
@@ -267,8 +385,137 @@ where
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let arc_pairs = pairs.into_iter().map(|(k, _)| (k, Arc::new(())));
         let new_tree: BTree<(IK, K), ()> = BTree::from_sorted(arc_pairs);
-        self.storage = NonUniqueStorage::from_btree(new_tree);
+        // See the comment in the `UniqueStorage` impl above: assigning the
+        // tree field directly preserves any `codec`/`persist` marker.
+        self.storage.tree = new_tree;
         Ok(())
+    }
+
+    #[cfg(feature = "persistence")]
+    fn attach_paged_source(&mut self, file: Arc<PageFile>, stats: Arc<PagedStats>, table_name: &str) {
+        let Some(p) = self.storage.persist.clone() else {
+            return; // not a persisted index — stays purely in-memory
+        };
+        let name = format!("{table_name}.{}", self.name);
+        (p.attach)(&mut self.storage.tree, file, stats, name);
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_write(&self, ctx: &PagedCtx) -> Result<Option<PagedIndexEntry>> {
+        let Some(p) = &self.storage.persist else {
+            return Ok(None);
+        };
+        if self.storage.tree.is_empty() {
+            return Ok(Some(PagedIndexEntry {
+                name: self.name.clone(),
+                ik_type_id: p.ik_type_id,
+                kind: 1,
+                generation: p.generation,
+                root_page: None,
+                height: 0,
+                len: 0,
+            }));
+        }
+        let root_id = p.write(&self.storage.tree, ctx)?;
+        Ok(Some(PagedIndexEntry {
+            name: self.name.clone(),
+            ik_type_id: p.ik_type_id,
+            kind: 1,
+            generation: p.generation,
+            root_page: Some(root_id),
+            height: self.storage.tree.height() as u32,
+            len: self.storage.tree.len() as u64,
+        }))
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_changed_pages(&self, prev: &dyn IndexMaintainer<R, K>) -> Vec<PageId> {
+        let Some(prev) = prev.as_any().downcast_ref::<ManagedIndex<R, IK, NonUniqueStorage<IK, K>>>() else {
+            return Vec::new();
+        };
+        self.storage.tree.changed_page_ids(&prev.storage.tree)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_generation(&self) -> u32 {
+        self.storage.persist.as_ref().map(|p| p.generation).unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PersistedIndex — the paged bookkeeping a `define_persisted_index` storage
+// carries; `None` on a plain `define_index` storage.
+// ---------------------------------------------------------------------------
+
+/// Encodes one node to its page payload+kind — see [`PersistedIndex`].
+#[cfg(feature = "persistence")]
+type EncodeFn<TK, TV> = Arc<dyn Fn(&BTreeNode<TK, TV>) -> Result<(PageKind, Vec<u8>)> + Send + Sync>;
+/// Builds this index's `PagedSource` and attaches it to a tree — see
+/// [`PersistedIndex`].
+#[cfg(feature = "persistence")]
+type AttachFn<TK, TV> = Arc<dyn Fn(&mut BTree<TK, TV>, Arc<PageFile>, Arc<PagedStats>, String) + Send + Sync>;
+
+/// Paged bookkeeping for a persisted index's tree (`TK`/`TV` are that
+/// tree's own key/value types — `(IK, K)`/`()` for `NonUniqueStorage`,
+/// `IK`/`K` for `UniqueStorage`). Built once by
+/// `UniqueStorage::new_persisted`/`NonUniqueStorage::new_persisted`, where
+/// the index key `IK` is known to satisfy `PrimaryKey` (that constructor
+/// carries its own `where IK: PrimaryKey`, same trick `NodeCodec` itself
+/// uses for its `unique_index`/`non_unique_index` constructors).
+///
+/// `IndexMaintainer`'s trait methods (`attach_paged_source`, `paged_write`,
+/// ...) are implemented once for `ManagedIndex<R, IK, UniqueStorage<IK,
+/// K>>` under `ManagedIndex`'s own, *looser* bound
+/// (`IK: Ord + Clone + Send + Sync + 'static`) — the same bound
+/// `Table::define_index` promises its callers, which this crate cannot
+/// tighten to `PrimaryKey` without breaking existing non-`PrimaryKey`
+/// index keys (`usize`, for one — see `src/store.rs`'s `by_len` indexes).
+/// So those trait bodies can never call `NodeCodec::encode`/`decode`
+/// directly (those require `K: PrimaryKey`, per `pagecodec.rs`). Capturing
+/// the codec inside plain closures here sidesteps that: a `Fn` trait
+/// object needs no bound on what it closed over in order to be *called*,
+/// only to be *built* — and it was built where the bound held.
+// No production caller yet — `Table::define_persisted_index` (Task 8+
+// wires it into `Store`). Used today by `table.rs`'s `paged` test module.
+#[allow(dead_code)]
+#[cfg(feature = "persistence")]
+#[derive(Clone)]
+struct PersistedIndex<TK, TV> {
+    ik_type_id: u32,
+    generation: u32,
+    encode: EncodeFn<TK, TV>,
+    attach: AttachFn<TK, TV>,
+}
+
+#[cfg(feature = "persistence")]
+impl<TK: Ord + Clone, TV> PersistedIndex<TK, TV> {
+    /// Write every dirty page of `tree` via the captured codec. Neither
+    /// this nor `BTree::write_dirty` itself needs `TK: PrimaryKey` — only
+    /// *building* the codec (inside the closure, at construction time)
+    /// did.
+    // No production caller yet — see the struct doc above.
+    #[allow(dead_code)]
+    fn write(&self, tree: &BTree<TK, TV>, ctx: &PagedCtx) -> Result<PageId> {
+        let mut first_err: Option<Error> = None;
+        let root_id = tree.write_dirty(&mut |node, _is_leaf| {
+            match (self.encode)(node).and_then(|(kind, bytes)| ctx.file.append(kind, &bytes)) {
+                Ok(id) => {
+                    ctx.stats.pages_written.fetch_add(1, Ordering::Relaxed);
+                    id
+                }
+                Err(e) => {
+                    // `write_dirty`'s callback can't return `Result`;
+                    // NO_PAGE aborts the walk (leaving the failed path
+                    // dirty) and this carries the error out.
+                    first_err.get_or_insert(e);
+                    NO_PAGE
+                }
+            }
+        });
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(root_id),
+        }
     }
 }
 
@@ -279,17 +526,49 @@ where
 #[derive(Clone)]
 pub(crate) struct UniqueStorage<IK: Ord + Clone, K: PrimaryKey> {
     tree: BTree<IK, K>,
+    /// Set by `Table::define_persisted_index`; `None` for a plain
+    /// `Table::define_index` index, which `paged_write` then skips and
+    /// `attach_paged_source` leaves without a page-file source.
+    // No production caller yet — see `PersistedIndex`'s doc.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    persist: Option<PersistedIndex<IK, K>>,
 }
 
 impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
     /// Creates a new, empty unique index storage.
     pub fn new() -> Self {
-        Self { tree: BTree::new() }
+        Self {
+            tree: BTree::new(),
+            #[cfg(feature = "persistence")]
+            persist: None,
+        }
     }
 
-    /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
-    pub(crate) fn from_btree(tree: BTree<IK, K>) -> Self {
-        Self { tree }
+    /// A storage stamped for the paged path — see [`PersistedIndex`].
+    // No production caller yet — see `PersistedIndex`'s doc.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    pub(crate) fn new_persisted(persist: (u32, u32)) -> Self
+    where
+        IK: PrimaryKey,
+    {
+        let (ik_type_id, generation) = persist;
+        let codec = NodeCodec::<IK, K>::unique_index::<IK, K>();
+        let codec_for_encode = codec.clone();
+        Self {
+            tree: BTree::new(),
+            persist: Some(PersistedIndex {
+                ik_type_id,
+                generation,
+                encode: Arc::new(move |node| codec_for_encode.encode(node)),
+                attach: Arc::new(move |tree, file, stats, name| {
+                    let source: Arc<PagedSource<IK, K>> =
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                    tree.set_source(Some(source));
+                }),
+            }),
+        }
     }
 
     /// The row key indexed under `key`, if present.
@@ -333,17 +612,48 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> IndexStorage<IK, K>
 #[derive(Clone)]
 pub(crate) struct NonUniqueStorage<IK: Ord + Clone, K: PrimaryKey> {
     tree: BTree<(IK, K), ()>,
+    /// See the field doc on `UniqueStorage` — same contract, just keyed by
+    /// the composite `(IK, K)` this storage's tree actually uses.
+    // No production caller yet — see `PersistedIndex`'s doc.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    persist: Option<PersistedIndex<(IK, K), ()>>,
 }
 
 impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK, K> {
     /// Creates a new, empty non-unique index storage.
     pub fn new() -> Self {
-        Self { tree: BTree::new() }
+        Self {
+            tree: BTree::new(),
+            #[cfg(feature = "persistence")]
+            persist: None,
+        }
     }
 
-    /// Construct from a fully-built B-tree. Used by the bulk-load index primitive.
-    pub(crate) fn from_btree(tree: BTree<(IK, K), ()>) -> Self {
-        Self { tree }
+    /// A storage stamped for the paged path — see [`PersistedIndex`].
+    // No production caller yet — see `PersistedIndex`'s doc.
+    #[allow(dead_code)]
+    #[cfg(feature = "persistence")]
+    pub(crate) fn new_persisted(persist: (u32, u32)) -> Self
+    where
+        IK: PrimaryKey,
+    {
+        let (ik_type_id, generation) = persist;
+        let codec = NodeCodec::<(IK, K), ()>::non_unique_index::<IK, K>();
+        let codec_for_encode = codec.clone();
+        Self {
+            tree: BTree::new(),
+            persist: Some(PersistedIndex {
+                ik_type_id,
+                generation,
+                encode: Arc::new(move |node| codec_for_encode.encode(node)),
+                attach: Arc::new(move |tree, file, stats, name| {
+                    let source: Arc<PagedSource<(IK, K), ()>> =
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                    tree.set_source(Some(source));
+                }),
+            }),
+        }
     }
 
     /// Row keys sharing the index key `key`, ascending. O(log n + k) — the
@@ -502,6 +812,27 @@ impl<R: Record, K: PrimaryKey, I: CustomIndex<R, K> + 'static> IndexMaintainer<R
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    #[cfg(feature = "persistence")]
+    fn attach_paged_source(&mut self, _file: Arc<PageFile>, _stats: Arc<PagedStats>, _table_name: &str) {
+        // A custom index's internal storage is opaque to this generic
+        // maintainer (see `empty_clone` above) — never paged.
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_write(&self, _ctx: &PagedCtx) -> Result<Option<PagedIndexEntry>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_changed_pages(&self, _prev: &dyn IndexMaintainer<R, K>) -> Vec<PageId> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_generation(&self) -> u32 {
+        0
     }
 }
 
