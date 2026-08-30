@@ -1484,6 +1484,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "io-uring",
+ "libc",
  "memmap2",
  "metrics",
  "mimalloc",

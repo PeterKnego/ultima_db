@@ -108,6 +108,8 @@ pub mod metrics;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 mod overlay;
+#[cfg(feature = "persistence")]
+mod pagefile;
 pub mod persistence;
 pub mod primary_key;
 #[cfg(feature = "persistence")]

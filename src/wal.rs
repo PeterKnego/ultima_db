@@ -629,7 +629,7 @@ fn write_entry_to_file(file: &mut File, entry: &WalEntry) -> Result<()> {
 /// On error the file may be left physically longer than `from` with that
 /// extension un-`sync_all`'d, so callers that care about the durability
 /// invariant must roll the size back — see `PreallocFileSink::sync`.
-fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
+pub(crate) fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     if to <= from {
         return Ok(());

@@ -46,7 +46,7 @@ default = []
 fanout-t8 = []
 fulltext = []
 metrics = ["dep:metrics"]
-persistence = ["dep:serde", "dep:bincode"]
+persistence = ["dep:serde", "dep:bincode", "dep:libc"]
 # Exposes internal handles (e.g. BenchWal) for the benches/ crate. Not a public API.
 bench-internals = ["persistence", "dep:memmap2"]
 wal-iouring = ["persistence", "dep:io-uring"]
@@ -68,6 +68,7 @@ memmap2 = { version = "0.9", optional = true }
 dashmap = "6"
 crc32fast = "1"
 io-uring = { version = "0.7", optional = true }
+libc = { version = "0.2", optional = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 
