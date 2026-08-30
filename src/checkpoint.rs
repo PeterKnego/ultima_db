@@ -2840,6 +2840,7 @@ mod tests {
         let src = crate::Store::new(crate::StoreConfig {
             persistence: crate::Persistence::Smr {
                 dir: dir.path().to_path_buf(),
+                paged: None,
             },
             ..crate::StoreConfig::default()
         })
@@ -2883,6 +2884,7 @@ mod tests {
         let store = crate::Store::new(crate::StoreConfig {
             persistence: crate::Persistence::Smr {
                 dir: dir.path().to_path_buf(),
+                paged: None,
             },
             ..crate::StoreConfig::default()
         })

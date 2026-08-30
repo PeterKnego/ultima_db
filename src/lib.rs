@@ -147,11 +147,13 @@ pub use index::{CustomIndex, IndexKind};
 pub use index::IndexDef;
 pub use intents::CommitWaiter;
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
-pub use persistence::{Durability, Persistence, Record, WalWrite};
+pub use persistence::{Durability, PagedOptions, Persistence, Record, WalWrite};
 pub use primary_key::{AutoKey, PrimaryKey};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;
 pub use snapshot_stream::{InstallOptions, OnExtra, OnUnknown, SnapshotStreamError};
+#[cfg(feature = "persistence")]
+pub use store::PagedStatsSnapshot;
 pub use store::{IsolationLevel, Readable, Store, StoreConfig, VersionPin, WriterMode};
 pub use table::{Table, TableDef, TableOpener};
 pub use transaction::{ReadTx, TableReader, TableWriter, WriteTx};

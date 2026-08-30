@@ -469,10 +469,41 @@ pub(crate) struct StoreInner {
     /// [`StoreConfig::checkpoint_chain_max`] to decide when a full is due.
     #[cfg(feature = "persistence")]
     checkpoint_chain_len: usize,
+    /// Paged-checkpoint state, present iff `config.persistence` carries
+    /// [`PagedOptions`](crate::persistence::PagedOptions) (see
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged)).
+    /// `None` for a plain row-format-checkpoint or in-memory store —
+    /// `checkpoint_impl` branches on this to pick the paged vs row-format
+    /// checkpoint path.
+    #[cfg(feature = "persistence")]
+    pub(crate) paged: Option<PagedState>,
     /// Test-only mock WAL for controlled fsync testing.
     #[cfg(all(test, feature = "persistence"))]
     pub(crate) mock_wal: Option<std::sync::Arc<crate::wal::MockWal>>,
     pub(crate) metrics: Arc<StoreMetrics>,
+}
+
+/// Paged-checkpoint bookkeeping held on [`StoreInner`]. Populated once at
+/// [`Store::new`] when `config.persistence` carries
+/// [`PagedOptions`](crate::persistence::PagedOptions).
+#[cfg(feature = "persistence")]
+pub(crate) struct PagedState {
+    /// The store's single page file (`pages.bin`), shared by every paged
+    /// table and index.
+    pub(crate) file: Arc<crate::pagefile::PageFile>,
+    /// Paging counters shared across every paged table/index — see
+    /// [`Store::paged_stats`].
+    pub(crate) stats: Arc<crate::pagecodec::PagedStats>,
+    pub(crate) opts: crate::persistence::PagedOptions,
+    /// The snapshot and version the last successful paged checkpoint wrote
+    /// — `None` before the first one. Holding the `Arc` keeps that
+    /// snapshot's tree nodes alive for a later task's dead-page diff, the
+    /// same way [`StoreInner::checkpoint_base`] keeps a row-format base
+    /// alive.
+    pub(crate) last_root: Option<(Arc<Snapshot>, u64)>,
+    /// When the last successful paged checkpoint finished — the background
+    /// checkpointer's (a later task) time-trigger clock.
+    pub(crate) last_checkpoint_at: std::time::Instant,
 }
 
 impl StoreInner {
@@ -530,6 +561,30 @@ pub struct Store {
     checkpoint_lock: Arc<Mutex<()>>,
 }
 
+/// A point-in-time snapshot of a paged store's paging counters. See
+/// [`Store::paged_stats`].
+#[cfg(feature = "persistence")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PagedStatsSnapshot {
+    /// Total pages faulted in (data + index).
+    pub page_faults: u64,
+    /// Of `page_faults`, how many were data pages.
+    pub data_page_faults: u64,
+    /// Of `page_faults`, how many were index pages.
+    pub index_page_faults: u64,
+    /// Pages written by a checkpoint since the store opened.
+    pub pages_written: u64,
+    /// Leaves demoted back to on-disk by the evictor.
+    pub leaves_demoted: u64,
+    /// Bytes reported dirty (a clean node CoW'd by a write).
+    pub dirty_bytes: u64,
+    /// Estimated resident (not-yet-demoted) leaf bytes, clamped to `0`.
+    pub resident_leaf_bytes_est: u64,
+    /// Number of times the background checkpointer has run. Always `0`
+    /// until the background checkpointer (a later task) lands.
+    pub checkpointer_runs: u64,
+}
+
 impl Store {
     /// Creates a new, empty store. The initial version is 0.
     ///
@@ -558,7 +613,7 @@ impl Store {
         let wal_poison = Arc::new(crate::wal::WalPoison::new());
         #[cfg(feature = "persistence")]
         let wal_handle = match &config.persistence {
-            crate::persistence::Persistence::Standalone { dir, durability, wal_write } => {
+            crate::persistence::Persistence::Standalone { dir, durability, wal_write, .. } => {
                 use crate::persistence::Durability;
                 // ConsistentInline appends inline in lock-acquisition order, which
                 // only equals version order under a single writer. MultiWriter
@@ -607,6 +662,45 @@ impl Store {
         );
         #[cfg(not(feature = "persistence"))]
         let wal_consistent = false;
+
+        // Open the page file and seed paging state iff this store was
+        // configured with `Persistence::paged`. `Persistence::None` can
+        // never reach here with `paged_opts()` returning `Some` — it is a
+        // unit variant with nowhere to carry `PagedOptions`, and
+        // `Persistence::paged` refuses to attach them to it in the first
+        // place — so there is no `Persistence::None` case to reject here.
+        #[cfg(feature = "persistence")]
+        let paged: Option<PagedState> = match config.persistence.paged_opts() {
+            Some(opts) => {
+                let dir = match &config.persistence {
+                    crate::persistence::Persistence::Standalone { dir, .. }
+                    | crate::persistence::Persistence::Smr { dir, .. } => dir.clone(),
+                    crate::persistence::Persistence::None => unreachable!(
+                        "Persistence::paged_opts() is Some only for Standalone/Smr; \
+                         Persistence::None cannot carry PagedOptions"
+                    ),
+                };
+                let path = crate::pagefile::page_file_path(&dir);
+                // Cursor 0: a fresh file, or (until a later task's recovery
+                // repositions it) whatever this file already holds — every
+                // paged table attaches with no root page yet, so nothing
+                // here reads past the cursor regardless.
+                let file = Arc::new(crate::pagefile::PageFile::open(
+                    &path,
+                    0,
+                    opts.prealloc_chunk_bytes,
+                    opts.page_prefetch_bytes,
+                )?);
+                Some(PagedState {
+                    file,
+                    stats: Arc::new(crate::pagecodec::PagedStats::default()),
+                    opts: opts.clone(),
+                    last_root: None,
+                    last_checkpoint_at: std::time::Instant::now(),
+                })
+            }
+            None => None,
+        };
 
         // Read once per store, not per open_table: the overlay is a
         // SingleWriter-only optimization (MultiWriter always gets 0 — its
@@ -663,6 +757,8 @@ impl Store {
                 checkpoint_base: None,
                 #[cfg(feature = "persistence")]
                 checkpoint_chain_len: 0,
+                #[cfg(feature = "persistence")]
+                paged,
                 #[cfg(all(test, feature = "persistence"))]
                 mock_wal: None,
                 metrics,
@@ -1019,12 +1115,22 @@ impl Store {
         // could otherwise prune/cleanup state only the faster one covers.
         let _serialize = self.checkpoint_lock.lock();
 
+        // Paged checkpoints have their own dirty-node-walk + root-record
+        // path (phases 1-2 of the paged design — no leaf demotion, no
+        // recovery, no background checkpointer thread yet). `force_full`
+        // and `StoreConfig::checkpoint_chain_max` are row-format-only
+        // knobs: a paged root is always self-contained, never part of a
+        // delta chain, so neither applies.
+        if self.inner.read().paged.is_some() {
+            return self.checkpoint_impl_paged();
+        }
+
         let (dir, snap, registry, base_candidate) = {
             let inner = self.inner.read();
             inner.wal_poison.check()?;
             let dir = match &inner.config.persistence {
                 crate::persistence::Persistence::Standalone { dir, .. }
-                | crate::persistence::Persistence::Smr { dir } => dir.clone(),
+                | crate::persistence::Persistence::Smr { dir, .. } => dir.clone(),
                 crate::persistence::Persistence::None => {
                     return Err(Error::Persistence(
                         "checkpoint requires persistence to be configured".into(),
@@ -1189,6 +1295,237 @@ impl Store {
         Ok(version)
     }
 
+    /// The paged checkpoint path: writes every registered table's dirty
+    /// (never-yet-on-disk) B-tree nodes to the page file, then a single
+    /// root record (`checkpoint_{version}.root`) naming each table's
+    /// current root page. Phases 1-2 of the paged checkpoint design — no
+    /// leaf demotion, no recovery, no background checkpointer thread (all
+    /// later tasks in this feature's sequence).
+    #[cfg(feature = "persistence")]
+    fn checkpoint_impl_paged(&self) -> Result<u64> {
+        use crate::checkpoint::{PagedRoot, PagedTableEntry, cleanup_old_roots, write_paged_root};
+        use crate::table::PagedCtx;
+
+        let (dir, snap, registry, file, stats, opts) = {
+            let inner = self.inner.read();
+            inner.wal_poison.check()?;
+            let dir = match &inner.config.persistence {
+                crate::persistence::Persistence::Standalone { dir, .. }
+                | crate::persistence::Persistence::Smr { dir, .. } => dir.clone(),
+                crate::persistence::Persistence::None => {
+                    return Err(Error::Persistence(
+                        "checkpoint requires persistence to be configured".into(),
+                    ));
+                }
+            };
+            let snap = inner.snapshots[&inner.latest_version].clone();
+            let registry = Arc::clone(&inner.registry);
+            let paged = inner
+                .paged
+                .as_ref()
+                .expect("checkpoint_impl_paged is only reached when inner.paged is Some");
+            let file = Arc::clone(&paged.file);
+            let stats = Arc::clone(&paged.stats);
+            let opts = paged.opts.clone();
+            (dir, snap, registry, file, stats, opts)
+        }; // read lock released here
+
+        let ctx = PagedCtx {
+            file: &file,
+            stats: &stats,
+        };
+        let mut entries: Vec<PagedTableEntry> = Vec::new();
+        // Tracks the most recently published `Arc<Snapshot>` at
+        // `snap.version` across the loop below, so `PagedState::last_root`
+        // ends up naming the fully-attached/fully-written state rather
+        // than the pre-loop snapshot this function started from.
+        let mut current: Arc<Snapshot> = Arc::clone(&snap);
+
+        for name in snap.table_names() {
+            // Only registered tables can be paged-written: `paged_write`
+            // is reached through the registry's `attach_paged` closure,
+            // and an unregistered table has no closure to downcast with
+            // (mirrors `serialize_snapshot`'s `registry.contains` filter
+            // for row-format checkpoints).
+            if !registry.contains(&name) {
+                continue;
+            }
+            let info = registry.get(&name).expect("just checked registry.contains");
+            let Some(live) = snap.tables.get(&name) else {
+                continue;
+            };
+
+            // Always clone, then (re-)attach, then write: `paged_write`
+            // assigns page ids to `Child` slots via interior mutability on
+            // nodes shared below the tree's root (unchanged subtrees are
+            // the same `Arc<BTreeNode>` across a `Table::clone` — see
+            // `BTree::clone`'s doc), but the *root* `Child`'s own id is
+            // only ever visible on whichever `Table` value `paged_write`
+            // was actually called on, because `BTree::clone` deep-clones
+            // just the root wrapper. `Store` never holds `&mut` on a live
+            // snapshot's `Arc<dyn MergeableTable>` — every call here
+            // necessarily runs against a fresh clone — so that clone (with
+            // its root id now set, and, on the overlay path, every
+            // buffered row) must be re-published via `install_table_clone`
+            // below or everything `paged_write` just wrote is reachable
+            // only from a value nothing keeps alive.
+            //
+            // Re-attaching unconditionally (rather than only for a table
+            // that has never been attached) is correct, not just
+            // convenient: `attach_paged_source`'s replaces only the tree's
+            // fault-in pointer, never a node's own dirty/page-id state
+            // (see `BTree::set_source`'s doc), so redoing it is a no-op
+            // for an already-attached table. It is also necessary: a
+            // table's attach state does not survive a `WriteTx` commit
+            // that touched it (the committed table is the writer's own
+            // dirty clone, taken from whatever `latest` looked like at
+            // `open_table` time — which may predate the last checkpoint's
+            // attach), so whether a table "already has a source" cannot be
+            // decided once and cached here.
+            let mut boxed = live.boxed_clone();
+            (info.attach_paged)(boxed.as_any_mut(), Arc::clone(&file), Arc::clone(&stats), &name)?;
+            let (entry, flushed) = boxed.paged_write(&ctx)?;
+            let final_table = flushed.unwrap_or(boxed);
+
+            if let Some(new_snap) = self.install_table_clone(snap.version, &name, final_table) {
+                current = new_snap;
+            }
+            entries.push(entry);
+        }
+
+        file.sync()?;
+
+        let root = PagedRoot {
+            version: snap.version,
+            file_end: file.file_end(),
+            tables: entries,
+            // A later task fills this in from a diff against `last_root`.
+            dead_pages: Vec::new(),
+        };
+        write_paged_root(&dir, &root)?;
+
+        {
+            let mut inner = self.inner.write();
+            if let Some(p) = inner.paged.as_mut() {
+                p.last_root = Some((current, snap.version));
+                p.last_checkpoint_at = std::time::Instant::now();
+            }
+        }
+
+        // WAL prune — same call path as the row-format branch above,
+        // simplified: a paged root is always self-contained (never part of
+        // a delta chain, unlike a row-format checkpoint — see `PagedRoot`'s
+        // doc), so pruning up to `snap.version` is unconditionally safe
+        // once the root record above is durable.
+        let prune_rx = {
+            let inner = self.inner.read();
+            match (&inner.config.persistence, &inner.wal_handle) {
+                (crate::persistence::Persistence::Standalone { .. }, Some(wal)) => {
+                    Some(wal.request_prune(snap.version)?)
+                }
+                _ => None,
+            }
+        };
+        if let Some(rx) = prune_rx {
+            match rx.recv() {
+                Ok(res) => res?,
+                Err(_) => {
+                    // WAL thread stopped before pruning: poisoned (surface
+                    // that error) or shutting down.
+                    self.inner.read().wal_poison.check()?;
+                    return Err(Error::Persistence(
+                        "WAL writer stopped before prune completed".into(),
+                    ));
+                }
+            }
+        }
+
+        cleanup_old_roots(&dir, opts.retained_checkpoints)?;
+
+        Ok(snap.version)
+    }
+
+    /// Re-publish `table` as the table named `name` at `version` — the
+    /// SAME version number, not a new commit: no WAL entry, no write-set
+    /// bookkeeping, no version bump. Used by [`Store::checkpoint_impl_paged`]
+    /// after `attach_paged_source`/`paged_write` produce a table clone that
+    /// supersedes what is currently published at `version` (the live table
+    /// itself is never mutated in place — `Store` only ever holds it
+    /// behind a shared `Arc`).
+    ///
+    /// Targets `version` explicitly rather than reading
+    /// `inner.latest_version` fresh: the paged checkpoint's per-table loop
+    /// can run across several calls to this function while concurrent
+    /// commits land, each of which advances `latest_version` past the
+    /// version this checkpoint captured — reading `latest_version` afresh
+    /// here would install into the wrong snapshot.
+    ///
+    /// Safe to interleave with [`WriteTx::commit`]: every commit path
+    /// (`commit_single_writer`, and `commit_multi_writer`'s promotion step)
+    /// re-reads `snapshots[latest_version]` fresh under its own final
+    /// `inner.write()` acquisition rather than an earlier-captured
+    /// reference, so whichever of this swap and a commit's install runs
+    /// first under the shared lock, the other observes it correctly — no
+    /// lost update, no torn read.
+    ///
+    /// Returns the newly published `Arc<Snapshot>`, or `None` if `version`
+    /// is no longer present in `snapshots` (evicted by a concurrent `gc()`
+    /// — a paged checkpoint holds no pin on the version it is writing). In
+    /// that case the pages just written are simply unreachable from any
+    /// live snapshot; nothing here claims them as live, so a later task's
+    /// dead-page tracking is unaffected.
+    #[cfg(feature = "persistence")]
+    fn install_table_clone(
+        &self,
+        version: u64,
+        name: &str,
+        table: Box<dyn MergeableTable>,
+    ) -> Option<Arc<Snapshot>> {
+        let mut inner = self.inner.write();
+        let existing = inner.snapshots.get(&version)?;
+        let mut tables = existing.tables.clone();
+        tables.insert(name.to_string(), Arc::from(table));
+        let snapshot = Arc::new(Snapshot {
+            version,
+            tables,
+        });
+        inner.snapshots.insert(version, Arc::clone(&snapshot));
+        Some(snapshot)
+    }
+
+    /// Snapshot of this store's paged-checkpoint counters, or `None` if it
+    /// was not configured with [`Persistence::paged`](crate::persistence::Persistence::paged).
+    #[cfg(feature = "persistence")]
+    pub fn paged_stats(&self) -> Option<PagedStatsSnapshot> {
+        let inner = self.inner.read();
+        let paged = inner.paged.as_ref()?;
+        let s = &paged.stats;
+        Some(PagedStatsSnapshot {
+            page_faults: s.page_faults.load(Ordering::Relaxed),
+            data_page_faults: s.data_page_faults.load(Ordering::Relaxed),
+            index_page_faults: s.index_page_faults.load(Ordering::Relaxed),
+            pages_written: s.pages_written.load(Ordering::Relaxed),
+            leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
+            dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
+            resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
+            // The background checkpointer (a later task) hasn't landed
+            // yet, so this is always 0 until then.
+            checkpointer_runs: 0,
+        })
+    }
+
+    /// The paged checkpoint page file's current write cursor (`file_end`),
+    /// or `None` if this store was not configured with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged).
+    ///
+    /// Test-only escape hatch for a later task's recovery tests; not part
+    /// of the stable public API.
+    #[cfg(feature = "persistence")]
+    #[doc(hidden)]
+    pub fn paged_file_end(&self) -> Option<u64> {
+        self.inner.read().paged.as_ref().map(|p| p.file.file_end())
+    }
+
     /// Refuse to replay a WAL op whose key was encoded with a different key
     /// type than the table is registered with in this build.
     ///
@@ -1234,7 +1571,7 @@ impl Store {
         let dir = {
             let inner = self.inner.read();
             match &inner.config.persistence {
-                Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
+                Persistence::Standalone { dir, .. } | Persistence::Smr { dir, .. } => dir.clone(),
                 Persistence::None => return Ok(()),
             }
         };
@@ -1470,7 +1807,7 @@ impl Store {
         let dir = {
             let inner = self.inner.read();
             match &inner.config.persistence {
-                Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
+                Persistence::Standalone { dir, .. } | Persistence::Smr { dir, .. } => dir.clone(),
                 Persistence::None => return Ok(Vec::new()),
             }
         };
@@ -1522,7 +1859,7 @@ impl Store {
         let (dir, registry) = {
             let inner = self.inner.read();
             let dir = match &inner.config.persistence {
-                Persistence::Standalone { dir, .. } | Persistence::Smr { dir } => dir.clone(),
+                Persistence::Standalone { dir, .. } | Persistence::Smr { dir, .. } => dir.clone(),
                 Persistence::None => {
                     return Err(SnapshotStreamError::BulkLoad(crate::Error::Persistence(
                         "open_checkpoint_reader requires persistence to be configured".into(),

@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::btree::Change;
+use crate::pagecodec::PagedStats;
+use crate::pagefile::PageFile;
 use crate::persistence::Record;
 use crate::primary_key::{
     PrimaryKey, auto_counter_seed, check_encoded_key_len, key_type_mismatch_msg,
@@ -58,6 +60,15 @@ type BuildFromRawRowsFn = Box<
         + Send
         + Sync,
 >;
+/// Attach a page file/stats as a `Table<R, K>`'s (as `&mut dyn Any`)
+/// on-disk paging source, delegating to `Table::attach_paged_source`. Lets
+/// a caller that only holds `&mut dyn Any` (via
+/// `MergeableTable::as_any_mut`) attach a table it cannot name `R`/`K`
+/// for — `Store::checkpoint`'s paged branch (task 8) is the first
+/// production caller; a later task's recovery path reuses it to attach a
+/// table rebuilt from a checkpoint's `PagedRoot` before its first read.
+type AttachPagedFn =
+    Box<dyn Fn(&mut dyn Any, Arc<PageFile>, Arc<PagedStats>, &str) -> Result<()> + Send + Sync>;
 
 /// Type-erased serialization functions for a single table type.
 pub(crate) struct TableTypeInfo {
@@ -135,6 +146,8 @@ pub(crate) struct TableTypeInfo {
     /// definitions are cloned and rebuilt over the new rows so secondary
     /// indexes survive the install.
     pub build_from_raw_rows: BuildFromRawRowsFn,
+    /// See [`AttachPagedFn`].
+    pub attach_paged: AttachPagedFn,
 }
 
 /// Registry mapping table names to their type-erased serializers.
@@ -349,6 +362,13 @@ impl TableRegistry {
                             .unwrap_or_default();
                         let table = Table::<R, K>::from_bulk(sorted, next_id, index_defs)?;
                         Ok(Box::new(table))
+                    }),
+                    attach_paged: Box::new(|table_any, file, stats, name| {
+                        let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
+                            Error::TypeMismatch("attach_paged downcast failed".into())
+                        })?;
+                        table.attach_paged_source(file, stats, name);
+                        Ok(())
                     }),
                 });
                 Ok(())
