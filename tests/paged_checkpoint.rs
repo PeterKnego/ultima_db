@@ -67,11 +67,97 @@ fn paged_checkpoint_writes_root_and_pages_only_for_dirty_nodes() {
         w.commit().unwrap();
     }
     s.checkpoint().unwrap();
-    let delta = s.paged_stats().unwrap().pages_written - pages_after_first;
+    let pages_after_update = s.paged_stats().unwrap().pages_written;
+    let delta = pages_after_update - pages_after_first;
     assert!((3..=5).contains(&delta), "leaf + inner path + root, got {delta}");
+    let installs_after_update = s.paged_install_count_for_test().unwrap();
     assert!(
-        s.paged_install_count_for_test().unwrap() > installs_after_first,
+        installs_after_update > installs_after_first,
         "a checkpoint that actually wrote new pages must install"
+    );
+
+    // A fourth checkpoint, with no intervening commit, must be a true
+    // no-op: zero pages written, zero installs. Round-1 of this fix got
+    // this wrong — the update's checkpoint (the one just above) wrote the
+    // live table's root page id onto a throwaway clone only, since
+    // `newly_attached`/`flushed.is_some()` were both false there (the
+    // table was already attached, and the update went through the
+    // no-overlay fast path). Without installing that clone, `live`'s own
+    // root `Child` stayed dirty forever, so *this* checkpoint would find
+    // the root dirty again and write it once more.
+    s.checkpoint().unwrap();
+    assert_eq!(
+        s.paged_stats().unwrap().pages_written,
+        pages_after_update,
+        "a checkpoint with nothing new to write must write zero pages"
+    );
+    assert_eq!(
+        s.paged_install_count_for_test().unwrap(),
+        installs_after_update,
+        "a checkpoint with nothing new to write must install nothing"
+    );
+}
+
+#[test]
+fn multiwriter_paged_checkpoint_settles_to_a_true_no_op() {
+    // `WriterMode::MultiWriter` always sets the write-overlay cap to 0 (see
+    // `StoreInner::overlay_cap`'s doc), so `MergeableTable::paged_write`
+    // never takes the clone-and-flush path — `flushed` is unconditionally
+    // `None` under MultiWriter. Before this fix, that meant an
+    // already-attached MultiWriter table's writes could never trigger an
+    // install: the `wrote_pages > 0` condition is what covers this case.
+    let d = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(d.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().build())
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(ultima_db::WriterMode::MultiWriter)
+            .build(),
+    )
+    .unwrap();
+    s.register_table::<Row>("rows").unwrap();
+
+    {
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        for i in 0..1_000 {
+            t.insert(Row { v: i }).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    s.checkpoint().unwrap();
+    let pages_after_first = s.paged_stats().unwrap().pages_written;
+    assert!(pages_after_first > 0);
+
+    {
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update(5, Row { v: 999 }).unwrap();
+        w.commit().unwrap();
+    }
+    s.checkpoint().unwrap();
+    let pages_after_update = s.paged_stats().unwrap().pages_written;
+    assert!(
+        pages_after_update > pages_after_first,
+        "the update's checkpoint must write new pages even with no overlay involved"
+    );
+    let installs_after_update = s.paged_install_count_for_test().unwrap();
+
+    // No-op: no intervening commit. Must write zero pages and install
+    // nothing — proves the previous checkpoint's install correctly
+    // republished the live root, rather than leaving it permanently dirty.
+    s.checkpoint().unwrap();
+    assert_eq!(
+        s.paged_stats().unwrap().pages_written,
+        pages_after_update,
+        "a MultiWriter no-op checkpoint must write zero pages"
+    );
+    assert_eq!(
+        s.paged_install_count_for_test().unwrap(),
+        installs_after_update,
+        "a MultiWriter no-op checkpoint must install nothing"
     );
 }
 

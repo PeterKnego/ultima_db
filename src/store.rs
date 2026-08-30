@@ -1404,21 +1404,32 @@ impl Store {
             // That clone only needs to be re-published when it actually
             // diverged from what's already live — `newly_attached` (this
             // call transitioned the table from unattached to attached, via
-            // `Table::is_paged_attached`) or `flushed.is_some()` (an
-            // overlay was cloned-and-flushed; see
-            // `MergeableTable::paged_write`'s doc). An already-attached
-            // table whose `paged_write` took the fast (no-overlay) path
-            // and returned `None` learned nothing durable the live
-            // snapshot doesn't already have: the fast path writes directly
-            // against `self.data`'s `Child` slots, so on a table that was
-            // already attached and already clean, nothing was dirty to
-            // write and the clone's tree is byte-for-byte what `live`
-            // already publishes.
+            // `Table::is_paged_attached`), `flushed.is_some()` (an overlay
+            // was cloned-and-flushed; see `MergeableTable::paged_write`'s
+            // doc), or `wrote_pages > 0` (the fast, no-overlay path wrote
+            // at least one page — which, on an already-attached table, it
+            // still can: `write_dirty` assigns the freshly-written *root*
+            // page id to `boxed`'s own root `Child` cell, and that cell is
+            // per-clone, not shared with `live`'s (unlike every node
+            // *below* the root, which stays the same `Arc<BTreeNode>`
+            // across a clone — see `BTree::clone`'s doc). Skipping the
+            // install here would strand that id: `live`'s root stays
+            // dirty forever, and every later checkpoint re-writes it from
+            // scratch. This is not limited to `SingleWriter`'s write
+            // overlay — a table with a secondary index, or a `MultiWriter`
+            // store (whose overlay cap is always 0, so `flushed` is always
+            // `None`), can dirty the root via the fast path alone, with no
+            // overlay involved at all — so `wrote_pages` is measured
+            // directly off `stats.pages_written` (this loop is
+            // single-threaded, so a before/after read is exact) rather
+            // than inferred from `newly_attached`/`flushed`.
+            let pages_before = stats.pages_written.load(Ordering::Relaxed);
             let mut boxed = live.boxed_clone();
             let newly_attached =
                 (info.attach_paged)(boxed.as_any_mut(), Arc::clone(&file), Arc::clone(&stats), &name)?;
             let (entry, flushed) = boxed.paged_write(&ctx)?;
-            let needs_install = newly_attached || flushed.is_some();
+            let wrote_pages = stats.pages_written.load(Ordering::Relaxed) - pages_before;
+            let needs_install = newly_attached || flushed.is_some() || wrote_pages > 0;
             let final_table = flushed.unwrap_or(boxed);
             if needs_install {
                 to_install.push((name.clone(), final_table));
