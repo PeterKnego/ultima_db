@@ -109,6 +109,8 @@ pub mod metrics;
 pub(crate) mod mutation;
 mod overlay;
 #[cfg(feature = "persistence")]
+mod pagecodec;
+#[cfg(feature = "persistence")]
 mod pagefile;
 pub mod persistence;
 pub mod primary_key;
