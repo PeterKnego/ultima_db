@@ -340,8 +340,14 @@ impl<K, V> Child<K, V> {
         }
     }
     pub(crate) fn load_arc(&self, src: Option<&dyn NodeSource<K, V>>) -> Arc<BTreeNode<K, V>> {
-        let p = self.load(src) as *const BTreeNode<K, V>;
-        // SAFETY: p came from Arc::into_raw and the slot still owns one count.
+        self.load(src); // ensure resident; discard the borrow
+        let p = self.node.load(Ordering::Acquire) as *const BTreeNode<K, V>;
+        // SAFETY: p came straight from the slot's AtomicPtr, i.e. from Arc::into_raw;
+        // the slot still owns one count, so the allocation is live. (Deriving the
+        // pointer from the `&BTreeNode` `load` returns instead is UB — Miri rejects
+        // it under both Stacked and Tree Borrows: that borrow's provenance is
+        // read-only and bounded to the payload, but increment_strong_count writes
+        // through it to the ArcInner's refcount.)
         unsafe { Arc::increment_strong_count(p); Arc::from_raw(p) }
     }
     pub(crate) fn strong_count(&self) -> Option<usize> {

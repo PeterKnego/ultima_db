@@ -174,8 +174,16 @@ impl<K, V> Child<K, V> {
     /// Like [`Self::load`], but hands back an owned `Arc` (bumping the
     /// refcount) instead of a borrow tied to `&self`.
     pub(crate) fn load_arc(&self, src: Option<&dyn NodeSource<K, V>>) -> Arc<BTreeNode<K, V>> {
-        let p = self.load(src) as *const BTreeNode<K, V>;
-        // SAFETY: p came from Arc::into_raw and the slot still owns one count.
+        self.load(src); // ensure resident; discard the borrow
+        let p = self.node.load(Ordering::Acquire) as *const BTreeNode<K, V>;
+        // SAFETY: p came straight from the slot's AtomicPtr, i.e. from
+        // Arc::into_raw; the slot still owns one count, so the allocation is
+        // live. (Deriving the pointer from the `&BTreeNode` that `load`
+        // returns instead — provenance read-only, bounded to the payload —
+        // is UB: `increment_strong_count` writes through it to the
+        // ArcInner's refcount at offset 0, which that borrow's provenance
+        // does not cover. Miri rejects that version under both Stacked and
+        // Tree Borrows.)
         unsafe {
             Arc::increment_strong_count(p);
             Arc::from_raw(p)
@@ -271,8 +279,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::btree::BTreeNode;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Barrier, Mutex};
 
     /// In-memory "disk": page id -> node. Counts reads.
     pub(crate) struct MockDisk<K, V> {
@@ -390,11 +398,17 @@ pub(crate) mod tests {
         let disk = Arc::new(MockDisk::new());
         disk.put(9, leaf(&[1]));
         let c: Arc<Child<u64, u64>> = Arc::new(Child::on_disk(9));
+        // Line every thread up at the gate so all 8 race `fault_in` together —
+        // without this, thread 0 can win (and publish the pointer) before
+        // thread 7 is even spawned, and the loser-drop path never executes.
+        let barrier = Arc::new(Barrier::new(8));
         let hs: Vec<_> = (0..8)
             .map(|_| {
                 let c = c.clone();
                 let d = disk.clone();
+                let b = barrier.clone();
                 std::thread::spawn(move || {
+                    b.wait();
                     c.load(Some(&*d));
                 })
             })
@@ -403,6 +417,41 @@ pub(crate) mod tests {
             h.join().unwrap();
         }
         assert_eq!(c.strong_count(), Some(1), "losers must drop their copies");
+        assert!(disk.reads.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn set_page_id_preserves_accessed_bit() {
+        // set_page_id only touches the id bits; a second-chance bit set
+        // before the call must survive it.
+        let c = Child::resident(leaf(&[1]));
+        c.mark_accessed();
+        c.set_page_id(4096);
+        assert_eq!(c.page_id(), Some(4096));
+        assert!(c.take_accessed(), "set_page_id must preserve a pre-existing accessed bit");
+        assert!(!c.take_accessed());
+    }
+
+    #[test]
+    fn set_page_id_terminates_under_concurrent_mark_accessed() {
+        // set_page_id's CAS loop retries whenever `meta` changes underneath
+        // it; a thread hammering mark_accessed (also a `meta` RMW) must not
+        // starve it out.
+        let c = Arc::new(Child::<u64, u64>::resident(leaf(&[1])));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = {
+            let c = c.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    c.mark_accessed();
+                }
+            })
+        };
+        c.set_page_id(4096);
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert_eq!(c.page_id(), Some(4096), "the id must land despite the concurrent accessed-bit writer");
     }
 
     #[test]
