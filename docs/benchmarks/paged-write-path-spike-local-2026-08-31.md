@@ -59,6 +59,19 @@ run-phase deltas; knobs ee0769a/ea2a165). Data: `data-paged-write-path-spike-202
   ReDB's 18.8k** at a tighter budget than the fs-paged run. Corroborated by
   the task16 acceptance JSON (A.json: 1531 → 4647 ops/s, 256 MiB cgroup).
 
+### Addendum: spike7 — mimalloc A/B (same cells as spike6, bench-mimalloc builds)
+
+| cell | run1 ops/s | majflt/op | run2 (compact) |
+|---|---|---|---|
+| mi-A (T=32, mimalloc) | 1,259 (+29% vs glibc) | 13.7 | 4,320 (+16%) |
+| mit8-A (T=8, mimalloc) | **6,222 (2.1x vs glibc-t8)** | 1.72 | **24,882 (1.9x)** |
+
+t8 + mimalloc + compact heap = 25.5x over baseline and ABOVE ReDB's 18.8k
+eventual-A from the fs-paged matrix, at a tighter budget. Sustained
+fresh-from-ingest (no reopen): 6,222 = 6.4x baseline, ~3x from ReDB.
+Caveat: the restart cells prove LOAD-era fragmentation clears; long-horizon
+churn re-fragmentation under mimalloc is unmeasured (60s runs).
+
 ## Cell tables (198 MiB cgroup unless noted)
 
 spike1 (pre-fix): base-A 980 ops/s, majflt 15.8, ckpt 0 | int5-A 815/28.9/4 |
