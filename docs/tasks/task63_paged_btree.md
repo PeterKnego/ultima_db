@@ -1,7 +1,11 @@
 # task63: Paged B-tree (stages 1+2) — config, metrics, and the consolidated record
 
-**Status:** Implemented (Tasks 1–14). Performance numbers unmeasured until Task 16
-(`make paging/check`) — see §7.
+**Status:** Implemented (Tasks 1–14) and accepted (Task 16, `make paging/check` — all six
+assertions PASS, local/shape-only; see the "Acceptance (Task 16, local, shape only)" section at
+the end of this doc). §7 below is unchanged from Task 14 and still describes itself as
+"unmeasured" — that referred to the sandbox regression gates that Task 15 filled in
+("Measured (Task 15 gates, local)" section) and the Task 16 acceptance run now also fills in;
+the published NVMe-rig numbers (spec follow-on 7) remain the only thing still open.
 **Related:** `docs/superpowers/specs/2026-08-30-paged-btree-stage-1-2-design.md` (design spec,
 binding authority), `docs/superpowers/plans/2026-08-30-paged-btree-stage-1-2.md` (16-task
 implementation plan, 4 phases), `.superpowers/sdd/2026-08-30-paged-btree-stage-1-2/progress.md`
@@ -336,5 +340,70 @@ types. "elle consistency check passed" printed three times (once per history cla
 | `cargo test -p ultima-vector` | ok, 0 failed (60 unit + doctest + integration suites, including `results_stay_inside_filter`) |
 | `cargo clippy --all-targets --all-features -- -D warnings` | clean, zero warnings/errors — `--all-features` (including `wal-iouring`) built and checked without conflict, so no fallback to the four documented configs was needed |
 | `cargo bench --no-run -p compare-benches` | compiles clean — all YCSB/SmallBank/paging_matrix bench binaries built |
+
+## Acceptance (Task 16, local, shape only)
+
+`make paging/check` (root Makefile): the `ultima-paged` `Engine` impl in
+`compare_benches/src/bin/paging_matrix.rs` (`Persistence::standalone(dir, Eventual, Coalesced)`
+`.paged(PagedOptions::builder().memory_budget_bytes(64 MiB).build())`, table built by
+`--load=insert` — batched `insert_batch` in 10k-row write transactions, not `bulk_load`'s
+`from_sorted`) run against 5,000,000 rows inside a `systemd-run --user --scope` cgroup v2 memory
+scope at `memory.max` = 256 MiB (`scripts/paging_matrix.sh LIMIT=268435456`) — a deliberately
+different knob from the store's own 64 MiB `--paged-budget`: the cgroup ceiling has to cover
+everything the process needs beyond paged data leaves (inner nodes, every index tree, WAL/
+checkpoint buffers, the harness itself), not just the thing `memory_budget_bytes` demotes. Two
+cells, each run with `--restart` (drop the store, reopen, `Store::recover()`, run the same
+workload again), `--ops=500000 --timeout-secs=60`. Run 2026-08-31 on the Claude sandbox host (not
+the NVMe bench host) — `compare_benches/target/bench-scratch` on the real ext4 root disk (not
+`/tmp`, which is tmpfs on this host — see the guardrail in this repo's bench methodology notes),
+verified via `bench_disk_dir`'s own fstype assertion. Per repo convention this is a **shape gate**,
+not a published perf number; the NVMe rig run (spec follow-on 7) is what produces those.
+
+Two summary lines (stderr, first run of each cell):
+
+```
+[ultima-paged] C/uniform ratio=LIMIT=268435456 ops=500000 (cap) 17113 ops/s p50=57.7us p99=271.0us p999=1304.8us majflt/op=0.753 minflt=284112 pswpin=712187 pswpout=183232 rss_end=193MiB psi_some=6370ms drop=0.00s (majflt 21)
+[ultima-paged] A/zipf ratio=LIMIT=268435456 ops=78336 (timeout) 1304 ops/s p50=83.5us p99=30973.4us p999=61081.0us majflt/op=11.976 minflt=82368 pswpin=983806 pswpout=974247 rss_end=257MiB psi_some=13048ms drop=0.00s (majflt 5)
+```
+
+(The A/zipf cell hit its 60s `--timeout-secs` cap at 78,336/500,000 ops under real swap
+thrashing — 50% writes at a hot-key zipfian distribution inside a 256 MiB cgroup over a ~1.7 GiB
+unconstrained working set. `timed_out=true` in the JSON; the checker's assertions still hold over
+whatever ops actually completed, per the brief.)
+
+Checker verdicts (`compare_benches/scripts/paging_check.py`, thresholds from the task16 brief):
+
+```
+[paging/check] C/uniform: engine=ultima-paged load=insert rows=5000000 ops=500000 timed_out=False ops_per_sec=17113 pf_per_op=0.156058 majflt_per_op=0.753 recover_secs=0.140189035
+[paging/check] A/zipf:    engine=ultima-paged load=insert rows=5000000 ops=78336 timed_out=True ops_per_sec=1304 pf_per_op=0.37037888071895425 majflt_per_op=11.976 recover_secs=2.120307247
+[paging/check] PASS: C/uniform cg_events_oom == 0 — cg_events_oom=0
+[paging/check] PASS: A/zipf cg_events_oom == 0 — cg_events_oom=0
+[paging/check] PASS: C-cell pf_per_op <= 1.5 — pf_per_op=0.156058
+[paging/check] PASS: A-cell pf_per_op <= 3.0 — pf_per_op=0.37037888071895425
+[paging/check] PASS: C/uniform recover_secs <= 5.0 — recover_secs=0.140189035
+[paging/check] PASS: A/zipf recover_secs <= 5.0 — recover_secs=2.120307247
+[paging/check] ALL ASSERTIONS PASSED
+```
+
+All six assertions **PASS**. Notable shape findings, not conclusions (sandbox, ±2×, single run,
+tmpfs-adjacent host — see the repo's bench A/B methodology notes):
+
+- `pf_per_op` — the DB-level counter (`PagedStats::data_page_faults / ops`, a positioned `pread`
+  against `pages.bin`, not an OS major fault) — stayed well under both thresholds (0.156 vs 1.5
+  for C; 0.370 vs 3.0 for A) even though the *OS-level* `majflt_per_op` was heavy (0.75 and 12.0
+  respectively) under the tight 256 MiB cgroup. The two numbers measure different things: OS
+  major faults include WAL/checkpoint-buffer and general allocator page-ins under real memory
+  pressure, not just paged B-tree data-leaf faults.
+- `recover_secs` came in at 0.14s (C) and 2.12s (A) against the 5.0s gate — both comfortably
+  under, though the A-cell's is ~15× the C-cell's, consistent with recovery replaying more WAL
+  entries after a write-heavy (50%), partially-completed (timed-out) run.
+- `cg_events_oom == 0` on both cells: the 256 MiB/64 MiB split held under real memory pressure
+  (`cg_pgmajfault` and `pswpin`/`pswpout` both far from zero) without the scope being OOM-killed.
+
+Files: `compare_benches/src/bin/paging_matrix.rs` (`UltimaPagedEngine`, `Engine::restart`/
+`paged_data_faults`, `run_workload` extraction, `--paged-budget`/`--restart` args), `Makefile`
+(`paging/check` target), `compare_benches/scripts/paging_check.py` (new checker),
+`compare_benches/scripts/paging_matrix_run.sh` (`ultima-paged` engine awareness for the general
+sweep script — `PAGED_BUDGET` env var, `engine_arg`/`extra_args_for`).
 
 No test failures were encountered at any point in this task; nothing was patched.

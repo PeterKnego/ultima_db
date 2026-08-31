@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration test/lifecycle-races test/wal-faults lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate
+.PHONY: build test test/unit test/integration test/lifecycle-races test/wal-faults lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate paging/check
 
 build:
 	cargo build
@@ -678,3 +678,60 @@ perf/baseline:
 		--json --write-baseline autobench/baselines/smr-apply.json > /dev/null
 	cargo run -p ultima-autobench --bin mw-commit-microbench --release -- \
 		--json --write-baseline autobench/baselines/multiwriter-commit.json > /dev/null
+
+# Paged B-tree acceptance gate (task16, docs/tasks/task63_paged_btree.md):
+# bigger-than-RAM, built by writes. Runs the `ultima-paged` engine (the
+# on-disk paged checkpoint path — see `Persistence::paged`/`PagedOptions`)
+# through `compare_benches/src/bin/paging_matrix.rs` inside a cgroup v2
+# memory-limited scope (`scripts/paging_matrix.sh`), then asserts shape
+# gates on the resulting JSON via `scripts/paging_check.py`.
+#
+# Two DIFFERENT memory knobs, deliberately not equal:
+#   - PAGING_CG_LIMIT: the outer cgroup `memory.max` — room for everything
+#     the process needs beyond paged data leaves (inner nodes, every index
+#     tree, WAL/checkpoint buffers, the harness itself). Too tight here and
+#     the process OOMs on bookkeeping that was never supposed to page.
+#   - PAGING_BUDGET: `PagedOptions::memory_budget_bytes` — the paged store's
+#     own soft cap on resident *data-leaf* bytes, the thing that actually
+#     drives demotion. This is the tight one.
+# At 5M rows (~1.7 GiB unconstrained resident), 256 MiB / 64 MiB is a real
+# bigger-than-budget cell, not a rounding error.
+#
+# Degrades to no cgroup (a warning, not a failure) when systemd-run --user
+# scopes or memory delegation aren't available — `cg_events_oom` is then
+# skipped by the checker (nothing to assert) rather than treated as a FAIL.
+PAGING_CG_LIMIT := 268435456
+PAGING_BUDGET := 67108864
+PAGING_OUT := $(CURDIR)/target/paging-check
+PAGING_ROWS := 5000000
+PAGING_OPS := 500000
+PAGING_TIMEOUT := 60
+# Resolve cargo's actual target dir (honours CARGO_TARGET_DIR / config
+# overrides — e.g. this repo's shared `/home/claude/.cache/cargo-target`)
+# rather than assuming `./target`.
+PAGING_TARGET_DIR := $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+PAGING_BIN := $(PAGING_TARGET_DIR)/release/paging_matrix
+
+paging/check:
+	cargo build --release -p compare-benches --bin paging_matrix
+	@mkdir -p $(PAGING_OUT)
+	@set -e; \
+	if command -v systemd-run >/dev/null 2>&1 && \
+	    cat /sys/fs/cgroup/user.slice/user-$$(id -u).slice/user@$$(id -u).service/cgroup.subtree_control 2>/dev/null | grep -qw memory; then \
+	  echo "[paging/check] cgroup v2 memory delegation available: memory.max=$(PAGING_CG_LIMIT) via scripts/paging_matrix.sh"; \
+	  RUN="$(CURDIR)/compare_benches/scripts/paging_matrix.sh LIMIT=$(PAGING_CG_LIMIT) --"; \
+	else \
+	  echo "[paging/check] WARNING: no systemd-run --user cgroup memory delegation on this host — running WITHOUT a memory limit; cg_events_oom and real paging pressure are not exercised"; \
+	  RUN=""; \
+	fi; \
+	echo "[paging/check] cell 1/2: workload=C dist=uniform"; \
+	$$RUN $(PAGING_BIN) --engine=ultima-paged --rows=$(PAGING_ROWS) --load=insert \
+		--paged-budget=$(PAGING_BUDGET) --workload=C --dist=uniform \
+		--ops=$(PAGING_OPS) --timeout-secs=$(PAGING_TIMEOUT) --restart \
+		> $(PAGING_OUT)/C.json; \
+	echo "[paging/check] cell 2/2: workload=A dist=zipf"; \
+	$$RUN $(PAGING_BIN) --engine=ultima-paged --rows=$(PAGING_ROWS) --load=insert \
+		--paged-budget=$(PAGING_BUDGET) --workload=A --dist=zipf \
+		--ops=$(PAGING_OPS) --timeout-secs=$(PAGING_TIMEOUT) --restart \
+		> $(PAGING_OUT)/A.json
+	python3 compare_benches/scripts/paging_check.py $(PAGING_OUT)/C.json $(PAGING_OUT)/A.json

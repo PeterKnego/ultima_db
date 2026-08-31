@@ -100,6 +100,19 @@ trait Engine {
     fn disk_dir(&self) -> Option<&Path> {
         None
     }
+    /// Drop the live store and reopen + recover it from the same on-disk
+    /// directory, timing the reopen+recover. `None` if this engine doesn't
+    /// support the `--restart` protocol (every engine except `ultima-paged`,
+    /// as of task16).
+    fn restart(&mut self) -> Option<f64> {
+        None
+    }
+    /// Cumulative data-page faults (`PagedStats::data_page_faults`) for a
+    /// paged UltimaDB engine — `None` for every other engine, including the
+    /// plain in-memory `ultima` engine.
+    fn paged_data_faults(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Total size of the files under `dir` (recursive).
@@ -194,6 +207,141 @@ impl Engine for UltimaEngine {
             t.update(key, Row::new(seed)).expect("update");
         }
         wtx.commit().expect("commit");
+    }
+}
+
+// --- UltimaDB paged (on-disk B-tree node store; the store itself demotes
+// leaves under a memory budget, instead of relying on the OS to page an
+// in-memory tree out to swap). See `Persistence::paged`/`PagedOptions`.
+
+struct UltimaPagedEngine {
+    // `Option` so `restart()` can drop the live store (stopping its
+    // background checkpointer thread) before opening a fresh one against
+    // the same directory — two live `Store`s against the same page/WAL file
+    // would race.
+    store: Option<ultima_db::Store>,
+    dir: tempfile::TempDir,
+    budget: u64,
+}
+
+impl UltimaPagedEngine {
+    fn new(disk_dir: &Path, budget: u64) -> Self {
+        let dir = tempfile::tempdir_in(disk_dir).expect("tempdir");
+        let store = Self::open(dir.path(), budget);
+        UltimaPagedEngine {
+            store: Some(store),
+            dir,
+            budget,
+        }
+    }
+
+    /// `Store::new` + `register_table` against `path` — does *not* recover;
+    /// callers that need the on-disk state loaded call `.recover()`
+    /// themselves (so its cost can be timed separately, see `restart`).
+    fn open(path: &Path, budget: u64) -> ultima_db::Store {
+        let p = ultima_db::Persistence::standalone(
+            path,
+            ultima_db::Durability::Eventual,
+            ultima_db::WalWrite::Coalesced,
+        )
+        .paged(ultima_db::PagedOptions::builder().memory_budget_bytes(budget).build())
+        .expect("paged persistence");
+        let store = ultima_db::Store::new(ultima_db::StoreConfig::builder().persistence(p).build())
+            .expect("Store::new");
+        store.register_table::<Row>("rows").expect("register_table");
+        store
+    }
+
+    fn store(&self) -> &ultima_db::Store {
+        self.store.as_ref().expect("store live between restart() calls")
+    }
+
+    fn store_mut(&mut self) -> &mut ultima_db::Store {
+        self.store.as_mut().expect("store live between restart() calls")
+    }
+}
+
+impl Engine for UltimaPagedEngine {
+    fn name(&self) -> &'static str {
+        "ultima-paged"
+    }
+
+    fn disk_dir(&self) -> Option<&Path> {
+        Some(self.dir.path())
+    }
+
+    fn load(&mut self, rows: u64, mode: LoadMode) {
+        match mode {
+            LoadMode::Bulk => {
+                use ultima_db::{BulkLoadInput, BulkLoadOptions, BulkSource};
+                let src = BulkSource::Sorted(Box::new((1..=rows).map(|i| (i, Row::new(i)))));
+                let opts = BulkLoadOptions {
+                    create_if_missing: true,
+                    ..Default::default()
+                };
+                self.store_mut()
+                    .bulk_load::<Row>("rows", BulkLoadInput::Replace(src), opts)
+                    .expect("bulk_load");
+            }
+            LoadMode::Insert => {
+                // Batched `insert_batch` in write transactions, not a
+                // put-loop — this is the "built by writes" criterion: CoW
+                // churn scatters node allocations the way real traffic
+                // would, rather than the single sorted `from_sorted` pass
+                // `LoadMode::Bulk` takes.
+                const CHUNK: u64 = 10_000;
+                let store = self.store_mut();
+                let mut next = 1u64;
+                while next <= rows {
+                    let end = (next + CHUNK - 1).min(rows);
+                    let mut wtx = store.begin_write(None).expect("begin_write");
+                    {
+                        let mut t = wtx.open_table::<Row>("rows").expect("open_table");
+                        let batch: Vec<Row> = (next..=end).map(Row::new).collect();
+                        t.insert_batch(batch).expect("insert_batch");
+                    }
+                    wtx.commit().expect("commit");
+                    next = end + 1;
+                }
+            }
+        }
+        // Write every dirty leaf to `pages.bin` and assign page ids. With
+        // `memory_budget_bytes` configured this also runs phase-3 demotion,
+        // so the run phase below starts from a genuinely paged tree instead
+        // of relying on the background checkpointer's first tick.
+        self.store().checkpoint().expect("checkpoint");
+    }
+
+    fn read(&self, key: u64) -> Option<u64> {
+        let rtx = self.store().begin_read(None).expect("begin_read");
+        let t = rtx.open_table::<Row>("rows").expect("open_table");
+        t.get(key).map(|r| black_box(r.a ^ r.pad[5]))
+    }
+
+    fn update(&mut self, key: u64, seed: u64) {
+        let store = self.store_mut();
+        let mut wtx = store.begin_write(None).expect("begin_write");
+        {
+            let mut t = wtx.open_table::<Row>("rows").expect("open_table");
+            t.update(key, Row::new(seed)).expect("update");
+        }
+        wtx.commit().expect("commit");
+    }
+
+    fn restart(&mut self) -> Option<f64> {
+        let path = self.dir.path().to_path_buf();
+        let budget = self.budget;
+        self.store = None; // drop first: see the `store` field's doc
+        let t0 = Instant::now();
+        let store = Self::open(&path, budget);
+        store.recover().expect("recover");
+        let secs = t0.elapsed().as_secs_f64();
+        self.store = Some(store);
+        Some(secs)
+    }
+
+    fn paged_data_faults(&self) -> Option<u64> {
+        self.store().paged_stats().map(|s| s.data_page_faults)
     }
 }
 
@@ -464,6 +612,14 @@ struct Args {
     /// value pins the workload to a hot subset, isolating write-path
     /// faults from key-coldness faults.
     keys: Option<u64>,
+    /// `PagedOptions::memory_budget_bytes` for `--engine=ultima-paged`.
+    /// Required for that engine (there is no sane default: it is the
+    /// whole point of the cell).
+    paged_budget: Option<u64>,
+    /// After the run phase, drop the store, reopen + recover it, then run
+    /// the same workload again — reports `recover_secs`/`ops_per_sec_2`/
+    /// `pf_per_op_2` alongside the first run's numbers.
+    restart: bool,
 }
 
 fn parse_args() -> Args {
@@ -480,8 +636,16 @@ fn parse_args() -> Args {
         ratio: "unlimited".into(),
         seed: 42,
         keys: None,
+        paged_budget: None,
+        restart: false,
     };
+    let mut load_explicit = false;
     for arg in std::env::args().skip(1) {
+        // `--restart` is a bare flag, not `--key=value`.
+        if arg == "--restart" {
+            a.restart = true;
+            continue;
+        }
         let (k, v) = arg
             .strip_prefix("--")
             .and_then(|s| s.split_once('='))
@@ -494,6 +658,7 @@ fn parse_args() -> Args {
             "ops" => a.ops = v.parse().expect("ops"),
             "timeout-secs" => a.timeout = Duration::from_secs(v.parse().expect("timeout")),
             "load" => {
+                load_explicit = true;
                 a.load = match v {
                     "bulk" => LoadMode::Bulk,
                     "insert" => LoadMode::Insert,
@@ -505,6 +670,7 @@ fn parse_args() -> Args {
             "ratio" => a.ratio = v.into(),
             "seed" => a.seed = v.parse().expect("seed"),
             "keys" => a.keys = Some(v.parse().expect("keys")),
+            "paged-budget" => a.paged_budget = Some(v.parse().expect("paged-budget")),
             _ => panic!("unknown arg --{k}"),
         }
     }
@@ -513,6 +679,17 @@ fn parse_args() -> Args {
         "--workload=A|C|DIAG (A: 50% read / 50% update; C: 100% read; DIAG: ultima-only per-phase fault decomposition)"
     );
     assert!(matches!(a.dist.as_str(), "zipf" | "uniform"), "--dist=zipf|uniform");
+    if a.engine == "ultima-paged" {
+        assert!(
+            a.paged_budget.is_some(),
+            "--engine=ultima-paged requires --paged-budget=BYTES"
+        );
+        // "Built by writes" is this engine's whole point (see `run` module
+        // doc / task16 brief) — default to it unless the caller overrode.
+        if !load_explicit {
+            a.load = LoadMode::Insert;
+        }
+    }
     a
 }
 
@@ -596,6 +773,135 @@ struct Report {
     drop_secs: f64,
     majflt_drop: u64,
     pswpin_drop: u64,
+    /// `PagedOptions::memory_budget_bytes` (`--engine=ultima-paged` only).
+    paged_budget_bytes: Option<u64>,
+    /// Data-page faults (`PagedStats::data_page_faults`) per op over the
+    /// run phase — `--engine=ultima-paged` only, `null` for every other
+    /// engine (they report OS-level `majflt_per_op` instead: a page-FILE
+    /// fault here is a positioned `pread` against `pages.bin`, not a kernel
+    /// major fault).
+    pf_per_op: Option<f64>,
+    /// `--restart`: time to drop the store and reopen + recover it from
+    /// disk (`Store::new` + `register_table` + `Store::recover`).
+    recover_secs: Option<f64>,
+    /// `--restart`: `ops_per_sec` of the second run (after recovery).
+    ops_per_sec_2: Option<f64>,
+    /// `--restart`: `pf_per_op` of the second run (after recovery).
+    pf_per_op_2: Option<f64>,
+}
+
+/// One pass through the op loop: same shape whether it's the first run or,
+/// under `--restart`, the second run against a freshly recovered store.
+struct RunOutcome {
+    ops: u64,
+    timed_out: bool,
+    run_secs: f64,
+    ops_per_sec: f64,
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+    max_us: f64,
+    majflt_run: u64,
+    majflt_per_op: f64,
+    minflt_run: u64,
+    pswpin_run: u64,
+    pswpout_run: u64,
+    trajectory: Vec<Trajectory>,
+    pf_per_op: Option<f64>,
+}
+
+/// Run `args.ops` (or until `args.timeout`) reads/updates against `engine`,
+/// drawing keys from `args.dist`/`args.keys` with `rng_seed`. Shared by the
+/// first run and, under `--restart`, the second (post-recovery) run.
+fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutcome {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(rng_seed);
+    let keyspace = args.keys.unwrap_or(args.rows).min(args.rows);
+    let zipf = (args.dist == "zipf").then(|| ZipfianGenerator::new(keyspace, 0.99));
+    let write_frac = if args.workload == "A" { 0.5 } else { 0.0 };
+
+    let mut lat: Vec<u32> = Vec::with_capacity(args.ops.min(50_000_000) as usize);
+    let mut trajectory = Vec::new();
+    let majflt0 = majflt();
+    let minflt0 = minflt();
+    let pswpin0 = vmstat("pswpin");
+    let pswpout0 = vmstat("pswpout");
+    let pf0 = engine.paged_data_faults();
+    let run_start = Instant::now();
+    let mut next_sample = Duration::from_secs(5);
+    let mut ops = 0u64;
+    let mut timed_out = false;
+    let mut wseed = args.rows + 1;
+
+    while ops < args.ops {
+        let key = match &zipf {
+            Some(z) => z.next(&mut rng),
+            None => rng.random_range(1..=keyspace),
+        };
+        let is_write = write_frac > 0.0 && rng.random_bool(write_frac);
+        let t = Instant::now();
+        if is_write {
+            wseed += 1;
+            engine.update(key, wseed);
+        } else {
+            let found = engine.read(key);
+            debug_assert!(found.is_some(), "key {key} missing");
+        }
+        lat.push(t.elapsed().as_nanos().min(u32::MAX as u128) as u32);
+        ops += 1;
+
+        if ops & 0xFF == 0 {
+            let el = run_start.elapsed();
+            if el >= next_sample {
+                trajectory.push(Trajectory {
+                    t_secs: el.as_secs_f64(),
+                    ops,
+                    majflt: majflt() - majflt0,
+                });
+                next_sample += Duration::from_secs(5);
+            }
+            if el >= args.timeout {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+    let run_secs = run_start.elapsed().as_secs_f64();
+    let majflt_run = majflt() - majflt0;
+    let minflt_run = minflt() - minflt0;
+    let pswpin_run = vmstat("pswpin") - pswpin0;
+    let pswpout_run = vmstat("pswpout") - pswpout0;
+    trajectory.push(Trajectory {
+        t_secs: run_secs,
+        ops,
+        majflt: majflt_run,
+    });
+    let pf_per_op = pf0
+        .zip(engine.paged_data_faults())
+        .map(|(before, after)| (after - before) as f64 / ops.max(1) as f64);
+
+    lat.sort_unstable();
+    let p50 = percentile(&lat, 0.50);
+    let p99 = percentile(&lat, 0.99);
+    let p999 = percentile(&lat, 0.999);
+    let max = lat.last().copied().unwrap_or(0) as f64 / 1000.0;
+
+    RunOutcome {
+        ops,
+        timed_out,
+        run_secs,
+        ops_per_sec: ops as f64 / run_secs,
+        p50_us: p50,
+        p99_us: p99,
+        p999_us: p999,
+        max_us: max,
+        majflt_run,
+        majflt_per_op: majflt_run as f64 / ops.max(1) as f64,
+        minflt_run,
+        pswpin_run,
+        pswpout_run,
+        trajectory,
+        pf_per_op,
+    }
 }
 
 /// Per-phase major-fault decomposition of a cold-key update on UltimaDB:
@@ -678,6 +984,10 @@ fn main() {
 
     let mut engine: Box<dyn Engine> = match args.engine.as_str() {
         "ultima" => Box::new(UltimaEngine::new()),
+        "ultima-paged" => Box::new(UltimaPagedEngine::new(
+            &disk_dir,
+            args.paged_budget.expect("checked in parse_args"),
+        )),
         "redb" => Box::new(RedbEngine::new(&disk_dir)),
         "rocksdb" => Box::new(RocksEngine::new(&disk_dir)),
         "fjall" => Box::new(FjallEngine::new(&disk_dir)),
@@ -715,83 +1025,52 @@ fn main() {
     }
 
     // --- run
-    let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
     let keyspace = args.keys.unwrap_or(args.rows).min(args.rows);
-    let zipf = (args.dist == "zipf").then(|| ZipfianGenerator::new(keyspace, 0.99));
-    let write_frac = if args.workload == "A" { 0.5 } else { 0.0 };
-
-    let mut lat: Vec<u32> = Vec::with_capacity(args.ops.min(50_000_000) as usize);
-    let mut trajectory = Vec::new();
-    let majflt0 = majflt();
-    let minflt0 = minflt();
-    let pswpin0 = vmstat("pswpin");
-    let pswpout0 = vmstat("pswpout");
-    let run_start = Instant::now();
-    let mut next_sample = Duration::from_secs(5);
-    let mut ops = 0u64;
-    let mut timed_out = false;
-    let mut seed = args.rows + 1;
-
-    while ops < args.ops {
-        let key = match &zipf {
-            Some(z) => z.next(&mut rng),
-            None => rng.random_range(1..=keyspace),
-        };
-        let is_write = write_frac > 0.0 && rng.random_bool(write_frac);
-        let t = Instant::now();
-        if is_write {
-            seed += 1;
-            engine.update(key, seed);
-        } else {
-            let found = engine.read(key);
-            debug_assert!(found.is_some(), "key {key} missing");
-        }
-        lat.push(t.elapsed().as_nanos().min(u32::MAX as u128) as u32);
-        ops += 1;
-
-        if ops & 0xFF == 0 {
-            let el = run_start.elapsed();
-            if el >= next_sample {
-                trajectory.push(Trajectory {
-                    t_secs: el.as_secs_f64(),
-                    ops,
-                    majflt: majflt() - majflt0,
-                });
-                next_sample += Duration::from_secs(5);
-            }
-            if el >= args.timeout {
-                timed_out = true;
-                break;
-            }
-        }
-    }
-    let run_secs = run_start.elapsed().as_secs_f64();
-    let majflt_run = majflt() - majflt0;
-    let minflt_run = minflt() - minflt0;
-    let pswpin_run = vmstat("pswpin") - pswpin0;
-    let pswpout_run = vmstat("pswpout") - pswpout0;
-    trajectory.push(Trajectory {
-        t_secs: run_secs,
-        ops,
-        majflt: majflt_run,
-    });
+    let run1 = run_workload(engine.as_mut(), &args, args.seed);
+    let ops = run1.ops;
+    let timed_out = run1.timed_out;
+    let run_secs = run1.run_secs;
+    let p50 = run1.p50_us;
+    let p99 = run1.p99_us;
+    let p999 = run1.p999_us;
+    let minflt_run = run1.minflt_run;
+    let pswpin_run = run1.pswpin_run;
+    let pswpout_run = run1.pswpout_run;
 
     let rss_after_run = rss_bytes();
 
-    // cgroup snapshot while the scope still exists
+    // --- restart (opt-in): drop the store, reopen + recover, run the same
+    // workload again. Only `ultima-paged` implements `Engine::restart`.
+    let mut recover_secs = None;
+    let mut ops_per_sec_2 = None;
+    let mut pf_per_op_2 = None;
+    if args.restart {
+        let secs = engine
+            .restart()
+            .unwrap_or_else(|| panic!("--restart is not supported by engine {name}"));
+        eprintln!("[{name}] recovered in {secs:.3}s");
+        recover_secs = Some(secs);
+        let run2 = run_workload(engine.as_mut(), &args, args.seed);
+        eprintln!(
+            "[{name}] (restart) {}/{} ops={} {:.0} ops/s pf/op={}",
+            args.workload,
+            args.dist,
+            run2.ops,
+            run2.ops_per_sec,
+            run2.pf_per_op.map_or("n/a".to_string(), |v| format!("{v:.3}")),
+        );
+        ops_per_sec_2 = Some(run2.ops_per_sec);
+        pf_per_op_2 = run2.pf_per_op;
+    }
+
+    // cgroup snapshot while the scope still exists (cumulative over both
+    // runs above, if `--restart` was passed)
     let cg_anon = cgroup_stat("memory.stat", "anon");
     let cg_file = cgroup_stat("memory.stat", "file");
     let cg_pgmajfault = cgroup_stat("memory.stat", "pgmajfault");
     let cg_events_max = cgroup_stat("memory.events", "max");
     let cg_events_oom = cgroup_stat("memory.events", "oom");
     let cg_pressure = cgroup_pressure_total_us();
-
-    lat.sort_unstable();
-    let p50 = percentile(&lat, 0.50);
-    let p99 = percentile(&lat, 0.99);
-    let p999 = percentile(&lat, 0.999);
-    let max = lat.last().copied().unwrap_or(0) as f64 / 1000.0;
-    drop(lat);
 
     // --- drop: freeing a cold CoW tree faults every page in just to run
     // `Arc` destructors. Disk engines should be ~free here.
@@ -824,9 +1103,9 @@ fn main() {
         p50_us: p50,
         p99_us: p99,
         p999_us: p999,
-        max_us: max,
-        majflt_run,
-        majflt_per_op: majflt_run as f64 / ops.max(1) as f64,
+        max_us: run1.max_us,
+        majflt_run: run1.majflt_run,
+        majflt_per_op: run1.majflt_per_op,
         minflt_run,
         pswpin_run,
         pswpout_run,
@@ -836,10 +1115,15 @@ fn main() {
         cg_events_max,
         cg_events_oom,
         cg_pressure_some_total_us: cg_pressure,
-        trajectory,
+        trajectory: run1.trajectory,
         drop_secs,
         majflt_drop,
         pswpin_drop,
+        paged_budget_bytes: args.paged_budget,
+        pf_per_op: run1.pf_per_op,
+        recover_secs,
+        ops_per_sec_2,
+        pf_per_op_2,
     };
 
     eprintln!(
