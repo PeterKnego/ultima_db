@@ -41,7 +41,7 @@ make bench-oneshot TARGET=competitor|wal-ab|autobench|checkpoint-delta   # up ->
 
 **Guardrails — read before touching `make up`/`bench-oneshot`:**
 
-- These commands spin up **real, billable AWS resources**. Get **explicit user authorization** before any `make up`/`bench-oneshot` — do not provision cloud infra on your own initiative.
+- These commands spin up **real, billable AWS resources**. Cloud fleet runs are allowed under exactly two conditions (Peter, 2026-08-31): **(1) ask first and run only after explicit approval for that run** — approval for one run does not carry to the next — and **(2) shut the fleet down when done and verify it** (`make destroy` if not using the oneshot wrapper, then `make status` to confirm nothing is left running).
 - **Nothing auto-reaps** (`ttl_hours` is only a tag). Always `make destroy` when done, and run `make status` to confirm no host is left running. Prefer `make bench-oneshot` for one-off runs so teardown is automatic.
 - **Same-host relative only** — compare engine ordering and ratios, never absolute numbers across machines. NVMe is ephemeral (instance store); never store data you want to keep.
 - Gate B (needs `ultima_cluster`) is **not** run remotely — it is a local-only step.
