@@ -140,6 +140,13 @@ trait Engine {
     fn paged_data_faults(&self) -> Option<u64> {
         None
     }
+    /// Full paged-stats snapshot (`Store::paged_stats`) — `ultima-paged`
+    /// only. Spike instrumentation: the run phase's checkpointer activity
+    /// (runs, pages written, leaves demoted) is invisible from
+    /// `paged_data_faults` alone.
+    fn paged_snapshot(&self) -> Option<ultima_db::PagedStatsSnapshot> {
+        None
+    }
 }
 
 /// Total size of the files under `dir` (recursive).
@@ -263,24 +270,36 @@ struct UltimaPagedEngine {
     dir: tempfile::TempDir,
     budget: u64,
     dur: Dur,
+    knobs: PagedKnobs,
+}
+
+/// Spike knobs for the background checkpointer's triggers (`None` = the
+/// `PagedOptions` default).
+#[derive(Clone, Copy, Default)]
+struct PagedKnobs {
+    /// `PagedOptions::checkpoint_dirty_bytes` — the volume trigger.
+    dirty_trigger: Option<u64>,
+    /// `PagedOptions::checkpoint_interval` — the time trigger, seconds.
+    interval_secs: Option<u64>,
 }
 
 impl UltimaPagedEngine {
-    fn new(disk_dir: &Path, budget: u64, dur: Dur) -> Self {
+    fn new(disk_dir: &Path, budget: u64, dur: Dur, knobs: PagedKnobs) -> Self {
         let dir = tempfile::tempdir_in(disk_dir).expect("tempdir");
-        let store = Self::open(dir.path(), budget, dur);
+        let store = Self::open(dir.path(), budget, dur, knobs);
         UltimaPagedEngine {
             store: Some(store),
             dir,
             budget,
             dur,
+            knobs,
         }
     }
 
     /// `Store::new` + `register_table` against `path` — does *not* recover;
     /// callers that need the on-disk state loaded call `.recover()`
     /// themselves (so its cost can be timed separately, see `restart`).
-    fn open(path: &Path, budget: u64, dur: Dur) -> ultima_db::Store {
+    fn open(path: &Path, budget: u64, dur: Dur, knobs: PagedKnobs) -> ultima_db::Store {
         // Strict = the `standalone_fast` pairing: the committing thread
         // fsyncs inline (`ConsistentInline`, SingleWriter-only — which this
         // harness is) into a pre-zero-filled WAL (`CoalescedPrealloc`,
@@ -293,8 +312,15 @@ impl UltimaPagedEngine {
                 ultima_db::WalWrite::CoalescedPrealloc,
             ),
         };
+        let mut b = ultima_db::PagedOptions::builder().memory_budget_bytes(budget);
+        if let Some(d) = knobs.dirty_trigger {
+            b = b.checkpoint_dirty_bytes(d);
+        }
+        if let Some(secs) = knobs.interval_secs {
+            b = b.checkpoint_interval(Duration::from_secs(secs));
+        }
         let p = ultima_db::Persistence::standalone(path, durability, wal_write)
-            .paged(ultima_db::PagedOptions::builder().memory_budget_bytes(budget).build())
+            .paged(b.build())
             .expect("paged persistence");
         let store = ultima_db::Store::new(ultima_db::StoreConfig::builder().persistence(p).build())
             .expect("Store::new");
@@ -395,9 +421,10 @@ impl Engine for UltimaPagedEngine {
         let path = self.dir.path().to_path_buf();
         let budget = self.budget;
         let dur = self.dur;
+        let knobs = self.knobs;
         self.store = None; // drop first: see the `store` field's doc
         let t0 = Instant::now();
-        let store = Self::open(&path, budget, dur);
+        let store = Self::open(&path, budget, dur, knobs);
         store.recover().expect("recover");
         let secs = t0.elapsed().as_secs_f64();
         self.store = Some(store);
@@ -406,6 +433,10 @@ impl Engine for UltimaPagedEngine {
 
     fn paged_data_faults(&self) -> Option<u64> {
         self.store().paged_stats().map(|s| s.data_page_faults)
+    }
+
+    fn paged_snapshot(&self) -> Option<ultima_db::PagedStatsSnapshot> {
+        self.store().paged_stats()
     }
 }
 
@@ -760,6 +791,9 @@ struct Args {
     /// `--engine=ultima` (in-memory, `Persistence::None` — strict is
     /// meaningless there).
     durability: Dur,
+    /// Spike knobs (`--paged-dirty-trigger=BYTES`, `--paged-interval-secs=N`)
+    /// — `--engine=ultima-paged` only.
+    paged_knobs: PagedKnobs,
 }
 
 fn parse_args() -> Args {
@@ -779,6 +813,7 @@ fn parse_args() -> Args {
         paged_budget: None,
         restart: false,
         durability: Dur::Eventual,
+        paged_knobs: PagedKnobs::default(),
     };
     let mut load_explicit = false;
     for arg in std::env::args().skip(1) {
@@ -812,6 +847,12 @@ fn parse_args() -> Args {
             "seed" => a.seed = v.parse().expect("seed"),
             "keys" => a.keys = Some(v.parse().expect("keys")),
             "paged-budget" => a.paged_budget = Some(v.parse().expect("paged-budget")),
+            "paged-dirty-trigger" => {
+                a.paged_knobs.dirty_trigger = Some(v.parse().expect("paged-dirty-trigger"))
+            }
+            "paged-interval-secs" => {
+                a.paged_knobs.interval_secs = Some(v.parse().expect("paged-interval-secs"))
+            }
             "durability" => {
                 a.durability = match v {
                     "eventual" => Dur::Eventual,
@@ -942,6 +983,20 @@ struct Report {
     ops_per_sec_2: Option<f64>,
     /// `--restart`: `pf_per_op` of the second run (after recovery).
     pf_per_op_2: Option<f64>,
+    /// Paged-store counter deltas over the FIRST run phase (`ultima-paged`
+    /// only): background-checkpointer activity that `pf_per_op` can't see.
+    paged_run: Option<PagedRunStats>,
+}
+
+#[derive(Serialize)]
+struct PagedRunStats {
+    checkpointer_runs: u64,
+    pages_written: u64,
+    leaves_demoted: u64,
+    index_page_faults: u64,
+    /// End-of-run values (not deltas).
+    dirty_bytes_end: u64,
+    resident_leaf_bytes_end: u64,
 }
 
 /// One pass through the op loop: same shape whether it's the first run or,
@@ -1169,6 +1224,7 @@ fn main() {
             &disk_dir,
             args.paged_budget.expect("checked in parse_args"),
             args.durability,
+            args.paged_knobs,
         )),
         "redb" => Box::new(RedbEngine::new(&disk_dir, args.durability)),
         "rocksdb" => Box::new(RocksEngine::new(&disk_dir, args.durability)),
@@ -1208,7 +1264,16 @@ fn main() {
 
     // --- run
     let keyspace = args.keys.unwrap_or(args.rows).min(args.rows);
+    let snap0 = engine.paged_snapshot();
     let run1 = run_workload(engine.as_mut(), &args, args.seed);
+    let paged_run = snap0.zip(engine.paged_snapshot()).map(|(a, b)| PagedRunStats {
+        checkpointer_runs: b.checkpointer_runs - a.checkpointer_runs,
+        pages_written: b.pages_written - a.pages_written,
+        leaves_demoted: b.leaves_demoted - a.leaves_demoted,
+        index_page_faults: b.index_page_faults - a.index_page_faults,
+        dirty_bytes_end: b.dirty_bytes,
+        resident_leaf_bytes_end: b.resident_leaf_bytes_est,
+    });
     let ops = run1.ops;
     let timed_out = run1.timed_out;
     let run_secs = run1.run_secs;
@@ -1308,6 +1373,7 @@ fn main() {
         recover_secs,
         ops_per_sec_2,
         pf_per_op_2,
+        paged_run,
     };
 
     eprintln!(
