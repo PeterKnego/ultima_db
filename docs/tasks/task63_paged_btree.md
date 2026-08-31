@@ -430,3 +430,47 @@ Files: `compare_benches/src/bin/paging_matrix.rs` (`UltimaPagedEngine`, `Engine:
 sweep script — `PAGED_BUDGET` env var, `engine_arg`/`extra_args_for`).
 
 No test failures were encountered at any point in this task; nothing was patched.
+
+## 7. Performance under memory pressure — the cheap stack (2026-08-31 spike follow-up)
+
+The fs-paged comparison matrix (paged UltimaDB vs RocksDB/Fjall/ReDB, every engine under one
+cgroup `memory.max`) exposed a 15-25× write-workload gap vs ReDB at 5M rows / 198 MiB. The
+spike (`docs/benchmarks/paged-write-path-spike-local-2026-08-31.md`, branch
+`spike/paged-write-path`) decomposed it; the dominant term is **heap fragmentation** (F6):
+insert-era CoW churn smears the surviving resident leaves + values across the whole load-era
+heap at low density, and a bounded-memory deployment then pays page-granularity swap rent on
+the scatter. It was *not* the paging machinery — the F1-fixed estimate proved resident data
+leaves sat *under* budget throughout.
+
+**Shipped from the spike:**
+
+- **F1 fix** — `resident_leaf_bytes` reconciliation at the end of every budget-configured
+  checkpoint (`checkpoint_impl_paged`). Pre-fix, node *creation* never credited the counter
+  while the demote debit was unconditional, so a store built by writes negative-saturated it;
+  the `.max(0)` clamp then reported 0 forever and the `due_mem` trigger + fault-in budget wake
+  were structurally dead. Regression test:
+  `paged_demotion::refaulted_leaves_raise_resident_estimate_after_full_demotion` (verified to
+  fail with the fix reverted).
+- **Deployment guidance** (measured, single NVMe box, ordering-grade evidence):
+  - **mimalloc** as the global allocator for paged deployments: +29% (T=32) to **2.1×** (T=8)
+    on pressured writes, consistent with task57's eventual-tier findings.
+  - **`fanout-t8`** for write-heavy paged deployments: 3.2× alone (leaf-granular residency —
+    scrambled-zipf pins ~1 hot key per leaf, so T=32 leaves overcommit any budget).
+  - **Ingest-then-serve reopen**: after a large insert-load, drop + `recover()` (~2-5 s at 5M
+    rows) rebuilds a compact heap: 3.8-4.3× on the subsequent workload. Combined stack
+    (t8 + mimalloc + reopen): 24.9k ops/s on pressured zipf A — above ReDB's 18.8k from the
+    same matrix at a tighter budget.
+
+**Deferred to the stage-3 spec** (with in-place eviction / pinning / `Result` reads):
+
+- **Leaf-arena allocation** — allocate a leaf's node + values from one arena so demotion frees
+  whole pages: kills F6 structurally (no reopen needed), and makes `memory_budget_bytes`
+  count real bytes (today `NODE_BYTES` excludes the per-entry `Arc<V>` value allocations, so
+  the budget under-counts true leaf cost). Bends the value-sharing contract (`Arc<V>` across
+  leaf CoW generations) for paged tables — needs its own design pass.
+- **Demote pressure override** — second-chance alone reclaims ~nothing from a continuously
+  touched leaf set (forced 1-5 s checkpoints demoted 0-41 of ~80k leaves); under sustained
+  over-budget pressure the pass needs an eviction mode that ignores the accessed bit.
+- **Open observation**: one ≥4.29 s op (u32-saturated `max_us`) per pressured write cell,
+  present with zero checkpointer runs — suspect first-gc drop of load-era memory under swap or
+  cgroup direct-reclaim; also raise the harness latency counter above u32 ns.
