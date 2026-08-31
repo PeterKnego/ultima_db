@@ -7,8 +7,13 @@
 # engine at each D/M ratio. Appends one JSON line per cell to $OUT.
 #
 #   ROWS=5000000 RATIOS="2 4" ENGINES="ultima redb" DISTS="zipf uniform" \
-#   WORKLOADS="C A" OPS=2000000 TIMEOUT=60 OUT=results.jsonl \
-#   scripts/paging_matrix_run.sh
+#   WORKLOADS="C A" DURABILITIES="eventual strict" OPS=2000000 TIMEOUT=60 \
+#   OUT=results.jsonl scripts/paging_matrix_run.sh
+#
+# DURABILITIES adds the commit-durability dimension (--durability=
+# eventual|strict, see paging_matrix.rs `Dur` for the per-engine mapping).
+# strict cells for the in-memory `ultima`/`ultima-mimalloc`/`ultima-t8`
+# build variants are SKIPPED (no persistence; the binary would refuse).
 #
 # ENGINES may include `ultima-mimalloc` (bench-mimalloc build, BIN_MIMALLOC)
 # and `ultima-t8` (ultima-db/fanout-t8 build, BIN_T8). Build them first:
@@ -27,13 +32,17 @@
 # this script's cgroup `LIMIT`/`RATIOS` (the outer memory ceiling): see
 # `make paging/check` in the root Makefile for the two-knob distinction.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Resolve to absolute paths BEFORE cd so the script works from any cwd
+# (the Makefile invokes it from the repo root).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 ROWS="${ROWS:-5000000}"
 RATIOS="${RATIOS:-0.5 2 4}"
 ENGINES="${ENGINES:-ultima redb}"
 DISTS="${DISTS:-zipf uniform}"
 WORKLOADS="${WORKLOADS:-C A}"
+DURABILITIES="${DURABILITIES:-eventual}"
 OPS="${OPS:-2000000}"
 TIMEOUT="${TIMEOUT:-60}"
 LOAD="${LOAD:-bulk}"
@@ -44,7 +53,7 @@ TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 
 BIN="${BIN:-$TARGET_DIR/release/paging_matrix}"
 BIN_MIMALLOC="${BIN_MIMALLOC:-$TARGET_DIR/mimalloc/release/paging_matrix}"
 BIN_T8="${BIN_T8:-$TARGET_DIR/t8/release/paging_matrix}"
-DRIVER="$(dirname "$0")/paging_matrix.sh"
+DRIVER="$SCRIPT_DIR/paging_matrix.sh"
 
 bin_for() {
   case "$1" in
@@ -81,14 +90,24 @@ for ratio in $RATIOS; do
     mode="LIMIT=$limit"
   fi
   for engine in $ENGINES; do
-    for dist in $DISTS; do
-      for wl in $WORKLOADS; do
-        echo "[matrix] ratio=$ratio ($mode) engine=$engine dist=$dist workload=$wl" >&2
-        line=$("$DRIVER" "$mode" -- "$(bin_for "$engine")" \
-                 --engine="$(engine_arg "$engine")" --rows="$ROWS" --load="$LOAD" \
-                 --dist="$dist" --workload="$wl" --ops="$OPS" --timeout-secs="$TIMEOUT" \
-                 --ratio="$ratio" $(extra_args_for "$engine"))
-        echo "$line" | python3 -c "import json,sys; d=json.load(sys.stdin); d['engine']='$engine'; d['limit_bytes']=int('${limit:-0}'); d['footprint_bytes']=$footprint; print(json.dumps(d))" >> "$OUT"
+    for dur in $DURABILITIES; do
+      # In-memory build variants (ultima, ultima-mimalloc, ultima-t8) have no
+      # durability; the binary rejects strict for them. ultima-paged is the
+      # one ultima variant with a real durability tier.
+      if [[ "$dur" != "eventual" && "$engine" == ultima* && "$engine" != "ultima-paged" ]]; then
+        echo "[matrix] skip engine=$engine durability=$dur (in-memory)" >&2
+        continue
+      fi
+      for dist in $DISTS; do
+        for wl in $WORKLOADS; do
+          echo "[matrix] ratio=$ratio ($mode) engine=$engine durability=$dur dist=$dist workload=$wl" >&2
+          line=$("$DRIVER" "$mode" -- "$(bin_for "$engine")" \
+                   --engine="$(engine_arg "$engine")" --rows="$ROWS" --load="$LOAD" \
+                   --dist="$dist" --workload="$wl" --durability="$dur" \
+                   --ops="$OPS" --timeout-secs="$TIMEOUT" \
+                   --ratio="$ratio" $(extra_args_for "$engine"))
+          echo "$line" | python3 -c "import json,sys; d=json.load(sys.stdin); d['engine']='$engine'; d['limit_bytes']=int('${limit:-0}'); d['footprint_bytes']=$footprint; print(json.dumps(d))" >> "$OUT"
+        done
       done
     done
   done

@@ -60,6 +60,18 @@
     executable: /bin/bash
   changed_when: true
 
+- name: Run fs-paged larger-than-memory comparison matrix
+  when: bench_target == "fs-paged"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    source /etc/profile.d/cargo.sh
+    cd {{ ud_src_dir }}
+    make bench/fs-paged ULTIMA_BENCH_DIR={{ bench_dir }} 2>&1 | tee {{ remote_home }}/results/fs-paged.log
+    cp target/fs-paged/results-*.jsonl target/fs-paged/results-*.md {{ remote_home }}/results/
+  args:
+    executable: /bin/bash
+  changed_when: true
+
 - name: Run SMR vs Eventual YCSB A/B
   when: bench_target == "smr-ycsb"
   ansible.builtin.shell: |

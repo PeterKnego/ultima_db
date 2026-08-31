@@ -1,4 +1,4 @@
-.PHONY: build test test/unit test/integration test/lifecycle-races test/wal-faults lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate paging/check
+.PHONY: build test test/unit test/integration test/lifecycle-races test/wal-faults lint coverage coverage/vector clean bench bench/scaling bench/ycsb bench/ycsb/fjall bench/ycsb/rocksdb bench/ycsb/redb bench/ycsb/compare bench/wal-ab bench/smr-ycsb bench/fanout bench/smr-ab bench/fanout-micro bench/bulk-load/compare bench/multiwriter bench/multiwriter/rocksdb bench/multiwriter/fjall bench/multiwriter/clean bench/multiwriter/compare bench/smallbank bench/smallbank/persistent bench/save bench/compare bench/flamegraph bench/compare-engines perf/check perf/baseline consistency/elle consistency/elle-mutation test/formal-kernel test/formal-key-kernel formal/drift-check formal/cite-check formal/tla-smoke formal/tla-model formal/tla-modes formal/tla-manifest formal/tla-calibrate paging/check bench/fs-paged
 
 build:
 	cargo build
@@ -735,3 +735,44 @@ paging/check:
 		--ops=$(PAGING_OPS) --timeout-secs=$(PAGING_TIMEOUT) --restart \
 		> $(PAGING_OUT)/A.json
 	python3 compare_benches/scripts/paging_check.py $(PAGING_OUT)/C.json $(PAGING_OUT)/A.json
+
+# fs-paged comparison matrix: paged UltimaDB vs RocksDB/Fjall/ReDB with a
+# dataset LARGER than memory, all engines under the SAME cgroup-v2 memory.max
+# (calibrated as in-memory-UltimaDB-footprint / ratio), across both commit-
+# durability tiers (eventual | strict — same per-engine mapping as the
+# `ycsb_*_bench` compare tier, see `Dur` in paging_matrix.rs). Workloads:
+# YCSB A/B/C/F point ops + E range scans (scan-only variant; E's 5% insert
+# leg is dropped, like D, to keep the dataset and budget calibration fixed).
+# The in-memory `ultima` engine is deliberately absent: OS-swap tiering was
+# evaluated and rejected (docs/benchmarks/paging-baseline-local-2026-08-29.md).
+#
+# LOCAL RUNS ARE SANITY ONLY (~2x sandbox noise floor) — publishable numbers
+# come from the bench-infra NVMe host (`cd bench-infra && make bench/fs-paged`,
+# billable, needs explicit authorization). Same ULTIMA_BENCH_DIR real-disk
+# guard as bench/ycsb/compare applies to the page/WAL/SST directories.
+# Two memory knobs, deliberately not equal (see paging/check above):
+# the cgroup limit is the comparable cross-engine budget; FS_PAGED_BUDGET is
+# ultima-paged's internal resident-data-leaf cap (`PagedOptions`).
+FS_PAGED_ROWS := 5000000
+FS_PAGED_RATIOS := 4
+FS_PAGED_ENGINES := ultima-paged redb rocksdb fjall
+FS_PAGED_DISTS := zipf
+FS_PAGED_WORKLOADS := A B C E F
+FS_PAGED_DURABILITIES := eventual strict
+FS_PAGED_OPS := 500000
+FS_PAGED_TIMEOUT := 60
+FS_PAGED_BUDGET := 67108864
+FS_PAGED_OUT_DIR := $(CURDIR)/target/fs-paged
+
+bench/fs-paged:
+	cargo build --release -p compare-benches --bin paging_matrix
+	@mkdir -p $(FS_PAGED_OUT_DIR)
+	@out="$(FS_PAGED_OUT_DIR)/results-$$(date +%Y%m%d-%H%M%S).jsonl"; \
+	ULTIMA_BENCH_DIR="$(ULTIMA_BENCH_DIR)" \
+	ROWS=$(FS_PAGED_ROWS) RATIOS="$(FS_PAGED_RATIOS)" \
+	ENGINES="$(FS_PAGED_ENGINES)" DISTS="$(FS_PAGED_DISTS)" \
+	WORKLOADS="$(FS_PAGED_WORKLOADS)" DURABILITIES="$(FS_PAGED_DURABILITIES)" \
+	OPS=$(FS_PAGED_OPS) TIMEOUT=$(FS_PAGED_TIMEOUT) LOAD=insert \
+	PAGED_BUDGET=$(FS_PAGED_BUDGET) OUT="$$out" \
+	compare_benches/scripts/paging_matrix_run.sh && \
+	python3 compare_benches/scripts/fs_paged_report.py "$$out" | tee "$${out%.jsonl}.md"

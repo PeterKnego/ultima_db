@@ -36,8 +36,14 @@ case "$mode" in
 esac
 
 # Launch in its own transient scope. MemorySwapMax=infinity: the budget is
-# RAM only; swap is unbounded (that is the whole point).
-systemd-run --user --scope --quiet \
+# RAM only; swap is unbounded (that is the whole point). As root (e.g. the
+# bench-infra NVMe host, where ansible runs become) there is no user manager
+# session — use the system manager instead; the harness reads its own cgroup
+# from /proc/self/cgroup either way, and root can write that cgroup's
+# memory.max directly.
+user_flag="--user"
+[[ "$(id -u)" == "0" ]] && user_flag=""
+systemd-run $user_flag --scope --quiet \
   -p MemorySwapMax=infinity \
   -- "$bin" --barrier="$barrier" --ratio="$label" "$@" \
   > "$work/out.json" 2> >(tee "$work/err.log" >&2) &

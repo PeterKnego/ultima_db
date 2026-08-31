@@ -14,7 +14,7 @@ SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS) 2>/de
 
 SAMPLES ?= 5
 
-.PHONY: init up inventory bench/competitor bench/wal-ab bench/smr-ycsb bench/autobench bench/autobench-median bench/fanout bench/smr-ab bench/fanout-micro bench/checkpoint-delta bench-oneshot status ssh destroy
+.PHONY: init up inventory bench/competitor bench/wal-ab bench/smr-ycsb bench/fs-paged bench/autobench bench/autobench-median bench/fanout bench/smr-ab bench/fanout-micro bench/checkpoint-delta bench-oneshot status ssh destroy
 
 init: ## terraform init
 	$(TF) init
@@ -36,6 +36,9 @@ bench/wal-ab: ## WAL/durability A/B sweep (ultima-only) on NVMe
 bench/smr-ycsb: ## SMR (checkpoint-only) vs Eventual YCSB A/B (ultima-only) on NVMe
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=smr-ycsb
 
+bench/fs-paged: ## larger-than-memory matrix: paged UltimaDB vs RocksDB/Fjall/ReDB under one cgroup budget, both durability tiers
+	cd ansible && $(ANSIBLE) bench.yml -e bench_target=fs-paged
+
 bench/autobench: ## autobench Gate-A microbenches + baseline record
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=autobench
 
@@ -54,8 +57,8 @@ bench/fanout-micro: ## Fanout (T) read-vs-write asymmetry — warm+cold get/inse
 bench/checkpoint-delta: ## Incremental checkpoints — crossover (dirty % vs chain_max) + recovery-vs-chain-length
 	cd ansible && $(ANSIBLE) bench.yml -e bench_target=checkpoint-delta
 
-bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro|checkpoint-delta) -> destroy (destroy runs even if up/bench fail)
-	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|smr-ycsb|autobench|autobench-median|fanout|smr-ab|fanout-micro|checkpoint-delta"; exit 1; fi
+bench-oneshot: ## guard TARGET, then up -> bench (TARGET=competitor|wal-ab|smr-ycsb|fs-paged|autobench|autobench-median|fanout|smr-ab|fanout-micro|checkpoint-delta) -> destroy (destroy runs even if up/bench fail)
+	@if [ -z "$(TARGET)" ]; then echo "ERROR: set TARGET=competitor|wal-ab|smr-ycsb|fs-paged|autobench|autobench-median|fanout|smr-ab|fanout-micro|checkpoint-delta"; exit 1; fi
 	@rc=0; \
 	( $(MAKE) up && cd ansible && $(ANSIBLE) bench.yml -e bench_target=$(TARGET) ) || rc=$$?; \
 	if ! $(MAKE) destroy; then \

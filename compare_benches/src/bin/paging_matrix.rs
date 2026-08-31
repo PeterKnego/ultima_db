@@ -84,6 +84,29 @@ enum LoadMode {
     Insert,
 }
 
+/// Commit-durability tier, mirroring the `BenchDurability` tiers of the
+/// criterion `ycsb_*_bench` compare tier so numbers line up across benches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dur {
+    /// Buffered/async: WAL on but no per-op fsync (UltimaDB `Eventual` +
+    /// `Coalesced`, RocksDB `sync=false`, Fjall buffered journal, ReDB
+    /// `Durability::None`).
+    Eventual,
+    /// Fsync per committed write op (UltimaDB `ConsistentInline` +
+    /// `CoalescedPrealloc` — the `standalone_fast` pairing — RocksDB
+    /// `sync=true`, Fjall `persist(SyncAll)`, ReDB `Durability::Immediate`).
+    Strict,
+}
+
+impl Dur {
+    fn as_str(self) -> &'static str {
+        match self {
+            Dur::Eventual => "eventual",
+            Dur::Strict => "strict",
+        }
+    }
+}
+
 trait Engine {
     fn name(&self) -> &'static str;
     fn load(&mut self, rows: u64, mode: LoadMode);
@@ -92,6 +115,10 @@ trait Engine {
     /// touches only the leaf page and leaves the value pages in swap.
     fn read(&self, key: u64) -> Option<u64>;
     fn update(&mut self, key: u64, seed: u64);
+    /// Range scan: visit up to `n` rows from `start` (inclusive), consuming
+    /// each value (fold a field), and return how many rows were visited
+    /// (scans near the end of the keyspace come up short).
+    fn scan(&self, start: u64, n: usize) -> u64;
     /// DIAG mode needs the concrete store.
     fn as_ultima(&self) -> Option<&UltimaEngine> {
         None
@@ -208,6 +235,19 @@ impl Engine for UltimaEngine {
         }
         wtx.commit().expect("commit");
     }
+
+    fn scan(&self, start: u64, n: usize) -> u64 {
+        let rtx = self.store.begin_read(None).expect("begin_read");
+        let t = rtx.open_table::<Row>("rows").expect("open_table");
+        let mut visited = 0u64;
+        let mut acc = 0u64;
+        for (_, r) in t.range(start..).take(n) {
+            acc ^= r.a ^ r.pad[5];
+            visited += 1;
+        }
+        black_box(acc);
+        visited
+    }
 }
 
 // --- UltimaDB paged (on-disk B-tree node store; the store itself demotes
@@ -222,30 +262,40 @@ struct UltimaPagedEngine {
     store: Option<ultima_db::Store>,
     dir: tempfile::TempDir,
     budget: u64,
+    dur: Dur,
 }
 
 impl UltimaPagedEngine {
-    fn new(disk_dir: &Path, budget: u64) -> Self {
+    fn new(disk_dir: &Path, budget: u64, dur: Dur) -> Self {
         let dir = tempfile::tempdir_in(disk_dir).expect("tempdir");
-        let store = Self::open(dir.path(), budget);
+        let store = Self::open(dir.path(), budget, dur);
         UltimaPagedEngine {
             store: Some(store),
             dir,
             budget,
+            dur,
         }
     }
 
     /// `Store::new` + `register_table` against `path` — does *not* recover;
     /// callers that need the on-disk state loaded call `.recover()`
     /// themselves (so its cost can be timed separately, see `restart`).
-    fn open(path: &Path, budget: u64) -> ultima_db::Store {
-        let p = ultima_db::Persistence::standalone(
-            path,
-            ultima_db::Durability::Eventual,
-            ultima_db::WalWrite::Coalesced,
-        )
-        .paged(ultima_db::PagedOptions::builder().memory_budget_bytes(budget).build())
-        .expect("paged persistence");
+    fn open(path: &Path, budget: u64, dur: Dur) -> ultima_db::Store {
+        // Strict = the `standalone_fast` pairing: the committing thread
+        // fsyncs inline (`ConsistentInline`, SingleWriter-only — which this
+        // harness is) into a pre-zero-filled WAL (`CoalescedPrealloc`,
+        // metadata-free fdatasync). CLAUDE.md: paged mode composes with
+        // every `Durability`/`WalWrite` combination.
+        let (durability, wal_write) = match dur {
+            Dur::Eventual => (ultima_db::Durability::Eventual, ultima_db::WalWrite::Coalesced),
+            Dur::Strict => (
+                ultima_db::Durability::ConsistentInline,
+                ultima_db::WalWrite::CoalescedPrealloc,
+            ),
+        };
+        let p = ultima_db::Persistence::standalone(path, durability, wal_write)
+            .paged(ultima_db::PagedOptions::builder().memory_budget_bytes(budget).build())
+            .expect("paged persistence");
         let store = ultima_db::Store::new(ultima_db::StoreConfig::builder().persistence(p).build())
             .expect("Store::new");
         store.register_table::<Row>("rows").expect("register_table");
@@ -328,12 +378,26 @@ impl Engine for UltimaPagedEngine {
         wtx.commit().expect("commit");
     }
 
+    fn scan(&self, start: u64, n: usize) -> u64 {
+        let rtx = self.store().begin_read(None).expect("begin_read");
+        let t = rtx.open_table::<Row>("rows").expect("open_table");
+        let mut visited = 0u64;
+        let mut acc = 0u64;
+        for (_, r) in t.range(start..).take(n) {
+            acc ^= r.a ^ r.pad[5];
+            visited += 1;
+        }
+        black_box(acc);
+        visited
+    }
+
     fn restart(&mut self) -> Option<f64> {
         let path = self.dir.path().to_path_buf();
         let budget = self.budget;
+        let dur = self.dur;
         self.store = None; // drop first: see the `store` field's doc
         let t0 = Instant::now();
-        let store = Self::open(&path, budget);
+        let store = Self::open(&path, budget, dur);
         store.recover().expect("recover");
         let secs = t0.elapsed().as_secs_f64();
         self.store = Some(store);
@@ -350,15 +414,23 @@ impl Engine for UltimaPagedEngine {
 struct RedbEngine {
     db: redb::Database,
     _dir: tempfile::TempDir,
+    /// Measured-phase commit durability (the unmeasured load always commits
+    /// `Durability::None`; ReDB's next durable commit persists the whole
+    /// tree state, so the first strict-tier update covers the load too).
+    durability: redb::Durability,
 }
 
 const REDB_TABLE: redb::TableDefinition<[u8; 8], &[u8]> = redb::TableDefinition::new("rows");
 
 impl RedbEngine {
-    fn new(disk_dir: &Path) -> Self {
+    fn new(disk_dir: &Path, dur: Dur) -> Self {
         let dir = tempfile::tempdir_in(disk_dir).expect("tempdir");
         let db = redb::Database::create(dir.path().join("rows.redb")).expect("redb create");
-        RedbEngine { db, _dir: dir }
+        let durability = match dur {
+            Dur::Eventual => redb::Durability::None,
+            Dur::Strict => redb::Durability::Immediate,
+        };
+        RedbEngine { db, _dir: dir, durability }
     }
 }
 
@@ -394,13 +466,28 @@ impl Engine for RedbEngine {
 
     fn update(&mut self, key: u64, seed: u64) {
         let mut tx = self.db.begin_write().expect("begin_write");
-        tx.set_durability(redb::Durability::None).expect("durability");
+        tx.set_durability(self.durability).expect("durability");
         {
             let mut t = tx.open_table(REDB_TABLE).expect("open_table");
             t.insert(encode_key(key), encode_row(&Row::new(seed)).as_slice())
                 .expect("insert");
         }
         tx.commit().expect("commit");
+    }
+
+    fn scan(&self, start: u64, n: usize) -> u64 {
+        use redb::ReadableDatabase;
+        let tx = self.db.begin_read().expect("begin_read");
+        let t = tx.open_table(REDB_TABLE).expect("open_table");
+        let mut visited = 0u64;
+        let mut acc = 0u64;
+        for item in t.range(encode_key(start)..).expect("range").take(n) {
+            let (_, v) = item.expect("scan item");
+            acc ^= first_u64(v.value());
+            visited += 1;
+        }
+        black_box(acc);
+        visited
     }
 }
 
@@ -409,16 +496,21 @@ impl Engine for RedbEngine {
 struct RocksEngine {
     db: rocksdb::DB,
     _dir: tempfile::TempDir,
+    /// Strict tier: fsync the WAL on every measured write. The eventual
+    /// tier uses default `WriteOptions` (WAL on, `sync=false`) — the same
+    /// mapping as `ycsb_rocksdb_bench` (only the unmeasured load runs
+    /// WAL-off).
+    sync: bool,
 }
 
 impl RocksEngine {
-    fn new(disk_dir: &Path) -> Self {
+    fn new(disk_dir: &Path, dur: Dur) -> Self {
         let dir = tempfile::tempdir_in(disk_dir).expect("tempdir");
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.set_write_buffer_size(256 * 1024 * 1024);
         let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb open");
-        RocksEngine { db, _dir: dir }
+        RocksEngine { db, _dir: dir, sync: dur == Dur::Strict }
     }
 }
 
@@ -453,9 +545,28 @@ impl Engine for RocksEngine {
     }
 
     fn update(&mut self, key: u64, seed: u64) {
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(self.sync);
         self.db
-            .put(encode_key(key), encode_row(&Row::new(seed)))
+            .put_opt(encode_key(key), encode_row(&Row::new(seed)), &wo)
             .expect("put");
+    }
+
+    fn scan(&self, start: u64, n: usize) -> u64 {
+        let key = encode_key(start);
+        let mut visited = 0u64;
+        let mut acc = 0u64;
+        for item in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&key, rocksdb::Direction::Forward))
+            .take(n)
+        {
+            let (_, v) = item.expect("scan item");
+            acc ^= first_u64(&v);
+            visited += 1;
+        }
+        black_box(acc);
+        visited
     }
 }
 
@@ -463,12 +574,16 @@ impl Engine for RocksEngine {
 
 struct FjallEngine {
     keyspace: fjall::Keyspace,
-    _db: fjall::Database,
+    db: fjall::Database,
     _dir: tempfile::TempDir,
+    /// Strict tier: `persist(PersistMode::SyncAll)` (fsync the journal)
+    /// after every measured write — same mapping as `ycsb_fjall_bench`.
+    /// Eventual: inserts stay on the buffered journal (OS page cache).
+    sync: bool,
 }
 
 impl FjallEngine {
-    fn new(disk_dir: &Path) -> Self {
+    fn new(disk_dir: &Path, dur: Dur) -> Self {
         let dir = tempfile::tempdir_in(disk_dir).expect("tempdir");
         let db = fjall::Database::builder(dir.path()).open().expect("fjall open");
         let keyspace = db
@@ -476,8 +591,9 @@ impl FjallEngine {
             .expect("keyspace");
         FjallEngine {
             keyspace,
-            _db: db,
+            db,
             _dir: dir,
+            sync: dur == Dur::Strict,
         }
     }
 }
@@ -497,6 +613,11 @@ impl Engine for FjallEngine {
                 .insert(encode_key(i), encode_row(&Row::new(i)))
                 .expect("insert");
         }
+        if self.sync {
+            // One fsync so the measured strict phase starts from a durable
+            // base (the load itself is unmeasured and buffered).
+            self.db.persist(fjall::PersistMode::SyncAll).expect("persist");
+        }
     }
 
     fn read(&self, key: u64) -> Option<u64> {
@@ -510,6 +631,21 @@ impl Engine for FjallEngine {
         self.keyspace
             .insert(encode_key(key), encode_row(&Row::new(seed)))
             .expect("insert");
+        if self.sync {
+            self.db.persist(fjall::PersistMode::SyncAll).expect("persist");
+        }
+    }
+
+    fn scan(&self, start: u64, n: usize) -> u64 {
+        let mut visited = 0u64;
+        let mut acc = 0u64;
+        for guard in self.keyspace.range(encode_key(start)..).take(n) {
+            let (_, v) = guard.into_inner().expect("scan item");
+            acc ^= first_u64(&v);
+            visited += 1;
+        }
+        black_box(acc);
+        visited
     }
 }
 
@@ -620,6 +756,10 @@ struct Args {
     /// the same workload again — reports `recover_secs`/`ops_per_sec_2`/
     /// `pf_per_op_2` alongside the first run's numbers.
     restart: bool,
+    /// Commit-durability tier for disk engines (see `Dur`). Rejected for
+    /// `--engine=ultima` (in-memory, `Persistence::None` — strict is
+    /// meaningless there).
+    durability: Dur,
 }
 
 fn parse_args() -> Args {
@@ -638,6 +778,7 @@ fn parse_args() -> Args {
         keys: None,
         paged_budget: None,
         restart: false,
+        durability: Dur::Eventual,
     };
     let mut load_explicit = false;
     for arg in std::env::args().skip(1) {
@@ -671,12 +812,19 @@ fn parse_args() -> Args {
             "seed" => a.seed = v.parse().expect("seed"),
             "keys" => a.keys = Some(v.parse().expect("keys")),
             "paged-budget" => a.paged_budget = Some(v.parse().expect("paged-budget")),
+            "durability" => {
+                a.durability = match v {
+                    "eventual" => Dur::Eventual,
+                    "strict" => Dur::Strict,
+                    _ => panic!("--durability=eventual|strict"),
+                }
+            }
             _ => panic!("unknown arg --{k}"),
         }
     }
     assert!(
-        matches!(a.workload.as_str(), "A" | "C" | "DIAG"),
-        "--workload=A|C|DIAG (A: 50% read / 50% update; C: 100% read; DIAG: ultima-only per-phase fault decomposition)"
+        matches!(a.workload.as_str(), "A" | "B" | "C" | "E" | "F" | "DIAG"),
+        "--workload=A|B|C|E|F|DIAG (A: 50% read / 50% update; B: 95% read / 5% update; C: 100% read; E: range scans, length uniform 1..=100 — YCSB-E minus its 5% insert leg, so the dataset and budget calibration stay fixed; F: read-modify-write; DIAG: ultima-only per-phase fault decomposition)"
     );
     assert!(matches!(a.dist.as_str(), "zipf" | "uniform"), "--dist=zipf|uniform");
     if a.engine == "ultima-paged" {
@@ -739,6 +887,12 @@ struct Report {
     dist: String,
     keys: u64,
     workload: String,
+    /// `eventual` or `strict` — see `--durability`.
+    durability: String,
+    /// Workload E only: average rows actually visited per scan op (target
+    /// is uniform 1..=100, i.e. ~50.5; lower means scans ran off the end
+    /// of the keyspace).
+    scan_rows_per_op: Option<f64>,
     load: String,
     load_secs: f64,
     rss_after_load_bytes: u64,
@@ -808,6 +962,7 @@ struct RunOutcome {
     pswpout_run: u64,
     trajectory: Vec<Trajectory>,
     pf_per_op: Option<f64>,
+    scan_rows_per_op: Option<f64>,
 }
 
 /// Run `args.ops` (or until `args.timeout`) reads/updates against `engine`,
@@ -817,7 +972,13 @@ fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutco
     let mut rng = rand::rngs::StdRng::seed_from_u64(rng_seed);
     let keyspace = args.keys.unwrap_or(args.rows).min(args.rows);
     let zipf = (args.dist == "zipf").then(|| ZipfianGenerator::new(keyspace, 0.99));
-    let write_frac = if args.workload == "A" { 0.5 } else { 0.0 };
+    let write_frac = match args.workload.as_str() {
+        "A" => 0.5,
+        "B" => 0.05,
+        _ => 0.0,
+    };
+    let is_scan = args.workload == "E";
+    let is_rmw = args.workload == "F";
 
     let mut lat: Vec<u32> = Vec::with_capacity(args.ops.min(50_000_000) as usize);
     let mut trajectory = Vec::new();
@@ -831,6 +992,7 @@ fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutco
     let mut ops = 0u64;
     let mut timed_out = false;
     let mut wseed = args.rows + 1;
+    let mut rows_scanned = 0u64;
 
     while ops < args.ops {
         let key = match &zipf {
@@ -839,7 +1001,19 @@ fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutco
         };
         let is_write = write_frac > 0.0 && rng.random_bool(write_frac);
         let t = Instant::now();
-        if is_write {
+        if is_scan {
+            // YCSB-E scan lengths: uniform 1..=100. E's 5% insert leg is
+            // dropped (as is workload D) so the dataset — and with it the
+            // memory-budget calibration — stays fixed over the whole cell.
+            let len = rng.random_range(1..=100u32) as usize;
+            rows_scanned += engine.scan(key, len);
+        } else if is_rmw {
+            // YCSB-F: read-modify-write, timed as ONE op.
+            let found = engine.read(key);
+            debug_assert!(found.is_some(), "key {key} missing");
+            wseed += 1;
+            engine.update(key, wseed);
+        } else if is_write {
             wseed += 1;
             engine.update(key, wseed);
         } else {
@@ -901,6 +1075,7 @@ fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutco
         pswpout_run,
         trajectory,
         pf_per_op,
+        scan_rows_per_op: is_scan.then(|| rows_scanned as f64 / ops.max(1) as f64),
     }
 }
 
@@ -983,14 +1158,21 @@ fn main() {
         .unwrap_or_else(ultima_bench_workloads::ycsb::bench_disk_dir);
 
     let mut engine: Box<dyn Engine> = match args.engine.as_str() {
-        "ultima" => Box::new(UltimaEngine::new()),
+        "ultima" => {
+            assert!(
+                args.durability == Dur::Eventual,
+                "--engine=ultima is in-memory (Persistence::None): --durability=strict is meaningless for it"
+            );
+            Box::new(UltimaEngine::new())
+        }
         "ultima-paged" => Box::new(UltimaPagedEngine::new(
             &disk_dir,
             args.paged_budget.expect("checked in parse_args"),
+            args.durability,
         )),
-        "redb" => Box::new(RedbEngine::new(&disk_dir)),
-        "rocksdb" => Box::new(RocksEngine::new(&disk_dir)),
-        "fjall" => Box::new(FjallEngine::new(&disk_dir)),
+        "redb" => Box::new(RedbEngine::new(&disk_dir, args.durability)),
+        "rocksdb" => Box::new(RocksEngine::new(&disk_dir, args.durability)),
+        "fjall" => Box::new(FjallEngine::new(&disk_dir, args.durability)),
         other => panic!("unknown engine {other}"),
     };
     let name = engine.name();
@@ -1089,6 +1271,8 @@ fn main() {
         dist: args.dist.clone(),
         keys: keyspace,
         workload: args.workload.clone(),
+        durability: args.durability.as_str().to_string(),
+        scan_rows_per_op: run1.scan_rows_per_op,
         load: format!("{:?}", args.load).to_ascii_lowercase(),
         load_secs,
         rss_after_load_bytes: rss_after_load,

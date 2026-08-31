@@ -12,6 +12,7 @@ cargo test --test store_integration      # integration tests only
 cargo clippy -- -D warnings              # lint (must pass with zero warnings)
 cargo bench                              # first-party benchmarks (criterion)
 make bench/compare-engines               # competitor baselines (RocksDB/Fjall/ReDB), opt-in
+make bench/fs-paged                      # larger-than-memory matrix: paged UltimaDB vs RocksDB/Fjall/ReDB, one cgroup budget, eventual+strict durability (local = sanity only)
 make perf/check                          # perf regression gate (autobench baselines)
 cargo run --example basic_usage          # run examples
 cargo run --example multi_store
