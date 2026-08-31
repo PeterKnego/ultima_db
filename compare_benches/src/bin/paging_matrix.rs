@@ -281,6 +281,12 @@ struct PagedKnobs {
     dirty_trigger: Option<u64>,
     /// `PagedOptions::checkpoint_interval` — the time trigger, seconds.
     interval_secs: Option<u64>,
+    /// `StoreConfig::num_snapshots_retained` (default 10). Spike probe F5:
+    /// retained snapshots pin the PRE-demotion tree — demotion re-publishes
+    /// only the latest version, so the 9 older snapshots keep every
+    /// demoted leaf's Arc (and its values) alive, invisible to the memory
+    /// budget. 653 MiB measured live post-load-checkpoint at 5M rows.
+    snapshots_retained: Option<usize>,
 }
 
 impl UltimaPagedEngine {
@@ -312,6 +318,10 @@ impl UltimaPagedEngine {
                 ultima_db::WalWrite::CoalescedPrealloc,
             ),
         };
+        let mut cfgb = ultima_db::StoreConfig::builder();
+        if let Some(n) = knobs.snapshots_retained {
+            cfgb = cfgb.num_snapshots_retained(n);
+        }
         let mut b = ultima_db::PagedOptions::builder().memory_budget_bytes(budget);
         if let Some(d) = knobs.dirty_trigger {
             b = b.checkpoint_dirty_bytes(d);
@@ -322,8 +332,7 @@ impl UltimaPagedEngine {
         let p = ultima_db::Persistence::standalone(path, durability, wal_write)
             .paged(b.build())
             .expect("paged persistence");
-        let store = ultima_db::Store::new(ultima_db::StoreConfig::builder().persistence(p).build())
-            .expect("Store::new");
+        let store = ultima_db::Store::new(cfgb.persistence(p).build()).expect("Store::new");
         store.register_table::<Row>("rows").expect("register_table");
         store
     }
@@ -864,6 +873,9 @@ fn parse_args() -> Args {
             }
             "paged-interval-secs" => {
                 a.paged_knobs.interval_secs = Some(v.parse().expect("paged-interval-secs"))
+            }
+            "snapshots-retained" => {
+                a.paged_knobs.snapshots_retained = Some(v.parse().expect("snapshots-retained"))
             }
             "durability" => {
                 a.durability = match v {
