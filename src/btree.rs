@@ -461,6 +461,25 @@ impl<K: Clone, V> Clone for BTreeNode<K, V> {
 }
 
 impl<K, V> BTreeNode<K, V> {
+    /// The one legal clone of a block leaf: values duplicated through the
+    /// source's `clone_value`. Non-block nodes take the plain-Clone path.
+    pub(crate) fn clone_with(&self, src: Option<&dyn NodeSource<K, V>>) -> BTreeNode<K, V>
+    where
+        K: Clone,
+    {
+        match &self.block {
+            None => self.clone(),
+            Some(b) => {
+                let src = src.expect("I-B: block leaf on a sourceless tree");
+                let block: Box<[V]> = b
+                    .iter()
+                    .map(|v| src.clone_value(v).expect("I-B: block leaf on a non-cloning source"))
+                    .collect();
+                BTreeNode { entries: self.entries.clone(), children: self.children.clone(), block: Some(block) }
+            }
+        }
+    }
+
     /// The value of entry `i`, from either representation. Panics on an
     /// in-block entry with no block — impossible under I-A.
     pub(crate) fn value_at(&self, i: usize) -> &V {

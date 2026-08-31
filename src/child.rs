@@ -39,6 +39,13 @@ pub(crate) trait NodeSource<K, V>: Send + Sync {
     fn read_node(&self, id: PageId) -> crate::Result<Arc<BTreeNode<K, V>>>;
     /// Called by `Child::make_mut` when it clones a *clean* node (dirty-bytes trigger).
     fn note_dirty(&self, _bytes: usize) {}
+    /// Clone one value for a block-leaf CoW. `None` (the default) means
+    /// this source cannot clone values — trees on such sources must never
+    /// hold block leaves (I-B). `PagedSource` returns `Some` via the fn
+    /// pointer captured at `register_table_paged` (Task 3).
+    fn clone_value(&self, _v: &V) -> Option<V> {
+        None
+    }
     /// Name used in the fault-in panic message.
     fn name(&self) -> &str {
         "<unnamed>"
@@ -336,7 +343,12 @@ impl<K: Clone, V> Child<K, V> {
         let p = *self.node.get_mut();
         // SAFETY: caller already ensured residency (via `load`/`load_quiet`), so p is non-null.
         let mut arc = unsafe { Arc::from_raw(p) };
-        Arc::make_mut(&mut arc); // clones iff shared; no-op (in place) if unique
+        // `Arc::make_mut` would clone through plain `Clone`, which cannot
+        // duplicate a value block (no `V: Clone` bound on the tree) — go
+        // through `clone_with`, which routes block values via the source.
+        if Arc::get_mut(&mut arc).is_none() {
+            arc = Arc::new(arc.clone_with(src));
+        }
         let raw = Arc::into_raw(arc) as *mut BTreeNode<K, V>;
         *self.node.get_mut() = raw;
         // Whether cloned or edited in place, the contents now diverge from the page.
@@ -392,8 +404,11 @@ pub(crate) mod tests {
         pub pages: Mutex<HashMap<PageId, Arc<BTreeNode<K, V>>>>,
         pub reads: AtomicUsize,
         pub dirty_bytes: AtomicUsize,
+        /// Number of `clone_value` calls — the block-leaf CoW must clone
+        /// exactly one value per entry, no more, no less.
+        pub cloned: AtomicU64,
     }
-    impl<K: Clone + Send + Sync, V: Send + Sync> NodeSource<K, V> for MockDisk<K, V> {
+    impl<K: Clone + Send + Sync, V: Send + Sync + Copy> NodeSource<K, V> for MockDisk<K, V> {
         fn read_node(&self, id: PageId) -> crate::Result<Arc<BTreeNode<K, V>>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let pages = self.pages.lock().unwrap();
@@ -404,10 +419,19 @@ pub(crate) mod tests {
         fn note_dirty(&self, bytes: usize) {
             self.dirty_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
+        fn clone_value(&self, v: &V) -> Option<V> {
+            self.cloned.fetch_add(1, Ordering::Relaxed);
+            Some(*v)
+        }
     }
     impl<K, V> MockDisk<K, V> {
         pub fn new() -> Self {
-            Self { pages: Mutex::new(HashMap::new()), reads: AtomicUsize::new(0), dirty_bytes: AtomicUsize::new(0) }
+            Self {
+                pages: Mutex::new(HashMap::new()),
+                reads: AtomicUsize::new(0),
+                dirty_bytes: AtomicUsize::new(0),
+                cloned: AtomicU64::new(0),
+            }
         }
         pub fn put(&self, id: PageId, n: Arc<BTreeNode<K, V>>) {
             self.pages.lock().unwrap().insert(id, n);
@@ -419,6 +443,17 @@ pub(crate) mod tests {
             entries: keys.iter().map(|k| (*k, Value::arc(Arc::new(*k * 10)))).collect(),
             children: Default::default(),
             block: None,
+        })
+    }
+
+    /// A leaf whose values live in `block` rather than behind per-entry
+    /// `Arc`s — the shape `clone_with`/`clone_value` exist to CoW.
+    fn block_leaf(keys: &[u64]) -> Arc<BTreeNode<u64, u64>> {
+        let values: Vec<u64> = keys.iter().map(|k| k * 10).collect();
+        Arc::new(BTreeNode {
+            entries: keys.iter().map(|k| (*k, Value::in_block())).collect(),
+            children: Default::default(),
+            block: Some(values.into_boxed_slice()),
         })
     }
 
@@ -522,6 +557,35 @@ pub(crate) mod tests {
         let n = c.make_mut(Some(&disk));
         assert_eq!(n as *const _, before_ptr, "unique owner: in place");
         assert_eq!(c.page_id(), None);
+    }
+
+    #[test]
+    fn make_mut_unique_block_leaf_is_in_place() {
+        // A uniquely-owned block leaf's make_mut must take the `Arc::get_mut`
+        // fast path — no `clone_with`/`clone_value` call at all.
+        let disk = MockDisk::new();
+        let mut c: Child<u64, u64> = Child::resident(block_leaf(&[1, 2]));
+        let before_ptr = c.load(Some(&disk)) as *const _;
+        let n = c.make_mut(Some(&disk));
+        assert_eq!(n as *const _, before_ptr, "unique owner: in place");
+        assert_eq!(disk.cloned.load(Ordering::Relaxed), 0, "no clone on the unique-owner path");
+        assert_eq!(c.page_id(), None);
+    }
+
+    #[test]
+    fn make_mut_shared_block_leaf_clones_via_source() {
+        // A block leaf shared with a second `Arc` owner can't take
+        // `Arc::get_mut`'s fast path, and plain `Clone` can't duplicate a
+        // block (no `V: Clone`) — make_mut must route through
+        // `clone_with`/`NodeSource::clone_value`, once per block entry.
+        let disk = MockDisk::new();
+        let node = block_leaf(&[1, 2, 3]);
+        let before_ptr = Arc::as_ptr(&node);
+        let mut c: Child<u64, u64> = Child::resident(node.clone()); // `node` is the second owner
+        let n = c.make_mut(Some(&disk));
+        assert_ne!(n as *const _, before_ptr, "shared owner: cloned, not mutated in place");
+        assert_eq!(disk.cloned.load(Ordering::Relaxed), 3, "one clone_value call per block entry");
+        drop(node);
     }
 
     #[test]
