@@ -60,14 +60,26 @@
     executable: /bin/bash
   changed_when: true
 
-- name: Run fs-paged larger-than-memory comparison matrix
+- name: Run fs-paged larger-than-memory comparison matrix (+ lever cells)
   when: bench_target == "fs-paged"
   ansible.builtin.shell: |
     set -euo pipefail
     source /etc/profile.d/cargo.sh
+    # The fs-paged cells measure degradation under a cgroup memory cap, which
+    # is swap-backed reclaim — on this swapless, swappiness=0 host they would
+    # OOM-kill instead. Give the run a swapfile on the ephemeral NVMe and a
+    # sane swappiness (host is destroyed after the run; nothing to restore).
+    if ! swapon --show | grep -q .; then
+      fallocate -l 16G {{ bench_dir }}/swapfile
+      chmod 600 {{ bench_dir }}/swapfile
+      mkswap {{ bench_dir }}/swapfile
+      swapon {{ bench_dir }}/swapfile
+    fi
+    sysctl -w vm.swappiness=60
     cd {{ ud_src_dir }}
     make bench/fs-paged ULTIMA_BENCH_DIR={{ bench_dir }} 2>&1 | tee {{ remote_home }}/results/fs-paged.log
     cp target/fs-paged/results-*.jsonl target/fs-paged/results-*.md {{ remote_home }}/results/
+    ULTIMA_BENCH_DIR={{ bench_dir }} OUT={{ remote_home }}/results/fs-paged-levers.jsonl       compare_benches/scripts/fs_paged_levers.sh 2>&1 | tee {{ remote_home }}/results/fs-paged-levers.log
   args:
     executable: /bin/bash
   changed_when: true
