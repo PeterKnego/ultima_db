@@ -334,11 +334,18 @@ Persistence::standalone_fast(dir).paged(..)     // durability knobs are orthogon
 |---|---|---|
 | `memory_budget_bytes` | `None` | resident data-leaf bytes (estimate); exceeding it runs a demotion pass. `None` = never demote on memory. The operator's one important knob. |
 | `checkpoint_dirty_bytes` | 256 MiB | dirty node bytes before a checkpoint; bounds WAL replay length and un-demotable memory |
-| `checkpoint_interval` | `None` | time-based checkpoint for quiet stores |
+| `checkpoint_interval` | `Some(60s)` | time-based checkpoint backstop — see below |
 | `demote_batch` | 1024 parents | lock hold per demotion batch |
 | `page_prefetch_bytes` | 4 KiB | first `pread` on fault-in |
 | `prealloc_chunk_bytes` | 16 MiB | zero-fill grow-ahead quantum |
 | `retained_checkpoints` | 2 | roots kept; a root's dead-list is punched when it is deleted |
+
+**`checkpoint_interval` default (Controller amendment, task12):** changed
+from `None` to `Some(60s)` — a backstop so no configuration leaves every
+trigger structurally false (`memory_budget_bytes` defaults to `None` and
+`checkpoint_dirty_bytes` alone can go unmet for a long time on a low-write
+workload); set `None` explicitly to opt back out and rely only on the other
+triggers or manual `Store::checkpoint()` calls.
 
 **Residency:** `Resident` (eager, never demoted) or `Lazy` (leaves on disk,
 demotable). Fixed by rule: index trees and every data tree's inner levels

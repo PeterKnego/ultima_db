@@ -315,7 +315,9 @@ fn dropped_table_with_pending_index_reclaims_its_pages() {
 
     assert!(
         with_index >= baseline as u64 + index_pages_written,
-        "dropping a table with a still-pending persisted index must reclaim at least its          {index_pages_written} pages on top of the {baseline}-range data-only baseline, got          {with_index}"
+        "dropping a table with a still-pending persisted index must reclaim at least its \
+         {index_pages_written} pages on top of the {baseline}-range data-only baseline, got \
+         {with_index}"
     );
 }
 

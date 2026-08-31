@@ -513,13 +513,15 @@ pub(crate) fn raw_reachable_page_ids(file: &PageFile, root: PageId, height: usiz
     fn go(file: &PageFile, id: PageId, depth: usize, height: usize, out: &mut Vec<PageId>) -> Result<()> {
         if depth > height {
             return Err(Error::CheckpointCorrupted(format!(
-                "raw_reachable_page_ids: page {id} is at depth {depth}, past the tree's own                  height ({height}) -- refusing to keep descending (cyclic or corrupt child pointer)"
+                "raw_reachable_page_ids: page {id} is at depth {depth}, past the tree's own \
+                 height ({height}) -- refusing to keep descending (cyclic or corrupt child pointer)"
             )));
         }
         let (kind, payload) = file.read(id)?;
         if !matches!(kind, PageKind::IndexLeaf | PageKind::IndexInner) {
             return Err(Error::CheckpointCorrupted(format!(
-                "raw_reachable_page_ids: page {id} has kind {kind:?}, not an index page --                  refusing to walk it as one"
+                "raw_reachable_page_ids: page {id} has kind {kind:?}, not an index page -- \
+                 refusing to walk it as one"
             )));
         }
         out.push(id);

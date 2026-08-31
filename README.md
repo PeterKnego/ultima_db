@@ -40,6 +40,11 @@ point-in-time reads are zero-copy and old versions stay alive for free.
   `Consistent` (fsync-acknowledged commits) or `Eventual` durability,
   CRC-protected checkpoints, crash recovery, and a checkpoint-only SMR mode
   for Raft/Paxos deployments where the consensus log owns durability.
+- **Paged checkpoints** — opt-in `.paged(PagedOptions)` backs a table's
+  B-tree nodes with an on-disk page file instead of full-row checkpoints, so
+  a data set bigger than RAM stays reachable: quiet leaves demote under a
+  memory budget, hot ones can be pinned resident, and a background
+  checkpointer thread runs on dirty-bytes/interval triggers.
 - **Bulk loads & snapshot streaming** — O(N) sorted rebuilds for restores
   and deltas, multi-table atomic installs, and a streaming wire format for
   replication.

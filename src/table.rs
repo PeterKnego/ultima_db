@@ -534,7 +534,10 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
                             // table or its data is affected. Logged so the
                             // leak is at least visible, not silent.
                             eprintln!(
-                                "ultima_db: paged_changed_pages: table '{table_name}' index                                  '{}' -- failed to walk its old on-disk tree (root page {root})                                  for the dead-page diff: {e}; its pages will not be reclaimed                                  this checkpoint (leaked, not lost)",
+                                "ultima_db: paged_changed_pages: table '{table_name}' index \
+                                 '{}' -- failed to walk its old on-disk tree (root page {root}) \
+                                 for the dead-page diff: {e}; its pages will not be reclaimed \
+                                 this checkpoint (leaked, not lost)",
                                 prev_pending.name
                             );
                         }

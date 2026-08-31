@@ -1116,9 +1116,13 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// never matter anyway (it is never demoted), but staying `load_quiet`
     /// keeps this consistent with every other non-workload walk in this
     /// file.
-    // Only called from `index.rs`'s `from_root_page` constructors, which
-    // are themselves `#[cfg(feature = "persistence")]` — dead code under a
-    // build without that feature, same as `load_inner_levels` above.
+    // Called from `index.rs`'s `from_root_page` constructors (attach time)
+    // and from its `paged_reachable_ids` methods (which re-assert the same
+    // full-residency invariant on every call, since `for_each_page_id`
+    // depends on it structurally — see that method's doc), plus this
+    // module's own test below. All persistence-feature call sites, so this
+    // is dead code under a build without that feature, same as
+    // `load_inner_levels` above.
     #[allow(dead_code)]
     pub(crate) fn load_all(&self) {
         let src = self.source.as_deref();

@@ -652,6 +652,29 @@ pub struct PagedStatsSnapshot {
     pub dead_pages_dropped: u64,
 }
 
+#[cfg(feature = "persistence")]
+impl PagedStatsSnapshot {
+    /// Build a snapshot from a paged store's live counters (relaxed loads —
+    /// see [`crate::pagecodec::PagedStats`]'s doc: these are statistics, not
+    /// synchronization). Shared by [`Store::paged_stats`] and the metrics
+    /// emission point at the end of `checkpoint_impl_paged`, so both read
+    /// the same fields the same way.
+    pub(crate) fn from_stats(s: &crate::pagecodec::PagedStats) -> Self {
+        Self {
+            page_faults: s.page_faults.load(Ordering::Relaxed),
+            data_page_faults: s.data_page_faults.load(Ordering::Relaxed),
+            index_page_faults: s.index_page_faults.load(Ordering::Relaxed),
+            pages_written: s.pages_written.load(Ordering::Relaxed),
+            leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
+            dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
+            resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
+            checkpointer_runs: s.checkpointer_runs.load(Ordering::Relaxed),
+            dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
+            dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl Store {
     /// Creates a new, empty store. The initial version is 0.
     ///
@@ -1838,6 +1861,17 @@ impl Store {
             }
         }
 
+        // Metrics emission point (task14): the cheapest sound place to
+        // mirror `PagedStats` into the `metrics` crate is here, once per
+        // completed checkpoint — not on the hot fault-in/dirty-tracking
+        // paths inside the loop above, which run per-node and must stay a
+        // bare atomic increment. This is the write-path half; the other
+        // half is in `Store::paged_stats` for a caller that polls without
+        // ever checkpointing (e.g. `memory_budget_bytes` alone, no
+        // `checkpoint_interval`).
+        #[cfg(feature = "metrics")]
+        crate::metrics::emit_paged_stats(&PagedStatsSnapshot::from_stats(&stats));
+
         Ok(snap.version)
     }
 
@@ -2033,7 +2067,7 @@ impl Store {
     /// Sets `table`'s residency policy (see [`Residency`](crate::table::Residency))
     /// and re-publishes `latest_version` with the change, via
     /// `Store::install_paged_tables` — the same same-version re-publish
-    /// `Store::demote_pass` and `Store::checkpoint_impl_paged` use.
+    /// mechanism `Store::demote_pass` and `Store::checkpoint_impl_paged` use.
     ///
     /// Blocks while a checkpoint is in flight: this holds
     /// `Store::checkpoint_lock` for its whole body, the same lock
@@ -2102,23 +2136,22 @@ impl Store {
 
     /// Snapshot of this store's paged-checkpoint counters, or `None` if it
     /// was not configured with [`Persistence::paged`](crate::persistence::Persistence::paged).
+    ///
+    /// Under the `metrics` cargo feature, each call also mirrors the
+    /// snapshot into the `metrics` crate as gauges (`ultima.paged.*` —
+    /// see `src/metrics.rs`'s `emit_paged_stats`) — the read-path half of
+    /// this store's metrics emission; the other half runs at the end of
+    /// every completed `checkpoint_impl_paged` call so a store that is
+    /// checkpointing but whose `paged_stats()` nobody polls still surfaces
+    /// fresh numbers.
     #[cfg(feature = "persistence")]
     pub fn paged_stats(&self) -> Option<PagedStatsSnapshot> {
         let inner = self.inner.read();
         let paged = inner.paged.as_ref()?;
-        let s = &paged.stats;
-        Some(PagedStatsSnapshot {
-            page_faults: s.page_faults.load(Ordering::Relaxed),
-            data_page_faults: s.data_page_faults.load(Ordering::Relaxed),
-            index_page_faults: s.index_page_faults.load(Ordering::Relaxed),
-            pages_written: s.pages_written.load(Ordering::Relaxed),
-            leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
-            dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
-            resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
-            checkpointer_runs: s.checkpointer_runs.load(Ordering::Relaxed),
-            dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
-            dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
-        })
+        let snap = PagedStatsSnapshot::from_stats(&paged.stats);
+        #[cfg(feature = "metrics")]
+        crate::metrics::emit_paged_stats(&snap);
+        Some(snap)
     }
 
     /// The paged checkpoint page file's current write cursor (`file_end`),

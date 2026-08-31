@@ -52,6 +52,13 @@
 //!   badge on docs.rs.
 //! - Bulk restores and deltas go through [`Store::bulk_load`] /
 //!   [`Store::bulk_load_batch`].
+//! - [`Persistence::paged`] opts a `Standalone`/`Smr` store into paged
+//!   checkpoints: table B-trees page against an on-disk node file instead
+//!   of a full-row checkpoint, so a data set bigger than RAM stays
+//!   reachable — quiet leaves demote back to disk under a
+//!   [`PagedOptions::memory_budget_bytes`] budget, and a background
+//!   checkpointer thread runs on dirty-bytes/interval triggers. See
+//!   `docs/tasks/task63_paged_btree.md` for the design.
 //!
 //! # Correctness
 //!
@@ -147,7 +154,7 @@ pub use index::{CustomIndex, IndexKind};
 pub use index::IndexDef;
 pub use intents::CommitWaiter;
 pub use metrics::{IndexMetricsSnapshot, MetricsSnapshot, TableMetricsSnapshot};
-pub use persistence::{Durability, PagedOptions, Persistence, Record, WalWrite};
+pub use persistence::{Durability, PagedOptions, PagedOptionsBuilder, Persistence, Record, WalWrite};
 pub use primary_key::{AutoKey, PrimaryKey};
 #[cfg(feature = "persistence")]
 pub use snapshot_stream::SnapshotReader;

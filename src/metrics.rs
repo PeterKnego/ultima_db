@@ -379,6 +379,40 @@ impl StoreMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Paged-checkpoint metrics (task14)
+// ---------------------------------------------------------------------------
+
+/// Mirrors a paged store's paging counters
+/// ([`crate::store::PagedStatsSnapshot`]) into the `metrics` crate as
+/// gauges, when both the `metrics` and `persistence` cargo features are
+/// enabled.
+///
+/// Gauges, not counters: unlike [`StoreMetrics`]'s `inc_*` methods, which
+/// each correspond to exactly one commit/rollback/etc. and so map cleanly
+/// onto `metrics::counter!().increment(1)`, `PagedStatsSnapshot`'s fields
+/// are already-cumulative totals read from `PagedStats`'s atomics at a
+/// point in time — not a delta since the last call. This function is called
+/// from more than one place (see its two call sites,
+/// `Store::checkpoint_impl_paged` and `Store::paged_stats`), so emitting
+/// them as counter increments would double-count on every call after the
+/// first. `metrics::gauge!().set(..)` is idempotent regardless of call
+/// count or frequency — the last value set is the value reported — which is
+/// what a cumulative total needs.
+#[cfg(all(feature = "metrics", feature = "persistence"))]
+pub(crate) fn emit_paged_stats(s: &crate::store::PagedStatsSnapshot) {
+    metrics::gauge!("ultima.paged.page_faults").set(s.page_faults as f64);
+    metrics::gauge!("ultima.paged.data_page_faults").set(s.data_page_faults as f64);
+    metrics::gauge!("ultima.paged.index_page_faults").set(s.index_page_faults as f64);
+    metrics::gauge!("ultima.paged.pages_written").set(s.pages_written as f64);
+    metrics::gauge!("ultima.paged.leaves_demoted").set(s.leaves_demoted as f64);
+    metrics::gauge!("ultima.paged.dirty_bytes").set(s.dirty_bytes as f64);
+    metrics::gauge!("ultima.paged.resident_leaf_bytes_est").set(s.resident_leaf_bytes_est as f64);
+    metrics::gauge!("ultima.paged.checkpointer_runs").set(s.checkpointer_runs as f64);
+    metrics::gauge!("ultima.paged.dead_pages_punched").set(s.dead_pages_punched as f64);
+    metrics::gauge!("ultima.paged.dead_pages_dropped").set(s.dead_pages_dropped as f64);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

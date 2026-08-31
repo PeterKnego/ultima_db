@@ -1319,7 +1319,11 @@ fn resident_table_never_demotes() {
   ```rust
   #[derive(Clone, Debug)] #[non_exhaustive]
   pub struct PagedOptions { pub memory_budget_bytes: Option<u64>, pub checkpoint_dirty_bytes: u64, pub checkpoint_interval: Option<Duration>, pub demote_batch: usize, pub page_prefetch_bytes: usize, pub prealloc_chunk_bytes: u64, pub retained_checkpoints: usize }
-  impl PagedOptions { pub fn builder() -> PagedOptionsBuilder; }   // setters named after fields; defaults: None, 256 MiB, None, 1024, 4096, 16 MiB, 2
+  impl PagedOptions { pub fn builder() -> PagedOptionsBuilder; }   // setters named after fields; defaults: None, 256 MiB, Some(60s), 1024, 4096, 16 MiB, 2
+  // checkpoint_interval's default changed from None to Some(60s) in Task 12's fix round: a
+  // backstop so no configuration leaves every checkpointer trigger structurally false (see
+  // spec §8's "checkpoint_interval default" note); PagedOptionsBuilder::checkpoint_interval_disabled()
+  // opts back out to None.
   impl Persistence { pub fn paged(self, opts: PagedOptions) -> Self; pub(crate) fn paged_opts(&self) -> Option<&PagedOptions>; }
   // Persistence::Standalone / Smr gain a field `paged: Option<PagedOptions>` (non_exhaustive, so additive)
   // StoreInner gains `paged: Option<PagedState>` where
