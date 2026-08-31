@@ -340,6 +340,7 @@ dependencies = [
  "bincode",
  "criterion",
  "fjall",
+ "libc",
  "mimalloc",
  "rand 0.10.0",
  "redb",
