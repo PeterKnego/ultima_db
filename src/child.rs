@@ -386,7 +386,15 @@ impl<K: Clone, V> Child<K, V> {
             s.note_dirty(Self::NODE_BYTES);
         }
         // SAFETY: raw is the pointer just stored in `self.node`, non-null, uniquely owned by `arc`.
-        unsafe { &mut *raw }
+        let node = unsafe { &mut *raw };
+        // Task 4 correctness stopgap — see `BTreeNode::materialize`'s doc:
+        // de-block in place before handing out a mutable reference, so no
+        // structural leaf mutation downstream (insert/delete, which shift
+        // or remove `entries` with no awareness of `block`) ever has to
+        // reason about a block leaf. A no-op for the overwhelmingly common
+        // non-block case (checked once, cheaply, inside `materialize`).
+        node.materialize();
+        node
     }
 }
 

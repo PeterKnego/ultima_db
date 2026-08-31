@@ -388,18 +388,14 @@ impl<V> Value<V> {
     pub(crate) fn arc(a: Arc<V>) -> Self {
         Value(Some(a))
     }
-    // No production caller yet: nothing constructs a block leaf in this
-    // task, so nothing calls `in_block`/`is_in_block` — a later task
-    // (block leaf CoW rebuilds, decode) is the intended caller. Kept now
-    // per the interface spec so that wiring is a pure addition.
-    #[allow(dead_code)]
+    /// Production caller: `NodeCodec::decode` (`DataLeaf` only, task 4) and
+    /// block-leaf CoW rebuilds.
     pub(crate) fn in_block() -> Self {
         Value(None)
     }
     pub(crate) fn as_arc(&self) -> Option<&Arc<V>> {
         self.0.as_ref()
     }
-    #[allow(dead_code)]
     pub(crate) fn is_in_block(&self) -> bool {
         self.0.is_none()
     }
@@ -493,6 +489,56 @@ impl<K, V> BTreeNode<K, V> {
         match self.entries[i].1.as_arc() {
             Some(a) => a,
             None => &self.block.as_ref().expect("I-A: in-block entry requires a block")[i],
+        }
+    }
+
+    /// This leaf's real resident byte cost: the fixed node cost plus one
+    /// `size_of::<V>()` per entry — honest for a block leaf (values are
+    /// inline) and, since it's driven by `entries.len()` rather than
+    /// `block`, an equally correct estimate for an all-Arc leaf (the `Arc`
+    /// control block plus the pointee is itself roughly `size_of::<V>()`
+    /// worth of heap, just allocated separately rather than in one block).
+    /// Consumed by `PagedSource::read_node`'s fault-in credit (this task)
+    /// and, from Task 8 on, the demote-side debit — see spec §5.
+    /// **Documented limit** (spec §5): heap bytes *inside* `V` (e.g. a
+    /// `String` field's own buffer) are not counted — exact for the flat
+    /// small-row target, an undercount for heap-carrying records.
+    pub(crate) fn leaf_bytes(&self) -> usize {
+        Child::<K, V>::NODE_BYTES + self.entries.len() * std::mem::size_of::<V>()
+    }
+
+    /// De-block this leaf in place: every in-block value is *moved* (not
+    /// cloned — `self` is `&mut`, i.e. already uniquely owned, so no
+    /// `V: Clone`/`NodeSource` is needed here at all) into its own fresh
+    /// `Arc`, and `block` is cleared. A no-op if this node isn't a block
+    /// leaf (the common case — checked once via `Option::take`, before
+    /// touching any entry).
+    ///
+    /// Correctness stopgap for decode-to-block (this task), pending Task
+    /// 5's real single-pass block-leaf CoW rebuild: `Child::make_mut`
+    /// (`make_mut_after_load`) calls this on every node about to be
+    /// mutably returned, so the pre-existing structural insert/delete code
+    /// below (`insert_into_node[_mut]`, `delete_from_node[_mut]`,
+    /// `maybe_split[_mut]`) — which shifts or removes `entries` with no
+    /// awareness of a same-length, unindexed `block` array — never has to
+    /// see a block leaf: without this, an insert/delete that changes
+    /// `entries.len()` desyncs `block`'s positions from the entries that
+    /// still reference it, corrupting every shifted in-block entry's
+    /// `value_at`. A leaf a write actually touches gives up its block's
+    /// memory advantage until Task 5's real rebuild lands; read-only
+    /// leaves (the common case) stay block-shaped exactly as Task 4
+    /// intends. Called *after* `make_mut_after_load` has already
+    /// established unique ownership (in place, or via `clone_with`'s own
+    /// one clone_value per entry) — moving out here adds zero further
+    /// clones on top of that, preserving Task 2's "no clone on the
+    /// unique-owner path" fast-path guarantee.
+    pub(crate) fn materialize(&mut self) {
+        let Some(block) = self.block.take() else { return };
+        let mut values = Vec::from(block).into_iter();
+        for i in 0..self.entries.len() {
+            debug_assert!(self.entries[i].1.is_in_block(), "I-A: block leaf entries must all be in-block");
+            let v = values.next().expect("I-A: block length must match entries length");
+            self.entries[i].1 = Value::arc(Arc::new(v));
         }
     }
 }
@@ -1733,9 +1779,19 @@ fn get_arc_in_node<K: Ord, V>(
     src: Option<&dyn NodeSource<K, V>>,
 ) -> Option<Arc<V>> {
     match node.entries.binary_search_by(|(k, _)| k.cmp(key)) {
-        // Task 5 wires the block branch — no block entry can exist yet, so
-        // this is always the Arc path.
-        Ok(pos) => node.entries[pos].1.as_arc().cloned(),
+        Ok(pos) => match node.entries[pos].1.as_arc() {
+            Some(a) => Some(a.clone()),
+            // In-block entry: no per-entry `Arc` exists to hand back, so
+            // build a fresh one by cloning the value out via the source
+            // (`clone_value`, guaranteed `Some` for any tree that could
+            // hold a block leaf — I-B). `Table::delete`/`update`'s
+            // existence probe (`merged_get_arc` -> `get_arc`) routes
+            // through here, so this must return the real value, not
+            // silently report "not found" the way the pre-block-decode
+            // `Task 5 wires it` stub used to (task 4: decode now legitimately
+            // builds block leaves, so this path is live).
+            None => src.and_then(|s| s.clone_value(node.value_at(pos))).map(Arc::new),
+        },
         Err(pos) => {
             if node.children.is_empty() {
                 None
