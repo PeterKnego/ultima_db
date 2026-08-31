@@ -285,11 +285,11 @@ SubIndex(c) == CHOOSE i \in 1..Len(submitted) : submitted[i].cid = c
 (* Which protection applies to which writer mode -- this asymmetry is the   *)
 (* whole reason M1 is a distinct calibration bug from M2/M3.                *)
 (*                                                                         *)
-(* commit_multi_writer (src/store.rs:5753) has BOTH the version bump        *)
-(* (:5938) and the PromoteGate FIFO (:6001 take, :6055/:6072 wait).         *)
-(* commit_single_writer (src/store.rs:5637-5739) has NEITHER. Its only      *)
+(* commit_multi_writer (src/store.rs:5762) has BOTH the version bump        *)
+(* (:5947) and the PromoteGate FIFO (:6010 take, :6064/:6081 wait).         *)
+(* commit_single_writer (src/store.rs:5646-5748) has NEITHER. Its only      *)
 (* protection is holding the writer slot through the fsync wait             *)
-(* (:5689-5705, and begin_write's active_writer_count check at              *)
+(* (:5698-5714, and begin_write's active_writer_count check at              *)
 (* src/store.rs:995).                                                       *)
 (*                                                                         *)
 (* Modelling the bump and the gate unconditionally would hand SingleWriter  *)
@@ -358,7 +358,7 @@ Begin(c, t) ==
     /\ UNCHANGED <<walBuffered, walDurable, submitted, parked, promoted,
                    latestVersion, lastSubmitted, acked, crashVars, sinkVars>>
 
-(* Phase 1 PREPARE (src/store.rs:5924 ff). Under the write lock: finalize   *)
+(* Phase 1 PREPARE (src/store.rs:5933 ff). Under the write lock: finalize   *)
 (* the version against max(last_submitted, latest) allocating from          *)
 (* next_version, submit the WAL entry (no fsync), take a ticket.            *)
 (* Under Eventual / no-WAL the lock is never released, so phases 2-3        *)
@@ -396,7 +396,7 @@ Submit(r) ==
                               ELSE IF M3 THEN Max2(nextVersion, v + 1)
                               ELSE nextVersion + 1
           \* `last_submitted_version` is maintained only by commit_multi_writer
-          \* (src/store.rs:5944). Kept unconditional here because it is read
+          \* (src/store.rs:5953). Kept unconditional here because it is read
           \* only by the bump, which BumpApplies already gates off.
           /\ lastSubmitted' = Max2(lastSubmitted, v)
           /\ begun'         = begun \ {r}

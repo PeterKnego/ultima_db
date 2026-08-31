@@ -490,11 +490,40 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
 /// collect a still-pending index's page ids for the dead-page diff without
 /// reinstating a live, typed `BTree` for it just to answer "which pages did
 /// this used to reach."
-pub(crate) fn raw_reachable_page_ids(file: &PageFile, root: PageId) -> Result<Vec<PageId>> {
-    fn go(file: &PageFile, id: PageId, out: &mut Vec<PageId>) -> Result<()> {
-        out.push(id);
+///
+/// Two defenses against a corrupt or malformed page graph (fix round 1,
+/// controller review — this walk has no `BTree`/`Child` machinery of its
+/// own underneath it to lean on for either):
+/// - `height` bounds the recursion: a walk that would descend past
+///   `height` levels below `root` refuses to continue instead of
+///   following a cyclic (or merely very deep, corrupt) child pointer
+///   forever. `height` is the caller's own already-trusted
+///   `PagedIndexEntry::height` — the same field `BTree::from_root_page`
+///   takes on the attach path — never re-derived from the walk itself, so
+///   a corrupt page graph has no way to lie its way past a bound it never
+///   gets to name.
+/// - Every page's `kind` must be `Index{Leaf,Inner}`; anything else
+///   (starting with `root` itself) is refused rather than walked. A
+///   `Data{Leaf,Inner}` page reachable from what was named as an index
+///   root — a corrupt `PagedIndexEntry`, or a stray pointer into the
+///   table's own data tree — would otherwise have this function
+///   enumerate the *table's own live data pages* as dead, and a caller
+///   that then hole-punched them would corrupt the table itself.
+pub(crate) fn raw_reachable_page_ids(file: &PageFile, root: PageId, height: usize) -> Result<Vec<PageId>> {
+    fn go(file: &PageFile, id: PageId, depth: usize, height: usize, out: &mut Vec<PageId>) -> Result<()> {
+        if depth > height {
+            return Err(Error::CheckpointCorrupted(format!(
+                "raw_reachable_page_ids: page {id} is at depth {depth}, past the tree's own                  height ({height}) -- refusing to keep descending (cyclic or corrupt child pointer)"
+            )));
+        }
         let (kind, payload) = file.read(id)?;
-        let is_inner = matches!(kind, PageKind::DataInner | PageKind::IndexInner);
+        if !matches!(kind, PageKind::IndexLeaf | PageKind::IndexInner) {
+            return Err(Error::CheckpointCorrupted(format!(
+                "raw_reachable_page_ids: page {id} has kind {kind:?}, not an index page --                  refusing to walk it as one"
+            )));
+        }
+        out.push(id);
+        let is_inner = kind == PageKind::IndexInner;
         let mut at = 0usize;
         let n = read_u16(&payload, &mut at)? as usize;
         for _ in 0..n {
@@ -509,13 +538,13 @@ pub(crate) fn raw_reachable_page_ids(file: &PageFile, root: PageId) -> Result<Ve
                 children.push(read_u64(&payload, &mut at)?);
             }
             for child_id in children {
-                go(file, child_id, out)?;
+                go(file, child_id, depth + 1, height, out)?;
             }
         }
         Ok(())
     }
     let mut out = Vec::new();
-    go(file, root, &mut out)?;
+    go(file, root, 0, height, &mut out)?;
     Ok(out)
 }
 
@@ -701,21 +730,83 @@ mod tests {
         let (kr, br) = codec.encode(&root).unwrap();
         let root_id = pf.append(kr, &br).unwrap();
 
-        let ids = raw_reachable_page_ids(&pf, root_id).unwrap();
+        // height=1: root is an inner level, leaves are one level below it.
+        let ids = raw_reachable_page_ids(&pf, root_id, 1).unwrap();
         assert_eq!(ids, vec![root_id, leaf1_id, leaf2_id]);
     }
 
     /// A single leaf root (no children) reports only itself — the base case
-    /// `raw_reachable_page_ids`'s recursion must terminate on.
+    /// `raw_reachable_page_ids`'s recursion must terminate on. Also covers
+    /// `height == 0` (no levels below the root).
     #[test]
     fn raw_reachable_page_ids_single_leaf() {
         let d = tempfile::tempdir().unwrap();
         let pf = crate::pagefile::PageFile::open(&crate::pagefile::page_file_path(d.path()), 0, 1 << 16, 4096).unwrap();
-        let codec = NodeCodec::<u64, u64>::records::<u64>();
+        let codec = NodeCodec::<u64, u64>::unique_index::<u64, u64>();
         let n = leaf(vec![(1u64, 42u64)]);
         let (k, b) = codec.encode(&n).unwrap();
         let id = pf.append(k, &b).unwrap();
 
-        assert_eq!(raw_reachable_page_ids(&pf, id).unwrap(), vec![id]);
+        assert_eq!(raw_reachable_page_ids(&pf, id, 0).unwrap(), vec![id]);
+    }
+
+    /// A page graph containing a cycle must not recurse forever: the
+    /// `height` bound refuses to keep descending once exceeded, rather
+    /// than stack-overflowing on a corrupt or adversarial child pointer
+    /// (fix round 1, controller review, IMPORTANT #2a).
+    ///
+    /// Page ids are just byte offsets assigned in append order, and a
+    /// page's on-disk length depends only on its payload's *byte length*
+    /// — never the numeric value of any child id it names — so both
+    /// halves of a two-page cycle can be computed before either page is
+    /// actually written: the first append into a fresh file (cursor 0)
+    /// always lands at id 0, and the second always lands exactly
+    /// `PageFile::page_len(first_payload.len())` bytes after it.
+    #[test]
+    fn raw_reachable_page_ids_rejects_a_cycle() {
+        let d = tempfile::tempdir().unwrap();
+        let pf = crate::pagefile::PageFile::open(&crate::pagefile::page_file_path(d.path()), 0, 1 << 16, 4096).unwrap();
+        let codec = NodeCodec::<u64, u64>::unique_index::<u64, u64>();
+
+        let mut probe = leaf(vec![]);
+        probe.children.push(Child::on_disk(0)); // placeholder: length is unaffected by the value
+        let (_, probe_bytes) = codec.encode(&probe).unwrap();
+        let id_a = 0u64;
+        let id_b = id_a + crate::pagefile::PageFile::page_len(probe_bytes.len());
+
+        let mut a = leaf(vec![]);
+        a.children.push(Child::on_disk(id_b));
+        let (ka, ba) = codec.encode(&a).unwrap();
+        let actual_a = pf.append(ka, &ba).unwrap();
+        assert_eq!(actual_a, id_a, "sanity: predicted id_a must match the real append");
+
+        let mut b = leaf(vec![]);
+        b.children.push(Child::on_disk(id_a));
+        let (kb, bb) = codec.encode(&b).unwrap();
+        let actual_b = pf.append(kb, &bb).unwrap();
+        assert_eq!(actual_b, id_b, "sanity: predicted id_b must match the real append");
+
+        // A generous height: the cycle must be caught well before any
+        // stack limit regardless of how generous the bound is.
+        let err = raw_reachable_page_ids(&pf, id_a, 5).unwrap_err();
+        assert!(matches!(err, Error::CheckpointCorrupted(_)), "{err:?}");
+    }
+
+    /// A root whose page kind is a *data* page (not an index page) is
+    /// refused outright: silently walking it as an index tree would
+    /// enumerate the table's own live data pages as dead (fix round 1,
+    /// controller review, IMPORTANT #2b).
+    #[test]
+    fn raw_reachable_page_ids_rejects_a_data_kind_root() {
+        let d = tempfile::tempdir().unwrap();
+        let pf = crate::pagefile::PageFile::open(&crate::pagefile::page_file_path(d.path()), 0, 1 << 16, 4096).unwrap();
+        let codec = NodeCodec::<u64, Row>::records::<Row>();
+        let n = leaf(vec![(1u64, Row { a: 1, s: "x".into() })]);
+        let (k, b) = codec.encode(&n).unwrap();
+        assert_eq!(k, PageKind::DataLeaf);
+        let id = pf.append(k, &b).unwrap();
+
+        let err = raw_reachable_page_ids(&pf, id, 0).unwrap_err();
+        assert!(matches!(err, Error::CheckpointCorrupted(_)), "{err:?}");
     }
 }

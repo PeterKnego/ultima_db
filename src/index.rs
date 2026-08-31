@@ -136,10 +136,12 @@ pub(crate) trait IndexMaintainer<R, K: PrimaryKey>: Send + Sync {
     #[allow(dead_code)]
     fn paged_generation(&self) -> u32;
 
-    /// This index's currently reachable page ids, read-only (via
-    /// [`crate::btree::BTree::for_each_page_id`], which marks nothing
-    /// "recently used"). `&[]` for a non-persisted index (no page-file
-    /// presence at all) or an empty persisted one.
+    /// This index's currently reachable page ids, read-only via
+    /// [`crate::btree::BTree::for_each_page_id`] after forcing the tree
+    /// fully resident with [`crate::btree::BTree::load_all`] first — see
+    /// that call's note on the impl for why this is structural, not just
+    /// an assumed invariant. `&[]` for a non-persisted index (no
+    /// page-file presence at all) or an empty persisted one.
     ///
     /// Used by `Table::paged_changed_pages`'s still-pending persisted-index
     /// carry-forward path (Task 13) to learn the "new" side of a pending
@@ -355,6 +357,17 @@ where
         if self.storage.persist.is_none() {
             return Vec::new();
         }
+        // Structural, not just documented: `for_each_page_id` only
+        // descends into slots that are *already* loaded, so if this tree
+        // were ever not fully resident (violating the invariant
+        // `from_root_page`'s `load_all` establishes at attach time), it
+        // would silently under-report rather than fault anything in.
+        // Calling `load_all` here makes full residency an invariant this
+        // method itself restores rather than merely assumes -- idempotent
+        // and O(already-resident) (a pointer-only walk, no I/O) whenever
+        // that invariant already holds, via `Child::load_quiet`'s fast
+        // path.
+        self.storage.tree.load_all();
         let mut out = Vec::new();
         self.storage.tree.for_each_page_id(&mut |id| out.push(id));
         out
@@ -492,6 +505,17 @@ where
         if self.storage.persist.is_none() {
             return Vec::new();
         }
+        // Structural, not just documented: `for_each_page_id` only
+        // descends into slots that are *already* loaded, so if this tree
+        // were ever not fully resident (violating the invariant
+        // `from_root_page`'s `load_all` establishes at attach time), it
+        // would silently under-report rather than fault anything in.
+        // Calling `load_all` here makes full residency an invariant this
+        // method itself restores rather than merely assumes -- idempotent
+        // and O(already-resident) (a pointer-only walk, no I/O) whenever
+        // that invariant already holds, via `Child::load_quiet`'s fast
+        // path.
+        self.storage.tree.load_all();
         let mut out = Vec::new();
         self.storage.tree.for_each_page_id(&mut |id| out.push(id));
         out

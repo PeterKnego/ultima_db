@@ -258,6 +258,67 @@ fn pending_index_survives_a_recover_checkpoint_round_trip_with_no_reattach() {
     assert_eq!(t.get_by_index::<u64>("by_v", &7).unwrap().len(), 50);
 }
 
+/// Fix round 1 (controller review): a table dropped via
+/// `WriteTx::delete_table` while it still has a never-reattached pending
+/// persisted index must not leak that index's on-disk pages.
+/// `Table::paged_changed_pages`'s pending-index diff needs `prev`'s
+/// `paged_file` as a fallback: `paged_dead_page_ids`'s dropped-table
+/// branch diffs against a *synthetic empty* table (`new_empty_table`)
+/// which was never itself attached, so `self.paged_file` alone would
+/// have skipped the whole pending-index diff for a dropped table.
+#[test]
+fn dropped_table_with_pending_index_reclaims_its_pages() {
+    // Baseline: drop a recovered table with NO pending persisted index —
+    // establishes how many pages a bare data-tree drop reports dead.
+    let baseline = {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let s = store(d.path());
+            write_rows(&s, 2_000);
+            s.checkpoint().unwrap();
+        }
+        let s = store(d.path());
+        s.recover().unwrap();
+        {
+            let mut w = s.begin_write(None).unwrap();
+            assert!(w.delete_table("rows"));
+            w.commit().unwrap();
+        }
+        let v = s.checkpoint().unwrap();
+        ultima_db::paged_root_dead_pages_for_test(d.path(), v).unwrap().len()
+    };
+
+    // Same shape, but with a still-pending persisted index nobody ever
+    // reattached: the drop must reclaim the index's own on-disk pages
+    // *on top of* the data tree's.
+    let d = tempfile::tempdir().unwrap();
+    let index_pages_written = {
+        let s = store(d.path());
+        write_rows(&s, 2_000);
+        s.checkpoint().unwrap();
+        let before = s.paged_stats().unwrap().pages_written;
+        define_by_v(&s, IndexKind::NonUnique, IndexDef::new(1)).unwrap();
+        s.checkpoint().unwrap();
+        s.paged_stats().unwrap().pages_written - before
+    };
+    assert!(index_pages_written > 0);
+
+    let s = store(d.path());
+    s.recover().unwrap();
+    {
+        let mut w = s.begin_write(None).unwrap();
+        assert!(w.delete_table("rows"));
+        w.commit().unwrap();
+    }
+    let v = s.checkpoint().unwrap();
+    let with_index = ultima_db::paged_root_dead_pages_for_test(d.path(), v).unwrap().len() as u64;
+
+    assert!(
+        with_index >= baseline as u64 + index_pages_written,
+        "dropping a table with a still-pending persisted index must reclaim at least its          {index_pages_written} pages on top of the {baseline}-range data-only baseline, got          {with_index}"
+    );
+}
+
 #[derive(Clone)]
 struct IdSetIndex {
     ids: ultima_db::BTree<u64, ()>,

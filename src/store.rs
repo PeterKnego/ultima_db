@@ -4673,6 +4673,15 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
     /// unpaged store). `IK` is the *index* key; the table's primary key
     /// stays `K`. See [`Table::define_persisted_index`] for the full
     /// attach-after-recovery behaviour (Task 13's spec §6 table).
+    ///
+    /// On a store never configured with `Persistence::..paged(..)`, this
+    /// index is in-memory-only forever — nothing about calling this method
+    /// over `define_index` makes it durable by itself; the persistence
+    /// asked for only actually happens once the *store* is paged. On a
+    /// paged store, an attach that faults in a corrupt or unreadable
+    /// on-disk page **panics** rather than returning `Err` (the same
+    /// lazy-read contract every other paged read follows — see the design
+    /// spec's Q2 and `Child::load`'s doc).
     #[cfg(feature = "persistence")]
     pub fn define_persisted_index<IK: crate::primary_key::PrimaryKey>(
         &mut self,

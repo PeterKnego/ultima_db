@@ -40,15 +40,15 @@ src/store.rs	2582-2594	-	latest_version = entry.version;
 src/store.rs	2593-2599	-	version: latest_version,
 src/store.rs	2253	e60f8ce^	fn commit_multi_writer(mut self) -> Result<u64> {
 src/store.rs	2361-2366	e60f8ce^	self.version = inner.latest_version + 1;
-src/store.rs	5637-5739	-	fn commit_single_writer(mut self) -> Result<u64> {
-src/store.rs	5689-5705	-	let mut inner = if needs_wal_wait {
-src/store.rs	5753	-	fn commit_multi_writer(mut self) -> Result<u64> {
-src/store.rs	5924	-	Phase 3: WAL submission + bookkeeping under brief write lock
-src/store.rs	5938	-	if !self.explicit_version
-src/store.rs	5944	-	if self.version > inner.last_submitted_version {
-src/store.rs	6001	-	let gate = if inner.commit_may_park() {
-src/store.rs	6055	-	gate.wait_turn(*ticket);
-src/store.rs	6072	-	gate.wait_turn(*ticket);
+src/store.rs	5646-5748	-	fn commit_single_writer(mut self) -> Result<u64> {
+src/store.rs	5698-5714	-	let mut inner = if needs_wal_wait {
+src/store.rs	5762	-	fn commit_multi_writer(mut self) -> Result<u64> {
+src/store.rs	5933	-	Phase 3: WAL submission + bookkeeping under brief write lock
+src/store.rs	5947	-	if !self.explicit_version
+src/store.rs	5953	-	if self.version > inner.last_submitted_version {
+src/store.rs	6010	-	let gate = if inner.commit_may_park() {
+src/store.rs	6064	-	gate.wait_turn(*ticket);
+src/store.rs	6081	-	gate.wait_turn(*ticket);
 src/wal.rs	623-627	-	Physically zero-fill
 src/wal.rs	623-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
 src/wal.rs	632-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {

@@ -1155,13 +1155,23 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         go(&self.root, h, src)
     }
 
-    /// Walk resident nodes, reporting every slot's page id — used by tests
-    /// and by a later task's punch (hole-punch reclaim) bookkeeping.
-    /// Read-only: uses [`Child::load_quiet`], so a punch-bookkeeping pass
-    /// never marks a leaf "recently used" just by visiting it — see the
-    /// same note on [`Self::changed_page_ids`].
-    // No production caller yet — a later task's punch bookkeeping is the
-    // intended caller. Used today by this task's tests.
+    /// Report every slot's own page id, in document order — a slot's id is
+    /// known without a fault (`Child::page_id()`), so this reports it
+    /// whether or not the slot is loaded. It only *descends* into an inner
+    /// slot's children when that slot is already resident: an unfaulted
+    /// inner node's children are simply invisible to this walk (nothing
+    /// here ever faults anything in). Correct and complete only when the
+    /// tree is already fully resident — load-bearing for
+    /// `IndexMaintainer::paged_reachable_ids` (Task 13), which calls
+    /// [`Self::load_all`] immediately before this for exactly that reason
+    /// (see that call site's note). Read-only otherwise: uses
+    /// [`Child::load_quiet`], so a walk never marks a leaf "recently used"
+    /// just by visiting it — see the same note on [`Self::changed_page_ids`].
+    // Production caller: `IndexMaintainer::paged_reachable_ids` (Task 13),
+    // always immediately after `load_all` -- both are `persistence`-gated,
+    // so this is still dead code under a build without that feature (same
+    // situation as `load_all` itself). Also exercised directly by this
+    // file's punch-bookkeeping tests.
     #[allow(dead_code)]
     pub(crate) fn for_each_page_id(&self, f: &mut dyn FnMut(PageId)) {
         fn go<K, V>(slot: &Child<K, V>, src: Option<&dyn NodeSource<K, V>>, f: &mut dyn FnMut(PageId)) {

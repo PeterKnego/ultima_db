@@ -106,8 +106,8 @@ promote time* — as `PromotionFaithful`.
 
 The version bump and the `PromoteGate` FIFO are gated on
 `WriterMode = "MultiWriter"`, because in the Rust they exist only in
-`commit_multi_writer` (`src/store.rs:5938`, `:6001`/`:6055`).
-`commit_single_writer` (`:5637-5739`) has neither — holding the writer slot
+`commit_multi_writer` (`src/store.rs:5947`, `:6010`/`:6064`).
+`commit_single_writer` (`:5646-5748`) has neither — holding the writer slot
 through the fsync wait is its *only* protection. Modelling them
 unconditionally would hand SingleWriter protections the code lacks, and would
 mask M1.
@@ -477,7 +477,7 @@ regex finds only the first:
 |---|---|---|
 | prefixed | `` `src/store.rs:2449-2454` ``, `(src/wal.rs:681-730)` | 147 |
 | frozen | `1e5d2b7^ src/wal.rs:1130-1136` | 8 |
-| bare continuation | `` (`src/store.rs:5938`, `:6001`/`:6055`) ``, `(src/wal.rs:1129, 1133-1136)` | 38 |
+| bare continuation | `` (`src/store.rs:5947`, `:6010`/`:6064`) ``, `(src/wal.rs:1129, 1133-1136)` | 38 |
 
 The bare forms carry no file of their own; they inherit the nearest *preceding*
 prefix cite in the document, and its revision with it: in

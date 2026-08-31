@@ -486,7 +486,24 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         // `changed_page_ids` computes for an index that already existed on
         // both sides, this is comparing two *entire* trees, one of which
         // (`prev`'s) is only reachable as raw bytes.
-        if let Some(file) = self.paged_file.as_deref() {
+        // `self.paged_file`, not `prev`'s: this method also runs with
+        // `self` as a *synthetic empty* table (`paged_dead_page_ids`'s
+        // dropped-table branch builds one via `new_empty_table` to diff
+        // against a table dropped since the last checkpoint) — a fresh
+        // table has never been attached, so `self.paged_file` is `None`
+        // there even though `prev` (the real, once-live table) has a real
+        // one. Falling back to `prev.paged_file` is what lets a dropped
+        // table's still-pending index pages be walked at all; without it
+        // they leak forever (fix round 1, controller review — dropping a
+        // table with a never-reattached persisted index silently orphaned
+        // its pages).
+        let file = self.paged_file.clone().or_else(|| prev.paged_file.clone());
+        if let Some(file) = file.as_deref() {
+            let table_name = self
+                .paged_name
+                .as_deref()
+                .or(prev.paged_name.as_deref())
+                .unwrap_or("");
             for prev_pending in &prev.pending_indexes {
                 // Reproduced byte-for-byte by `paged_write_tree`'s
                 // carry-forward (still pending, same root) — no change,
@@ -502,10 +519,26 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
                     Some(idx) => idx.paged_reachable_ids().into_iter().collect(),
                     None => BTreeSet::new(),
                 };
-                if let Some(root) = prev_pending.root_page
-                    && let Ok(old_ids) = raw_reachable_page_ids(file, root)
-                {
-                    out.extend(old_ids.into_iter().filter(|id| !new_ids.contains(id)));
+                if let Some(root) = prev_pending.root_page {
+                    match raw_reachable_page_ids(file, root, prev_pending.height as usize) {
+                        Ok(old_ids) => {
+                            out.extend(old_ids.into_iter().filter(|id| !new_ids.contains(id)));
+                        }
+                        Err(e) => {
+                            // Fix round 1 (controller review): this used to
+                            // be a silent `if let Ok(..)`. A walk failure
+                            // here (a corrupt or unreadable old root) means
+                            // this index's superseded pages are not added
+                            // to this checkpoint's dead list — they leak
+                            // (never punched), but nothing about the live
+                            // table or its data is affected. Logged so the
+                            // leak is at least visible, not silent.
+                            eprintln!(
+                                "ultima_db: paged_changed_pages: table '{table_name}' index                                  '{}' -- failed to walk its old on-disk tree (root page {root})                                  for the dead-page diff: {e}; its pages will not be reclaimed                                  this checkpoint (leaked, not lost)",
+                                prev_pending.name
+                            );
+                        }
+                    }
                 }
             }
         }
