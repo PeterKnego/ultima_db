@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::btree::BTreeNode;
+#[cfg(test)]
+use crate::btree::Value;
 
 /// Byte offset of a page in the (future) page file. Opaque outside `child`
 /// and the paging layer added in later tasks.
@@ -413,7 +415,11 @@ pub(crate) mod tests {
     }
 
     fn leaf(keys: &[u64]) -> Arc<BTreeNode<u64, u64>> {
-        Arc::new(BTreeNode { entries: keys.iter().map(|k| (*k, Arc::new(*k * 10))).collect(), children: Default::default() })
+        Arc::new(BTreeNode {
+            entries: keys.iter().map(|k| (*k, Value::arc(Arc::new(*k * 10)))).collect(),
+            children: Default::default(),
+            block: None,
+        })
     }
 
     #[test]
@@ -496,7 +502,7 @@ pub(crate) mod tests {
         c.load(Some(&disk));
         let keep = c.load_arc(Some(&disk)); // second owner
         let n = c.make_mut(Some(&disk));
-        n.entries.push((3, Arc::new(30)));
+        n.entries.push((3, Value::arc(Arc::new(30))));
         assert_eq!(c.page_id(), None, "a CoW'd node is dirty");
         assert_eq!(keep.entries.len(), 2, "old owner unaffected");
         assert!(disk.dirty_bytes.load(Ordering::Relaxed) > 0);

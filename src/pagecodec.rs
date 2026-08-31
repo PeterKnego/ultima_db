@@ -26,7 +26,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use crate::btree::BTreeNode;
+use crate::btree::{BTreeNode, Value};
 use crate::child::{Child, NodeSource, PageId};
 use crate::pagefile::{PageFile, PageKind};
 use crate::persistence::Record;
@@ -178,14 +178,14 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
             .map_err(|_| Error::Persistence(format!("page payload: {n} entries, over u16 range")))?;
         buf.extend_from_slice(&n16.to_le_bytes());
         for i in 0..n {
-            let (k, v) = &node.entries[i];
+            let k = &node.entries[i].0;
             let kb = k.encode();
             check_encoded_key_len(kb.len(), "page payload")?;
             let klen = u16::try_from(kb.len())
                 .map_err(|_| Error::Persistence(format!("page payload: key encodes to {} bytes, over u16 range", kb.len())))?;
             buf.extend_from_slice(&klen.to_le_bytes());
             buf.extend_from_slice(&kb);
-            let vb = (self.value.enc)(v)?;
+            let vb = (self.value.enc)(node.value_at(i))?;
             let vlen = u32::try_from(vb.len())
                 .map_err(|_| Error::Persistence(format!("page payload: value encodes to {} bytes, over u32 range", vb.len())))?;
             buf.extend_from_slice(&vlen.to_le_bytes());
@@ -260,7 +260,7 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
             let val_len = read_u32(payload, &mut at)? as usize;
             let val_bytes = read_bytes(payload, &mut at, val_len)?;
             let val = (self.value.dec)(val_bytes)?;
-            entries.push((key, Arc::new(val)));
+            entries.push((key, Value::arc(Arc::new(val))));
         }
         let mut children = Vec::new();
         if is_inner {
@@ -275,7 +275,11 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
                 payload.len() - at
             )));
         }
-        Ok(BTreeNode { entries: entries.into_iter().collect(), children: children.into_iter().collect() })
+        Ok(BTreeNode {
+            entries: entries.into_iter().collect(),
+            children: children.into_iter().collect(),
+            block: None,
+        })
     }
 }
 
@@ -568,7 +572,11 @@ mod tests {
     }
 
     fn leaf<K: Clone, V>(pairs: Vec<(K, V)>) -> BTreeNode<K, V> {
-        BTreeNode { entries: pairs.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(), children: Default::default() }
+        BTreeNode {
+            entries: pairs.into_iter().map(|(k, v)| (k, Value::arc(Arc::new(v)))).collect(),
+            children: Default::default(),
+            block: None,
+        }
     }
 
     #[test]
@@ -579,7 +587,7 @@ mod tests {
         assert_eq!(kind, PageKind::DataLeaf);
         let back = c.decode(kind, &bytes).unwrap();
         assert_eq!(back.entries.len(), 2);
-        assert_eq!(*back.entries[1].1, Row { a: 2, s: "yy".into() });
+        assert_eq!(*back.value_at(1), Row { a: 2, s: "yy".into() });
     }
 
     #[test]
@@ -595,7 +603,7 @@ mod tests {
         assert_eq!(back.children[0].page_id(), Some(100));
         assert_eq!(back.children[1].page_id(), Some(200));
         assert!(!back.children[0].is_loaded());
-        assert_eq!(back.entries[0].1.a, 9);
+        assert_eq!(back.value_at(0).a, 9);
     }
 
     #[test]
@@ -613,7 +621,7 @@ mod tests {
         let n = leaf(vec![("a".to_string(), 5u64)]);
         let (k, b) = u.encode(&n).unwrap();
         assert_eq!(k, PageKind::IndexLeaf);
-        assert_eq!(*u.decode(k, &b).unwrap().entries[0].1, 5);
+        assert_eq!(*u.decode(k, &b).unwrap().value_at(0), 5);
 
         let nu = NodeCodec::<(i32, Vec<u8>), ()>::non_unique_index::<i32, Vec<u8>>();
         let n = leaf(vec![((-3, vec![1, 2]), ())]);
