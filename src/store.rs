@@ -877,7 +877,7 @@ impl Store {
         {
             let has_paged = store.inner.read().paged.is_some();
             if has_paged {
-                let checkpointer = Checkpointer::start(&store);
+                let checkpointer = Checkpointer::start(&store)?;
                 store.inner.write().checkpointer = Some(checkpointer);
             }
         }
@@ -2175,7 +2175,7 @@ impl Store {
     /// for their whole body. That means the background checkpointer
     /// (task12, already running by the time `recover()` is called, since
     /// `Store::new` starts it) can interleave with a `recover()` call in
-    /// progress. Two cases, both already handled elsewhere rather than
+    /// progress. Three cases, all already handled elsewhere rather than
     /// here:
     /// - **A paged directory with existing roots, opened by a store that
     ///   hasn't recovered yet**: `checkpoint_impl_paged`'s own guard
@@ -2190,6 +2190,22 @@ impl Store {
     ///   but open, so no checkpoint actually fires. This is exactly Task
     ///   8's original "no background checkpointer" semantics for that
     ///   case, preserved rather than changed by task12.
+    /// - **A concurrent checkpoint (this store's own background thread, or
+    ///   another caller entirely) pruning the WAL while this call's own
+    ///   replay is in flight** — reachable if, unusually, the application
+    ///   had already written through this store before calling `recover()`
+    ///   (so the triggers above are no longer all vacuously false). Safe
+    ///   for two independent reasons: the WAL scan below (`scan_wal`) reads
+    ///   the whole file into a fully materialized `Vec<WalEntry>` *before*
+    ///   the replay loop starts, so a prune rewriting or truncating
+    ///   `wal.bin` afterward cannot affect entries this call already holds
+    ///   in memory — replay works off its own already-scanned copy, never
+    ///   touching the file again. And whatever new root the concurrent
+    ///   checkpoint writes only ever names a version that was already
+    ///   durable in the WAL at the moment it ran (pruning is only ever safe
+    ///   up to a version whose covering checkpoint is itself durable), so
+    ///   it can never invalidate the prefix this call is replaying past its
+    ///   own already-loaded checkpoint's version.
     #[cfg(feature = "persistence")]
     pub fn recover(&self) -> Result<()> {
         use crate::persistence::Persistence;
@@ -3498,8 +3514,14 @@ impl Checkpointer {
     /// the commit path (a commit crossing the dirty-bytes threshold) can
     /// wake it early instead of waiting out the full `checkpoint_interval`.
     /// Only ever called once per store, from `Store::new`, after confirming
-    /// `inner.paged` is `Some`.
-    fn start(store: &Store) -> Self {
+    /// `inner.paged` is `Some`. `Err` iff the OS refuses to spawn the
+    /// thread (resource exhaustion, essentially never in practice) — this
+    /// runs at `Store::new` time, where an infallible-in-practice `.expect`
+    /// would abort a caller that could otherwise recover (e.g. a service
+    /// that retries store construction under a fd/thread-count ceiling),
+    /// so the failure is surfaced through the ordinary `Result` path
+    /// instead.
+    fn start(store: &Store) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -3540,18 +3562,27 @@ impl Checkpointer {
                     thread_wake,
                 );
             })
-            .expect("spawn ultima-checkpointer background thread");
+            .map_err(|e| Error::Persistence(format!("spawn background checkpointer thread: {e}")))?;
 
-        Checkpointer { stop, wake, handle: Some(handle) }
+        Ok(Checkpointer { stop, wake, handle: Some(handle) })
     }
 }
 
 #[cfg(feature = "persistence")]
 impl Drop for Checkpointer {
+    /// Same shutdown shape as `WalHandle::drop` (`src/wal.rs`): flip the
+    /// stop flag, wake the thread so it observes it promptly rather than
+    /// waiting out the interval, then join.
+    ///
+    /// The join below can still block the dropping thread for as long as a
+    /// checkpoint the background thread is *already mid-way through* takes
+    /// to finish — `stop` only stops the loop from starting another one; it
+    /// does not (and cannot safely) cancel a `checkpoint_impl` call already
+    /// in progress. In practice this is the same "commit"-shaped wait every
+    /// other synchronous cleanup path in this codebase already has (e.g.
+    /// `WalHandle::drop` itself waits out an in-flight fsync batch), not a
+    /// new class of latency this type introduces.
     fn drop(&mut self) {
-        // Same shutdown shape as `WalHandle::drop` (`src/wal.rs`): flip the
-        // stop flag, wake the thread so it observes it promptly rather than
-        // waiting out the interval, then join.
         self.stop.store(true, Ordering::Relaxed);
         {
             let mut has_work = self.wake.0.lock();
@@ -3577,6 +3608,43 @@ impl Drop for Checkpointer {
     }
 }
 
+/// The minimum spacing between two thread-initiated checkpoints (task12 fix
+/// round 1, IMPORTANT). Caps a *permanently* true trigger — a table parked
+/// over its `memory_budget_bytes` that a demote pass can't fully clear in
+/// one go, or a sustained stream of dirty leaves — to at most `1s /
+/// MIN_INTER_RUN` = 5 runs/s, instead of re-firing every time this loop
+/// comes back around and finds the same condition still true. Independent
+/// of (and a backstop for) the edge-triggered wake in
+/// [`PagedStats::wake_checkpointer`]: that gate only dedupes redundant
+/// *notifies*, not a trigger that stays true across many iterations on its
+/// own without needing another notify to re-evaluate it.
+#[cfg(feature = "persistence")]
+const MIN_INTER_RUN: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Blocks until `deadline` passes or `stop` is set. Used only for the
+/// inter-run floor above. Deliberately does not touch `wake`'s `has_work`
+/// flag: any real notify that arrives during this wait is left for the next
+/// iteration's normal wake-wait section to observe (consuming it here,
+/// only to have this floor-wait ignore what it means, would make that
+/// notify indistinguishable from one that never happened). Loops rather
+/// than a single `wait_for`, since a spurious wakeup or a notify both
+/// return from `wait_for` well before `deadline` — this must hold the
+/// floor regardless of either.
+#[cfg(feature = "persistence")]
+fn wait_until_or_stop(wake: &(Mutex<bool>, Condvar), stop: &AtomicBool, deadline: std::time::Instant) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let mut guard = wake.0.lock();
+        let _ = wake.1.wait_for(&mut guard, deadline - now);
+    }
+}
+
 /// The background checkpointer thread's body — see [`Checkpointer`]'s doc
 /// for the reference-cycle and self-join reasoning behind its shape.
 ///
@@ -3599,6 +3667,10 @@ fn checkpointer_loop(
     // still has to be free to run): a persistent failure (a full disk, say)
     // prints once, not once per tick.
     let mut last_err: Option<String> = None;
+    // `None` until this thread's first checkpoint attempt — the inter-run
+    // floor below is a no-op until then, so a store's very first
+    // background checkpoint is never delayed by it.
+    let mut last_run_at: Option<std::time::Instant> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -3633,30 +3705,47 @@ fn checkpointer_loop(
             return;
         }
 
+        // Inter-run floor (see `MIN_INTER_RUN`'s doc): whatever woke this
+        // iteration — timeout or notify — a run less than `MIN_INTER_RUN`
+        // ago means we wait out the remainder before touching the store
+        // again, regardless of how due-looking the triggers currently are.
+        if let Some(last) = last_run_at {
+            let deadline = last + MIN_INTER_RUN;
+            wait_until_or_stop(&wake, &stop, deadline);
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+
         let Some(inner) = weak_inner.upgrade() else { return };
         let (due_dirty, due_mem, due_time, stats) = {
             let g = inner.read();
             let Some(paged) = g.paged.as_ref() else { return };
+            // Clear the edge-trigger before evaluating (task12 fix round
+            // 1): a wake that lands from here on — mid-evaluation, or
+            // during the `checkpoint_impl` call below — must survive to be
+            // observed on a *later* iteration, not be silently absorbed by
+            // a clear that happens after this iteration already decided
+            // whether to act.
+            paged.stats.signalled.store(false, Ordering::Release);
             let dirty = paged.stats.dirty_bytes.load(Ordering::Relaxed);
             let resident = paged.stats.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64;
             let due_dirty = dirty >= paged.opts.checkpoint_dirty_bytes;
             let due_mem = paged.opts.memory_budget_bytes.is_some_and(|b| resident >= b);
             // "Is there anything a checkpoint would actually write" — NOT
-            // `dirty_bytes > 0`. `PagedSource::note_dirty` only fires on a
-            // clean-node CoW (a node that already has a page id, i.e.
-            // already survived one checkpoint); a table's very first write,
-            // before it has ever been paged-attached, never touches it —
-            // there is no `NodeSource` yet for `Child::make_mut` to notify,
-            // and a freshly built leaf starts life already `NO_PAGE`
-            // ("dirty" from birth, not by transition). So `dirty_bytes`
-            // alone cannot tell a fresh, never-checkpointed but genuinely
-            // non-empty store apart from a truly idle one. Comparing
-            // `latest_version` against the version the last paged
-            // checkpoint actually named can: it starts at `0 == 0`
-            // (nothing committed yet, matching `last_root`'s absence) and
-            // only diverges once a real commit lands, regardless of
-            // whether that commit's nodes ever got a chance to be
-            // "re-dirtied".
+            // `dirty_bytes > 0`. Even after `Child::resident_new` (task12
+            // fix round 1) closed the "brand-new node never credits
+            // dirty_bytes" gap, a table's *very first* write — before it
+            // has ever been paged-attached — still can't register: there is
+            // no `NodeSource` yet for `resident_new` to notify (attachment
+            // itself happens as part of a checkpoint). So `dirty_bytes`
+            // alone still can't tell a fresh, never-checkpointed but
+            // genuinely non-empty store apart from a truly idle one.
+            // Comparing `latest_version` against the version the last paged
+            // checkpoint actually named can: it starts at `0 == 0` (nothing
+            // committed yet, matching `last_root`'s absence) and only
+            // diverges once a real commit lands, regardless of whether that
+            // commit's nodes ever had a chance to credit `dirty_bytes`.
             let last_checkpointed_version = paged.last_root.as_ref().map(|(_, v)| *v).unwrap_or(0);
             let has_uncommitted = g.latest_version > last_checkpointed_version;
             let due_time = paged
@@ -3680,6 +3769,7 @@ fn checkpointer_loop(
             };
             let result = store.checkpoint_impl(false);
             stats.checkpointer_runs.fetch_add(1, Ordering::Relaxed);
+            last_run_at = Some(std::time::Instant::now());
             match result {
                 Ok(_) => last_err = None,
                 Err(e) => {

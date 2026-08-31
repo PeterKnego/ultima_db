@@ -73,6 +73,25 @@ impl<K, V> Child<K, V> {
         }
     }
 
+    /// Like [`Self::resident`], but for a brand-new node joining a tree that
+    /// may already have a [`NodeSource`] attached — every mutation-path
+    /// creation site (a split's new sibling, a grown root, a delete-path
+    /// rebuild, a live `extend_from_sorted` append) rather than a truly
+    /// sourceless fresh tree (`BTree::new`, `BTree::from_sorted`'s initial
+    /// build). Credits `src.note_dirty` when `src` is `Some` — a newly
+    /// created node was never on disk, so it has no clean-to-dirty
+    /// *transition* for [`Self::make_mut`] to notice later, but it is just
+    /// as much a byte a checkpoint will have to write as one CoW'd from a
+    /// clean page. `src: None` (an unattached tree) credits nothing, which
+    /// is correct: there is no checkpoint to owe bytes to yet. See
+    /// `docs/tasks/task12_background_checkpointer.md`.
+    pub(crate) fn resident_new(node: Arc<BTreeNode<K, V>>, src: Option<&dyn NodeSource<K, V>>) -> Self {
+        if let Some(s) = src {
+            s.note_dirty(Self::NODE_BYTES);
+        }
+        Self::resident(node)
+    }
+
     /// A slot that references a page but has not been faulted in yet.
     // No production caller yet: this task threads `Child` through `BTree`
     // with every slot built via `resident` (source is always `None`); a
@@ -366,6 +385,37 @@ pub(crate) mod tests {
         assert_eq!(c.page_id(), None);
         assert!(c.is_loaded());
         assert_eq!(c.strong_count(), Some(1));
+    }
+
+    /// `resident_new` credits `note_dirty` for a brand-new node when a
+    /// source is attached (task12 fix round 1) — the case `resident` alone
+    /// (and, before this fix, every btree.rs creation site) could never
+    /// report: a newly split/rebuilt node was never on disk, so it has no
+    /// clean-to-dirty *transition* for `make_mut` to notice.
+    #[test]
+    fn resident_new_credits_dirty_bytes_when_src_is_some() {
+        let disk = MockDisk::new();
+        let c: Child<u64, u64> = Child::resident_new(leaf(&[1]), Some(&disk));
+        assert_eq!(c.page_id(), None);
+        assert!(c.is_loaded());
+        assert_eq!(
+            disk.dirty_bytes.load(Ordering::Relaxed),
+            Child::<u64, u64>::NODE_BYTES,
+            "a brand-new node must be credited exactly once, at NODE_BYTES"
+        );
+    }
+
+    /// The other half of the same fix: an unattached tree (`src: None`,
+    /// e.g. a fresh `from_sorted` build with no checkpoint yet) must credit
+    /// nothing — there is no checkpoint to owe these bytes to.
+    #[test]
+    fn resident_new_credits_nothing_when_src_is_none() {
+        let c: Child<u64, u64> = Child::resident_new(leaf(&[1]), None);
+        assert_eq!(c.page_id(), None);
+        assert!(c.is_loaded());
+        // No disk to check a counter on — the only assertion is that this
+        // doesn't panic on a `None` source, which it would if `resident_new`
+        // unwrapped `src` instead of checking it.
     }
 
     #[test]

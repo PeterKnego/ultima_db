@@ -24,7 +24,7 @@
 
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use crate::btree::BTreeNode;
 use crate::child::{Child, NodeSource, PageId};
@@ -356,16 +356,36 @@ pub(crate) struct PagedStats {
     /// calls [`Self::wake_checkpointer`] for that reason, matching
     /// `checkpoint_impl_paged`'s own "no budget, never demote" rule.
     pub mem_budget_bytes: OnceLock<u64>,
+    /// Edge-trigger gate for [`Self::wake_checkpointer`] (task12 fix round
+    /// 1, IMPORTANT): `PagedSource::read_node` is a hot path — every leaf
+    /// fault past a configured memory budget calls `wake_checkpointer`, and
+    /// under sustained read pressure (a table that stays over budget) that
+    /// could mean a mutex lock + `notify_one` on every single fault.
+    /// `false -> true` via `compare_exchange` gates the actual mutex+notify
+    /// to once per "unacknowledged" wake; the checkpointer thread clears it
+    /// back to `false` at the top of every loop iteration (right where it
+    /// also clears `wake`'s own `has_work` flag), so a wake that arrives
+    /// while the thread is busy running a checkpoint is never lost — the
+    /// next `compare_exchange` after the clear succeeds and notifies again.
+    /// This only dedupes *redundant* notifies between clears; it never
+    /// suppresses one the thread hasn't yet had a chance to observe.
+    pub signalled: AtomicBool,
 }
 
 impl PagedStats {
     /// Notify the background checkpointer thread's condvar that there may
     /// be work to do, if one is wired up ([`Self::wake`] is set — true for
     /// the whole life of any `PagedStats` a caller outside `Store::new` can
-    /// reach). A no-op otherwise; harmless (parking_lot's `notify_one` with
-    /// no waiter parked is a no-op) if the thread happens to already be
-    /// awake or mid-shutdown.
+    /// reach). Edge-triggered via [`Self::signalled`] (see its doc): a
+    /// no-op both when no thread is wired up and when this call loses the
+    /// `compare_exchange` race (someone already signalled since the last
+    /// clear) — harmless either way, since `notify_one` with no waiter
+    /// parked is itself a no-op, and a still-`true` flag means the
+    /// checkpointer thread hasn't consumed the earlier signal yet.
     pub(crate) fn wake_checkpointer(&self) {
+        if self.signalled.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
         if let Some(w) = self.wake.get() {
             let mut has_work = w.0.lock();
             *has_work = true;

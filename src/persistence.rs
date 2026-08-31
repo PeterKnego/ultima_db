@@ -250,11 +250,13 @@ pub struct PagedOptions {
     /// trigger. Default: 256 MiB.
     pub checkpoint_dirty_bytes: u64,
     /// A checkpoint runs at least this often regardless of dirty volume —
-    /// the background checkpointer's (a later task) time trigger. `None`
-    /// (the default) disables the time trigger; only
-    /// `checkpoint_dirty_bytes` and manual
-    /// [`Store::checkpoint`](crate::Store::checkpoint) calls drive
-    /// checkpoints.
+    /// the background checkpointer's time trigger (task12). Default:
+    /// `Some(60s)` — a backstop so no configuration leaves every trigger
+    /// false (`checkpoint_dirty_bytes` alone can go unmet for a long time
+    /// on a low-write workload, and `memory_budget_bytes` defaults to
+    /// `None`); set `None` explicitly to disable time-based checkpoints
+    /// and rely only on `checkpoint_dirty_bytes`/`memory_budget_bytes`/
+    /// manual [`Store::checkpoint`](crate::Store::checkpoint) calls.
     pub checkpoint_interval: Option<Duration>,
     /// Leaf-parents processed per demote pass batch (a later task).
     /// Default: 1024.
@@ -279,7 +281,7 @@ impl Default for PagedOptions {
         Self {
             memory_budget_bytes: None,
             checkpoint_dirty_bytes: 256 << 20,
-            checkpoint_interval: None,
+            checkpoint_interval: Some(Duration::from_secs(60)),
             demote_batch: 1024,
             page_prefetch_bytes: 4096,
             prealloc_chunk_bytes: 16 << 20,
@@ -317,6 +319,15 @@ impl PagedOptionsBuilder {
     /// See [`PagedOptions::checkpoint_interval`].
     pub fn checkpoint_interval(mut self, d: Duration) -> Self {
         self.opts.checkpoint_interval = Some(d);
+        self
+    }
+    /// Disable the time trigger entirely — the default is `Some(60s)`
+    /// (see [`PagedOptions::checkpoint_interval`]'s doc for why), so this
+    /// is how a caller who wants only the dirty-bytes/memory-budget
+    /// triggers (or purely manual [`Store::checkpoint`](crate::Store::checkpoint)
+    /// calls) opts back out of it.
+    pub fn checkpoint_interval_disabled(mut self) -> Self {
+        self.opts.checkpoint_interval = None;
         self
     }
     /// See [`PagedOptions::demote_batch`].
@@ -402,10 +413,20 @@ mod tests {
         let o = PagedOptions::builder().build();
         assert_eq!(o.memory_budget_bytes, None);
         assert_eq!(o.checkpoint_dirty_bytes, 256 << 20);
-        assert_eq!(o.checkpoint_interval, None);
+        assert_eq!(
+            o.checkpoint_interval,
+            Some(Duration::from_secs(60)),
+            "task12 fix round 1: a backstop default, not None -- see the field's doc"
+        );
         assert_eq!(o.demote_batch, 1024);
         assert_eq!(o.page_prefetch_bytes, 4096);
         assert_eq!(o.prealloc_chunk_bytes, 16 << 20);
         assert_eq!(o.retained_checkpoints, 2);
+
+        assert_eq!(
+            PagedOptions::builder().checkpoint_interval_disabled().build().checkpoint_interval,
+            None,
+            "checkpoint_interval_disabled must be able to opt back out of the backstop"
+        );
     }
 }

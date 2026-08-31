@@ -614,7 +614,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 let mut children = Children::new();
                 children.push(left);
                 children.push(right);
-                let new_root = Child::resident(Arc::new(BTreeNode { entries, children }));
+                let new_root = Child::resident_new(Arc::new(BTreeNode { entries, children }), self.source.as_deref());
                 BTree {
                     root: new_root,
                     len: new_len,
@@ -666,6 +666,13 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 }
                 // Root split: the mutated `self.root` is now the left half.
                 // Lift it under a fresh root alongside the promoted median.
+                //
+                // The placeholder handed to `mem::replace` below is a
+                // throwaway: it lives only until `self.root` is reassigned
+                // a few lines down and is never reachable from any
+                // snapshot, so it deliberately stays a plain `resident` —
+                // `resident_new` here would credit `dirty_bytes` for a node
+                // no checkpoint will ever have to write.
                 let left = std::mem::replace(
                     &mut self.root,
                     Child::resident(Arc::new(BTreeNode {
@@ -678,7 +685,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 let mut children = Children::new();
                 children.push(left);
                 children.push(right);
-                self.root = Child::resident(Arc::new(BTreeNode { entries, children }));
+                self.root = Child::resident_new(Arc::new(BTreeNode { entries, children }), src);
                 self.height += 1;
             }
         }
@@ -1542,20 +1549,23 @@ fn insert_into_node<K: Ord + Clone, V>(
             // Replace existing value.
             entries[pos] = (key, val);
             let children = node.children.clone();
-            InsertResult::Fit(Child::resident(Arc::new(BTreeNode { entries, children })), true)
+            InsertResult::Fit(Child::resident_new(Arc::new(BTreeNode { entries, children }), src), true)
         }
         Err(pos) => {
             if node.children.is_empty() {
                 // Leaf: insert and possibly split.
                 entries.insert(pos, (key, val));
-                maybe_split(entries, Children::new(), false)
+                maybe_split(entries, Children::new(), false, src)
             } else {
                 // Internal: recurse into child[pos], then merge the result.
                 let mut children = node.children.clone();
                 match insert_into_node(&children[pos], key, val, src) {
                     InsertResult::Fit(new_child, replaced) => {
                         children[pos] = new_child;
-                        InsertResult::Fit(Child::resident(Arc::new(BTreeNode { entries, children })), replaced)
+                        InsertResult::Fit(
+                            Child::resident_new(Arc::new(BTreeNode { entries, children }), src),
+                            replaced,
+                        )
                     }
                     InsertResult::Split {
                         left,
@@ -1566,7 +1576,7 @@ fn insert_into_node<K: Ord + Clone, V>(
                         entries.insert(pos, median);
                         children[pos] = left;
                         children.insert(pos + 1, right);
-                        maybe_split(entries, children, replaced)
+                        maybe_split(entries, children, replaced, src)
                     }
                 }
             }
@@ -1585,9 +1595,10 @@ fn maybe_split<K: Clone, V>(
     mut entries: Entries<K, V>,
     mut children: Children<K, V>,
     replaced: bool,
+    src: Option<&dyn NodeSource<K, V>>,
 ) -> InsertResult<K, V> {
     if entries.len() <= MAX_KEYS {
-        InsertResult::Fit(Child::resident(Arc::new(BTreeNode { entries, children })), replaced)
+        InsertResult::Fit(Child::resident_new(Arc::new(BTreeNode { entries, children }), src), replaced)
     } else {
         // entries.len() == MAX_KEYS + 1; split at mid.
         let mid = entries.len() / 2;
@@ -1601,15 +1612,21 @@ fn maybe_split<K: Clone, V>(
         };
 
         InsertResult::Split {
-            left: Child::resident(Arc::new(BTreeNode {
-                entries,
-                children,
-            })),
+            left: Child::resident_new(
+                Arc::new(BTreeNode {
+                    entries,
+                    children,
+                }),
+                src,
+            ),
             median,
-            right: Child::resident(Arc::new(BTreeNode {
-                entries: right_entries,
-                children: right_children,
-            })),
+            right: Child::resident_new(
+                Arc::new(BTreeNode {
+                    entries: right_entries,
+                    children: right_children,
+                }),
+                src,
+            ),
             replaced,
         }
     }
@@ -1877,7 +1894,7 @@ fn insert_into_node_mut<K: Ord + Clone, V>(
                     None => InsertOutcome::Fit { replaced: false },
                     Some((median, right)) => InsertOutcome::Split {
                         median,
-                        right: Child::resident(right),
+                        right: Child::resident_new(right, src),
                         replaced: false,
                     },
                 }
@@ -1896,7 +1913,7 @@ fn insert_into_node_mut<K: Ord + Clone, V>(
                             None => InsertOutcome::Fit { replaced },
                             Some((median, right)) => InsertOutcome::Split {
                                 median,
-                                right: Child::resident(right),
+                                right: Child::resident_new(right, src),
                                 replaced,
                             },
                         }
@@ -1955,10 +1972,13 @@ fn delete_from_node<K: Ord + Clone, V>(
                 entries.remove(i);
                 let underfull = entries.len() < MIN_KEYS;
                 DeleteResult::Removed {
-                    node: Child::resident(Arc::new(BTreeNode {
-                        entries,
-                        children: Children::new(),
-                    })),
+                    node: Child::resident_new(
+                        Arc::new(BTreeNode {
+                            entries,
+                            children: Children::new(),
+                        }),
+                        src,
+                    ),
                     underfull,
                 }
             }
@@ -1979,7 +1999,7 @@ fn delete_from_node<K: Ord + Clone, V>(
                 }
                 let underfull = entries.len() < MIN_KEYS;
                 DeleteResult::Removed {
-                    node: Child::resident(Arc::new(BTreeNode { entries, children })),
+                    node: Child::resident_new(Arc::new(BTreeNode { entries, children }), src),
                     underfull,
                 }
             }
@@ -1999,7 +2019,7 @@ fn delete_from_node<K: Ord + Clone, V>(
                         }
                         let node_underfull = entries.len() < MIN_KEYS;
                         DeleteResult::Removed {
-                            node: Child::resident(Arc::new(BTreeNode { entries, children })),
+                            node: Child::resident_new(Arc::new(BTreeNode { entries, children }), src),
                             underfull: node_underfull,
                         }
                     }
@@ -2023,10 +2043,13 @@ fn remove_leftmost<K: Ord + Clone, V>(
         let underfull = entries.len() < MIN_KEYS;
         (
             first,
-            Child::resident(Arc::new(BTreeNode {
-                entries,
-                children: Children::new(),
-            })),
+            Child::resident_new(
+                Arc::new(BTreeNode {
+                    entries,
+                    children: Children::new(),
+                }),
+                src,
+            ),
             underfull,
         )
     } else {
@@ -2038,7 +2061,7 @@ fn remove_leftmost<K: Ord + Clone, V>(
             fix_underfull_child(&mut entries, &mut children, 0, src);
         }
         let underfull = entries.len() < MIN_KEYS;
-        (entry, Child::resident(Arc::new(BTreeNode { entries, children })), underfull)
+        (entry, Child::resident_new(Arc::new(BTreeNode { entries, children }), src), underfull)
     }
 }
 
@@ -2381,7 +2404,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         // If the leaf is already at capacity, freeze it and promote the new
         // entry up as the separator between this leaf and the next.
         if self.levels[0].entries.len() == MAX_KEYS {
-            let frozen = freeze_leaf(&mut self.levels[0]);
+            let frozen = freeze_leaf(&mut self.levels[0], self.source.as_deref());
             self.attach_child(1, frozen, k, v);
         } else {
             self.levels[0].entries.push((k, v));
@@ -2404,7 +2427,7 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         // finish()'s carry) fills it.
         lv.children.push(child);
         if lv.entries.len() == MAX_KEYS {
-            let frozen = freeze_internal(lv);
+            let frozen = freeze_internal(lv, self.source.as_deref());
             self.attach_child(level + 1, frozen, sep_k, sep_v);
         } else {
             lv.entries.push((sep_k, sep_v));
@@ -2503,10 +2526,13 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
 
             let node = if is_leaf_level {
                 computed_height = 0;
-                Child::resident(Arc::new(BTreeNode {
-                    entries: std::mem::take(&mut lv.entries).into_iter().collect(),
-                    children: Children::new(),
-                }))
+                Child::resident_new(
+                    Arc::new(BTreeNode {
+                        entries: std::mem::take(&mut lv.entries).into_iter().collect(),
+                        children: Children::new(),
+                    }),
+                    self.source.as_deref(),
+                )
             } else {
                 let mut entries = std::mem::take(&mut lv.entries);
                 let mut children = std::mem::take(&mut lv.children);
@@ -2555,20 +2581,26 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
                     children.pop().unwrap()
                 } else {
                     computed_height += 1;
-                    Child::resident(Arc::new(BTreeNode {
-                        entries: entries.into_iter().collect(),
-                        children: children.into_iter().collect(),
-                    }))
+                    Child::resident_new(
+                        Arc::new(BTreeNode {
+                            entries: entries.into_iter().collect(),
+                            children: children.into_iter().collect(),
+                        }),
+                        self.source.as_deref(),
+                    )
                 }
             };
             carry = Some(node);
         }
 
         let mut root = carry.unwrap_or_else(|| {
-            Child::resident(Arc::new(BTreeNode {
-                entries: Entries::new(),
-                children: Children::new(),
-            }))
+            Child::resident_new(
+                Arc::new(BTreeNode {
+                    entries: Entries::new(),
+                    children: Children::new(),
+                }),
+                self.source.as_deref(),
+            )
         });
         fix_right_spine_tail(&mut root, self.source.as_deref());
         let len = self.len - pending_reinsert.len();
@@ -2643,6 +2675,21 @@ fn fix_right_spine_tail<K: Ord + Clone, V>(
 /// in half so both resulting nodes satisfy `MIN_KEYS`. The new left node and
 /// separator go back into the parent; the partial node receives the right
 /// half.
+///
+/// Dirty-bytes accounting note (task12 fix round 1): when `src` is `Some`
+/// (a live `extend_from_sorted` append), the popped `sibling` may itself
+/// have already been `Child::resident_new`-credited — by an earlier
+/// `freeze_leaf`/`freeze_internal` call in this same build — and is
+/// discarded here (only its *contents* survive, folded into `new_left`).
+/// That credit is not un-charged: nothing here can tell "a node this exact
+/// build round just froze" apart from "a `seed_from_spine` clone of an
+/// unrelated already-dirty node" using only the `Child`'s own state. The
+/// result is a small, bounded (at most one `Child::NODE_BYTES` per
+/// rebalanced level, not per row) permanent over-credit into `dirty_bytes`
+/// — see `tests/paged_checkpointer.rs`'s
+/// `dirty_bytes_trigger_fires_for_newly_created_nodes_on_a_live_attached_table`
+/// for where this was found and why it's an accepted imprecision rather
+/// than a bug to chase further.
 fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usize, src: Option<&dyn NodeSource<K, V>>) {
     let is_leaf_level = level == 0;
     let (lower, upper) = levels.split_at_mut(level + 1);
@@ -2706,10 +2753,13 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
         debug_assert_eq!(new_right_children.len(), right_entries.len() + 1);
     }
 
-    let new_left = Child::resident(Arc::new(BTreeNode {
-        entries: new_left_entries.into_iter().collect(),
-        children: new_left_children.into_iter().collect(),
-    }));
+    let new_left = Child::resident_new(
+        Arc::new(BTreeNode {
+            entries: new_left_entries.into_iter().collect(),
+            children: new_left_children.into_iter().collect(),
+        }),
+        src,
+    );
 
     parent.children.push(new_left);
     parent.entries.push(new_separator);
@@ -2717,21 +2767,33 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     lv.children = new_right_children;
 }
 
-fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>) -> Child<K, V> {
-    Child::resident(Arc::new(BTreeNode {
-        entries: std::mem::take(&mut lv.entries).into_iter().collect(),
-        children: Children::new(),
-    }))
+/// `src` is `BulkBuilder::source`: `None` for a from-scratch `from_sorted`
+/// build (nothing to credit — there is no checkpoint yet to owe bytes to),
+/// `Some` when `extend_from_sorted` is appending onto an already-attached
+/// live tree (the frozen node is exactly as new to the checkpoint as any
+/// other freshly split node on the ordinary insert path).
+fn freeze_leaf<K, V>(lv: &mut LevelBuilder<K, V>, src: Option<&dyn NodeSource<K, V>>) -> Child<K, V> {
+    Child::resident_new(
+        Arc::new(BTreeNode {
+            entries: std::mem::take(&mut lv.entries).into_iter().collect(),
+            children: Children::new(),
+        }),
+        src,
+    )
 }
 
-fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>) -> Child<K, V> {
+/// See [`freeze_leaf`]'s doc for `src`.
+fn freeze_internal<K, V>(lv: &mut LevelBuilder<K, V>, src: Option<&dyn NodeSource<K, V>>) -> Child<K, V> {
     let entries = std::mem::take(&mut lv.entries);
     let children = std::mem::take(&mut lv.children);
     debug_assert_eq!(children.len(), entries.len() + 1);
-    Child::resident(Arc::new(BTreeNode {
-        entries: entries.into_iter().collect(),
-        children: children.into_iter().collect(),
-    }))
+    Child::resident_new(
+        Arc::new(BTreeNode {
+            entries: entries.into_iter().collect(),
+            children: children.into_iter().collect(),
+        }),
+        src,
+    )
 }
 
 // ---------------------------------------------------------------------------

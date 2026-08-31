@@ -59,7 +59,10 @@ fn write_rows(s: &Store, n: u64) {
 #[test]
 fn dirty_bytes_trigger_checkpoints_without_app_call() {
     let d = tempfile::tempdir().unwrap();
-    let s = store_with(d.path(), PagedOptions::builder().checkpoint_dirty_bytes(1 << 20).build());
+    let s = store_with(
+        d.path(),
+        PagedOptions::builder().checkpoint_dirty_bytes(1 << 20).checkpoint_interval_disabled().build(),
+    );
     write_rows(&s, 50_000);
     s.checkpoint().unwrap(); // attach + assign every leaf a page id (setup, not the trigger under test)
     let runs_before = s.paged_stats().unwrap().checkpointer_runs;
@@ -109,7 +112,7 @@ fn memory_budget_trigger_demotes_read_only_store() {
         let r = s.begin_read(None).unwrap();
         let t = r.open_table::<Row>("rows").unwrap();
         for k in 1..=50_000u64 {
-            t.get(&k);
+            t.get(k);
         }
     } // reads only; faults every leaf back in, well past the 64 KiB budget
 
@@ -172,12 +175,18 @@ fn drop_joins_the_thread() {
     watchdog.join().unwrap();
 }
 
-/// `checkpointer_runs` advances even across a fully idle store (nothing
-/// ever written) once the interval elapses, and — since `dirty_bytes` stays
-/// `0` the whole time — must NOT actually invoke a paged checkpoint (no
-/// `.root` file). This is `due_time`'s `&& dirty_bytes > 0` guard: without
-/// it a freshly opened idle paged store would checkpoint forever for no
-/// reason.
+/// A fully idle store (nothing ever written, so `latest_version` stays `0`
+/// — the same version [`PagedState::last_root`] implicitly starts at)
+/// must NOT invoke a paged checkpoint on the interval trigger alone: no
+/// `.root` file, `checkpointer_runs` stays `0`. This is `due_time`'s
+/// `has_uncommitted` guard (`latest_version > last-checkpointed-version`)
+/// — see `checkpointer_loop`'s doc for why that, not `dirty_bytes > 0`, is
+/// the actual condition (a table's first write never touches
+/// `dirty_bytes` before this fix, and even after it, a table with zero
+/// writes obviously has no dirty bytes either — this test only needs the
+/// weaker, always-true-for-both-versions claim: without *some* guard here,
+/// a freshly opened idle paged store would checkpoint forever for no
+/// reason).
 #[test]
 fn idle_store_does_not_spuriously_checkpoint_on_interval_alone() {
     let d = tempfile::tempdir().unwrap();
@@ -189,12 +198,122 @@ fn idle_store_does_not_spuriously_checkpoint_on_interval_alone() {
     assert_eq!(
         s.paged_stats().unwrap().checkpointer_runs,
         0,
-        "an idle store (dirty_bytes == 0 throughout) must never fire the interval trigger"
+        "an idle store (latest_version == last-checkpointed-version throughout) must never fire the interval trigger"
     );
     assert!(
         !std::fs::read_dir(d.path())
             .unwrap()
             .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".root")),
         "an idle store must never write a checkpoint"
+    );
+}
+
+/// Fix round 1, CRITICAL: a brand-new node (never on disk, so no
+/// clean-to-dirty *transition* for `PagedSource::note_dirty` to notice) has
+/// to credit `dirty_bytes` too, not just a CoW of an already-clean page —
+/// otherwise the dirty-bytes trigger can never fire for a fresh table's
+/// first real volume of writes, only for a *second* round of edits onto
+/// already-checkpointed data (exactly what the test above this one used to
+/// have to contrive). `Child::resident_new` (task12 fix round 1) is what
+/// closes that gap, wired into every live-mutation-path node-creation site
+/// in `btree.rs`, including `BulkBuilder`'s `extend_from_sorted` — which is
+/// exactly the path `Table::insert_batch` always takes (never a from-scratch
+/// `from_sorted`; see `Table::insert_batch`'s own doc), so this test's
+/// second `write_rows` call — appending to an *already paged-attached*
+/// table — exercises that path directly.
+///
+/// One `checkpoint()` first attaches the table (assigns every leaf a page
+/// id) with a single throwaway row — a setup step, not the trigger under
+/// test, so `checkpointer_runs`/`dirty_bytes` are captured *after* it, not
+/// before. `checkpoint_interval_disabled()` isolates the dirty-bytes
+/// trigger from the (now non-`None`) interval default.
+///
+/// Also checks the credit-back actually settles, not just clamps at some
+/// arbitrary value via `subtract_dirty_bytes`'s saturation hiding an
+/// incomplete credit — but *not* down to an exact `0`. Investigated and
+/// understood, not just observed: `BulkBuilder::redistribute_tail` (the
+/// tail-rebalance step `finish()` runs when a partial node would otherwise
+/// end up underfull) can pop an already-frozen, already-`resident_new`
+/// -credited sibling purely to discard it — merging its contents into a
+/// freshly built `new_left` replacement — so that original sibling's
+/// credit is orphaned: `note_dirty` charged for a node that never actually
+/// reaches disk, and nothing this task adds un-charges it, because
+/// distinguishing "this popped `Child` was frozen fresh by this exact
+/// build round" from "this popped `Child` is a `seed_from_spine` clone of
+/// an old, already-dirty-for unrelated-reasons node" isn't derivable from
+/// the `Child` alone. At most `O(tree height)` such discards can happen
+/// per bulk append (one per rebalanced level, not one per row), so the
+/// leak is small and bounded, not proportional to write volume — an
+/// accepted imprecision of the same *kind* `PagedStats::resident_leaf_bytes`
+/// already documents, not a new correctness problem for the trigger (worst
+/// case: it fires a few `Child::NODE_BYTES` earlier than the configured
+/// threshold, never later, never wrongly-never). A real concurrent write
+/// racing the checkpoint's own capture window would exercise a different,
+/// *also* accepted source of imprecision, but isn't cheaply/deterministically
+/// arrangeable without a dedicated race hook (paged_demotion.rs's
+/// `race_hook` pattern) that this task doesn't add; the bounded-residual
+/// check below is the documented fallback for both.
+#[test]
+fn dirty_bytes_trigger_fires_for_newly_created_nodes_on_a_live_attached_table() {
+    let d = tempfile::tempdir().unwrap();
+    let s = store_with(
+        d.path(),
+        PagedOptions::builder()
+            .checkpoint_dirty_bytes(1 << 20)
+            .checkpoint_interval_disabled()
+            .build(),
+    );
+    write_rows(&s, 1); // fresh, unattached table -- BulkBuilder source is None, credits nothing
+    s.checkpoint().unwrap(); // attach: every leaf (just the one) gets a page id
+    let runs_before = s.paged_stats().unwrap().checkpointer_runs;
+    assert_eq!(
+        s.paged_stats().unwrap().dirty_bytes,
+        0,
+        "the setup row must not have credited anything before this point"
+    );
+
+    // ~1.5 KB x 800 leaves >> 1 MiB: brand-new leaves appended via
+    // `extend_from_sorted`'s live path (the table is now attached), never
+    // a clean-node CoW -- exactly the case `Child::resident_new` exists for.
+    write_rows(&s, 50_000);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.paged_stats().unwrap().checkpointer_runs <= runs_before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        s.paged_stats().unwrap().checkpointer_runs > runs_before,
+        "background checkpointer never ran for newly created nodes within the deadline \
+         (dirty_bytes credit for brand-new nodes regressed)"
+    );
+    assert!(
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".root")),
+        "no .root file appeared in {}",
+        d.path().display()
+    );
+
+    // Credit-back settle check — bounded residual, not exact `0`; see the
+    // test's doc for the `redistribute_tail` discard-orphan mechanism this
+    // is deliberately tolerating. Poll briefly: the trigger firing and the
+    // checkpoint actually completing are two different moments, and more
+    // than one background run may be needed (the inter-run floor caps how
+    // fast those runs can happen, not whether they do).
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let residual_bound = 64 * 1024; // generous: a handful of orphaned nodes, not a real leak
+    loop {
+        let dirty = s.paged_stats().unwrap().dirty_bytes;
+        if dirty <= residual_bound || std::time::Instant::now() >= settle_deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let settled = s.paged_stats().unwrap().dirty_bytes;
+    assert!(
+        settled <= residual_bound,
+        "credit-in (note_dirty via resident_new) and credit-back (subtract_dirty_bytes) \
+         must cancel down to a small bounded residual, not stay pinned near the ~1 MiB \
+         that was credited in: settled at {settled} bytes"
     );
 }
