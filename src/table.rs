@@ -24,7 +24,7 @@ use crate::index::{
 use crate::index::IndexDef;
 use crate::overlay::{MergedIter, Overlay, OverlayOp, TableIter};
 #[cfg(feature = "persistence")]
-use crate::pagecodec::{NodeCodec, PagedSource, PagedStats};
+use crate::pagecodec::{NodeCodec, PagedSource, PagedStats, raw_reachable_page_ids};
 #[cfg(feature = "persistence")]
 use crate::pagefile::PageFile;
 use crate::persistence::Record;
@@ -141,6 +141,14 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// Used by `SnapshotReader` to emit table headers.
     #[cfg(feature = "persistence")]
     fn index_list(&self) -> Vec<(u8, String)>;
+
+    /// Names of this table's still-pending persisted indexes (recovered via
+    /// `from_paged_entry` but not yet re-attached this process by a
+    /// `define_persisted_index`/`define_index` call). Type-erased so
+    /// `Store::recover`'s paged branch can log which indexes need
+    /// reattachment without downcasting to a concrete `Table<R, K>`.
+    #[cfg(feature = "persistence")]
+    fn pending_index_names(&self) -> Vec<String>;
 
     /// Serialize every row to (encoded-key-bytes, bincode-bytes) pairs using
     /// the provided type-erased serializer from the registry. Returns them in
@@ -353,6 +361,11 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
     }
 
     #[cfg(feature = "persistence")]
+    fn pending_index_names(&self) -> Vec<String> {
+        self.pending_indexes.iter().map(|p| p.name.clone()).collect()
+    }
+
+    #[cfg(feature = "persistence")]
     fn collect_serialized_rows(
         &self,
         serialize_record: &(dyn Fn(&dyn Any) -> Result<Vec<u8>> + Send + Sync),
@@ -449,6 +462,51 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
                 && let Ok(empty) = prev_idx.empty_clone()
             {
                 out.extend(empty.paged_changed_pages(prev_idx.as_ref()));
+            }
+        }
+        // Task 13 carry-forward hazard: a still-pending persisted index on
+        // `prev` (recovered via `from_paged_entry`, but never re-attached
+        // by a `define_persisted_index`/`define_index` call in *any*
+        // process, this one included) has no entry in `prev.indexes` at
+        // all — the two loops above never see it, so without this its
+        // pages would never be marked dead no matter what becomes of it
+        // here: attached unchanged, rebuilt under a new generation, or
+        // dropped by a plain `define_index`. `prev`'s side of that
+        // comparison has no live, typed `BTree` to walk — only a
+        // `PagedIndexEntry`, whose index key type is known solely as a
+        // persisted `ik_type_id` *code*, not a concrete Rust type this
+        // generic method could instantiate — so it walks raw page bytes
+        // structurally via `raw_reachable_page_ids` instead of the typed
+        // `BTree::changed_page_ids` the loops above use. The "new" side,
+        // when a live index of that name exists in `self.indexes`, uses
+        // `IndexMaintainer::paged_reachable_ids`: that index's tree is
+        // always fully resident here (either just attached via
+        // `from_root_page`, or freshly built by a from-scratch rebuild),
+        // so a full walk is exact — unlike the O(changed) diff
+        // `changed_page_ids` computes for an index that already existed on
+        // both sides, this is comparing two *entire* trees, one of which
+        // (`prev`'s) is only reachable as raw bytes.
+        if let Some(file) = self.paged_file.as_deref() {
+            for prev_pending in &prev.pending_indexes {
+                // Reproduced byte-for-byte by `paged_write_tree`'s
+                // carry-forward (still pending, same root) — no change,
+                // nothing dead.
+                let unchanged = self
+                    .pending_indexes
+                    .iter()
+                    .any(|p| p.name == prev_pending.name && p.root_page == prev_pending.root_page);
+                if unchanged {
+                    continue;
+                }
+                let new_ids: BTreeSet<PageId> = match self.indexes.get(&prev_pending.name) {
+                    Some(idx) => idx.paged_reachable_ids().into_iter().collect(),
+                    None => BTreeSet::new(),
+                };
+                if let Some(root) = prev_pending.root_page
+                    && let Ok(old_ids) = raw_reachable_page_ids(file, root)
+                {
+                    out.extend(old_ids.into_iter().filter(|id| !new_ids.contains(id)));
+                }
             }
         }
         out
@@ -572,6 +630,17 @@ pub struct Table<R, K = u64> {
     /// of the name's bytes on every one of those.
     #[cfg(feature = "persistence")]
     paged_name: Option<Arc<str>>,
+    /// The page file this table's (and its persisted indexes') trees fault
+    /// pages in from, set alongside `stats` by `attach_paged_source` and
+    /// `from_paged_entry`. Retained (rather than only threaded through a
+    /// per-call `PagedCtx`) because `define_persisted_index`'s attach
+    /// branch (Task 13) needs it to build a `PagedSource` for a still-
+    /// pending index's tree, and that call has no `PagedCtx` of its own —
+    /// unlike `paged_write`, it isn't invoked by the checkpoint writer.
+    /// `Arc<PageFile>`, not a borrow: this field rides along on every
+    /// `Table::clone` the same way `stats`/`paged_name` do.
+    #[cfg(feature = "persistence")]
+    paged_file: Option<Arc<PageFile>>,
 }
 
 /// Captured table state for atomic batch rollback.
@@ -600,6 +669,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             stats: None,
             #[cfg(feature = "persistence")]
             paged_name: None,
+            #[cfg(feature = "persistence")]
+            paged_file: None,
         }
     }
 
@@ -641,6 +712,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             stats: None,
             #[cfg(feature = "persistence")]
             paged_name: None,
+            #[cfg(feature = "persistence")]
+            paged_file: None,
         })
     }
 
@@ -717,6 +790,8 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             stats: None,
             #[cfg(feature = "persistence")]
             paged_name: None,
+            #[cfg(feature = "persistence")]
+            paged_file: None,
         }
     }
 
@@ -1263,6 +1338,17 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             // or key type are the same, so trust the caller.)
             return Ok(());
         }
+        // Task 13: a plain (non-persisted) index is never paged, so it has
+        // nothing to attach a pending persisted entry of the same name to —
+        // drop the pending metadata rather than leave it stranded forever
+        // (unreachable from `self.indexes`, and no longer reachable via
+        // `define_persisted_index` either, since this name is about to be
+        // occupied by a non-persisted index). The dropped entry's on-disk
+        // pages become unreachable from this table from this point on;
+        // `Table::paged_changed_pages`'s pending-index carry-forward path
+        // reports them dead at the next checkpoint.
+        #[cfg(feature = "persistence")]
+        self.pending_indexes.retain(|p| p.name != name);
         let extractor = Arc::new(extractor);
         let mut index: Box<dyn IndexMaintainer<R, K>> = match kind {
             IndexKind::Unique => Box::new(ManagedIndex::<R, IK, UniqueStorage<IK, K>>::new(
@@ -1503,6 +1589,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         self.data.set_source(Some(source));
         self.stats = Some(stats.clone());
         self.paged_name = Some(Arc::from(table_name));
+        self.paged_file = Some(file.clone());
         for idx in self.indexes.values_mut() {
             idx.attach_paged_source(file.clone(), stats.clone(), table_name);
         }
@@ -1556,11 +1643,25 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             (Some(root_id), self.data.height() as u32)
         };
 
-        let mut indexes = Vec::with_capacity(self.indexes.len());
+        let mut indexes = Vec::with_capacity(self.indexes.len() + self.pending_indexes.len());
         for idx in self.indexes.values() {
             if let Some(entry) = idx.paged_write(ctx)? {
                 indexes.push(entry);
             }
+        }
+        // Task 13 carry-forward (Task 9 hazard): a still-pending persisted
+        // index (recovered via `from_paged_entry` but not yet re-attached
+        // by a `define_persisted_index`/`define_index` call this process)
+        // has no `IndexMaintainer` in `self.indexes` for the loop above to
+        // walk — without re-emitting its metadata here, the very first
+        // checkpoint after recovery would silently drop it from the
+        // outgoing root entry, orphaning pages a later
+        // `define_persisted_index` could otherwise have attached for free.
+        // Carried through byte-for-byte: nothing in this process has ever
+        // loaded, let alone written, this entry's tree, so re-emitting the
+        // same `PagedIndexEntry` is exactly correct.
+        for pending in &self.pending_indexes {
+            indexes.push(pending.clone());
         }
 
         Ok(PagedTableEntry {
@@ -1605,16 +1706,18 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         stats: Arc<PagedStats>,
     ) -> Result<Self> {
         if e.key_type_id != K::KEY_TYPE_ID {
-            return Err(Error::Persistence(
-                crate::primary_key::key_type_mismatch_msg::<K>(e.key_type_id),
-            ));
+            return Err(Error::Persistence(format!(
+                "table '{}': {}",
+                e.name,
+                crate::primary_key::key_type_mismatch_msg::<K>(e.key_type_id)
+            )));
         }
 
         let data: BTree<K, R> = match e.root_page {
             Some(root_page) => {
                 let codec = NodeCodec::<K, R>::records::<R>();
                 let source: Arc<PagedSource<K, R>> = Arc::new(PagedSource {
-                    file,
+                    file: file.clone(),
                     codec,
                     name: e.name.clone(),
                     stats: stats.clone(),
@@ -1633,7 +1736,14 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         let next_id = e
             .next_id
             .as_ref()
-            .map(|bytes| K::decode(bytes))
+            .map(|bytes| {
+                K::decode(bytes).map_err(|err| {
+                    Error::Persistence(format!(
+                        "table '{}': failed to decode next_id: {err}",
+                        e.name
+                    ))
+                })
+            })
             .transpose()?;
 
         Ok(Self {
@@ -1645,6 +1755,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             pending_indexes: e.indexes.clone(),
             stats: Some(stats),
             paged_name: Some(Arc::from(e.name.as_str())),
+            paged_file: Some(file),
         })
     }
 
@@ -1657,10 +1768,35 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// index never gets that marker and stays purely in-memory even once
     /// the table itself is paged. `IndexKind::Custom` is rejected: a custom
     /// index's storage is opaque to this generic maintainer, so there is no
-    /// tree to page. Task 13 adds the attach path and richer error
-    /// variants; this is the minimal signature Task 13 builds on.
-    // No production caller yet — see `attach_paged_source` above.
-    #[allow(dead_code)]
+    /// tree to page.
+    ///
+    /// Task 13's attach behaviour (spec §6), checked against
+    /// `pending_indexes` (the persisted-but-not-yet-reattached metadata
+    /// `from_paged_entry` carried forward from recovery) before falling
+    /// through to the plain rebuild-by-scan path every other case takes:
+    ///
+    /// - No pending entry named `name`: rebuild by scan (logged) — same as
+    ///   before this task, including on a paged store, where that faults
+    ///   every data leaf.
+    /// - A pending entry exists but its `ik_type_id` or `kind` disagrees
+    ///   with this call: `Err(Error::IndexDefinitionMismatch)`. Both fields
+    ///   decide how the on-disk bytes are interpreted (the index key type,
+    ///   and `BTree<IK, K>` vs. `BTree<(IK, K), ()>`), so silently rebuilding
+    ///   over a shape mismatch would risk misreading old pages under a new
+    ///   codec rather than failing loudly.
+    /// - A pending entry matches on `ik_type_id`, `kind`, *and*
+    ///   `generation`: attach — reconstruct the index tree straight from
+    ///   the recovered root page via `UniqueStorage`/`NonUniqueStorage::
+    ///   from_root_page` (which fully resident-loads it, since an index
+    ///   tree is never demoted) and bind the extractor. Zero data-page
+    ///   reads: nothing here ever touches `self.data`.
+    /// - A pending entry matches on `ik_type_id`/`kind` but a different
+    ///   `generation`: the on-disk shape is stale relative to what this
+    ///   call describes (the extractor/key semantics evolved upstream) —
+    ///   rebuild by scan under the *new* generation, same as the no-pending
+    ///   case from here, and drop the stale pending entry. Its old pages
+    ///   become unreachable and are reported dead at the next checkpoint
+    ///   (`Table::paged_changed_pages`'s pending-index carry-forward path).
     #[cfg(feature = "persistence")]
     pub(crate) fn define_persisted_index<IK: PrimaryKey>(
         &mut self,
@@ -1678,6 +1814,116 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             }
             return Ok(());
         }
+        if kind == IndexKind::Custom {
+            return Err(Error::IndexTypeMismatch(name.to_string()));
+        }
+        let table_name = self.paged_name.as_deref().unwrap_or("").to_string();
+
+        if let Some(pos) = self.pending_indexes.iter().position(|p| p.name == name) {
+            let entry = self.pending_indexes[pos].clone();
+            let expected_kind_byte: u8 = match kind {
+                IndexKind::Unique => 0,
+                IndexKind::NonUnique => 1,
+                IndexKind::Custom => unreachable!("returned above"),
+            };
+            if entry.ik_type_id != IK::KEY_TYPE_ID {
+                return Err(Error::IndexDefinitionMismatch {
+                    table: table_name,
+                    index: name.to_string(),
+                    reason: format!(
+                        "index key type changed: persisted with ik_type_id {}, redefined as \
+                         {} ({})",
+                        entry.ik_type_id,
+                        IK::KEY_TYPE_ID,
+                        std::any::type_name::<IK>()
+                    ),
+                });
+            }
+            if entry.kind != expected_kind_byte {
+                return Err(Error::IndexDefinitionMismatch {
+                    table: table_name,
+                    index: name.to_string(),
+                    reason: format!(
+                        "index kind changed: persisted as {}, redefined as {kind:?}",
+                        if entry.kind == 0 { "Unique" } else { "NonUnique" }
+                    ),
+                });
+            }
+            if entry.generation == def.generation {
+                // ATTACH: rebuild the storage straight from the recovered
+                // root — no scan of `self.data` at all.
+                let file = self.paged_file.clone().ok_or_else(|| {
+                    Error::Persistence(format!(
+                        "table '{table_name}': index '{name}' has pending persisted contents \
+                         but no page file is attached"
+                    ))
+                })?;
+                let stats = self.stats.clone().ok_or_else(|| {
+                    Error::Persistence(format!(
+                        "table '{table_name}': index '{name}' has pending persisted contents \
+                         but no PagedStats is attached"
+                    ))
+                })?;
+                let source_name = format!("{table_name}.{name}");
+                eprintln!(
+                    "ultima_db: attaching persisted index '{name}' on table '{table_name}' \
+                     from root page {:?} (generation {})",
+                    entry.root_page, entry.generation
+                );
+                let index: Box<dyn IndexMaintainer<R, K>> = match kind {
+                    IndexKind::Unique => Box::new(ManagedIndex::<R, IK, UniqueStorage<IK, K>>::new(
+                        name.to_string(),
+                        kind,
+                        Arc::new(extractor),
+                        UniqueStorage::from_root_page(
+                            entry.root_page,
+                            entry.len as usize,
+                            entry.height as usize,
+                            entry.ik_type_id,
+                            entry.generation,
+                            file,
+                            stats,
+                            source_name,
+                        ),
+                    )),
+                    IndexKind::NonUnique => {
+                        Box::new(ManagedIndex::<R, IK, NonUniqueStorage<IK, K>>::new(
+                            name.to_string(),
+                            kind,
+                            Arc::new(extractor),
+                            NonUniqueStorage::from_root_page(
+                                entry.root_page,
+                                entry.len as usize,
+                                entry.height as usize,
+                                entry.ik_type_id,
+                                entry.generation,
+                                file,
+                                stats,
+                                source_name,
+                            ),
+                        ))
+                    }
+                    IndexKind::Custom => unreachable!("returned above"),
+                };
+                self.indexes.insert(name.to_string(), index);
+                self.pending_indexes.remove(pos);
+                return Ok(());
+            }
+            // Generation differs: fall through to the rebuild-by-scan path
+            // below, under the new generation, dropping the stale entry.
+            eprintln!(
+                "ultima_db: persisted index '{name}' on table '{table_name}' changed generation \
+                 ({} -> {}); rebuilding by scan",
+                entry.generation, def.generation
+            );
+            self.pending_indexes.remove(pos);
+        } else {
+            eprintln!(
+                "ultima_db: no pending persisted contents for index '{name}' on table \
+                 '{table_name}'; rebuilding by scan"
+            );
+        }
+
         let extractor = Arc::new(extractor);
         let persist = (IK::KEY_TYPE_ID, def.generation);
         let mut index: Box<dyn IndexMaintainer<R, K>> = match kind {
@@ -1693,9 +1939,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                 extractor,
                 NonUniqueStorage::new_persisted(persist),
             )),
-            IndexKind::Custom => {
-                return Err(Error::IndexTypeMismatch(name.to_string()));
-            }
+            IndexKind::Custom => unreachable!("returned above"),
         };
         index.rebuild_from_sorted_data(&self.data)?;
         self.indexes.insert(name.to_string(), index);
@@ -1723,6 +1967,8 @@ impl<R: Record, K: AutoKey> Table<R, K> {
             stats: None,
             #[cfg(feature = "persistence")]
             paged_name: None,
+            #[cfg(feature = "persistence")]
+            paged_file: None,
         }
     }
 
@@ -1945,6 +2191,8 @@ impl<R, K: PrimaryKey> Clone for Table<R, K> {
             stats: self.stats.clone(),
             #[cfg(feature = "persistence")]
             paged_name: self.paged_name.clone(),
+            #[cfg(feature = "persistence")]
+            paged_file: self.paged_file.clone(),
         }
     }
 }

@@ -216,6 +216,28 @@ pub enum Error {
         /// The persistence directory that holds the paged checkpoint.
         dir: PathBuf,
     },
+    /// `Table::define_persisted_index` found a pending, recovered-but-not-
+    /// yet-attached persisted index of the same name whose `ik_type_id` or
+    /// `IndexKind` disagrees with what this call is defining. Both fields
+    /// determine how the on-disk tree's bytes must be decoded (the index
+    /// key type and the storage shape — `BTree<IK, K>` vs. `BTree<(IK, K),
+    /// ()>`), so reusing it under a different one would silently
+    /// misinterpret the persisted bytes rather than fail loudly. Unlike a
+    /// `generation` change (which is expected to happen when an index's
+    /// shape evolves, and just triggers a rebuild-by-scan), a type or kind
+    /// mismatch means this call does not actually describe the index that
+    /// was persisted — define it under a different name, or bump
+    /// `IndexDef::generation` if the intent really is to replace it.
+    #[error("index '{index}' on table '{table}' does not match its persisted definition: {reason}")]
+    IndexDefinitionMismatch {
+        /// Name of the table the index is defined on.
+        table: String,
+        /// Name of the index whose redefinition disagreed with what was
+        /// persisted.
+        index: String,
+        /// Which field disagreed (`ik_type_id` or `kind`) and how.
+        reason: String,
+    },
 }
 
 /// Crate-wide result alias: `std::result::Result<T, Error>`.
@@ -337,6 +359,20 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "table 'accounts' changed record or key type since the base checkpoint"
+        );
+    }
+
+    #[test]
+    fn error_index_definition_mismatch_displays() {
+        let e = Error::IndexDefinitionMismatch {
+            table: "rows".to_string(),
+            index: "by_v".to_string(),
+            reason: "index kind changed: persisted as NonUnique, redefined as Unique".to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "index 'by_v' on table 'rows' does not match its persisted definition: \
+             index kind changed: persisted as NonUnique, redefined as Unique"
         );
     }
 

@@ -478,6 +478,47 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
     }
 }
 
+/// Every page id reachable from a page-file root, discovered by walking raw
+/// page payloads structurally (child pointers only) — no `K`/`V` type
+/// required, unlike [`NodeCodec::decode`]: an entry's key/value bytes are
+/// only ever *skipped* by their own length prefixes here, never decoded.
+///
+/// Built for `Table::paged_changed_pages`'s still-pending persisted-index
+/// carry-forward path (Task 13): a pending index's `IK` type is not known
+/// statically wherever `Table<R, K>` reasons about its `pending_indexes`
+/// (only the persisted `ik_type_id` *code* is), so this is the only way to
+/// collect a still-pending index's page ids for the dead-page diff without
+/// reinstating a live, typed `BTree` for it just to answer "which pages did
+/// this used to reach."
+pub(crate) fn raw_reachable_page_ids(file: &PageFile, root: PageId) -> Result<Vec<PageId>> {
+    fn go(file: &PageFile, id: PageId, out: &mut Vec<PageId>) -> Result<()> {
+        out.push(id);
+        let (kind, payload) = file.read(id)?;
+        let is_inner = matches!(kind, PageKind::DataInner | PageKind::IndexInner);
+        let mut at = 0usize;
+        let n = read_u16(&payload, &mut at)? as usize;
+        for _ in 0..n {
+            let key_len = read_u16(&payload, &mut at)? as usize;
+            read_bytes(&payload, &mut at, key_len)?;
+            let val_len = read_u32(&payload, &mut at)? as usize;
+            read_bytes(&payload, &mut at, val_len)?;
+        }
+        if is_inner {
+            let mut children = Vec::with_capacity(n + 1);
+            for _ in 0..=n {
+                children.push(read_u64(&payload, &mut at)?);
+            }
+            for child_id in children {
+                go(file, child_id, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    go(file, root, &mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +675,47 @@ mod tests {
                 }),
             }
         }
+    }
+
+    /// `raw_reachable_page_ids` walks a two-level tree (root + two leaves)
+    /// using only child-pointer structure — never decoding a key or value —
+    /// and must report exactly the root and both leaf ids, root first
+    /// (Task 13, `Table::paged_changed_pages`'s pending-index diff).
+    #[test]
+    fn raw_reachable_page_ids_walks_a_two_level_tree() {
+        let d = tempfile::tempdir().unwrap();
+        let pf = crate::pagefile::PageFile::open(&crate::pagefile::page_file_path(d.path()), 0, 1 << 16, 4096).unwrap();
+        let codec = NodeCodec::<u64, u64>::unique_index::<u64, u64>();
+
+        let leaf1 = leaf(vec![(1u64, 100u64), (2u64, 200u64)]);
+        let (k1, b1) = codec.encode(&leaf1).unwrap();
+        let leaf1_id = pf.append(k1, &b1).unwrap();
+
+        let leaf2 = leaf(vec![(5u64, 500u64)]);
+        let (k2, b2) = codec.encode(&leaf2).unwrap();
+        let leaf2_id = pf.append(k2, &b2).unwrap();
+
+        let mut root = leaf(vec![(3u64, 300u64)]);
+        root.children.push(Child::on_disk(leaf1_id));
+        root.children.push(Child::on_disk(leaf2_id));
+        let (kr, br) = codec.encode(&root).unwrap();
+        let root_id = pf.append(kr, &br).unwrap();
+
+        let ids = raw_reachable_page_ids(&pf, root_id).unwrap();
+        assert_eq!(ids, vec![root_id, leaf1_id, leaf2_id]);
+    }
+
+    /// A single leaf root (no children) reports only itself — the base case
+    /// `raw_reachable_page_ids`'s recursion must terminate on.
+    #[test]
+    fn raw_reachable_page_ids_single_leaf() {
+        let d = tempfile::tempdir().unwrap();
+        let pf = crate::pagefile::PageFile::open(&crate::pagefile::page_file_path(d.path()), 0, 1 << 16, 4096).unwrap();
+        let codec = NodeCodec::<u64, u64>::records::<u64>();
+        let n = leaf(vec![(1u64, 42u64)]);
+        let (k, b) = codec.encode(&n).unwrap();
+        let id = pf.append(k, &b).unwrap();
+
+        assert_eq!(raw_reachable_page_ids(&pf, id).unwrap(), vec![id]);
     }
 }

@@ -14,6 +14,8 @@ use parking_lot::{ArcMutexGuard, Condvar, Mutex, RwLock};
 use dashmap::DashMap;
 
 use crate::index::IndexKind;
+#[cfg(feature = "persistence")]
+use crate::index::IndexDef;
 use crate::intents::{CommitWaiter, IntentMap, IntentWaiter};
 use crate::metrics::StoreMetrics;
 use crate::persistence::Record;
@@ -2313,6 +2315,24 @@ impl Store {
                         .ok_or_else(|| Error::TableNotRegistered(entry.name.clone()))?;
                     let table =
                         (info.attach_paged_entry)(entry, Arc::clone(&file), Arc::clone(&stats))?;
+                    // Task 13: a recovered table's persisted indexes are
+                    // metadata-only until a matching `define_persisted_index`
+                    // call attaches them (`Table::from_paged_entry` docs).
+                    // Logged here, once per recovery, so an operator who
+                    // forgets to redefine an index on the new process learns
+                    // about it from `recover()` rather than from a silent
+                    // "index not found" the first time application code
+                    // queries it.
+                    let pending = table.pending_index_names();
+                    if !pending.is_empty() {
+                        eprintln!(
+                            "ultima_db: recover(): table '{}' has {} persisted index(es) \
+                             pending re-attachment via define_persisted_index: {}",
+                            entry.name,
+                            pending.len(),
+                            pending.join(", ")
+                        );
+                    }
                     tables.insert(entry.name.clone(), Arc::from(table));
                 }
                 // A table this build has registered but the root record does
@@ -4640,6 +4660,30 @@ impl<'tx, R: Record, K: PrimaryKey> TableWriter<'tx, R, K> {
         self.table.define_index(name, kind, extractor)?;
         // Only a *successful* DDL taints the commit (task41) — a rejected
         // define (kind mismatch, name collision) changed nothing.
+        if let Some(ddl) = self.ddl_tables {
+            ddl.borrow_mut().insert(self.table_name.to_string());
+        }
+        Ok(())
+    }
+
+    /// Define a secondary index whose tree is written to the page file
+    /// alongside the table's data tree (paged stores only — a store
+    /// without `Persistence::..paged(..)` never faults this index in from
+    /// disk, but the call still succeeds, same as any other index on an
+    /// unpaged store). `IK` is the *index* key; the table's primary key
+    /// stays `K`. See [`Table::define_persisted_index`] for the full
+    /// attach-after-recovery behaviour (Task 13's spec §6 table).
+    #[cfg(feature = "persistence")]
+    pub fn define_persisted_index<IK: crate::primary_key::PrimaryKey>(
+        &mut self,
+        name: &str,
+        kind: IndexKind,
+        def: IndexDef,
+        extractor: impl Fn(&R) -> IK + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.metrics.register_index(&self.table_name, name);
+        self.table.define_persisted_index(name, kind, def, extractor)?;
+        // Same DDL-conflict bookkeeping as `define_index` — see its comment.
         if let Some(ddl) = self.ddl_tables {
             ddl.borrow_mut().insert(self.table_name.to_string());
         }

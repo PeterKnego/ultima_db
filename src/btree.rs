@@ -1102,6 +1102,39 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         go(&self.root, h, src)
     }
 
+    /// Fault in every node — inner levels *and* leaves — leaving nothing on
+    /// disk. Unlike [`Self::load_inner_levels`] (which the data tree uses:
+    /// a leaf there is meant to stay on disk until a read actually touches
+    /// it), this is for a persisted *index* tree being attached after
+    /// recovery (`Table::define_persisted_index`'s attach branch, Task 13):
+    /// an index tree is never demoted (see `Residency`'s doc — demotion is
+    /// a data-tree-only concept), so leaving any of it on disk after attach
+    /// would just re-fault the same pages on the very first query with
+    /// nothing ever gained back. Uses [`Child::load_quiet`] throughout —
+    /// same reasoning as `changed_page_ids`'s note: this is startup
+    /// bookkeeping, not a workload read, and an index tree's accessed bits
+    /// never matter anyway (it is never demoted), but staying `load_quiet`
+    /// keeps this consistent with every other non-workload walk in this
+    /// file.
+    // Only called from `index.rs`'s `from_root_page` constructors, which
+    // are themselves `#[cfg(feature = "persistence")]` — dead code under a
+    // build without that feature, same as `load_inner_levels` above.
+    #[allow(dead_code)]
+    pub(crate) fn load_all(&self) {
+        let src = self.source.as_deref();
+        let h = self.height();
+        fn go<K, V>(slot: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) {
+            let n = slot.load_quiet(src);
+            if depth == 0 {
+                return; // leaf slot: loaded above, nothing further to descend into
+            }
+            for c in n.children.iter() {
+                go(c, depth - 1, src);
+            }
+        }
+        go(&self.root, h, src)
+    }
+
     /// Bytes of resident leaves, estimated as loaded-leaf-slots × NODE_BYTES.
     /// Read-only: uses [`Child::load_quiet`], so measuring residency never
     /// marks anything "recently used" — see the same note on
@@ -5078,6 +5111,43 @@ mod tests {
                 }
             }
             check(&t2.root, t2.height(), t2.source.as_deref());
+        }
+
+        /// `load_all` (Task 13's attach path) faults in every node — inner
+        /// levels *and* leaves — unlike `load_inner_levels`, which stops
+        /// one level short. Every slot must be `is_loaded()` afterward, and
+        /// a subsequent `get` must not fault anything further.
+        #[test]
+        fn load_all_faults_every_node_including_leaves() {
+            let disk = Arc::new(MockDisk::new());
+            let t = tree(20_000);
+            let mut next = 0;
+            let root = flush(&t, &disk, &mut next);
+            let t2: BTree<u64, u64> = BTree::from_root_page(root, 20_000, t.height(), disk.clone());
+            t2.load_all();
+
+            fn check(slot: &Child<u64, u64>) {
+                assert!(slot.is_loaded(), "load_all must leave nothing on disk, leaves included");
+            }
+            fn walk(slot: &Child<u64, u64>, depth: usize, src: Option<&dyn NodeSource<u64, u64>>) {
+                check(slot);
+                if depth == 0 {
+                    return;
+                }
+                let n = slot.load_quiet(src);
+                for c in n.children.iter() {
+                    walk(c, depth - 1, src);
+                }
+            }
+            walk(&t2.root, t2.height(), t2.source.as_deref());
+
+            let reads_before = disk.reads.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(t2.get(&123), Some(&123));
+            assert_eq!(
+                disk.reads.load(std::sync::atomic::Ordering::Relaxed),
+                reads_before,
+                "every node is already resident; a read after load_all must fault nothing"
+            );
         }
 
         // -------------------------------------------------------------

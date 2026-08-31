@@ -135,6 +135,22 @@ pub(crate) trait IndexMaintainer<R, K: PrimaryKey>: Send + Sync {
     #[cfg(feature = "persistence")]
     #[allow(dead_code)]
     fn paged_generation(&self) -> u32;
+
+    /// This index's currently reachable page ids, read-only (via
+    /// [`crate::btree::BTree::for_each_page_id`], which marks nothing
+    /// "recently used"). `&[]` for a non-persisted index (no page-file
+    /// presence at all) or an empty persisted one.
+    ///
+    /// Used by `Table::paged_changed_pages`'s still-pending persisted-index
+    /// carry-forward path (Task 13) to learn the "new" side of a pending
+    /// index that got attached, regenerated, or dropped this checkpoint:
+    /// `prev`'s side of that diff has no live `IndexMaintainer` at all (it
+    /// is only a [`crate::checkpoint::PagedIndexEntry`] in
+    /// `pending_indexes`), so the diff walks `prev`'s pages with the
+    /// type-erased [`crate::pagecodec::raw_reachable_page_ids`] instead —
+    /// this method is only ever the "new" half of that comparison.
+    #[cfg(feature = "persistence")]
+    fn paged_reachable_ids(&self) -> Vec<PageId>;
 }
 
 /// Extracts an index key of type `IK` from a record of type `R`. Implemented
@@ -333,6 +349,16 @@ where
     fn paged_generation(&self) -> u32 {
         self.storage.persist.as_ref().map(|p| p.generation).unwrap_or(0)
     }
+
+    #[cfg(feature = "persistence")]
+    fn paged_reachable_ids(&self) -> Vec<PageId> {
+        if self.storage.persist.is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.storage.tree.for_each_page_id(&mut |id| out.push(id));
+        out
+    }
 }
 
 impl<R, IK, K> IndexMaintainer<R, K> for ManagedIndex<R, IK, NonUniqueStorage<IK, K>>
@@ -460,6 +486,16 @@ where
     fn paged_generation(&self) -> u32 {
         self.storage.persist.as_ref().map(|p| p.generation).unwrap_or(0)
     }
+
+    #[cfg(feature = "persistence")]
+    fn paged_reachable_ids(&self) -> Vec<PageId> {
+        if self.storage.persist.is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.storage.tree.for_each_page_id(&mut |id| out.push(id));
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,8 +602,6 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
     }
 
     /// A storage stamped for the paged path — see [`PersistedIndex`].
-    // No production caller yet — see `PersistedIndex`'s doc.
-    #[allow(dead_code)]
     #[cfg(feature = "persistence")]
     pub(crate) fn new_persisted(persist: (u32, u32)) -> Self
     where
@@ -578,6 +612,64 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
         let codec_for_encode = codec.clone();
         Self {
             tree: BTree::new(),
+            persist: Some(PersistedIndex {
+                ik_type_id,
+                generation,
+                encode: Arc::new(move |node| codec_for_encode.encode(node)),
+                attach: Arc::new(move |tree, file, stats, name| {
+                    let source: Arc<PagedSource<IK, K>> =
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                    tree.set_source(Some(source));
+                }),
+            }),
+        }
+    }
+
+    /// A storage rebuilt from a recovered [`PagedIndexEntry`] (Task 13's
+    /// attach path): the tree is reconstructed via `BTree::from_root_page`
+    /// and immediately made fully resident via `BTree::load_all` — an
+    /// index tree is never demoted (see `load_all`'s doc), so leaving any
+    /// of it on disk here would just re-fault the same pages on the first
+    /// query with nothing gained. `root_page: None` (an empty persisted
+    /// index) needs neither: `BTree::new()` is already fully resident.
+    ///
+    /// Stamps a fresh `persist` marker under `ik_type_id`/`generation` the
+    /// same way `new_persisted` does, so a later `paged_write` call on this
+    /// storage knows its codec — the caller (`Table::define_persisted_index`)
+    /// only reaches this once `ik_type_id`, `kind`, and `generation` have
+    /// already been checked to match the pending entry, so re-stamping here
+    /// (rather than trusting the pending entry's own fields verbatim) is
+    /// just avoiding a second place that could drift from what was
+    /// actually validated.
+    #[cfg(feature = "persistence")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_root_page(
+        root_page: Option<u64>,
+        len: usize,
+        height: usize,
+        ik_type_id: u32,
+        generation: u32,
+        file: Arc<PageFile>,
+        stats: Arc<PagedStats>,
+        name: String,
+    ) -> Self
+    where
+        IK: PrimaryKey,
+    {
+        let codec = NodeCodec::<IK, K>::unique_index::<IK, K>();
+        let codec_for_encode = codec.clone();
+        let tree = match root_page {
+            Some(id) => {
+                let source: Arc<PagedSource<IK, K>> =
+                    Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                let t = BTree::from_root_page(id, len, height, source);
+                t.load_all();
+                t
+            }
+            None => BTree::new(),
+        };
+        Self {
+            tree,
             persist: Some(PersistedIndex {
                 ik_type_id,
                 generation,
@@ -666,8 +758,6 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
     }
 
     /// A storage stamped for the paged path — see [`PersistedIndex`].
-    // No production caller yet — see `PersistedIndex`'s doc.
-    #[allow(dead_code)]
     #[cfg(feature = "persistence")]
     pub(crate) fn new_persisted(persist: (u32, u32)) -> Self
     where
@@ -678,6 +768,51 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
         let codec_for_encode = codec.clone();
         Self {
             tree: BTree::new(),
+            persist: Some(PersistedIndex {
+                ik_type_id,
+                generation,
+                encode: Arc::new(move |node| codec_for_encode.encode(node)),
+                attach: Arc::new(move |tree, file, stats, name| {
+                    let source: Arc<PagedSource<(IK, K), ()>> =
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                    tree.set_source(Some(source));
+                }),
+            }),
+        }
+    }
+
+    /// A storage rebuilt from a recovered [`PagedIndexEntry`] — see the
+    /// doc on [`UniqueStorage::from_root_page`], the same contract applied
+    /// to this storage's composite `(IK, K)` tree.
+    #[cfg(feature = "persistence")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_root_page(
+        root_page: Option<u64>,
+        len: usize,
+        height: usize,
+        ik_type_id: u32,
+        generation: u32,
+        file: Arc<PageFile>,
+        stats: Arc<PagedStats>,
+        name: String,
+    ) -> Self
+    where
+        IK: PrimaryKey,
+    {
+        let codec = NodeCodec::<(IK, K), ()>::non_unique_index::<IK, K>();
+        let codec_for_encode = codec.clone();
+        let tree = match root_page {
+            Some(id) => {
+                let source: Arc<PagedSource<(IK, K), ()>> =
+                    Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                let t = BTree::from_root_page(id, len, height, source);
+                t.load_all();
+                t
+            }
+            None => BTree::new(),
+        };
+        Self {
+            tree,
             persist: Some(PersistedIndex {
                 ik_type_id,
                 generation,
@@ -877,6 +1012,12 @@ impl<R: Record, K: PrimaryKey, I: CustomIndex<R, K> + 'static> IndexMaintainer<R
     #[cfg(feature = "persistence")]
     fn paged_generation(&self) -> u32 {
         0
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_reachable_ids(&self) -> Vec<PageId> {
+        // Never paged — see `attach_paged_source` above.
+        Vec::new()
     }
 }
 
