@@ -634,7 +634,7 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
                 encode: Arc::new(move |node| codec_for_encode.encode(node)),
                 attach: Arc::new(move |tree, file, stats, name| {
                     let source: Arc<PagedSource<IK, K>> =
-                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats, clone: None });
                     tree.set_source(Some(source));
                 }),
             }),
@@ -677,7 +677,7 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
         let tree = match root_page {
             Some(id) => {
                 let source: Arc<PagedSource<IK, K>> =
-                    Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                    Arc::new(PagedSource { file, codec: codec.clone(), name, stats, clone: None });
                 let t = BTree::from_root_page(id, len, height, source);
                 // Fallible (I-1): a corrupt/unreadable index page must fail
                 // `define_persisted_index` with `Err`, not panic.
@@ -694,7 +694,7 @@ impl<IK: Ord + Clone + 'static, K: PrimaryKey> UniqueStorage<IK, K> {
                 encode: Arc::new(move |node| codec_for_encode.encode(node)),
                 attach: Arc::new(move |tree, file, stats, name| {
                     let source: Arc<PagedSource<IK, K>> =
-                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats, clone: None });
                     tree.set_source(Some(source));
                 }),
             }),
@@ -790,7 +790,7 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
                 encode: Arc::new(move |node| codec_for_encode.encode(node)),
                 attach: Arc::new(move |tree, file, stats, name| {
                     let source: Arc<PagedSource<(IK, K), ()>> =
-                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats, clone: None });
                     tree.set_source(Some(source));
                 }),
             }),
@@ -820,7 +820,7 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
         let tree = match root_page {
             Some(id) => {
                 let source: Arc<PagedSource<(IK, K), ()>> =
-                    Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                    Arc::new(PagedSource { file, codec: codec.clone(), name, stats, clone: None });
                 let t = BTree::from_root_page(id, len, height, source);
                 // Fallible (I-1): a corrupt/unreadable index page must fail
                 // `define_persisted_index` with `Err`, not panic.
@@ -837,7 +837,7 @@ impl<IK: Ord + Clone + Send + Sync + 'static, K: PrimaryKey> NonUniqueStorage<IK
                 encode: Arc::new(move |node| codec_for_encode.encode(node)),
                 attach: Arc::new(move |tree, file, stats, name| {
                     let source: Arc<PagedSource<(IK, K), ()>> =
-                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats });
+                        Arc::new(PagedSource { file, codec: codec.clone(), name, stats, clone: None });
                     tree.set_source(Some(source));
                 }),
             }),

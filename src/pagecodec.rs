@@ -436,6 +436,17 @@ pub(crate) struct PagedSource<K, V> {
     pub(crate) codec: NodeCodec<K, V>,
     pub(crate) name: String,
     pub(crate) stats: Arc<PagedStats>,
+    /// The row type's clone fn, captured at `register_table_paged` time
+    /// (`TableRegistry::register_paged`, Task 3) and threaded down through
+    /// `Table::attach_paged_source`/`from_paged_entry`. `None` for every
+    /// index `PagedSource` (indexes never carry block leaves — see
+    /// `NodeSource::clone_value`'s doc, I-B) and for a data-tree source
+    /// built on a store that was never told `R: Clone` (`register_table`'s
+    /// plain path is refused up front by `Error::PagedNeedsClone` on a
+    /// paged store, so this only stays `None` off that plain path on a
+    /// *non*-paged store, where a table's tree never holds block leaves in
+    /// the first place).
+    pub(crate) clone: Option<fn(&V) -> V>,
 }
 
 impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K, V> {
@@ -480,6 +491,10 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
 
     fn note_dirty(&self, bytes: usize) {
         self.stats.dirty_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn clone_value(&self, v: &V) -> Option<V> {
+        self.clone.map(|f| f(v))
     }
 
     fn name(&self) -> &str {
@@ -644,7 +659,7 @@ mod tests {
         let (k, b) = codec.encode(&n).unwrap();
         let id = pf.append(k, &b).unwrap();
         let stats = Arc::new(PagedStats::default());
-        let src = PagedSource { file: pf, codec, name: "t".into(), stats: stats.clone() };
+        let src = PagedSource { file: pf, codec, name: "t".into(), stats: stats.clone(), clone: None };
         let back = crate::child::NodeSource::read_node(&src, id).unwrap();
         assert_eq!(back.entries.len(), 1);
         assert_eq!(stats.page_faults.load(std::sync::atomic::Ordering::Relaxed), 1);

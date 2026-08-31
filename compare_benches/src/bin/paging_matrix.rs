@@ -302,7 +302,7 @@ impl UltimaPagedEngine {
         }
     }
 
-    /// `Store::new` + `register_table` against `path` — does *not* recover;
+    /// `Store::new` + `register_table_paged` against `path` — does *not* recover;
     /// callers that need the on-disk state loaded call `.recover()`
     /// themselves (so its cost can be timed separately, see `restart`).
     fn open(path: &Path, budget: u64, dur: Dur, knobs: PagedKnobs) -> ultima_db::Store {
@@ -333,7 +333,7 @@ impl UltimaPagedEngine {
             .paged(b.build())
             .expect("paged persistence");
         let store = ultima_db::Store::new(cfgb.persistence(p).build()).expect("Store::new");
-        store.register_table::<Row>("rows").expect("register_table");
+        store.register_table_paged::<Row>("rows").expect("register_table_paged");
         store
     }
 

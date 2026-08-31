@@ -1215,6 +1215,12 @@ impl Store {
     /// [`Store::register_table_keyed`]. (This method cannot itself take the
     /// key parameter: Rust has no default type parameters on functions, so
     /// `register_table::<R>(..)` would stop compiling.)
+    ///
+    /// On a store built with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged), this
+    /// returns [`Error::PagedNeedsClone`] — use
+    /// [`Store::register_table_paged`] instead, which also works (as plain
+    /// registration) on a non-paged store.
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
         self.register_table_keyed::<R, u64>(name)
@@ -1234,12 +1240,72 @@ impl Store {
     /// without this check the registry and the snapshot could drift apart —
     /// and every consumer that trusts the registry, notably the snapshot wire
     /// format, would then act on the wrong key type.
+    ///
+    /// On a store built with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged), this
+    /// returns [`Error::PagedNeedsClone`] — use
+    /// [`Store::register_table_paged_keyed`] instead.
     #[cfg(feature = "persistence")]
     pub fn register_table_keyed<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
         &self,
         name: &str,
     ) -> Result<()> {
+        self.register_table_impl::<R, K>(name, None)
+    }
+
+    /// Register a table type for persistence on a store whose paged leaves
+    /// need `R: Clone` for their block-CoW (`NodeSource::clone_value`) — the
+    /// required registration for a paged store's tables. Also correct (and
+    /// unconditionally accepted) on a non-paged store: it behaves exactly
+    /// like [`Store::register_table`] there, since `clone_value` is never
+    /// called on a tree with no paged source attached. There is no reason
+    /// *not* to use this over [`Store::register_table`] for a table type
+    /// that implements `Clone` — it is strictly additive.
+    ///
+    /// Registers the `u64`-keyed table `Table<R>`. For a table with an
+    /// explicit primary-key type, use
+    /// [`Store::register_table_paged_keyed`].
+    #[cfg(feature = "persistence")]
+    pub fn register_table_paged<R: crate::persistence::Record + Clone>(
+        &self,
+        name: &str,
+    ) -> Result<()> {
+        self.register_table_paged_keyed::<R, u64>(name)
+    }
+
+    /// [`Store::register_table_paged`] for a table keyed by `K`. See
+    /// [`Store::register_table_keyed`]'s doc for the key-type-match and
+    /// registration-ordering rules this shares.
+    #[cfg(feature = "persistence")]
+    pub fn register_table_paged_keyed<
+        R: crate::persistence::Record + Clone,
+        K: crate::primary_key::PrimaryKey,
+    >(
+        &self,
+        name: &str,
+    ) -> Result<()> {
+        self.register_table_impl::<R, K>(name, Some(<R as Clone>::clone as fn(&R) -> R))
+    }
+
+    /// Shared body of `register_table_keyed`/`register_table_paged_keyed`.
+    /// `clone` is `Some` only from the paged-registration entry points; a
+    /// `None` on a store whose persistence is paged is refused up front
+    /// with [`Error::PagedNeedsClone`] (checked here, under the same write
+    /// lock as the rest of the registration, so it can never race a
+    /// concurrent `Persistence` change — there is none: paged-ness is fixed
+    /// at `Store::new`).
+    #[cfg(feature = "persistence")]
+    fn register_table_impl<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        name: &str,
+        clone: Option<fn(&R) -> R>,
+    ) -> Result<()> {
         let mut inner = self.inner.write();
+        if clone.is_none() && inner.paged.is_some() {
+            return Err(Error::PagedNeedsClone {
+                table: name.to_string(),
+            });
+        }
         if let Some(live) = inner
             .snapshots
             .get(&inner.latest_version)
@@ -1254,7 +1320,7 @@ impl Store {
                     "cannot register table: registry is in use (checkpoint in progress?)".into(),
                 )
             })?
-            .register::<R, K>(name)
+            .register_impl::<R, K>(name, clone)
     }
 
     /// Write a checkpoint of the latest snapshot to disk.
@@ -10221,7 +10287,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        store.register_table::<String>("rows").unwrap();
+        store.register_table_paged::<String>("rows").unwrap();
 
         // Bulk insert (not a loop of single inserts — see
         // `tests/paged_demotion.rs`'s `write_rows` doc for why: a put-loop
@@ -10322,7 +10388,7 @@ mod tests {
 
         let version = {
             let store = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-            store.register_table::<String>("rows").unwrap();
+            store.register_table_paged::<String>("rows").unwrap();
             let mut w = store.begin_write(None).unwrap();
             let mut t = w.open_table::<String>("rows").unwrap();
             // Enough rows to force an inner level (MAX_KEYS is 63 at T=32) —
@@ -10354,7 +10420,7 @@ mod tests {
         drop(f);
 
         let store2 = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-        store2.register_table::<String>("rows").unwrap();
+        store2.register_table_paged::<String>("rows").unwrap();
         let err = store2.recover().unwrap_err();
         assert!(
             matches!(err, Error::CheckpointCorrupted(_) | Error::Persistence(_)),
@@ -10381,7 +10447,7 @@ mod tests {
 
         let version = {
             let store = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-            store.register_table::<String>("rows").unwrap();
+            store.register_table_paged::<String>("rows").unwrap();
             {
                 let mut w = store.begin_write(None).unwrap();
                 let mut t = w.open_table::<String>("rows").unwrap();
@@ -10417,7 +10483,7 @@ mod tests {
         drop(f);
 
         let store2 = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-        store2.register_table::<String>("rows").unwrap();
+        store2.register_table_paged::<String>("rows").unwrap();
         store2.recover().unwrap();
 
         let mut w = store2.begin_write(None).unwrap();
@@ -10462,7 +10528,7 @@ mod tests {
             .paged(PagedOptions::builder().checkpoint_interval(Duration::from_millis(20)).build())
             .unwrap();
         let store = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-        store.register_table::<String>("rows").unwrap();
+        store.register_table_paged::<String>("rows").unwrap();
 
         // Arm the hook before any commit exists to check, so the
         // background thread's first eligible tick is the one that panics.

@@ -1608,6 +1608,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         file: Arc<PageFile>,
         stats: Arc<PagedStats>,
         table_name: &str,
+        clone: Option<fn(&R) -> R>,
     ) {
         let codec = NodeCodec::<K, R>::records::<R>();
         let source: Arc<PagedSource<K, R>> = Arc::new(PagedSource {
@@ -1615,11 +1616,14 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             codec,
             name: table_name.to_string(),
             stats: stats.clone(),
+            clone,
         });
         self.data.set_source(Some(source));
         self.stats = Some(stats.clone());
         self.paged_name = Some(Arc::from(table_name));
         self.paged_file = Some(file.clone());
+        // Index trees never carry block leaves (I-B) — the index-side
+        // `attach_paged_source` signature stays clone-free.
         for idx in self.indexes.values_mut() {
             idx.attach_paged_source(file.clone(), stats.clone(), table_name);
         }
@@ -1732,6 +1736,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         e: &PagedTableEntry,
         file: Arc<PageFile>,
         stats: Arc<PagedStats>,
+        clone: Option<fn(&R) -> R>,
     ) -> Result<Self> {
         if e.key_type_id != K::KEY_TYPE_ID {
             return Err(Error::Persistence(format!(
@@ -1749,6 +1754,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                     codec,
                     name: e.name.clone(),
                     stats: stats.clone(),
+                    clone,
                 });
                 let tree =
                     BTree::from_root_page(root_page, e.len as usize, e.height as usize, source);
@@ -5192,7 +5198,7 @@ mod paged {
         let mut t: Table<u64, u64> = Table::new();
         let ids = t.insert_batch((1..=20_000u64).map(|i| i * 2).collect()).unwrap();
         assert_eq!(ids, (1..=20_000u64).collect::<Vec<_>>());
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.attach_paged_source(file.clone(), stats.clone(), "rows", Some(u64::clone as fn(&u64) -> u64));
         let (_entry, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
         assert!(flushed.is_none(), "a freshly bulk-built table has no overlay to flush");
         t
@@ -5237,7 +5243,7 @@ mod paged {
         // `Error::DuplicateKey` while backfilling — irrelevant to what this
         // "plain index is skipped by paged_write" test is checking.
         t.define_index("plain", IndexKind::NonUnique, |r: &u64| *r + 1_000_000).unwrap();
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.attach_paged_source(file.clone(), stats.clone(), "rows", Some(u64::clone as fn(&u64) -> u64));
         let (e, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
         assert!(flushed.is_none());
         assert_eq!(e.indexes.len(), 1);
@@ -5382,7 +5388,7 @@ mod paged {
         let mut t: Table<u64, u64> = Table::new();
         let ids = t.insert_batch((1..=100u64).map(|i| i * 2).collect()).unwrap();
         assert_eq!(ids.len(), 100);
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.attach_paged_source(file.clone(), stats.clone(), "rows", Some(u64::clone as fn(&u64) -> u64));
         // Buffer one row directly in the overlay (bypassing the tree) so
         // `paged_write` must take the clone-and-flush path.
         t.overlay_mut_for_test(8).set_put(9_999, Arc::new(24_998), false);
@@ -5404,6 +5410,7 @@ mod paged {
             codec: NodeCodec::<u64, u64>::records::<u64>(),
             name: "rows".to_string(),
             stats: read_stats,
+            clone: Some(u64::clone as fn(&u64) -> u64),
         });
         let read_back: BTree<u64, u64> =
             BTree::from_root_page(root_id, entry.len as usize, entry.height as usize, source);

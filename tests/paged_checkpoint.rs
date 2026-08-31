@@ -23,7 +23,7 @@ fn store(dir: &std::path::Path) -> Store {
         .paged(PagedOptions::builder().build())
         .unwrap();
     let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
     s
 }
 
@@ -117,7 +117,7 @@ fn multiwriter_paged_checkpoint_settles_to_a_true_no_op() {
             .build(),
     )
     .unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
 
     {
         let mut w = s.begin_write(None).unwrap();
