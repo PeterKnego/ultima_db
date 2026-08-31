@@ -399,6 +399,14 @@ impl<V> Value<V> {
     pub(crate) fn is_in_block(&self) -> bool {
         self.0.is_none()
     }
+    /// Take the slot's `Arc` by value. `None` for an in-block slot, whose
+    /// value lives in the node's `block` and has no per-entry `Arc` at all.
+    /// Handing the `Arc` out *by value* (rather than cloning it out of the
+    /// entry) is what lets `take_value`'s `Arc::try_unwrap` fast path fire
+    /// when this node held the last reference.
+    pub(crate) fn into_arc(self) -> Option<Arc<V>> {
+        self.0
+    }
 }
 impl<V> Clone for Value<V> {
     fn clone(&self) -> Self {
@@ -429,11 +437,19 @@ pub(crate) struct BTreeNode<K, V> {
     pub(crate) children: Children<K, V>,
     /// Some only on paged data-tree leaves ("block leaves"). `None` for
     /// every other node: inner nodes and index trees stay all-Arc always
-    /// (I-B); a data leaf is block-shaped only while nothing has mutably
-    /// touched it since it was last decoded off disk (`NodeCodec::decode`,
-    /// task 4, is the sole production constructor of `Some` — see also
-    /// `BTreeNode::materialize`, which is what un-does it on write). +8B
-    /// per node.
+    /// (I-B). +8B per node.
+    ///
+    /// Constructed by `NodeCodec::decode` (task 4, fault-in) and, since
+    /// Task 5, by every immutable-path leaf mutation — `rebuild_block_leaf`,
+    /// `split_block`, `absorb`, `put_entry_from_arc` — so a block leaf that
+    /// is inserted into, deleted from, split, rotated, or merged comes back
+    /// out block-shaped rather than silently de-blocking.
+    ///
+    /// The one thing that still un-does it is `BTreeNode::materialize`, the
+    /// task 4 stopgap `Child::make_mut` runs before handing out a `&mut`
+    /// node, which keeps the not-yet-block-aware in-place (`_mut`) family
+    /// correct until Task 6 lands. `Child::make_mut_keep_block` is the
+    /// deliberate exception; see `materialize`'s own doc.
     pub(crate) block: Option<Box<[V]>>,
 }
 
@@ -518,27 +534,37 @@ impl<K, V> BTreeNode<K, V> {
     /// leaf (the common case — checked once via `Option::take`, before
     /// touching any entry).
     ///
-    /// Correctness stopgap for decode-to-block (task 4), pending Task 5's
-    /// real single-pass block-leaf CoW rebuild. **The precise invariant**
-    /// (fix round 1, Minor 4 — search for this if you're Task 5/6/7):
-    /// *every node reached through `&mut` is materialized* —
-    /// `Child::make_mut`/`make_mut_after_load` calls this on every node
-    /// about to be handed back mutably, and `absorb` (fix round 1,
-    /// Critical 1) calls it explicitly on a sibling consumed by value. A
-    /// node reached only by **value** (moved out and dropped without ever
-    /// going through `&mut`, e.g. an old `absorb` before that fix) or by
-    /// **shared reference for a read that copies elsewhere**
-    /// (`seed_from_spine`, `redistribute_tail` — fix round 1, Critical 2)
-    /// is NOT covered by this function and must clone the value out via
-    /// `NodeSource::clone_value` at its own call site instead. Any new
-    /// code path that acquires a block leaf by one of those two routes
-    /// needs its own fix, not a call to `materialize`.
+    /// Correctness stopgap for decode-to-block (task 4), now narrowed by
+    /// Task 5 and due to be removed by Task 6. **The precise invariant**
+    /// (fix round 1, Minor 4 — search for this if you're Task 6/7):
+    /// *every node reached through `Child::make_mut`/`make_mut_quiet` is
+    /// materialized*, which is what keeps the still-block-unaware in-place
+    /// (`_mut`) family — `insert_into_node_mut`, `maybe_split_mut`,
+    /// `delete_from_node_mut`, `remove_leftmost_mut` — correct: they shift
+    /// and remove `entries` with no awareness of a parallel `block` array.
     ///
-    /// A leaf a write actually touches gives up its block's memory
-    /// advantage until Task 5's real rebuild lands; read-only leaves (the
-    /// common case) stay block-shaped exactly as Task 4 intends. Moving
-    /// out here — whether the node was mutated in place or freshly built
-    /// by `clone_with`'s one `clone_value` per entry — adds zero further
+    /// Three routes are deliberately NOT covered and handle blocks
+    /// themselves instead:
+    /// - `Child::make_mut_keep_block` (Task 5) — the rebalance path
+    ///   (`rotate_right`/`rotate_left`/`merge_with_left`/`merge_with_right`
+    ///   -> `absorb`), which rebuilds blocks rather than shifting entries
+    ///   under them, so a rotation or merge of block leaves yields a block
+    ///   leaf.
+    /// - A node reached only **by value** — `absorb`'s sibling, moved out
+    ///   via `Arc::try_unwrap` and folded into the merged block directly.
+    /// - A node read by **shared reference for a copy made elsewhere**
+    ///   (`seed_from_spine`, `redistribute_tail` — fix round 1, Critical 2;
+    ///   the whole immutable path since Task 5), which clones values out
+    ///   via `NodeSource::clone_value` at its own call site.
+    ///
+    /// Any new code path that acquires a block leaf by one of those routes
+    /// needs its own handling, not a call to `materialize`.
+    ///
+    /// A leaf the in-place path writes to still gives up its block's
+    /// memory advantage until Task 6 lands; read-only leaves and every
+    /// immutable-path mutation stay block-shaped. Moving out here —
+    /// whether the node was mutated in place or freshly built by
+    /// `clone_with`'s one `clone_value` per entry — adds zero further
     /// clones on top of whatever already ran, preserving Task 2's "no
     /// clone on the unique-owner path" fast-path guarantee.
     pub(crate) fn materialize(&mut self) {
@@ -1830,6 +1856,211 @@ fn get_arc_in_node<K: Ord, V>(
     }
 }
 
+/// One edit applied to a block leaf by [`rebuild_block_leaf`].
+///
+/// Spec §4: a block-leaf mutation "builds the new block in one allocation
+/// pass — never clone-then-mutate". A `Box<[V]>` can neither grow, shrink,
+/// nor have an element replaced while the node is only held by shared
+/// reference, which is all the immutable path ever has, so every immutable
+/// block-leaf mutation is expressed as one of these three edits and
+/// streamed into a fresh node in a single pass.
+pub(crate) enum LeafEdit<K, V> {
+    /// Overwrite the value at `entries[i]`; the key is unchanged.
+    Replace(usize, V),
+    /// Insert `(key, value)` at index `i`, shifting `[i, len)` right.
+    Insert(usize, K, V),
+    /// Drop `entries[i]`, shifting `(i, len)` left.
+    Remove(usize),
+}
+
+/// Turn an incoming `Arc<V>` into an owned `V` bound for a block slot.
+///
+/// The common insert/update carries a freshly allocated `Arc` nobody else
+/// holds, so `try_unwrap` moves the value straight into the block with no
+/// copy at all; a genuinely shared `Arc` (a commit-merge `upsert_arc`, an
+/// overlay flush replaying a value an older snapshot still references)
+/// falls back to the source's `clone_value`. A missing `src` (or one whose
+/// `clone_value` returns `None`) here is an I-B breach — a block leaf on a
+/// non-cloning source — and panics, the same way every other I-B check in
+/// this file does.
+fn take_value<K, V>(val: Arc<V>, src: Option<&dyn NodeSource<K, V>>) -> V {
+    match Arc::try_unwrap(val) {
+        Ok(v) => v,
+        Err(a) => src
+            .and_then(|s| s.clone_value(&a))
+            .expect("I-B: block leaf requires a cloning source"),
+    }
+}
+
+/// Build a fresh block leaf from `node` with `edit` applied.
+///
+/// One pass, one allocation for the new block: values the edit does not
+/// touch are cloned straight from the old block into their final slot via
+/// `NodeSource::clone_value`, and the edit's own value moves in. The result
+/// is always block-shaped (`block: Some`, every entry `in_block`), so an
+/// immutable-path mutation of a block leaf yields a block leaf rather than
+/// silently de-blocking it — that is the whole point of Task 5.
+///
+/// `Insert` may return `MAX_KEYS + 1` entries (the `Entries` capacity
+/// headroom); the caller hands such a node to [`split_block`].
+fn rebuild_block_leaf<K: Clone, V>(
+    node: &BTreeNode<K, V>,
+    edit: LeafEdit<K, V>,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> BTreeNode<K, V> {
+    debug_assert!(node.children.is_empty(), "I-A: only leaves carry a value block");
+    let old = node.block.as_ref().expect("rebuild_block_leaf: not a block leaf");
+    debug_assert_eq!(
+        old.len(),
+        node.entries.len(),
+        "I-A: block length must match entries length"
+    );
+    let s = src.expect("I-B: block leaf requires a cloning source");
+    let n = node.entries.len();
+    let mut entries: Entries<K, V> = Entries::new();
+    let mut block: Vec<V> = Vec::with_capacity(match &edit {
+        LeafEdit::Insert(..) => n + 1,
+        LeafEdit::Remove(_) => n - 1,
+        LeafEdit::Replace(..) => n,
+    });
+    // Carry entry `i` across untouched: its key is cloned and its value is
+    // duplicated out of the old block directly into the new one.
+    let carry = |entries: &mut Entries<K, V>, block: &mut Vec<V>, i: usize| {
+        entries.push((node.entries[i].0.clone(), Value::in_block()));
+        block.push(
+            s.clone_value(&old[i])
+                .expect("I-B: block leaf requires a cloning source"),
+        );
+    };
+    match edit {
+        LeafEdit::Replace(pos, v) => {
+            debug_assert!(pos < n, "Replace out of range");
+            let mut v = Some(v);
+            for i in 0..n {
+                if i == pos {
+                    entries.push((node.entries[i].0.clone(), Value::in_block()));
+                    block.push(v.take().expect("Replace visits pos exactly once"));
+                } else {
+                    carry(&mut entries, &mut block, i);
+                }
+            }
+        }
+        LeafEdit::Insert(pos, key, v) => {
+            debug_assert!(pos <= n, "Insert out of range");
+            for i in 0..pos {
+                carry(&mut entries, &mut block, i);
+            }
+            entries.push((key, Value::in_block()));
+            block.push(v);
+            for i in pos..n {
+                carry(&mut entries, &mut block, i);
+            }
+        }
+        LeafEdit::Remove(pos) => {
+            debug_assert!(pos < n, "Remove out of range");
+            for i in 0..n {
+                if i != pos {
+                    carry(&mut entries, &mut block, i);
+                }
+            }
+        }
+    }
+    BTreeNode {
+        entries,
+        children: Children::new(),
+        block: Some(block.into_boxed_slice()),
+    }
+}
+
+/// Split an over-full block leaf (`MAX_KEYS + 1` entries, straight out of
+/// [`rebuild_block_leaf`]) into two block leaves plus the promoted median.
+///
+/// Takes the node **by value**: it was just built by this thread and is not
+/// shared, so each half's block is filled by *moving* values out of the
+/// original — one fresh `Box<[V]>` per half, zero `clone_value` calls. The
+/// median's value cannot stay in a block: it becomes a separator entry in
+/// an inner node, and inner nodes are always Arc-backed (I-B), so it is
+/// re-homed into a fresh `Arc` at the boundary.
+///
+/// The split point (`mid = len / 2`, median promoted, `[..mid]` left,
+/// `[mid+1..]` right) is exactly `maybe_split`'s, so block and all-Arc
+/// leaves produce identically-shaped trees.
+#[allow(clippy::type_complexity)]
+fn split_block<K: Clone, V>(node: BTreeNode<K, V>) -> (BTreeNode<K, V>, (K, Value<V>), BTreeNode<K, V>) {
+    let BTreeNode {
+        mut entries,
+        children,
+        block,
+    } = node;
+    debug_assert!(children.is_empty(), "I-A: only leaves carry a value block");
+    let block = block.expect("split_block: not a block leaf");
+    debug_assert_eq!(
+        block.len(),
+        entries.len(),
+        "I-A: block length must match entries length"
+    );
+    let mid = entries.len() / 2;
+    let right_entries = entries.split_off(mid + 1);
+    // Drops an `in_block` marker slot (no `Arc`, nothing to release); the
+    // real value comes out of the block below.
+    let median_key = entries.pop().expect("entries[mid] exists").0;
+    // `entries` is now `[..mid]`; the block still runs in entry order, so
+    // draining it front-to-back lines the halves up with their keys.
+    let mut vals = Vec::from(block).into_iter();
+    let left_block: Vec<V> = vals.by_ref().take(entries.len()).collect();
+    let median_val = vals.next().expect("I-A: block length must match entries length");
+    let right_block: Vec<V> = vals.collect();
+    debug_assert_eq!(left_block.len(), entries.len(), "I-A");
+    debug_assert_eq!(right_block.len(), right_entries.len(), "I-A");
+    (
+        BTreeNode {
+            entries,
+            children: Children::new(),
+            block: Some(left_block.into_boxed_slice()),
+        },
+        (median_key, Value::arc(Arc::new(median_val))),
+        BTreeNode {
+            entries: right_entries,
+            children: Children::new(),
+            block: Some(right_block.into_boxed_slice()),
+        },
+    )
+}
+
+/// Immutable-path insert into a **block leaf**: one `rebuild_block_leaf`
+/// pass, then `split_block` if that overflowed. The block-shaped
+/// counterpart of `insert_into_node`'s leaf arms + `maybe_split`.
+fn insert_into_block_leaf<K: Ord + Clone, V>(
+    node: &BTreeNode<K, V>,
+    key: K,
+    val: Arc<V>,
+    src: Option<&dyn NodeSource<K, V>>,
+) -> InsertResult<K, V> {
+    debug_assert!(node.children.is_empty(), "I-A: only leaves carry a value block");
+    match node.entries.binary_search_by(|(k, _)| k.cmp(&key)) {
+        Ok(pos) => {
+            // Replace: the stored key already compares equal, so the rebuild
+            // keeps it and only the value changes.
+            let n = rebuild_block_leaf(node, LeafEdit::Replace(pos, take_value(val, src)), src);
+            InsertResult::Fit(Child::resident_new(Arc::new(n), src), true)
+        }
+        Err(pos) => {
+            let n = rebuild_block_leaf(node, LeafEdit::Insert(pos, key, take_value(val, src)), src);
+            if n.entries.len() <= MAX_KEYS {
+                InsertResult::Fit(Child::resident_new(Arc::new(n), src), false)
+            } else {
+                let (left, median, right) = split_block(n);
+                InsertResult::Split {
+                    left: Child::resident_new(Arc::new(left), src),
+                    median,
+                    right: Child::resident_new(Arc::new(right), src),
+                    replaced: false,
+                }
+            }
+        }
+    }
+}
+
 /// Recursively inserts a key-value pair into a node, potentially splitting it.
 fn insert_into_node<K: Ord + Clone, V>(
     node: &Child<K, V>,
@@ -1838,6 +2069,14 @@ fn insert_into_node<K: Ord + Clone, V>(
     src: Option<&dyn NodeSource<K, V>>,
 ) -> InsertResult<K, V> {
     let node = node.load(src);
+    if node.block.is_some() {
+        // Block leaf (always a leaf — I-A): rebuild the block in one pass
+        // instead of shifting `entries` out from under it. Before Task 5
+        // this fell through to the all-Arc code below, which cloned the
+        // `in_block` marker slots into a `block: None` node and left every
+        // value dangling for `value_at` to panic on.
+        return insert_into_block_leaf(node, key, val, src);
+    }
     let mut entries = node.entries.clone();
 
     match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
@@ -2291,18 +2530,22 @@ fn delete_from_node<K: Ord + Clone, V>(
         match pos {
             Err(_) => DeleteResult::NotFound,
             Ok(i) => {
-                let mut entries = node.entries.clone();
-                entries.remove(i);
-                let underfull = entries.len() < MIN_KEYS;
+                // A block leaf rebuilds its block in one pass and stays
+                // block-shaped; an all-Arc leaf shifts its entries as before.
+                let new = if node.block.is_some() {
+                    rebuild_block_leaf(node, LeafEdit::Remove(i), src)
+                } else {
+                    let mut entries = node.entries.clone();
+                    entries.remove(i);
+                    BTreeNode {
+                        entries,
+                        children: Children::new(),
+                        block: None,
+                    }
+                };
+                let underfull = new.entries.len() < MIN_KEYS;
                 DeleteResult::Removed {
-                    node: Child::resident_new(
-                        Arc::new(BTreeNode {
-                            entries,
-                            children: Children::new(),
-                            block: None,
-                        }),
-                        src,
-                    ),
+                    node: Child::resident_new(Arc::new(new), src),
                     underfull,
                 }
             }
@@ -2368,6 +2611,25 @@ fn remove_leftmost<K: Ord + Clone, V>(
 ) -> ((K, Value<V>), Child<K, V>, bool) {
     let node = node.load(src);
     if node.children.is_empty() {
+        if node.block.is_some() {
+            // The removed entry is promoted into the *parent* (an inner
+            // node), whose entries are always Arc-backed (I-B) — so the
+            // value has to leave the block entirely, not just move slots.
+            // Before Task 5 this handed the parent a bare `in_block` marker
+            // with no block behind it, an I-A violation that surfaced as a
+            // `value_at` panic on the next read of that separator.
+            let key = node.entries[0].0.clone();
+            let val = src
+                .and_then(|s| s.clone_value(node.value_at(0)))
+                .expect("I-B: block leaf requires a cloning source");
+            let new = rebuild_block_leaf(node, LeafEdit::Remove(0), src);
+            let underfull = new.entries.len() < MIN_KEYS;
+            return (
+                (key, Value::arc(Arc::new(val))),
+                Child::resident_new(Arc::new(new), src),
+                underfull,
+            );
+        }
         let mut entries = node.entries.clone();
         let first = entries.remove(0);
         let underfull = entries.len() < MIN_KEYS;
@@ -2418,12 +2680,83 @@ fn fix_underfull_child<K: Ord + Clone, V>(
     }
 }
 
+/// Take entry `i` out of a uniquely-owned node, handing it back with its
+/// value in an `Arc`.
+///
+/// A rotation lifts an entry into the *parent*, and an inner node's entries
+/// are always Arc-backed (I-B), so a value coming out of a block has to
+/// leave the block entirely rather than just change slots. The surviving
+/// values are moved into one exactly-sized fresh block — never
+/// clone-then-mutate (spec §4), and never a `Box<[V]>` shrink-realloc.
+fn take_entry_as_arc<K, V>(n: &mut BTreeNode<K, V>, i: usize) -> (K, Value<V>) {
+    let (k, slot) = n.entries.remove(i);
+    match slot.into_arc() {
+        Some(a) => (k, Value::arc(a)),
+        None => {
+            let old = Vec::from(n.block.take().expect("I-A: in-block entry requires a block"));
+            debug_assert_eq!(old.len(), n.entries.len() + 1, "I-A: block length must match entries length");
+            let mut kept: Vec<V> = Vec::with_capacity(old.len() - 1);
+            let mut taken = None;
+            for (j, v) in old.into_iter().enumerate() {
+                if j == i {
+                    taken = Some(v);
+                } else {
+                    kept.push(v);
+                }
+            }
+            n.block = Some(kept.into_boxed_slice());
+            (k, Value::arc(Arc::new(taken.expect("i is in range"))))
+        }
+    }
+}
+
+/// Insert an Arc-backed entry at index `i` of a uniquely-owned node — the
+/// inverse of [`take_entry_as_arc`]: a separator descending out of the
+/// parent into a child. If the child is block-backed the value is re-homed
+/// into a fresh, exactly-sized block; otherwise the `Arc` is stored as-is.
+fn put_entry_from_arc<K, V>(
+    n: &mut BTreeNode<K, V>,
+    i: usize,
+    key: K,
+    val: Value<V>,
+    src: Option<&dyn NodeSource<K, V>>,
+) {
+    match n.block.take() {
+        None => n.entries.insert(i, (key, val)),
+        Some(b) => {
+            let old = Vec::from(b);
+            debug_assert_eq!(old.len(), n.entries.len(), "I-A: block length must match entries length");
+            let v = take_value(
+                val.into_arc()
+                    .expect("I-B: a separator lives in an inner node and is always Arc-backed"),
+                src,
+            );
+            let mut fresh: Vec<V> = Vec::with_capacity(old.len() + 1);
+            let mut it = old.into_iter();
+            for _ in 0..i {
+                fresh.push(it.next().expect("i <= len"));
+            }
+            fresh.push(v);
+            fresh.extend(it);
+            n.block = Some(fresh.into_boxed_slice());
+            n.entries.insert(i, (key, Value::in_block()));
+        }
+    }
+}
+
 /// Rotates an entry from the left sibling into the current child.
 ///
-/// Mutates the two siblings in place via [`Child::make_mut`]: each is cloned
-/// only if still shared with an older snapshot, otherwise edited directly.
-/// `split_at_mut` (via `as_mut_slice`) yields disjoint `&mut` handles to the
-/// two adjacent children at once.
+/// Mutates the two siblings in place via [`Child::make_mut_keep_block`]:
+/// each is cloned only if still shared with an older snapshot, otherwise
+/// edited directly. `split_at_mut` (via `as_mut_slice`) yields disjoint
+/// `&mut` handles to the two adjacent children at once.
+///
+/// `make_mut_keep_block`, not `make_mut`: a rotation between block leaves
+/// must leave both of them block-backed (spec §4). The one migrating value
+/// crosses the Arc boundary twice — out of the left leaf's block into the
+/// parent's separator slot ([`take_entry_as_arc`]), and out of the parent's
+/// old separator into the right leaf's block ([`put_entry_from_arc`]) —
+/// while every other value stays exactly where it is.
 fn rotate_right<K: Clone, V>(
     entries: &mut Entries<K, V>,
     children: &mut Children<K, V>,
@@ -2431,11 +2764,11 @@ fn rotate_right<K: Clone, V>(
     src: Option<&dyn NodeSource<K, V>>,
 ) {
     let (left_part, right_part) = children.as_mut_slice().split_at_mut(idx);
-    let left = left_part[idx - 1].make_mut(src);
-    let right = right_part[0].make_mut(src);
+    let left = left_part[idx - 1].make_mut_keep_block(src);
+    let right = right_part[0].make_mut_keep_block(src);
 
     // Steal the last entry (and trailing child) of the left sibling.
-    let stolen = left.entries.pop().unwrap();
+    let stolen = take_entry_as_arc(left, left.entries.len() - 1);
     let stolen_child = if left.children.is_empty() {
         None
     } else {
@@ -2444,7 +2777,7 @@ fn rotate_right<K: Clone, V>(
     // The stolen entry becomes the new separator; the old separator descends
     // into the front of the right child.
     let separator = std::mem::replace(&mut entries[idx - 1], stolen);
-    right.entries.insert(0, separator);
+    put_entry_from_arc(right, 0, separator.0, separator.1, src);
     if let Some(sc) = stolen_child {
         right.children.insert(0, sc);
     }
@@ -2460,11 +2793,11 @@ fn rotate_left<K: Clone, V>(
     src: Option<&dyn NodeSource<K, V>>,
 ) {
     let (left_part, right_part) = children.as_mut_slice().split_at_mut(idx + 1);
-    let left = left_part[idx].make_mut(src);
-    let right = right_part[0].make_mut(src);
+    let left = left_part[idx].make_mut_keep_block(src);
+    let right = right_part[0].make_mut_keep_block(src);
 
     // Steal the first entry (and leading child) of the right sibling.
-    let stolen = right.entries.remove(0);
+    let stolen = take_entry_as_arc(right, 0);
     let stolen_child = if right.children.is_empty() {
         None
     } else {
@@ -2473,7 +2806,8 @@ fn rotate_left<K: Clone, V>(
     // The stolen entry becomes the new separator; the old separator descends
     // onto the end of the left child.
     let separator = std::mem::replace(&mut entries[idx], stolen);
-    left.entries.push(separator);
+    let at = left.entries.len();
+    put_entry_from_arc(left, at, separator.0, separator.1, src);
     if let Some(sc) = stolen_child {
         left.children.push(sc);
     }
@@ -2492,9 +2826,13 @@ fn merge_with_left<K: Clone, V>(
 ) {
     let separator = entries.remove(idx - 1);
     let right = children.remove(idx);
-    let left = children[idx - 1].make_mut(src);
-    left.entries.push(separator);
-    absorb(left, right, src);
+    // `make_mut_keep_block`, not `make_mut`: a block-leaf `left` must stay
+    // block-shaped so `absorb` can fold both sides into ONE fresh block
+    // (spec §4) instead of de-blocking the merged result. The separator is
+    // handed to `absorb` rather than pushed here, because pushing an
+    // Arc-backed entry onto a block leaf would break I-A in between.
+    let left = children[idx - 1].make_mut_keep_block(src);
+    absorb(left, separator, right, src);
 }
 
 /// Merges an underfull child with its right sibling.
@@ -2508,13 +2846,22 @@ fn merge_with_right<K: Clone, V>(
 ) {
     let separator = entries.remove(idx);
     let right = children.remove(idx + 1);
-    let left = children[idx].make_mut(src);
-    left.entries.push(separator);
-    absorb(left, right, src);
+    // See `merge_with_left` for why this is `make_mut_keep_block` and why
+    // the separator travels into `absorb` instead of being pushed here.
+    let left = children[idx].make_mut_keep_block(src);
+    absorb(left, separator, right, src);
 }
 
-/// Appends `right`'s entries and children onto `left`. `left` must already
-/// carry the descended separator as its last entry.
+/// Appends the descended `separator` and then `right`'s entries and
+/// children onto `left`.
+///
+/// If either side is a block leaf, the merged node is a block leaf too:
+/// both sides' values (and the separator's, converted out of its `Arc`) are
+/// folded into **one** fresh block in a single pass, rather than the merge
+/// silently de-blocking the result (spec §4). Values already living in a
+/// block move across untouched; an all-Arc side's values are taken out of
+/// their entry slots first, so `take_value`'s `Arc::try_unwrap` fast path
+/// can still fire when this node held the last reference.
 ///
 /// `right` is faulted in (if needed) and moved out via `Arc::try_unwrap`,
 /// falling back to a clone if it is still shared with a snapshot. The
@@ -2526,23 +2873,80 @@ fn merge_with_right<K: Clone, V>(
 /// releases that count first, so the fast (move) path actually fires
 /// whenever nothing else holds the node — see
 /// `merge_moves_unshared_sibling_instead_of_cloning` for a regression test.
-fn absorb<K: Clone, V>(left: &mut BTreeNode<K, V>, right: Child<K, V>, src: Option<&dyn NodeSource<K, V>>) {
+fn absorb<K: Clone, V>(
+    left: &mut BTreeNode<K, V>,
+    separator: (K, Value<V>),
+    right: Child<K, V>,
+    src: Option<&dyn NodeSource<K, V>>,
+) {
     let arc = right.load_arc(src);
     drop(right); // release the slot's own count first, so try_unwrap can succeed
-    // `right` is consumed *by value* here, never through `make_mut` — the one
-    // route `Child::make_mut_after_load`'s `materialize()` call does NOT cover
-    // (fix round 1, Critical 1). A block leaf faulted in by `load_arc` above
-    // would otherwise have its in-block entries appended into `left` (already
-    // materialized, `block: None`) while `rn.block` silently drops with them
-    // still inside it — I-A violated with no assert on this path, then a
-    // panic somewhere downstream. `clone_with` (not plain `Clone`, which
-    // itself would assert/corrupt on a block leaf — see its own I-B guard)
-    // on the shared branch, then an explicit `materialize()` on the result
-    // either way, closes the hole the same way `make_mut_after_load` does.
+    // `right` is consumed *by value* here, never through `make_mut` — one of
+    // the routes `Child::make_mut_after_load`'s `materialize()` call does NOT
+    // cover (fix round 1, Critical 1). `clone_with` (not plain `Clone`, which
+    // would assert/corrupt on a block leaf — see its own I-B guard) is what
+    // duplicates the shared branch; Task 4 then called `materialize()` on the
+    // result to keep the old entry-appending code below safe. Task 5 folds
+    // the sibling into the merged block directly instead, which is both
+    // correct and block-preserving, so that `materialize()` is gone.
     let mut rn = Arc::try_unwrap(arc).unwrap_or_else(|a| a.clone_with(src));
-    rn.materialize();
-    left.entries.extend(rn.entries);
-    left.children.extend(rn.children);
+    if left.block.is_none() && rn.block.is_none() {
+        // Neither side is block-shaped (every inner-node merge, and every
+        // leaf merge on a non-paged or already-materialized tree): the
+        // pre-block code, unchanged.
+        left.entries.push(separator);
+        left.entries.extend(rn.entries);
+        left.children.extend(rn.children);
+        return;
+    }
+    // At least one side is block-shaped, so the merged node is too. Blocks
+    // only ever live at leaf depth, so neither side has children (I-A).
+    debug_assert!(
+        left.children.is_empty() && rn.children.is_empty(),
+        "I-A: only leaves carry a value block"
+    );
+    let mut block: Vec<V> = Vec::with_capacity(left.entries.len() + 1 + rn.entries.len());
+    match left.block.take() {
+        // Already block-backed: entries are already `in_block` markers and
+        // the values move straight across, no clone.
+        Some(b) => block.extend(Vec::from(b)),
+        // All-Arc side: take each slot's `Arc` out of its entry by value
+        // (not a clone of it) so `take_value` can move the value out when
+        // this was the last reference, then re-mark the slot `in_block`.
+        None => {
+            for i in 0..left.entries.len() {
+                let slot = std::mem::replace(&mut left.entries[i].1, Value::in_block());
+                block.push(take_value(
+                    slot.into_arc().expect("I-A: a non-block leaf's entries are Arc-backed"),
+                    src,
+                ));
+            }
+        }
+    }
+    let (sk, sv) = separator;
+    block.push(take_value(
+        sv.into_arc()
+            .expect("I-B: a separator lives in an inner node and is always Arc-backed"),
+        src,
+    ));
+    left.entries.push((sk, Value::in_block()));
+    match rn.block.take() {
+        Some(b) => {
+            block.extend(Vec::from(b));
+            left.entries
+                .extend(rn.entries.into_iter().map(|(k, _)| (k, Value::in_block())));
+        }
+        None => {
+            for (k, v) in rn.entries {
+                block.push(take_value(
+                    v.into_arc().expect("I-A: a non-block leaf's entries are Arc-backed"),
+                    src,
+                ));
+                left.entries.push((k, Value::in_block()));
+            }
+        }
+    }
+    left.block = Some(block.into_boxed_slice());
 }
 
 /// In-place counterpart to `delete_from_node`. Descends through
@@ -5212,6 +5616,417 @@ mod tests {
                     prop_assert_eq!(fv.len(), model.len());
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Block-leaf mutations on the IMMUTABLE path (Task 5, spec §4).
+    //
+    // A block leaf (`block: Some`, every entry an `in_block` marker) is
+    // what `NodeCodec::decode` builds for a `DataLeaf` page. Before Task 5
+    // the immutable path (`BTree::insert`/`remove` -> `insert_into_node` /
+    // `delete_from_node` / `remove_leftmost` / `absorb`) cloned such a
+    // leaf's `entries` into a `block: None` node, leaving every untouched
+    // entry an `in_block` marker with no block behind it — an I-A
+    // violation that surfaces as a `value_at` panic on the next read.
+    //
+    // These tests assert both halves of the fix: the *values* are right
+    // (behavioural), and the mutated leaves are still **block-backed**
+    // (representational — the point of the task; materialising them would
+    // give the right answers while silently throwing the memory-honesty
+    // win away).
+    // -----------------------------------------------------------------
+    mod block_leaves {
+        use super::*;
+        use crate::child::tests::MockDisk;
+        use std::sync::Arc;
+
+        /// Rebuild `c`'s subtree with every leaf in **block** form — the
+        /// shape `NodeCodec::decode` hands back for a `DataLeaf` page.
+        /// Inner nodes stay all-Arc (I-B).
+        fn blockify_child(c: &Child<u64, u64>) -> Child<u64, u64> {
+            let n = c.load(None);
+            if n.children.is_empty() {
+                let mut entries: Entries<u64, u64> = Entries::new();
+                let mut block: Vec<u64> = Vec::with_capacity(n.entries.len());
+                for i in 0..n.entries.len() {
+                    entries.push((n.entries[i].0, Value::in_block()));
+                    block.push(*n.value_at(i));
+                }
+                Child::resident(Arc::new(BTreeNode {
+                    entries,
+                    children: Children::new(),
+                    block: Some(block.into_boxed_slice()),
+                }))
+            } else {
+                let mut children: Children<u64, u64> = Children::new();
+                for i in 0..n.children.len() {
+                    children.push(blockify_child(&n.children[i]));
+                }
+                Child::resident(Arc::new(BTreeNode {
+                    entries: n.entries.clone(),
+                    children,
+                    block: None,
+                }))
+            }
+        }
+
+        /// `t` with every leaf block-backed and `disk` attached as the
+        /// value-cloning source (I-B: a block leaf may only exist on a
+        /// source that can clone values).
+        fn blockify(t: &BTree<u64, u64>, disk: &Arc<MockDisk<u64, u64>>) -> BTree<u64, u64> {
+            let mut out = BTree {
+                root: blockify_child(&t.root),
+                len: t.len,
+                height: t.height,
+                source: None,
+            };
+            out.set_source(Some(disk.clone()));
+            out
+        }
+
+        /// Counted result of [`walk_representation`].
+        #[derive(Debug, Default, PartialEq)]
+        struct Repr {
+            leaves: usize,
+            block_leaves: usize,
+        }
+
+        /// Walk every reachable node asserting the representation
+        /// invariants: I-A (every entry's slot kind agrees with the node's
+        /// `block`, and the block is exactly as long as `entries`) and
+        /// "blocks only at leaf depth". Counts leaves and block leaves.
+        fn walk_representation(t: &BTree<u64, u64>) -> Repr {
+            fn go(
+                c: &Child<u64, u64>,
+                src: Option<&dyn NodeSource<u64, u64>>,
+                depth: usize,
+                leaf_depth: &mut Option<usize>,
+                out: &mut Repr,
+            ) {
+                let n = c.load(src);
+                for i in 0..n.entries.len() {
+                    assert_eq!(
+                        n.entries[i].1.is_in_block(),
+                        n.block.is_some(),
+                        "I-A: entry {i} slot kind disagrees with the node's block"
+                    );
+                }
+                if let Some(b) = &n.block {
+                    assert_eq!(b.len(), n.entries.len(), "I-A: block length must match entries length");
+                    assert!(n.children.is_empty(), "blocks live only at leaf depth");
+                }
+                if n.children.is_empty() {
+                    out.leaves += 1;
+                    if n.block.is_some() {
+                        out.block_leaves += 1;
+                    }
+                    match *leaf_depth {
+                        Some(d) => assert_eq!(d, depth, "non-uniform leaf depth"),
+                        None => *leaf_depth = Some(depth),
+                    }
+                } else {
+                    for i in 0..n.children.len() {
+                        go(&n.children[i], src, depth + 1, leaf_depth, out);
+                    }
+                }
+            }
+            let mut out = Repr::default();
+            go(&t.root, t.source(), 0, &mut None, &mut out);
+            out
+        }
+
+        /// Row counts for the two "deep tree" tests, capped hard under
+        /// Miri (whose interpreter makes a 5k-row build minutes of work)
+        /// while staying well past a single leaf so the multi-level shapes
+        /// these tests exist for still form.
+        const DEEP: u64 = if cfg!(miri) { 300 } else { 5_000 };
+
+        fn read_all(t: &BTree<u64, u64>, keys: impl Iterator<Item = u64>) {
+            for k in keys {
+                assert_eq!(t.get(&k), Some(&(k * 10)), "key {k}");
+            }
+        }
+
+        /// Baseline: `blockify` really does produce block leaves, and a
+        /// block tree reads exactly like the all-Arc tree it came from.
+        /// Without this the "still block-backed" assertions below could
+        /// pass vacuously on a tree that never had a block at all.
+        #[test]
+        fn blockify_produces_block_leaves_that_read_correctly() {
+            let disk = Arc::new(MockDisk::new());
+            let t = blockify(&insert_range(1, DEEP), &disk);
+            let r = walk_representation(&t);
+            assert!(r.leaves > 1, "a deep tree must span more than one leaf");
+            assert_eq!(r.block_leaves, r.leaves, "every leaf blockified");
+            read_all(&t, 1..=DEEP);
+            check_invariants(&t);
+        }
+
+        /// `insert` over an existing key: the leaf is rebuilt in one pass
+        /// and stays block-backed; every *other* value in that leaf still
+        /// reads (pre-Task-5 they became dangling `in_block` markers in a
+        /// `block: None` node).
+        #[test]
+        fn immutable_replace_keeps_the_leaf_block_backed() {
+            let disk = Arc::new(MockDisk::new());
+            let t = blockify(&insert_range(1, 40), &disk);
+            let t2 = t.insert(7, 999);
+            assert_eq!(t2.get(&7), Some(&999));
+            for k in 1..=40u64 {
+                if k != 7 {
+                    assert_eq!(t2.get(&k), Some(&(k * 10)), "key {k}");
+                }
+            }
+            let r = walk_representation(&t2);
+            assert_eq!(r, Repr { leaves: 1, block_leaves: 1 }, "a replaced block leaf must stay block-backed");
+            // The base tree is untouched (CoW): still block-backed, old value.
+            assert_eq!(t.get(&7), Some(&70));
+            assert_eq!(walk_representation(&t), Repr { leaves: 1, block_leaves: 1 });
+        }
+
+        /// `insert` of a new key that fits: block-backed in, block-backed out.
+        #[test]
+        fn immutable_insert_keeps_the_leaf_block_backed() {
+            let disk = Arc::new(MockDisk::new());
+            let t = blockify(&insert_range(1, 40), &disk);
+            let t2 = t.insert(0, 0);
+            assert_eq!(t2.len(), 41);
+            assert_eq!(t2.get(&0), Some(&0));
+            read_all(&t2, 1..=40);
+            assert_eq!(walk_representation(&t2), Repr { leaves: 1, block_leaves: 1 });
+        }
+
+        /// An overflowing insert splits through `split_block`: BOTH halves
+        /// come out block-backed and the promoted median is Arc-backed
+        /// (separators live in inner nodes, which are never block-backed —
+        /// I-B). `walk_representation` asserts that second half directly.
+        #[test]
+        fn immutable_insert_splits_a_block_leaf_into_two_block_leaves() {
+            let disk = Arc::new(MockDisk::new());
+            let base = insert_range(1, MAX_KEYS as u64);
+            assert_eq!(base.height(), 0, "MAX_KEYS rows must still be a single leaf");
+            let t = blockify(&base, &disk);
+            let t2 = t.insert(0, 0);
+            assert_eq!(t2.height(), 1, "the leaf must have split");
+            assert_eq!(t2.len(), MAX_KEYS + 1);
+            assert_eq!(t2.get(&0), Some(&0));
+            read_all(&t2, 1..=MAX_KEYS as u64);
+            assert_eq!(
+                walk_representation(&t2),
+                Repr { leaves: 2, block_leaves: 2 },
+                "both halves of a split block leaf must be block-backed"
+            );
+            check_invariants(&t2);
+        }
+
+        /// `remove` on a block leaf rebuilds the block without that slot.
+        #[test]
+        fn immutable_delete_keeps_the_leaf_block_backed() {
+            let disk = Arc::new(MockDisk::new());
+            let t = blockify(&insert_range(1, 40), &disk);
+            let t2 = t.remove(&7).unwrap();
+            assert_eq!(t2.len(), 39);
+            assert_eq!(t2.get(&7), None);
+            for k in (1..=40u64).filter(|k| *k != 7) {
+                assert_eq!(t2.get(&k), Some(&(k * 10)), "key {k}");
+            }
+            assert_eq!(walk_representation(&t2), Repr { leaves: 1, block_leaves: 1 });
+        }
+
+        /// Deleting a key that sits in an *inner* node replaces it with the
+        /// in-order successor lifted out of a block leaf
+        /// (`remove_leftmost`). That entry lands in an inner node, so its
+        /// value must leave the block and be re-homed into an `Arc` —
+        /// before Task 5 the parent got a bare `in_block` marker with no
+        /// block behind it, and reading the separator panicked.
+        #[test]
+        fn immutable_delete_of_an_inner_separator_rehomes_the_successor() {
+            let disk = Arc::new(MockDisk::new());
+            let base = insert_range(1, DEEP);
+            let sep = {
+                // A key that really is stored in the root, not in a leaf.
+                let root = base.root.load(None);
+                assert!(!root.children.is_empty(), "a deep tree's root is internal");
+                root.entries[0].0
+            };
+            let t = blockify(&base, &disk);
+            let t2 = t.remove(&sep).unwrap();
+            assert_eq!(t2.get(&sep), None);
+            assert_eq!(t2.len() as u64, DEEP - 1);
+            read_all(&t2, (1..=DEEP).filter(move |k| *k != sep));
+            let r = walk_representation(&t2);
+            assert_eq!(r.block_leaves, r.leaves, "every leaf stays block-backed");
+            check_invariants(&t2);
+        }
+
+        /// A delete that underflows a leaf and merges it with its sibling
+        /// must produce ONE fresh block leaf holding both sides' values
+        /// plus the descended separator (spec §4) — not a materialised
+        /// all-Arc leaf, which is what the Task 4 stopgap produced.
+        #[test]
+        fn merging_two_block_leaves_yields_one_block_leaf() {
+            let disk = Arc::new(MockDisk::new());
+            // Two leaves under one root: MAX_KEYS + 1 ascending keys split
+            // into halves of `MAX_KEYS / 2` and `MAX_KEYS - MAX_KEYS / 2`.
+            let base = insert_range(1, MAX_KEYS as u64 + 1);
+            assert_eq!(base.height(), 1);
+            let mut t = blockify(&base, &disk);
+            assert_eq!(walk_representation(&t).block_leaves, 2);
+            // Delete from the left leaf until it underflows and merges.
+            let mut alive: Vec<u64> = (1..=MAX_KEYS as u64 + 1).collect();
+            let mut k = 1u64;
+            while walk_representation(&t).leaves > 1 {
+                t = t.remove(&k).unwrap();
+                alive.retain(|x| *x != k);
+                k += 1;
+                assert!(k <= MAX_KEYS as u64, "the leaves must merge before running out of keys");
+            }
+            assert_eq!(
+                walk_representation(&t),
+                Repr { leaves: 1, block_leaves: 1 },
+                "a merge of block leaves must yield a block leaf, not a materialised one"
+            );
+            assert_eq!(t.len(), alive.len());
+            for key in alive {
+                assert_eq!(t.get(&key), Some(&(key * 10)), "key {key}");
+            }
+            check_invariants(&t);
+        }
+
+        /// Equivalence oracle at the `BTree` level: a long mixed
+        /// insert/replace/delete sequence run against a block-backed tree
+        /// and against a plain all-Arc tree must agree key for key, the
+        /// block tree must keep every structural invariant, and its leaves
+        /// must still be block-backed at the end.
+        ///
+        /// This is the `BTree`-level counterpart of the store-level oracle
+        /// in `tests/paged_block_leaves.rs`; it lives here because the
+        /// *representation* assertion needs crate internals, and because
+        /// the immutable path (`BTree::insert`/`remove`) is not what
+        /// `Table` drives — the store-level oracle exercises the shared
+        /// rebalance/merge code, this exercises the immutable path itself.
+        #[test]
+        fn immutable_mixed_workload_matches_a_plain_tree_and_stays_block_backed() {
+            let disk = Arc::new(MockDisk::new());
+            // Miri caps (see `DEEP`): still multi-level and still merge/
+            // rotate-heavy, just small enough for the interpreter.
+            let (rows, rounds, space) = if cfg!(miri) { (200u64, 150u64, 250u64) } else { (2_000, 1_500, 2_500) };
+            let mut blocked = blockify(&insert_range(1, rows), &disk);
+            let mut plain = insert_range(1, rows);
+            // Deterministic xorshift: a failing run is reproducible from
+            // the source alone, and it needs no dev-dependency under Miri.
+            let mut x: u64 = 0x9E3779B97F4A7C15;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            for _ in 0..rounds {
+                let r = next();
+                let key = r % space;
+                match r % 3 {
+                    0 => {
+                        blocked = blocked.insert(key, key * 10);
+                        plain = plain.insert(key, key * 10);
+                    }
+                    1 => {
+                        blocked = blocked.insert(key, key * 10 + 1);
+                        plain = plain.insert(key, key * 10 + 1);
+                    }
+                    _ => {
+                        if plain.get(&key).is_some() {
+                            blocked = blocked.remove(&key).unwrap();
+                            plain = plain.remove(&key).unwrap();
+                        } else {
+                            assert!(blocked.remove(&key).is_err());
+                        }
+                    }
+                }
+            }
+            assert_eq!(blocked.len(), plain.len());
+            let a: Vec<(u64, u64)> = blocked.range(..).map(|(k, v)| (*k, *v)).collect();
+            let b: Vec<(u64, u64)> = plain.range(..).map(|(k, v)| (*k, *v)).collect();
+            assert_eq!(a, b, "block-backed tree diverged from the all-Arc oracle");
+            check_invariants(&blocked);
+            let r = walk_representation(&blocked);
+            assert_eq!(
+                r.block_leaves, r.leaves,
+                "every leaf must still be block-backed after a mixed immutable workload"
+            );
+        }
+
+        /// `redistribute_tail`'s block-leaf branch (`src/btree.rs`) — the
+        /// `BulkBuilder` tail rebalance reading a block-shaped sibling by
+        /// shared reference and cloning its values out via
+        /// `NodeSource::clone_value`.
+        ///
+        /// Task 4 added that branch defensively and left it uncovered; a
+        /// store-level route to it looks unreachable in practice (the
+        /// sibling `redistribute_tail` pops is the level's most recently
+        /// *frozen* node, which the builder built itself and is therefore
+        /// always all-Arc — a seeded on-disk sibling is only ever popped
+        /// when the level never froze, which in turn can only happen when
+        /// the seeded level is underfull, and a well-formed tree's
+        /// rightmost non-root leaf never is). Rather than leave the branch
+        /// untested on that argument, this drives `redistribute_tail`
+        /// directly with hand-built level state whose sibling IS a block
+        /// leaf, and pins both the values it recovers and the fact that it
+        /// recovered them through `clone_value` (the `cloned` counter is
+        /// the proof the block branch, not the `as_arc` branch, ran).
+        #[test]
+        fn redistribute_tail_reads_a_block_leaf_sibling_through_clone_value() {
+            let disk = MockDisk::<u64, u64>::new();
+            // Sibling: a block leaf holding keys 0..MAX_KEYS.
+            let sib_keys: Vec<u64> = (0..MAX_KEYS as u64).collect();
+            let sibling = Arc::new(BTreeNode {
+                entries: sib_keys.iter().map(|k| (*k, Value::in_block())).collect(),
+                children: Children::new(),
+                block: Some(sib_keys.iter().map(|k| k * 10).collect::<Vec<_>>().into_boxed_slice()),
+            });
+            // levels[0]: the underfull partial leaf the builder is holding.
+            let mut lv0 = LevelBuilder::<u64, u64>::new();
+            let tail_keys: Vec<u64> = (MAX_KEYS as u64 + 1..MAX_KEYS as u64 + 1 + MIN_KEYS as u64).collect();
+            lv0.entries = tail_keys.iter().map(|k| (*k, Arc::new(k * 10))).collect();
+            // levels[1]: the parent, holding the sibling and the separator
+            // that linked it to the partial node.
+            let mut lv1 = LevelBuilder::<u64, u64>::new();
+            lv1.children = vec![Child::resident(sibling)];
+            lv1.entries = vec![(MAX_KEYS as u64, Arc::new(MAX_KEYS as u64 * 10))];
+
+            let before = disk.cloned.load(std::sync::atomic::Ordering::Relaxed);
+            let mut levels = vec![lv0, lv1];
+            redistribute_tail::<u64, u64>(&mut levels, 0, Some(&disk));
+            let cloned = disk.cloned.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert_eq!(
+                cloned, MAX_KEYS as u64,
+                "the block branch must clone exactly one value per in-block sibling entry"
+            );
+
+            // Every key, in order, survives the redistribution with the
+            // right value: the popped sibling's, the separator's, and the
+            // partial node's.
+            let expected: Vec<u64> = (0..MAX_KEYS as u64 + 1)
+                .chain(tail_keys.iter().copied())
+                .collect();
+            let mut got: Vec<(u64, u64)> = Vec::new();
+            for c in &levels[1].children {
+                let n = c.load(Some(&disk));
+                for i in 0..n.entries.len() {
+                    got.push((n.entries[i].0, *n.value_at(i)));
+                }
+            }
+            for (k, v) in &levels[1].entries {
+                got.push((*k, **v));
+            }
+            for (k, v) in &levels[0].entries {
+                got.push((*k, **v));
+            }
+            got.sort_unstable();
+            assert_eq!(got.iter().map(|(k, _)| *k).collect::<Vec<_>>(), expected);
+            assert!(got.iter().all(|(k, v)| *v == k * 10), "values must survive the fold");
+            assert!(levels[0].entries.len() >= MIN_KEYS, "the partial node is no longer underfull");
         }
     }
 

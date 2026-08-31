@@ -321,7 +321,25 @@ impl<K: Clone, V> Child<K, V> {
     /// its contents diverge from the page it was loaded from.
     pub(crate) fn make_mut(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         self.load(src);
-        self.make_mut_after_load(src)
+        self.make_mut_after_load(src, true)
+    }
+
+    /// Like [`Self::make_mut`], but leaves a block leaf **block-shaped**:
+    /// the caller takes responsibility for keeping I-A (entries and `block`
+    /// in lockstep) itself.
+    ///
+    /// The callers are the rebalance path — `btree`'s `rotate_right`,
+    /// `rotate_left`, `merge_with_left`, `merge_with_right` and the `absorb`
+    /// they feed — which rebuild the affected blocks rather than shifting
+    /// `entries` underneath an untouched block, so a rotation or merge of
+    /// block leaves yields block leaves (spec §4). Every other
+    /// `&mut` route still goes through the materializing
+    /// [`Self::make_mut`]/[`Self::make_mut_quiet`]; see
+    /// `BTreeNode::materialize`'s doc for that (Task 4) stopgap invariant
+    /// and its exceptions.
+    pub(crate) fn make_mut_keep_block(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
+        self.load(src);
+        self.make_mut_after_load(src, false)
     }
 
     /// Like [`Self::make_mut`], but for an already-resident node it does not
@@ -332,13 +350,15 @@ impl<K: Clone, V> Child<K, V> {
     /// any other fault — see [`Self::load_quiet`].
     pub(crate) fn make_mut_quiet(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         self.load_quiet(src);
-        self.make_mut_after_load(src)
+        self.make_mut_after_load(src, true)
     }
 
     /// Shared tail of [`Self::make_mut`]/[`Self::make_mut_quiet`]: the slot
     /// is already resident (by whichever load the caller used above); clone
-    /// it on write and mark it dirty.
-    fn make_mut_after_load(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
+    /// it on write and mark it dirty. `materialize` de-blocks a block leaf
+    /// before handing it back (the Task 4 stopgap); `false` is the merge
+    /// path's block-preserving variant, see [`Self::make_mut_keep_block`].
+    fn make_mut_after_load(&mut self, src: Option<&dyn NodeSource<K, V>>, materialize: bool) -> &mut BTreeNode<K, V> {
         let was_clean = self.page_id().is_some();
         let p = *self.node.get_mut();
         // SAFETY: caller already ensured residency (via `load`/`load_quiet`), so p is non-null.
@@ -388,12 +408,16 @@ impl<K: Clone, V> Child<K, V> {
         // SAFETY: raw is the pointer just stored in `self.node`, non-null, uniquely owned by `arc`.
         let node = unsafe { &mut *raw };
         // Task 4 correctness stopgap — see `BTreeNode::materialize`'s doc:
-        // de-block in place before handing out a mutable reference, so no
-        // structural leaf mutation downstream (insert/delete, which shift
-        // or remove `entries` with no awareness of `block`) ever has to
-        // reason about a block leaf. A no-op for the overwhelmingly common
-        // non-block case (checked once, cheaply, inside `materialize`).
-        node.materialize();
+        // de-block in place before handing out a mutable reference, so the
+        // still-block-unaware in-place (`_mut`) family downstream (which
+        // shifts or removes `entries` with no awareness of `block`) never
+        // has to reason about a block leaf. A no-op for the overwhelmingly
+        // common non-block case (checked once, cheaply, inside
+        // `materialize`), and skipped entirely by `make_mut_keep_block`,
+        // whose callers handle blocks themselves.
+        if materialize {
+            node.materialize();
+        }
         node
     }
 }
