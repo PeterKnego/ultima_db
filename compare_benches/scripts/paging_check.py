@@ -14,13 +14,24 @@
 #   cg_events_oom == 0        (both cells, only when a cgroup snapshot exists)
 #   C-cell pf_per_op <= 1.5
 #   A-cell pf_per_op <= 3.0
-#   recover_secs    <= 5.0    (both cells, when --restart was passed)
+#   recover_secs    <= RECOVER_SECS_MAX (both cells, when --restart was passed;
+#                       see the disclosure comment above that constant)
 #
 # Prints one PASS/FAIL line per assertion and exits nonzero if any assertion
 # failed. Per task rules, thresholds are never adjusted here to force a pass.
 
 import json
 import sys
+
+# DISCLOSED SUBSTITUTION (fix round 1, controller-ruled): the task16 plan
+# specified a size-scaled recover_secs bound — "5x the first checkpoint's
+# inner-level count x 0.1 ms" — that is unimplementable as written: "inner-
+# level count" is defined nowhere in the plan, and no such field exists in
+# the paging_matrix report JSON to compute it from. The controller ruled
+# that the flat bound below stands as a coarse LOCAL shape gate in place of
+# the unimplementable formula; the NVMe-host rerun (spec follow-on 7) is
+# what sets real, published bounds.
+RECOVER_SECS_MAX = 5.0
 
 
 def load(path):
@@ -86,8 +97,8 @@ def main():
         rs = report.get("recover_secs")
         results.append(
             check(
-                f"{label} recover_secs <= 5.0",
-                rs is not None and rs <= 5.0,
+                f"{label} recover_secs <= {RECOVER_SECS_MAX}",
+                rs is not None and rs <= RECOVER_SECS_MAX,
                 f"recover_secs={rs}",
             )
         )

@@ -371,6 +371,13 @@ thrashing — 50% writes at a hot-key zipfian distribution inside a 256 MiB cgro
 unconstrained working set. `timed_out=true` in the JSON; the checker's assertions still hold over
 whatever ops actually completed, per the brief.)
 
+**Disclosed substitution (fix round 1, controller-ruled):** the task16 plan specified a
+size-scaled `recover_secs` bound — "5x the first checkpoint's inner-level count x 0.1 ms" — that
+is unimplementable as written: "inner-level count" is defined nowhere in the plan, and no such
+field exists in the paging_matrix report JSON to compute it from. The controller ruled that the
+flat `<= 5.0s` bound below stands as a coarse LOCAL shape gate in place of the unimplementable
+formula; the NVMe-host rerun (spec follow-on 7) is what sets real, published bounds.
+
 Checker verdicts (`compare_benches/scripts/paging_check.py`, thresholds from the task16 brief):
 
 ```
