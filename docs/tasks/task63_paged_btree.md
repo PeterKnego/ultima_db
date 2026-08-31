@@ -451,15 +451,17 @@ leaves sat *under* budget throughout.
   were structurally dead. Regression test:
   `paged_demotion::refaulted_leaves_raise_resident_estimate_after_full_demotion` (verified to
   fail with the fix reverted).
-- **Deployment guidance** (measured, single NVMe box, ordering-grade evidence):
-  - **mimalloc** as the global allocator for paged deployments: +29% (T=32) to **2.1×** (T=8)
-    on pressured writes, consistent with task57's eventual-tier findings.
-  - **`fanout-t8`** for write-heavy paged deployments: 3.2× alone (leaf-granular residency —
-    scrambled-zipf pins ~1 hot key per leaf, so T=32 leaves overcommit any budget).
-  - **Ingest-then-serve reopen**: after a large insert-load, drop + `recover()` (~2-5 s at 5M
-    rows) rebuilds a compact heap: 3.8-4.3× on the subsequent workload. Combined stack
-    (t8 + mimalloc + reopen): 24.9k ops/s on pressured zipf A — above ReDB's 18.8k from the
-    same matrix at a tighter budget.
+- **Deployment guidance** (CORRECTED by the 2026-08-31 NVMe bench-host run —
+  `docs/benchmarks/fs-paged-nvme-2026-08-31.md`; the two struck items were local-box artifacts):
+  - **Low `num_snapshots_retained`** for memory-budgeted paged deployments: retention 10 vs 1
+    is **237 vs 13,343 ops/s (~56×)** on the NVMe host — older retained snapshots CoW-pin the
+    pre-demotion tree, invisible to the budget. THE dominant lever there.
+  - **`fanout-t8`** for write-heavy paged deployments: +2.2× on NVMe, +3.2× locally — the one
+    lever that replicates across boxes. Best validated config (t8 + retention 1): 29.4k ops/s,
+    2.2× ReDB on the same cells.
+  - ~~mimalloc~~: no effect on the NVMe host (local kernel/glibc swap-path artifact).
+  - ~~Ingest-then-serve reopen~~: NEGATIVE on NVMe (run2 20-45% below run1 — cold recovery
+    never re-warms inside the window). Do not recommend.
 
 **Deferred to the stage-3 spec** (with in-place eviction / pinning / `Result` reads):
 
