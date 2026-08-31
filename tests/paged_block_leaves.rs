@@ -162,8 +162,19 @@ fn assert_tables_equal(a: &Store, b: &Store, what: &str) {
 }
 
 proptest! {
+    // No `cfg!(miri)` case cap here, deliberately (review round 1, Minor 4):
+    // this file does real filesystem I/O — `tempfile::tempdir`, `checkpoint`,
+    // `recover` — which Miri refuses without `-Zmiri-disable-isolation`, so
+    // an integration test in this file never runs under Miri and a cap would
+    // read as coverage that does not exist. The Miri-facing block-leaf tests
+    // are the `--lib` ones in `src/btree.rs::tests::block_leaves`, whose
+    // `cfg!(miri)` caps are live.
+    //
+    // 64 cases of up to 120 ops is the figure the task brief specifies and
+    // costs well under a second here; it was reduced during implementation
+    // and is restored (review round 1, Warning 2).
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(miri) { 2 } else { 24 },
+        cases: 64,
         ..ProptestConfig::default()
     })]
 
@@ -173,7 +184,7 @@ proptest! {
     /// through the page file (which is what makes them block-shaped again
     /// on the way back in).
     #[test]
-    fn paged_blocks_equal_in_memory_oracle(ops in prop::collection::vec(op_strategy(), 1..90)) {
+    fn paged_blocks_equal_in_memory_oracle(ops in prop::collection::vec(op_strategy(), 1..120)) {
         let dir = tempfile::tempdir().unwrap();
         let plain = plain_store();
 
