@@ -26,29 +26,29 @@
 src/persistence.rs	47-49	-	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 src/persistence.rs	73-78	-	#[default]
 src/persistence.rs	159-163	-	wal_write: WalWrite,
-src/store.rs	548	-	fn commit_may_park(&self) -> bool {
-src/store.rs	927	-	pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
-src/store.rs	940	-	if inner.active_writer_count > 0 {
+src/store.rs	557	-	fn commit_may_park(&self) -> bool {
+src/store.rs	942	-	pub fn begin_write(&self, version: Option<u64>) -> Result<WriteTx> {
+src/store.rs	955	-	if inner.active_writer_count > 0 {
 src/store.rs	720	22baf49	if inner.active_writer_count > 0 {
-src/store.rs	2008	-	pub fn recover(&self) -> Result<()> {
+src/store.rs	2118	-	pub fn recover(&self) -> Result<()> {
 src/store.rs	2008-2358	-	pub fn recover(&self) -> Result<()> {
-src/store.rs	2045-2051	-	inner.snapshots.insert(v, Arc::new(snapshot));
-src/store.rs	2201-2206	-	let tolerant = match inner.config.persistence {
-src/store.rs	2207	-	scan_wal(&wal_path_buf, tolerant)?
-src/store.rs	2211-2214	-	.filter(|e| e.version > base_version)
-src/store.rs	2341-2353	-	latest_version = entry.version;
-src/store.rs	2345-2351	-	version: latest_version,
+src/store.rs	2151-2157	-	inner.snapshots.insert(v, Arc::new(snapshot));
+src/store.rs	2337-2342	-	let tolerant = match inner.config.persistence {
+src/store.rs	2343	-	scan_wal(&wal_path_buf, tolerant)?
+src/store.rs	2347-2350	-	.filter(|e| e.version > base_version)
+src/store.rs	2470-2482	-	latest_version = entry.version;
+src/store.rs	2481-2487	-	version: latest_version,
 src/store.rs	2253	e60f8ce^	fn commit_multi_writer(mut self) -> Result<u64> {
 src/store.rs	2361-2366	e60f8ce^	self.version = inner.latest_version + 1;
-src/store.rs	5033-5135	-	fn commit_single_writer(mut self) -> Result<u64> {
-src/store.rs	5085-5101	-	let mut inner = if needs_wal_wait {
-src/store.rs	5140	-	fn commit_multi_writer(mut self) -> Result<u64> {
-src/store.rs	5311	-	Phase 3: WAL submission + bookkeeping under brief write lock
-src/store.rs	5325	-	if !self.explicit_version
-src/store.rs	5331	-	if self.version > inner.last_submitted_version {
-src/store.rs	5388	-	let gate = if inner.commit_may_park() {
-src/store.rs	5442	-	gate.wait_turn(*ticket);
-src/store.rs	5459	-	gate.wait_turn(*ticket);
+src/store.rs	5162-5264	-	fn commit_single_writer(mut self) -> Result<u64> {
+src/store.rs	5214-5230	-	let mut inner = if needs_wal_wait {
+src/store.rs	5276	-	fn commit_multi_writer(mut self) -> Result<u64> {
+src/store.rs	5447	-	Phase 3: WAL submission + bookkeeping under brief write lock
+src/store.rs	5461	-	if !self.explicit_version
+src/store.rs	5467	-	if self.version > inner.last_submitted_version {
+src/store.rs	5524	-	let gate = if inner.commit_may_park() {
+src/store.rs	5578	-	gate.wait_turn(*ticket);
+src/store.rs	5595	-	gate.wait_turn(*ticket);
 src/wal.rs	623-627	-	Physically zero-fill
 src/wal.rs	623-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {
 src/wal.rs	632-671	-	fn preallocate_to(file: &mut File, from: u64, to: u64) -> Result<()> {

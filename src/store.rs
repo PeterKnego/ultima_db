@@ -523,6 +523,15 @@ pub(crate) struct PagedState {
     /// unconditionally by the very next `checkpoint()`, since recovery only
     /// rebuilds bookkeeping and never mutates the page file itself.
     pub(crate) pending_punch: Vec<(u64, u64)>,
+    /// Test-only: force the very next hole-punch attempt in
+    /// `checkpoint_impl_paged`'s punch step to fail, exactly once — set via
+    /// the `#[doc(hidden)]` `Store::paged_fail_next_punch_for_test` and
+    /// consumed (`mem::take`) at the top of that step. Exercises the I-2
+    /// best-effort-punch retry path (fix round 1) without needing a real
+    /// failing filesystem; `#[cfg(test)]` would not do here since the
+    /// covering test lives in `tests/paged_reclaim.rs`, a separate crate
+    /// that only sees this store's public API.
+    pub(crate) fail_next_punch_for_test: bool,
     /// When the last successful paged checkpoint finished — the background
     /// checkpointer's (a later task) time-trigger clock.
     pub(crate) last_checkpoint_at: std::time::Instant,
@@ -617,6 +626,11 @@ pub struct PagedStatsSnapshot {
     /// cleared count here; a range merely recorded in a root's `dead_pages`
     /// (predecessor still retained) does not.
     pub dead_pages_punched: u64,
+    /// Dead-page ranges dropped before ever reaching a punch attempt
+    /// because they failed the [`Store::checkpoint_impl_paged`] punch
+    /// step's out-of-bounds check (fix round 1, I-1). Space named by a
+    /// dropped range leaks permanently — never retried.
+    pub dead_pages_dropped: u64,
 }
 
 impl Store {
@@ -732,6 +746,7 @@ impl Store {
                     last_root: None,
                     punch_after: BTreeMap::new(),
                     pending_punch: Vec::new(),
+                    fail_next_punch_for_test: false,
                     last_checkpoint_at: std::time::Instant::now(),
                     installs: std::sync::atomic::AtomicU64::new(0),
                 })
@@ -1681,8 +1696,87 @@ impl Store {
             }
         }
         if !to_punch.is_empty() {
-            file.punch(&to_punch)?;
-            stats.dead_pages_punched.fetch_add(to_punch.len() as u64, Ordering::Relaxed);
+            // I-1 (fix round 1): a range's `(offset, len)` was computed once,
+            // possibly checkpoints ago, and is trusted verbatim here — never
+            // re-derived by re-reading the page it named. `read_len`'s own
+            // capacity bound (added alongside this) rejects an
+            // implausible length at the point it is *computed*; this is
+            // the second, independent check at the point it is *used*: a
+            // range whose claimed extent now reaches past the page file's
+            // current logical end is dropped rather than hitting
+            // `fallocate`, which gives no way to undo a punch once issued
+            // and would zero out whatever legitimately live bytes (if any)
+            // now occupy that range — a leaked few pages beats a
+            // corrupted live one. Logged and counted (`dead_pages_dropped`)
+            // rather than silently discarded, so a persistently corrupt
+            // range is at least visible in `paged_stats()`.
+            let file_end = file.file_end();
+            let mut safe = Vec::with_capacity(to_punch.len());
+            for (off, len) in to_punch {
+                match off.checked_add(len) {
+                    Some(end) if end <= file_end => safe.push((off, len)),
+                    end => {
+                        eprintln!(
+                            "ultima_db: dropping a dead-page range [{off}, {}) — past the \
+                             page file's current end ({file_end} bytes); a corrupted length \
+                             would otherwise be handed to fallocate. Not punched: the space \
+                             leaks, nothing else is affected.",
+                            end.map(|e| e.to_string()).unwrap_or_else(|| "overflow".into())
+                        );
+                        stats.dead_pages_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            if !safe.is_empty() {
+                // I-2 (fix round 1): the root record above is already
+                // durable and correct regardless of whether this punch
+                // succeeds — reclaiming space is pure best-effort cleanup,
+                // and must never fail an already-committed checkpoint. A
+                // test-only injected failure (`paged_fail_next_punch_for_test`)
+                // takes the same path as a real `fallocate` failure
+                // (`EOPNOTSUPP` on a filesystem without hole-punch support,
+                // for instance) so the retry logic below is exercised
+                // end-to-end rather than only unit-tested in isolation.
+                let inject_failure = {
+                    let mut inner = self.inner.write();
+                    inner
+                        .paged
+                        .as_mut()
+                        .map(|p| std::mem::take(&mut p.fail_next_punch_for_test))
+                        .unwrap_or(false)
+                };
+                let punch_result = if inject_failure {
+                    Err(Error::Persistence("injected: punch failure (test)".into()))
+                } else {
+                    file.punch(&safe)
+                };
+                match punch_result {
+                    Ok(()) => {
+                        stats.dead_pages_punched.fetch_add(safe.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Space reclaim never fails the commit: the ranges
+                        // go back into `pending_punch` so the very next
+                        // checkpoint retries them unconditionally (the same
+                        // path `Store::recover()` seeds from an
+                        // already-cleared retention gate). On a filesystem
+                        // that never supports hole-punching (EOPNOTSUPP),
+                        // this leaks the space forever and logs once per
+                        // checkpoint — the best available outcome without
+                        // failing every checkpoint on such a filesystem.
+                        eprintln!(
+                            "ultima_db: hole-punch failed ({e}); {} range(s) queued for retry \
+                             on the next checkpoint",
+                            safe.len()
+                        );
+                        let mut inner = self.inner.write();
+                        if let Some(p) = inner.paged.as_mut() {
+                            p.pending_punch.extend(safe);
+                        }
+                    }
+                }
+            }
         }
 
         Ok(snap.version)
@@ -1932,6 +2026,21 @@ impl Store {
             .map(|p| p.installs.load(Ordering::Relaxed))
     }
 
+    /// Test-only: force the next hole-punch attempt in this store's
+    /// checkpoint path to fail, exactly once — see
+    /// [`PagedState::fail_next_punch_for_test`]. A no-op if this store was
+    /// not configured with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged). Not
+    /// part of the stable public API.
+    #[cfg(feature = "persistence")]
+    #[doc(hidden)]
+    pub fn paged_fail_next_punch_for_test(&self) {
+        let mut inner = self.inner.write();
+        if let Some(p) = inner.paged.as_mut() {
+            p.fail_next_punch_for_test = true;
+        }
+    }
+
     /// Snapshot of this store's paged-checkpoint counters, or `None` if it
     /// was not configured with [`Persistence::paged`](crate::persistence::Persistence::paged).
     #[cfg(feature = "persistence")]
@@ -1951,6 +2060,7 @@ impl Store {
             // yet, so this is always 0 until then.
             checkpointer_runs: 0,
             dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
+            dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
         })
     }
 
@@ -2139,27 +2249,53 @@ impl Store {
                 let mut pending_punch: Vec<(u64, u64)> = Vec::new();
                 let mut prev_version: Option<u64> = None;
                 for (i, (ver, root_path)) in roots_on_disk.iter().enumerate() {
+                    // I-4 (fix round 1): only the HEAD root is load-bearing
+                    // for correctness (already read with a hard error
+                    // above, before this loop). Every other surviving
+                    // `.root` file is read purely to learn what dead-page
+                    // ranges it once named -- a skip-and-leak, not a
+                    // recovery-refusing error, is the right response to a
+                    // corrupted OLDER root: `prev_version` still advances
+                    // (the filename alone gives the version), so pairing
+                    // resumes correctly at the next readable root; only the
+                    // bookkeeping this specific root would have contributed
+                    // (its own dead list, and the predecessor pairing that
+                    // runs through it) is permanently leaked.
                     let r = if *ver == root.version {
-                        root.clone()
+                        Some(root.clone())
                     } else {
-                        crate::checkpoint::read_paged_root(root_path)?
+                        match crate::checkpoint::read_paged_root(root_path) {
+                            Ok(r) => Some(r),
+                            Err(e) => {
+                                eprintln!(
+                                    "ultima_db: recover(): {} is unreadable ({e}); \
+                                     skipping it -- the dead-page ranges it named (and \
+                                     the predecessor pairing through it) are \
+                                     permanently leaked, not punched",
+                                    root_path.display()
+                                );
+                                None
+                            }
+                        }
                     };
-                    if i == 0 && !r.dead_pages.is_empty() {
-                        // The oldest surviving root's own dead list is
-                        // non-empty, so it WAS diffed against a real
-                        // predecessor — one no longer among the survivors,
-                        // meaning a completed `cleanup_old_roots` call
-                        // already deleted it before this root's dead list
-                        // could be punched (`Mutation::CrashBeforePunch`'s
-                        // test is exactly this case). Its retention gate has
-                        // therefore already cleared; queue it for the very
-                        // next checkpoint rather than punching here —
-                        // recovery only rebuilds bookkeeping, it never
-                        // mutates the page file itself.
-                        pending_punch.extend(r.dead_pages.clone());
-                    }
-                    if let Some(pv) = prev_version {
-                        punch_after.insert(pv, r.dead_pages.clone());
+                    if let Some(r) = &r {
+                        if i == 0 && !r.dead_pages.is_empty() {
+                            // The oldest surviving root's own dead list is
+                            // non-empty, so it WAS diffed against a real
+                            // predecessor — one no longer among the survivors,
+                            // meaning a completed `cleanup_old_roots` call
+                            // already deleted it before this root's dead list
+                            // could be punched (`Mutation::CrashBeforePunch`'s
+                            // test is exactly this case). Its retention gate has
+                            // therefore already cleared; queue it for the very
+                            // next checkpoint rather than punching here —
+                            // recovery only rebuilds bookkeeping, it never
+                            // mutates the page file itself.
+                            pending_punch.extend(r.dead_pages.clone());
+                        }
+                        if let Some(pv) = prev_version {
+                            punch_after.insert(pv, r.dead_pages.clone());
+                        }
                     }
                     prev_version = Some(*ver);
                 }

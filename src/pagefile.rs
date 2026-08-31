@@ -249,7 +249,12 @@ impl PageFile {
     /// punching a hole needs a byte range, and the checkpoint diff that
     /// produces the dead-page-id list only has ids. Rejects the same
     /// corruption a full [`Self::read`] would (bad kind byte, wrong format
-    /// byte) without paying for the payload read `read` does.
+    /// byte, or a `payload_len` that would reach past the file's known
+    /// physical extent) without paying for the payload read `read` does.
+    /// The capacity bound matters here specifically: this length flows,
+    /// uninspected, into a dead-page range that a much later checkpoint may
+    /// hand straight to `punch` (`FALLOC_FL_PUNCH_HOLE`) — a corrupted,
+    /// too-large length caught here can never become a destructive punch.
     pub(crate) fn read_len(&self, id: PageId) -> Result<u64> {
         let mut hdr = [0u8; PAGE_HEADER_LEN];
         let got = read_fully_at(&self.file, &mut hdr, id, id)?;
@@ -264,6 +269,14 @@ impl PageFile {
         }
         let plen = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
         if plen > MAX_PAGE_BYTES {
+            return Err(Error::CheckpointCorrupted(format!("page {id}: payload_len {plen} exceeds limits")));
+        }
+        // Same bound `read` enforces before it trusts a decoded length
+        // enough to size a read: the physical file may not (yet) extend as
+        // far as a corrupted `payload_len` claims.
+        let total = PAGE_HEADER_LEN + plen;
+        let capacity = self.w.lock().capacity;
+        if id + total as u64 > capacity {
             return Err(Error::CheckpointCorrupted(format!("page {id}: payload_len {plen} exceeds limits")));
         }
         Ok(Self::page_len(plen))
@@ -366,6 +379,26 @@ mod tests {
         let (_d, pf) = tmp();
         let id = pf.append(PageKind::DataLeaf, &[7; 321]).unwrap();
         assert_eq!(pf.read_len(id).unwrap(), PageFile::page_len(321));
+    }
+
+    #[test]
+    fn read_len_rejects_a_payload_len_past_the_file_extent() {
+        // Same corruption `payload_len_past_file_extent_rejected` exercises
+        // against `read` (task11 fix round 1, I-1): a bit-flipped
+        // `payload_len` that decodes to something still under
+        // MAX_PAGE_BYTES but past the file's known physical extent must
+        // not silently produce a byte range `read_len`'s caller then hands
+        // to `punch`.
+        let (d, pf) = tmp(); // chunk = 1 << 20, so capacity is exactly 1 MiB after this append
+        let id = pf.append(PageKind::DataLeaf, &[1; 20]).unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(page_file_path(d.path())).unwrap();
+            let bogus_len = 1u32 << 20; // == capacity; id + PAGE_HEADER_LEN + bogus_len overshoots it
+            f.write_at(&bogus_len.to_le_bytes(), id + 4).unwrap();
+        }
+        let e = pf.read_len(id).unwrap_err();
+        assert!(matches!(e, crate::Error::CheckpointCorrupted(_)), "{e:?}");
     }
 
     #[test]

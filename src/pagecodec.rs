@@ -323,6 +323,15 @@ pub(crate) struct PagedStats {
     /// see `Store::checkpoint_impl_paged`'s punch step), never at the point
     /// a range is merely computed and recorded in a root's `dead_pages`.
     pub dead_pages_punched: AtomicU64,
+    /// Dead-page ranges dropped before ever reaching `punch` (fix round 1,
+    /// I-1) because their claimed `(offset, len)` extent reached past the
+    /// page file's current logical end — a defense against a corrupted
+    /// length that was already-stored (possibly checkpoints ago) rather
+    /// than re-derived at punch time. A range counted here is never
+    /// punched and never retried: it is permanently abandoned, leaking
+    /// that much disk space rather than risking a destructive
+    /// `fallocate` over live data.
+    pub dead_pages_dropped: AtomicU64,
 }
 
 /// A [`NodeSource`] that reads pages off a [`PageFile`] and decodes them
