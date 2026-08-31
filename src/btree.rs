@@ -428,8 +428,12 @@ pub(crate) struct BTreeNode<K, V> {
     /// Children; empty for leaf nodes, len == entries.len() + 1 for internal nodes.
     pub(crate) children: Children<K, V>,
     /// Some only on paged data-tree leaves ("block leaves"). `None` for
-    /// every node built so far — nothing here ever creates a block leaf;
-    /// that lands in a later task. +8B per node.
+    /// every other node: inner nodes and index trees stay all-Arc always
+    /// (I-B); a data leaf is block-shaped only while nothing has mutably
+    /// touched it since it was last decoded off disk (`NodeCodec::decode`,
+    /// task 4, is the sole production constructor of `Some` — see also
+    /// `BTreeNode::materialize`, which is what un-does it on write). +8B
+    /// per node.
     pub(crate) block: Option<Box<[V]>>,
 }
 
@@ -514,29 +518,44 @@ impl<K, V> BTreeNode<K, V> {
     /// leaf (the common case — checked once via `Option::take`, before
     /// touching any entry).
     ///
-    /// Correctness stopgap for decode-to-block (this task), pending Task
-    /// 5's real single-pass block-leaf CoW rebuild: `Child::make_mut`
-    /// (`make_mut_after_load`) calls this on every node about to be
-    /// mutably returned, so the pre-existing structural insert/delete code
-    /// below (`insert_into_node[_mut]`, `delete_from_node[_mut]`,
-    /// `maybe_split[_mut]`) — which shifts or removes `entries` with no
-    /// awareness of a same-length, unindexed `block` array — never has to
-    /// see a block leaf: without this, an insert/delete that changes
-    /// `entries.len()` desyncs `block`'s positions from the entries that
-    /// still reference it, corrupting every shifted in-block entry's
-    /// `value_at`. A leaf a write actually touches gives up its block's
-    /// memory advantage until Task 5's real rebuild lands; read-only
-    /// leaves (the common case) stay block-shaped exactly as Task 4
-    /// intends. Called *after* `make_mut_after_load` has already
-    /// established unique ownership (in place, or via `clone_with`'s own
-    /// one clone_value per entry) — moving out here adds zero further
-    /// clones on top of that, preserving Task 2's "no clone on the
-    /// unique-owner path" fast-path guarantee.
+    /// Correctness stopgap for decode-to-block (task 4), pending Task 5's
+    /// real single-pass block-leaf CoW rebuild. **The precise invariant**
+    /// (fix round 1, Minor 4 — search for this if you're Task 5/6/7):
+    /// *every node reached through `&mut` is materialized* —
+    /// `Child::make_mut`/`make_mut_after_load` calls this on every node
+    /// about to be handed back mutably, and `absorb` (fix round 1,
+    /// Critical 1) calls it explicitly on a sibling consumed by value. A
+    /// node reached only by **value** (moved out and dropped without ever
+    /// going through `&mut`, e.g. an old `absorb` before that fix) or by
+    /// **shared reference for a read that copies elsewhere**
+    /// (`seed_from_spine`, `redistribute_tail` — fix round 1, Critical 2)
+    /// is NOT covered by this function and must clone the value out via
+    /// `NodeSource::clone_value` at its own call site instead. Any new
+    /// code path that acquires a block leaf by one of those two routes
+    /// needs its own fix, not a call to `materialize`.
+    ///
+    /// A leaf a write actually touches gives up its block's memory
+    /// advantage until Task 5's real rebuild lands; read-only leaves (the
+    /// common case) stay block-shaped exactly as Task 4 intends. Moving
+    /// out here — whether the node was mutated in place or freshly built
+    /// by `clone_with`'s one `clone_value` per entry — adds zero further
+    /// clones on top of whatever already ran, preserving Task 2's "no
+    /// clone on the unique-owner path" fast-path guarantee.
     pub(crate) fn materialize(&mut self) {
+        // Length-equality is I-A itself (every in-block entry has exactly
+        // one corresponding `block` slot, same order) — assert it once,
+        // before consuming `block`, rather than per-iteration: a
+        // `block.len() < entries.len()` mismatch would otherwise panic
+        // mid-loop via the `expect` below, leaving `self.block == None`
+        // with some entries still marked in-block (a still-reachable,
+        // I-A-violating node) instead of failing atomically up front.
+        debug_assert!(
+            self.block.as_ref().is_none_or(|b| b.len() == self.entries.len()),
+            "I-A: block length must match entries length"
+        );
         let Some(block) = self.block.take() else { return };
         let mut values = Vec::from(block).into_iter();
         for i in 0..self.entries.len() {
-            debug_assert!(self.entries[i].1.is_in_block(), "I-A: block leaf entries must all be in-block");
             let v = values.next().expect("I-A: block length must match entries length");
             self.entries[i].1 = Value::arc(Arc::new(v));
         }
@@ -1789,8 +1808,17 @@ fn get_arc_in_node<K: Ord, V>(
             // through here, so this must return the real value, not
             // silently report "not found" the way the pre-block-decode
             // `Task 5 wires it` stub used to (task 4: decode now legitimately
-            // builds block leaves, so this path is live).
-            None => src.and_then(|s| s.clone_value(node.value_at(pos))).map(Arc::new),
+            // builds block leaves, so this path is live). `src`/`clone_value`
+            // being absent here would itself be an I-B breach (a block leaf
+            // with no cloning source) — every other I-B breach in this file
+            // panics loudly (`value_at`, `clone_with`, `absorb`,
+            // `seed_from_spine`), so this asserts too (fix round 1, Important
+            // 1) rather than quietly degrading into the exact spurious
+            // `KeyNotFound` this branch exists to fix.
+            None => Some(Arc::new(
+                src.and_then(|s| s.clone_value(node.value_at(pos)))
+                    .expect("I-B: block leaf requires a cloning source"),
+            )),
         },
         Err(pos) => {
             if node.children.is_empty() {
@@ -2030,7 +2058,18 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
                 // Leaf: slots are entries directly, no interleaving.
                 if slot < node.entries.len() {
                     let (k, v) = &node.entries[slot];
-                    // Task 5 wires the block branch — no block entry exists yet.
+                    // Unlike `seed_from_spine`/`redistribute_tail` (fix round
+                    // 1, Critical 2), this `expect` is genuinely unreachable
+                    // in production, not merely untested (fix round 1, Minor
+                    // 2): `diff` is only ever called from
+                    // `registry.rs::diff_table`, the row-format incremental-
+                    // checkpoint delta path, and `StoreConfig::checkpoint_chain_max`
+                    // is documented inert in paged mode (a paged root is
+                    // always self-contained, never part of a delta chain —
+                    // see `Store::checkpoint_impl`) — so a block leaf never
+                    // reaches this iterator. Left as `expect` (not fixed to
+                    // clone via `clone_value`) since there is no live paged
+                    // call site to regression-test against.
                     return Some((k, v.as_arc().expect("diff over block leaf not yet supported (I-A)")));
                 }
                 self.stack.pop();
@@ -2043,7 +2082,9 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
             let idx = slot / 2;
             if idx < node.entries.len() {
                 let (k, v) = &node.entries[idx];
-                // Task 5 wires the block branch — no block entry exists yet.
+                // See the leaf-arm comment above: unreachable in production
+                // (paged mode never calls `diff` — `checkpoint_chain_max` is
+                // inert there), not merely untested.
                 return Some((k, v.as_arc().expect("diff over block leaf not yet supported (I-A)")));
             }
             self.stack.pop();
@@ -2488,7 +2529,18 @@ fn merge_with_right<K: Clone, V>(
 fn absorb<K: Clone, V>(left: &mut BTreeNode<K, V>, right: Child<K, V>, src: Option<&dyn NodeSource<K, V>>) {
     let arc = right.load_arc(src);
     drop(right); // release the slot's own count first, so try_unwrap can succeed
-    let rn = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
+    // `right` is consumed *by value* here, never through `make_mut` — the one
+    // route `Child::make_mut_after_load`'s `materialize()` call does NOT cover
+    // (fix round 1, Critical 1). A block leaf faulted in by `load_arc` above
+    // would otherwise have its in-block entries appended into `left` (already
+    // materialized, `block: None`) while `rn.block` silently drops with them
+    // still inside it — I-A violated with no assert on this path, then a
+    // panic somewhere downstream. `clone_with` (not plain `Clone`, which
+    // itself would assert/corrupt on a block leaf — see its own I-B guard)
+    // on the shared branch, then an explicit `materialize()` on the result
+    // either way, closes the hole the same way `make_mut_after_load` does.
+    let mut rn = Arc::try_unwrap(arc).unwrap_or_else(|a| a.clone_with(src));
+    rn.materialize();
     left.entries.extend(rn.entries);
     left.children.extend(rn.children);
 }
@@ -2666,12 +2718,24 @@ impl<K: Ord + Clone, V> BulkBuilder<K, V> {
         let mut levels = Vec::with_capacity(spine.len());
         for (i, spine_node) in spine.iter().rev().enumerate() {
             let mut lv = LevelBuilder::new();
-            // Task 5 wires the block branch — no block entry exists yet.
-            lv.entries.extend(spine_node.entries.iter().map(|(k, v)| {
-                (
-                    k.clone(),
-                    Arc::clone(v.as_arc().expect("seed_from_spine over block leaf not yet supported (I-A)")),
-                )
+            // The spine's leaf level (the last iteration, `i == spine.len() -
+            // 1`) can be a block leaf on a recovered paged tree — dead at
+            // task 3, live since task 4's decode-to-block (fix round 1,
+            // Critical 2). Reads only (this never mutates through the
+            // `Arc`, so no `make_mut`/`materialize` applies here): an
+            // in-block entry has no per-entry `Arc` to clone, so build a
+            // fresh one via the source's `clone_value` (I-B: guaranteed
+            // `Some` for any tree that could hold a block leaf) instead of
+            // the old "not yet supported" stub.
+            lv.entries.extend(spine_node.entries.iter().enumerate().map(|(idx, (k, v))| {
+                let arc = match v.as_arc() {
+                    Some(a) => Arc::clone(a),
+                    None => Arc::new(
+                        src.and_then(|s| s.clone_value(spine_node.value_at(idx)))
+                            .expect("I-B: block leaf requires a cloning source"),
+                    ),
+                };
+                (k.clone(), arc)
             }));
             if i > 0 {
                 let n = spine_node.children.len();
@@ -3017,15 +3081,25 @@ fn redistribute_tail<K: Clone, V>(levels: &mut [LevelBuilder<K, V>], level: usiz
     let sibling = sibling.load(src);
 
     // Reconstruct the full ordered sequence: sibling.entries ++ separator ++ lv.entries.
-    // Task 5 wires the block branch — no block entry exists yet.
+    // `sibling` at the leaf level can be a block leaf on a recovered paged
+    // tree — dead at task 3, live since task 4's decode-to-block (fix round
+    // 1, Critical 2, same shape as `seed_from_spine` above). Reads only, no
+    // `make_mut`/`materialize` applies: an in-block entry has no per-entry
+    // `Arc`, so clone one out via the source (I-B) instead of the old
+    // "not yet supported" stub.
     let mut merged_entries: Vec<(K, Arc<V>)> = sibling
         .entries
         .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                v.as_arc().expect("redistribute_tail over block leaf not yet supported (I-A)").clone(),
-            )
+        .enumerate()
+        .map(|(idx, (k, v))| {
+            let arc = match v.as_arc() {
+                Some(a) => a.clone(),
+                None => Arc::new(
+                    src.and_then(|s| s.clone_value(sibling.value_at(idx)))
+                        .expect("I-B: block leaf requires a cloning source"),
+                ),
+            };
+            (k.clone(), arc)
         })
         .collect();
     merged_entries.push(separator);

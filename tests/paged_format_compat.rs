@@ -10,8 +10,18 @@
 //! bytes themselves — that's also what the golden-bytes unit test in
 //! `src/pagecodec.rs` (`encode_bytes_identical_across_representations`)
 //! pins directly against the codec, without going through a whole store.
+//!
+//! Gated off `fanout-t8` (fix round 1, Important 2): the committed
+//! `pages.bin` was written by a T=32 build, and a `pages.bin`'s fanout is
+//! not portable across that flag — a documented task63 limitation
+//! (`decode`'s `n > MAX_KEYS + 1` bound-check, `src/pagecodec.rs`, rejects
+//! a T=32-encoded 32-entry node as oversized under T=8's `MAX_KEYS = 15`).
+//! No CI job runs `fanout-t8` today, so this was a developer-facing break
+//! rather than a CI one, but the fixture's own README already documents
+//! the fanout dependency and this test should honor it rather than
+//! hard-coding a foot-gun for the next `--features fanout-t8` build.
 
-#![cfg(feature = "persistence")]
+#![cfg(all(feature = "persistence", not(feature = "fanout-t8")))]
 
 use std::path::Path;
 
