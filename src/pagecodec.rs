@@ -23,7 +23,7 @@
 //! LE](n+1 if inner)`.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::btree::BTreeNode;
@@ -332,6 +332,67 @@ pub(crate) struct PagedStats {
     /// that much disk space rather than risking a destructive
     /// `fallocate` over live data.
     pub dead_pages_dropped: AtomicU64,
+    /// Number of times the background checkpointer thread (task12,
+    /// `crate::store::Checkpointer`) has actually invoked a checkpoint —
+    /// bumped once per `Store::checkpoint_impl` call the thread itself
+    /// initiates, whether or not that call succeeds. Counts *attempts* by
+    /// the thread, not application-driven `Store::checkpoint()` calls, and
+    /// not "work done" the way `pages_written`/`leaves_demoted` do.
+    pub checkpointer_runs: AtomicU64,
+    /// The background checkpointer's wake signal (task12): `(has_work,
+    /// condvar)`. Set exactly once, by `Store::new`'s paged branch,
+    /// immediately after the checkpointer thread is spawned — every paged
+    /// store starts one (see `crate::store::Checkpointer::start`), so this
+    /// is `Some` for the whole lifetime of a `PagedStats` a live
+    /// `PagedSource`/commit path can ever observe. [`Self::wake_checkpointer`]
+    /// is the only thing that should call through this — everything else
+    /// should treat it as an opaque handle.
+    pub wake: OnceLock<Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>,
+    /// This store's `PagedOptions::memory_budget_bytes`, mirrored here
+    /// (task12) so [`PagedSource::read_node`] can wake the checkpointer on
+    /// a leaf fault that crosses the budget without needing access to
+    /// `PagedOptions` itself (only `Store::new`, which sees both, can set
+    /// this). `None` iff no budget is configured — `read_node` then never
+    /// calls [`Self::wake_checkpointer`] for that reason, matching
+    /// `checkpoint_impl_paged`'s own "no budget, never demote" rule.
+    pub mem_budget_bytes: OnceLock<u64>,
+}
+
+impl PagedStats {
+    /// Notify the background checkpointer thread's condvar that there may
+    /// be work to do, if one is wired up ([`Self::wake`] is set — true for
+    /// the whole life of any `PagedStats` a caller outside `Store::new` can
+    /// reach). A no-op otherwise; harmless (parking_lot's `notify_one` with
+    /// no waiter parked is a no-op) if the thread happens to already be
+    /// awake or mid-shutdown.
+    pub(crate) fn wake_checkpointer(&self) {
+        if let Some(w) = self.wake.get() {
+            let mut has_work = w.0.lock();
+            *has_work = true;
+            w.1.notify_one();
+        }
+    }
+
+    /// Atomically subtract `amount` from `dirty_bytes`, clamping at `0`
+    /// instead of wrapping. Used by `checkpoint_impl_paged`'s phase 2 to
+    /// undo the `note_dirty` credit for exactly the bytes *this* checkpoint
+    /// just wrote — not a blind reset to `0`, since a concurrent writer can
+    /// dirty more nodes while phases 1-2 are still running, and those bytes
+    /// must not be lost. A plain `fetch_sub` would wrap `AtomicU64` on
+    /// underflow (e.g. if the running total briefly reads lower than
+    /// `amount` due to relaxed-ordering interleaving) into a huge bogus
+    /// value that would then permanently pin the dirty-bytes trigger on;
+    /// clamping avoids that.
+    pub(crate) fn subtract_dirty_bytes(&self, amount: u64) {
+        let mut cur = self.dirty_bytes.load(Ordering::Relaxed);
+        loop {
+            let new = cur.saturating_sub(amount);
+            match self.dirty_bytes.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 /// A [`NodeSource`] that reads pages off a [`PageFile`] and decodes them
@@ -367,9 +428,23 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
         // here would inflate the estimate against a demote pass that can
         // never claim those bytes back.
         if kind == PageKind::DataLeaf {
-            self.stats
+            let prev = self
+                .stats
                 .resident_leaf_bytes
                 .fetch_add(Child::<K, V>::NODE_BYTES as i64, Ordering::Relaxed);
+            // Wake the background checkpointer (task12) the moment this
+            // fault-in pushes resident bytes at/over the memory budget —
+            // only when a budget is actually configured (`mem_budget_bytes`
+            // is set iff `PagedOptions::memory_budget_bytes` is `Some`; see
+            // its doc). Cheaper than notifying on every fault: a read-only
+            // store that never crosses the budget never wakes the thread
+            // early at all, just falls back to the interval poll.
+            if let Some(&budget) = self.stats.mem_budget_bytes.get() {
+                let resident = (prev + Child::<K, V>::NODE_BYTES as i64).max(0) as u64;
+                if resident >= budget {
+                    self.stats.wake_checkpointer();
+                }
+            }
         }
         Ok(Arc::new(self.codec.decode(kind, &bytes)?))
     }

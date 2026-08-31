@@ -4,7 +4,11 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "persistence")]
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+#[cfg(feature = "persistence")]
+use std::sync::Weak;
 use parking_lot::{ArcMutexGuard, Condvar, Mutex, RwLock};
 
 use dashmap::DashMap;
@@ -477,6 +481,15 @@ pub(crate) struct StoreInner {
     /// checkpoint path.
     #[cfg(feature = "persistence")]
     pub(crate) paged: Option<PagedState>,
+    /// Background checkpointer thread (task12), started once from
+    /// `Store::new` whenever `paged` is `Some` (see [`Checkpointer::start`]).
+    /// `None` for a row-format or in-memory store. Lives here — a sibling
+    /// of `wal_handle`, not nested inside `PagedState` — for the same
+    /// reason `wal_handle` does: dropping `StoreInner` drops this field,
+    /// which (via `impl Drop for Checkpointer`) stops and joins the thread,
+    /// mirroring `WalHandle`'s own stop-then-join `Drop`.
+    #[cfg(feature = "persistence")]
+    pub(crate) checkpointer: Option<Checkpointer>,
     /// Test-only mock WAL for controlled fsync testing.
     #[cfg(all(test, feature = "persistence"))]
     pub(crate) mock_wal: Option<std::sync::Arc<crate::wal::MockWal>>,
@@ -618,8 +631,12 @@ pub struct PagedStatsSnapshot {
     pub dirty_bytes: u64,
     /// Estimated resident (not-yet-demoted) leaf bytes, clamped to `0`.
     pub resident_leaf_bytes_est: u64,
-    /// Number of times the background checkpointer has run. Always `0`
-    /// until the background checkpointer (a later task) lands.
+    /// Number of times the background checkpointer thread (task12) has
+    /// actually invoked a checkpoint — bumped once per attempt, whether or
+    /// not it succeeded. `0` for a store with no memory budget, no dirty
+    /// bytes ever written, and an interval that never elapsed; in
+    /// particular an idle paged store (nothing ever written) never fires
+    /// this on its own, however long `checkpoint_interval` is set.
     pub checkpointer_runs: u64,
     /// Dead-page ranges actually hole-punched since the store opened (task11)
     /// — counted in ranges, not bytes. Only ranges whose retention gate has
@@ -809,7 +826,7 @@ impl Store {
         });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
-        Ok(Self {
+        let store = Self {
             inner: Arc::new(RwLock::new(StoreInner {
                 snapshots,
                 latest_version: 0,
@@ -835,6 +852,8 @@ impl Store {
                 checkpoint_chain_len: 0,
                 #[cfg(feature = "persistence")]
                 paged,
+                #[cfg(feature = "persistence")]
+                checkpointer: None,
                 #[cfg(all(test, feature = "persistence"))]
                 mock_wal: None,
                 metrics,
@@ -844,7 +863,26 @@ impl Store {
             table_locks: Arc::new(TableLockTable::new()),
             #[cfg(feature = "persistence")]
             checkpoint_lock: Arc::new(Mutex::new(())),
-        })
+        };
+
+        // Start the background checkpointer (task12) whenever this store
+        // has paged state — which only ever happens with persistence
+        // configured too, since `PagedOptions` can only attach to
+        // `Persistence::Standalone`/`Smr` (see `Persistence::paged`), never
+        // `Persistence::None`. Started here, after `store` is fully built
+        // (`Checkpointer::start` needs `&Store` to clone its Arc fields and
+        // to downgrade `store.inner`), and installed into `StoreInner`
+        // under one more brief write-lock acquisition.
+        #[cfg(feature = "persistence")]
+        {
+            let has_paged = store.inner.read().paged.is_some();
+            if has_paged {
+                let checkpointer = Checkpointer::start(&store);
+                store.inner.write().checkpointer = Some(checkpointer);
+            }
+        }
+
+        Ok(store)
     }
 
     /// The version number of the most recently committed snapshot.
@@ -1467,6 +1505,11 @@ impl Store {
         // whole checkpoint's changes land in a single `inner.write()`
         // critical section (`install_paged_tables`), not one per table.
         let mut to_install: Vec<(String, Box<dyn MergeableTable>)> = Vec::new();
+        // Running total of bytes this checkpoint itself writes, credited
+        // back against `dirty_bytes` once the loop finishes (task12) — see
+        // `PagedStats::subtract_dirty_bytes`'s doc for why a saturating
+        // subtraction, not a reset to `0`.
+        let mut dirty_bytes_written: u64 = 0;
 
         for name in snap.table_names() {
             // Only registered tables can be paged-written: `paged_write`
@@ -1523,11 +1566,25 @@ impl Store {
             let wrote_pages = stats.pages_written.load(Ordering::Relaxed) - pages_before;
             let needs_install = newly_attached || flushed.is_some() || wrote_pages > 0;
             let final_table = flushed.unwrap_or(boxed);
+            // Each page this table just wrote corresponds to one dirtied
+            // node `note_dirty` already credited into `dirty_bytes` at the
+            // same `Child::NODE_BYTES`-per-node estimate (see
+            // `PagedSource::note_dirty`/`Child::make_mut`) — `paged_node_bytes`
+            // is this table's own `(K, R)` node size, the type-erased
+            // accessor `Store::demote_pass` already relies on for the same
+            // reason (`MergeableTable::paged_node_bytes`'s doc). Approximate
+            // like `resident_leaf_bytes` already is (see its doc): `wrote_pages`
+            // covers this table's secondary indexes too, whose `(IK, K)` node
+            // size can differ from the data tree's, applied uniformly here —
+            // fine for a trigger-threshold comparison, not exact accounting.
+            dirty_bytes_written = dirty_bytes_written
+                .saturating_add(wrote_pages.saturating_mul(final_table.paged_node_bytes() as u64));
             if needs_install {
                 to_install.push((name.clone(), final_table));
             }
             entries.push(entry);
         }
+        stats.subtract_dirty_bytes(dirty_bytes_written);
 
         // Tracks the fully-attached/fully-written state this checkpoint
         // produced, so `PagedState::last_root` names it rather than the
@@ -2056,9 +2113,7 @@ impl Store {
             leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
             dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
             resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
-            // The background checkpointer (a later task) hasn't landed
-            // yet, so this is always 0 until then.
-            checkpointer_runs: 0,
+            checkpointer_runs: s.checkpointer_runs.load(Ordering::Relaxed),
             dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
             dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
         })
@@ -2114,6 +2169,27 @@ impl Store {
     /// 2. In Standalone mode, replays WAL entries after the checkpoint.
     ///
     /// For `Persistence::None`, this is a no-op.
+    ///
+    /// Does **not** hold `Store::checkpoint_lock` for its own duration —
+    /// unlike `checkpoint_impl`/`checkpoint_impl_paged`, which both take it
+    /// for their whole body. That means the background checkpointer
+    /// (task12, already running by the time `recover()` is called, since
+    /// `Store::new` starts it) can interleave with a `recover()` call in
+    /// progress. Two cases, both already handled elsewhere rather than
+    /// here:
+    /// - **A paged directory with existing roots, opened by a store that
+    ///   hasn't recovered yet**: `checkpoint_impl_paged`'s own guard
+    ///   (`paged.last_root.is_none() && list_paged_roots(&dir)` non-empty
+    ///   ⇒ refuse) stops the checkpointer thread's own attempt from
+    ///   corrupting anything — it just logs the refusal (once) and retries
+    ///   next tick, same as any other checkpoint error.
+    /// - **A fresh directory (nothing to recover)**: the checkpointer
+    ///   thread may still tick before this call runs, but `due_time`
+    ///   requires `has_uncommitted` (`latest_version` above the last
+    ///   checkpointed version) — false on a store that has done nothing
+    ///   but open, so no checkpoint actually fires. This is exactly Task
+    ///   8's original "no background checkpointer" semantics for that
+    ///   case, preserved rather than changed by task12.
     #[cfg(feature = "persistence")]
     pub fn recover(&self) -> Result<()> {
         use crate::persistence::Persistence;
@@ -3367,6 +3443,271 @@ fn paged_dead_page_ids(
         }
     }
     ids
+}
+
+// ---------------------------------------------------------------------------
+// Checkpointer — background thread driving paged checkpoints (task12)
+// ---------------------------------------------------------------------------
+
+/// Background checkpointer thread (task12): drives `Store::checkpoint_impl`
+/// off dirty-bytes / memory-budget / interval triggers so a paged store
+/// checkpoints (and, when a memory budget is configured, demotes) without
+/// any application call to `Store::checkpoint()`.
+///
+/// Lives on `StoreInner::checkpointer`, started once from `Store::new`
+/// whenever `StoreInner::paged` is `Some` — paged options can only ever
+/// attach to `Persistence::Standalone`/`Smr` (see `Persistence::paged`),
+/// never `Persistence::None`, so "paged is configured" already implies
+/// persistence is configured; there is no separate condition to check.
+///
+/// Shutdown mirrors [`crate::wal::WalHandle`]'s stop-then-join `Drop`:
+/// `stop` and `wake` tell the thread to exit, and `Drop` joins it so a
+/// dropped `StoreInner` never leaves the thread running past it.
+///
+/// Deliberately holds no strong reference to `Store`/`Arc<RwLock<StoreInner>>`
+/// anywhere in its own fields — only a [`Weak`] inside the spawned closure.
+/// `StoreInner` owns this struct (it is one of its fields), so a strong
+/// reference back to `StoreInner` here would be a reference cycle: neither
+/// side could ever fully drop. The thread instead re-derives a transient
+/// [`Store`] each iteration via `Weak::upgrade`, using it only for the
+/// duration of one `checkpoint_impl` call, and simply exits once upgrading
+/// fails (the real store is gone) or `stop` is set (an explicit `Drop`).
+///
+/// One more subtlety `Drop` has to account for: because the thread body
+/// upgrades its `Weak` into a real strong `Arc<RwLock<StoreInner>>` for the
+/// duration of a checkpoint, *this thread's own* drop of that temporary
+/// `Arc` can — if the application dropped its last `Store` handle while a
+/// checkpoint was in flight — be the very decrement that brings the strong
+/// count to zero. That runs `StoreInner`'s destructor (and so this
+/// `Checkpointer`'s `Drop`) **on the checkpointer thread itself**. Joining
+/// `self.handle` in that situation would be a self-join: the thread
+/// blocking on its own completion, which can never happen. See `Drop`'s
+/// impl below for the guard.
+#[cfg(feature = "persistence")]
+pub(crate) struct Checkpointer {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "persistence")]
+impl Checkpointer {
+    /// Spawn the background thread and wire its wake condvar — and, when a
+    /// memory budget is configured, that budget itself — into `PagedStats`
+    /// so `PagedSource::read_node` (a leaf fault crossing the budget) and
+    /// the commit path (a commit crossing the dirty-bytes threshold) can
+    /// wake it early instead of waiting out the full `checkpoint_interval`.
+    /// Only ever called once per store, from `Store::new`, after confirming
+    /// `inner.paged` is `Some`.
+    fn start(store: &Store) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+
+        {
+            let inner = store.inner.read();
+            let paged = inner
+                .paged
+                .as_ref()
+                .expect("Checkpointer::start is only called when inner.paged is Some");
+            // Both `set` calls below only ever run once — this whole block
+            // runs exactly once per store — so the `Result` an
+            // already-populated `OnceLock` would return is intentionally
+            // discarded rather than unwrapped.
+            let _ = paged.stats.wake.set(Arc::clone(&wake));
+            if let Some(budget) = paged.opts.memory_budget_bytes {
+                let _ = paged.stats.mem_budget_bytes.set(budget);
+            }
+        }
+
+        let weak_inner = Arc::downgrade(&store.inner);
+        let intents = Arc::clone(&store.intents);
+        let next_writer_id = Arc::clone(&store.next_writer_id);
+        let table_locks = Arc::clone(&store.table_locks);
+        let checkpoint_lock = Arc::clone(&store.checkpoint_lock);
+        let thread_stop = Arc::clone(&stop);
+        let thread_wake = Arc::clone(&wake);
+
+        let handle = std::thread::Builder::new()
+            .name("ultima-checkpointer".into())
+            .spawn(move || {
+                checkpointer_loop(
+                    weak_inner,
+                    intents,
+                    next_writer_id,
+                    table_locks,
+                    checkpoint_lock,
+                    thread_stop,
+                    thread_wake,
+                );
+            })
+            .expect("spawn ultima-checkpointer background thread");
+
+        Checkpointer { stop, wake, handle: Some(handle) }
+    }
+}
+
+#[cfg(feature = "persistence")]
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        // Same shutdown shape as `WalHandle::drop` (`src/wal.rs`): flip the
+        // stop flag, wake the thread so it observes it promptly rather than
+        // waiting out the interval, then join.
+        self.stop.store(true, Ordering::Relaxed);
+        {
+            let mut has_work = self.wake.0.lock();
+            *has_work = true;
+        }
+        self.wake.1.notify_one();
+        if let Some(handle) = self.handle.take() {
+            // Self-join guard (see the struct doc's last paragraph): if
+            // this `drop` is running ON the checkpointer thread itself
+            // (its own transient strong `Arc<RwLock<StoreInner>>` was what
+            // brought the count to zero), `handle.join()` would block the
+            // thread on its own completion forever. Detect that case by
+            // comparing thread identities and skip the join — dropping a
+            // `JoinHandle` without joining just detaches it, which is safe
+            // here: `stop` is already set and the next `weak_inner.upgrade()`
+            // this thread would have attempted is about to fail anyway
+            // (the store is gone), so it is already on its way to
+            // returning on its own.
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+/// The background checkpointer thread's body — see [`Checkpointer`]'s doc
+/// for the reference-cycle and self-join reasoning behind its shape.
+///
+/// Never busy-spins: every iteration blocks on `wake`'s condvar with a
+/// timeout, waking only on an explicit notify (a crossed threshold, or
+/// `Drop`) or the interval elapsing.
+#[cfg(feature = "persistence")]
+fn checkpointer_loop(
+    weak_inner: Weak<RwLock<StoreInner>>,
+    intents: Arc<IntentMap>,
+    next_writer_id: Arc<AtomicU64>,
+    table_locks: Arc<TableLockTable>,
+    checkpoint_lock: Arc<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+) {
+    // Only a *transition* to a new error string is logged (mirrors the WAL
+    // poison latch's "don't spam" shape, but this is not itself a poison
+    // latch — a failed background checkpoint just means the next attempt
+    // still has to be free to run): a persistent failure (a full disk, say)
+    // prints once, not once per tick.
+    let mut last_err: Option<String> = None;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Block on the wake condvar until notified or `interval` elapses.
+        // Re-read the interval from the live store every iteration rather
+        // than capturing it once at thread start: it doubles as this
+        // iteration's "is the store still alive" check, so a store that
+        // vanished while this thread was parked is caught here rather than
+        // only on the next section's `upgrade()`.
+        {
+            let interval = match weak_inner.upgrade() {
+                Some(inner) => {
+                    let g = inner.read();
+                    match g.paged.as_ref() {
+                        Some(p) => p.opts.checkpoint_interval.unwrap_or(std::time::Duration::from_secs(1)),
+                        None => return, // paged state torn down out from under us
+                    }
+                }
+                None => return, // store dropped while we were idle
+            };
+            let mut has_work = wake.0.lock();
+            if !*has_work {
+                let _ = wake.1.wait_for(&mut has_work, interval);
+            }
+            *has_work = false;
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Some(inner) = weak_inner.upgrade() else { return };
+        let (due_dirty, due_mem, due_time, stats) = {
+            let g = inner.read();
+            let Some(paged) = g.paged.as_ref() else { return };
+            let dirty = paged.stats.dirty_bytes.load(Ordering::Relaxed);
+            let resident = paged.stats.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64;
+            let due_dirty = dirty >= paged.opts.checkpoint_dirty_bytes;
+            let due_mem = paged.opts.memory_budget_bytes.is_some_and(|b| resident >= b);
+            // "Is there anything a checkpoint would actually write" — NOT
+            // `dirty_bytes > 0`. `PagedSource::note_dirty` only fires on a
+            // clean-node CoW (a node that already has a page id, i.e.
+            // already survived one checkpoint); a table's very first write,
+            // before it has ever been paged-attached, never touches it —
+            // there is no `NodeSource` yet for `Child::make_mut` to notify,
+            // and a freshly built leaf starts life already `NO_PAGE`
+            // ("dirty" from birth, not by transition). So `dirty_bytes`
+            // alone cannot tell a fresh, never-checkpointed but genuinely
+            // non-empty store apart from a truly idle one. Comparing
+            // `latest_version` against the version the last paged
+            // checkpoint actually named can: it starts at `0 == 0`
+            // (nothing committed yet, matching `last_root`'s absence) and
+            // only diverges once a real commit lands, regardless of
+            // whether that commit's nodes ever got a chance to be
+            // "re-dirtied".
+            let last_checkpointed_version = paged.last_root.as_ref().map(|(_, v)| *v).unwrap_or(0);
+            let has_uncommitted = g.latest_version > last_checkpointed_version;
+            let due_time = paged
+                .opts
+                .checkpoint_interval
+                .is_some_and(|i| paged.last_checkpoint_at.elapsed() >= i)
+                && has_uncommitted;
+            (due_dirty, due_mem, due_time, Arc::clone(&paged.stats))
+        };
+
+        if due_dirty || due_mem || due_time {
+            // A transient `Store`, alive only for this one checkpoint call
+            // — see the struct doc for why nothing here is held any longer
+            // than that.
+            let store = Store {
+                inner: Arc::clone(&inner),
+                intents: Arc::clone(&intents),
+                next_writer_id: Arc::clone(&next_writer_id),
+                table_locks: Arc::clone(&table_locks),
+                checkpoint_lock: Arc::clone(&checkpoint_lock),
+            };
+            let result = store.checkpoint_impl(false);
+            stats.checkpointer_runs.fetch_add(1, Ordering::Relaxed);
+            match result {
+                Ok(_) => last_err = None,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if last_err.as_deref() != Some(msg.as_str()) {
+                        eprintln!("ultima_db: background checkpointer: {msg}");
+                        last_err = Some(msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// If this store is paged and a commit's new dirty-bytes total crosses the
+/// checkpoint threshold, wake the background checkpointer (task12) rather
+/// than waiting for it to notice on its own next interval tick. Called from
+/// both `WriteTx::commit_single_writer` and `commit_multi_writer` right
+/// after the new snapshot is installed, while `inner` is still held — cheap
+/// (an atomic load plus, only when actually due, a mutex lock + notify), so
+/// paying it under the write lock costs nothing readers would notice.
+#[cfg(feature = "persistence")]
+fn maybe_wake_checkpointer(inner: &StoreInner) {
+    if let Some(paged) = inner.paged.as_ref()
+        && paged.stats.dirty_bytes.load(Ordering::Relaxed) >= paged.opts.checkpoint_dirty_bytes
+    {
+        paged.stats.wake_checkpointer();
+    }
 }
 
 /// Remove a base version from the active writer tracking list.
@@ -5262,6 +5603,8 @@ impl WriteTx {
         if v > inner.latest_version {
             inner.latest_version = v;
         }
+        #[cfg(feature = "persistence")]
+        maybe_wake_checkpointer(&inner);
         if inner.config.auto_snapshot_gc {
             gc_inner(&mut inner);
         }
@@ -5628,6 +5971,8 @@ impl WriteTx {
         if v > inner.latest_version {
             inner.latest_version = v;
         }
+        #[cfg(feature = "persistence")]
+        maybe_wake_checkpointer(&inner);
         if inner.config.auto_snapshot_gc {
             gc_inner(&mut inner);
         }
