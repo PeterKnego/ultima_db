@@ -1777,6 +1777,41 @@ impl Store {
             if let (Some(p), Some(refreshed)) = (inner.paged.as_mut(), refreshed) {
                 p.last_root = Some((refreshed, snap.version));
             }
+
+            // F1 (spike/paged-write-path, 2026-08-31): reconcile the
+            // resident-leaf soft counter against an exact walk of the
+            // post-demote tables. `Child::resident_new` credits only
+            // `dirty_bytes` — a node CREATED in memory (bulk load, insert
+            // traffic, CoW splits) never credits `resident_leaf_bytes`,
+            // while the demote debit above is unconditional, so a store
+            // built by writes drives the i64 counter permanently negative
+            // after its first demote-everything checkpoint. The `.max(0)`
+            // clamp then reads 0 forever: `due_mem` (the checkpointer's
+            // memory-budget trigger) and the fault-in budget wake in
+            // `PagedSource::read_node` both go structurally silent, so
+            // between interval ticks nothing ever demotes and the resident
+            // set grows unbounded under write load — kernel-swap thrash in
+            // any bounded-memory deployment. Re-basing the counter here
+            // (the walk touches only always-resident inner levels via
+            // `load_quiet` + `is_loaded` leaf checks — no fault-ins) makes
+            // fault-in credits start from an accurate floor each
+            // checkpoint; drift until the next reconcile is only the
+            // CoW-created leaves of the interval, and the store() racing a
+            // concurrent fault-in's fetch_add costs at most one
+            // NODE_BYTES of that bounded drift — this is a soft trigger,
+            // not an invariant.
+            let latest = inner.latest_version;
+            let resident: usize = inner.snapshots[&latest]
+                .tables
+                .iter()
+                .filter(|(n, _)| inner.registry.contains(n))
+                .map(|(_, t)| t.paged_resident_leaf_bytes())
+                .sum();
+            if let Some(p) = inner.paged.as_ref() {
+                p.stats
+                    .resident_leaf_bytes
+                    .store(resident as i64, Ordering::Relaxed);
+            }
         }
 
         // WAL prune — same call path as the row-format branch above,
