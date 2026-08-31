@@ -10835,4 +10835,138 @@ mod tests {
         }
         assert_eq!(t.get(101).map(String::as_str), Some("d101"));
     }
+    /// **The store-level representation assertion** (Task 5 review, warning
+    /// 3; Task 6). `tests/paged_block_leaves.rs` proves a paged table's
+    /// *values* survive every mutation; it cannot prove the leaves are still
+    /// **block**-backed afterwards, because nothing on the public surface
+    /// exposes a node's representation. This does, from inside the crate,
+    /// against a real `Store` -> `WriteTx` -> `Table` workload — which is
+    /// what drives the in-place (`_mut`) mutation family that Task 6 made
+    /// block-aware.
+    ///
+    /// Before Task 6 this failed with `block_leaves == 0`: `Child::make_mut`
+    /// ran the Task 4 `materialize()` stopgap, so the very first write to a
+    /// recovered leaf de-blocked it and the store gave the whole
+    /// memory-honesty win back on contact with a workload.
+    ///
+    /// `MultiWriter` for the reason `tests/paged_block_leaves.rs` documents:
+    /// the SingleWriter overlay (`src/overlay.rs`, cap 32) would buffer the
+    /// single-row writes and keep most of them out of the B-tree entirely.
+    ///
+    /// Deliberately no `insert_batch` in the workload: an auto-id bulk
+    /// append goes through `BulkBuilder`, which still builds all-Arc leaves
+    /// — that is Task 7's scope, and including it here would assert a
+    /// property this task does not yet own.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn paged_table_leaves_stay_block_backed_across_a_mixed_table_workload() {
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let open = || {
+            let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+                .paged(PagedOptions::builder().build())
+                .unwrap();
+            let s = Store::new(
+                StoreConfig::builder()
+                    .persistence(p)
+                    .writer_mode(WriterMode::MultiWriter)
+                    .build(),
+            )
+            .unwrap();
+            s.register_table_paged::<String>("rows").unwrap();
+            s
+        };
+        // `(leaves, block_leaves)` of the row tree in the latest snapshot.
+        // Faults in every leaf on the way, which is exactly what a workload
+        // read would do — a leaf still on disk comes back block-shaped from
+        // `NodeCodec::decode`, a resident one is reported as it stands.
+        let repr = |s: &Store| {
+            let r = s.begin_read(None).unwrap();
+            let t = r.open_table::<String>("rows").unwrap();
+            t.table.data_tree().leaf_representation()
+        };
+        let put = |s: &Store, k: u64, v: String| {
+            let mut w = s.begin_write(None).unwrap();
+            w.open_table::<String>("rows").unwrap().put(k, v).unwrap();
+            w.commit().unwrap();
+        };
+        let delete = |s: &Store, k: u64| {
+            let mut w = s.begin_write(None).unwrap();
+            w.open_table::<String>("rows").unwrap().delete(k).unwrap();
+            w.commit().unwrap();
+        };
+
+        {
+            let store = open();
+            {
+                let mut w = store.begin_write(None).unwrap();
+                let mut t = w.open_table::<String>("rows").unwrap();
+                for k in 0..2_000u64 {
+                    t.put(k, format!("v{k}")).unwrap();
+                }
+                w.commit().unwrap();
+            }
+            store.checkpoint().unwrap();
+        }
+
+        // Cold: every leaf comes back off `pages.bin` block-shaped.
+        let store = open();
+        store.recover().unwrap();
+        let (leaves, blocks) = repr(&store);
+        assert!(leaves > 8, "the tree must span many leaves, not one: {leaves}");
+        assert_eq!(blocks, leaves, "every recovered leaf starts block-backed");
+
+        // 1. Updates of existing keys — the O(1) `block[pos] = v` hot path.
+        for k in (0..2_000u64).step_by(37) {
+            put(&store, k, format!("u{k}"));
+        }
+        // 2. Inserts of new keys between existing ones — block rebuilds,
+        //    and enough of them (all in one narrow range) to force splits.
+        for k in 0..300u64 {
+            put(&store, 2_000 + k, format!("n{k}"));
+        }
+        // 3. Deletes clustered enough to drive underflow -> rotate -> merge.
+        for k in 300..1_500u64 {
+            delete(&store, k);
+        }
+
+        let (leaves, blocks) = repr(&store);
+        assert!(leaves > 8, "still a multi-leaf tree: {leaves}");
+        assert_eq!(
+            blocks, leaves,
+            "a Table workload must leave every data leaf block-backed ({blocks}/{leaves})"
+        );
+
+        // The values are right too, and stay right across a second
+        // checkpoint + recover of the mutated (block-rebuilt) leaves.
+        let expect = |s: &Store| {
+            let r = s.begin_read(None).unwrap();
+            let t = r.open_table::<String>("rows").unwrap();
+            assert_eq!(t.len(), 2_000 + 300 - 1_200);
+            for k in 0..2_000u64 {
+                let want = if (300..1_500).contains(&k) {
+                    None
+                } else if k % 37 == 0 {
+                    Some(format!("u{k}"))
+                } else {
+                    Some(format!("v{k}"))
+                };
+                assert_eq!(t.get(k).cloned(), want, "row {k}");
+            }
+            for k in 0..300u64 {
+                assert_eq!(t.get(2_000 + k).cloned(), Some(format!("n{k}")), "row {}", 2_000 + k);
+            }
+        };
+        expect(&store);
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let again = open();
+        again.recover().unwrap();
+        expect(&again);
+        let (leaves, blocks) = repr(&again);
+        assert_eq!(blocks, leaves, "re-encoded mutated leaves decode block-backed again");
+    }
 }

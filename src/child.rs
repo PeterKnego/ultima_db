@@ -319,27 +319,17 @@ impl<K: Clone, V> Child<K, V> {
     /// in first if it's on-disk. Always leaves the slot dirty (`NO_PAGE`):
     /// even an in-place edit of a uniquely-owned resident-clean node makes
     /// its contents diverge from the page it was loaded from.
+    ///
+    /// A block leaf is handed back **as a block leaf** (Task 6). Until the
+    /// in-place (`_mut`) mutation family became block-aware this ran the
+    /// Task 4 stopgap `BTreeNode::materialize` first, de-blocking every leaf
+    /// a write touched; every `&mut` consumer in the tree now keeps
+    /// `entries` and `block` in lockstep itself (I-A), so the stopgap — and
+    /// with it the sibling `make_mut_keep_block` that existed only to skip
+    /// it — is gone.
     pub(crate) fn make_mut(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         self.load(src);
-        self.make_mut_after_load(src, true)
-    }
-
-    /// Like [`Self::make_mut`], but leaves a block leaf **block-shaped**:
-    /// the caller takes responsibility for keeping I-A (entries and `block`
-    /// in lockstep) itself.
-    ///
-    /// The callers are the rebalance path — `btree`'s `rotate_right`,
-    /// `rotate_left`, `merge_with_left`, `merge_with_right` and the `absorb`
-    /// they feed — which rebuild the affected blocks rather than shifting
-    /// `entries` underneath an untouched block, so a rotation or merge of
-    /// block leaves yields block leaves (spec §4). Every other
-    /// `&mut` route still goes through the materializing
-    /// [`Self::make_mut`]/[`Self::make_mut_quiet`]; see
-    /// `BTreeNode::materialize`'s doc for that (Task 4) stopgap invariant
-    /// and its exceptions.
-    pub(crate) fn make_mut_keep_block(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
-        self.load(src);
-        self.make_mut_after_load(src, false)
+        self.make_mut_after_load(src)
     }
 
     /// Like [`Self::make_mut`], but for an already-resident node it does not
@@ -350,15 +340,13 @@ impl<K: Clone, V> Child<K, V> {
     /// any other fault — see [`Self::load_quiet`].
     pub(crate) fn make_mut_quiet(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         self.load_quiet(src);
-        self.make_mut_after_load(src, true)
+        self.make_mut_after_load(src)
     }
 
     /// Shared tail of [`Self::make_mut`]/[`Self::make_mut_quiet`]: the slot
     /// is already resident (by whichever load the caller used above); clone
-    /// it on write and mark it dirty. `materialize` de-blocks a block leaf
-    /// before handing it back (the Task 4 stopgap); `false` is the merge
-    /// path's block-preserving variant, see [`Self::make_mut_keep_block`].
-    fn make_mut_after_load(&mut self, src: Option<&dyn NodeSource<K, V>>, materialize: bool) -> &mut BTreeNode<K, V> {
+    /// it on write and mark it dirty.
+    fn make_mut_after_load(&mut self, src: Option<&dyn NodeSource<K, V>>) -> &mut BTreeNode<K, V> {
         let was_clean = self.page_id().is_some();
         let p = *self.node.get_mut();
         // SAFETY: caller already ensured residency (via `load`/`load_quiet`), so p is non-null.
@@ -406,19 +394,16 @@ impl<K: Clone, V> Child<K, V> {
             s.note_dirty(Self::NODE_BYTES);
         }
         // SAFETY: raw is the pointer just stored in `self.node`, non-null, uniquely owned by `arc`.
-        let node = unsafe { &mut *raw };
-        // Task 4 correctness stopgap — see `BTreeNode::materialize`'s doc:
-        // de-block in place before handing out a mutable reference, so the
-        // still-block-unaware in-place (`_mut`) family downstream (which
-        // shifts or removes `entries` with no awareness of `block`) never
-        // has to reason about a block leaf. A no-op for the overwhelmingly
-        // common non-block case (checked once, cheaply, inside
-        // `materialize`), and skipped entirely by `make_mut_keep_block`,
-        // whose callers handle blocks themselves.
-        if materialize {
-            node.materialize();
-        }
-        node
+        //
+        // Handed out exactly as it is: a block leaf stays a block leaf. Every
+        // caller that edits one — `btree`'s in-place `_mut` family and the
+        // shared rebalance path (`rotate_*`/`merge_*`/`absorb`) — rebuilds or
+        // stores into the block itself and so keeps I-A (`entries` and
+        // `block` in lockstep). Task 4's `materialize()` stopgap used to run
+        // here for the benefit of the then-block-unaware `_mut` family; Task
+        // 6 removed both it and the `make_mut_keep_block` variant that had to
+        // opt out of it.
+        unsafe { &mut *raw }
     }
 }
 
@@ -636,6 +621,11 @@ pub(crate) mod tests {
         for (i, k) in [1u64, 2].into_iter().enumerate() {
             assert_eq!(*n.value_at(i), k * 10, "block content unchanged by the in-place path");
         }
+        // Task 6: `make_mut` hands the block back *as a block*. Until the
+        // in-place (`_mut`) family became block-aware it ran the Task 4
+        // stopgap `BTreeNode::materialize` here and de-blocked the leaf on
+        // first write — right answers, no memory-honesty win.
+        assert!(n.block.is_some(), "make_mut must not de-block a block leaf");
         // `n`'s mutable borrow of `c` ends at its last use above; only now
         // can `c` be borrowed again (immutably) below.
         assert_eq!(disk.cloned.load(Ordering::Relaxed), 0, "no clone on the unique-owner path");
@@ -659,6 +649,7 @@ pub(crate) mod tests {
             assert_eq!(*node.value_at(i), k * 10, "the original (surviving) node is unmutated");
         }
         assert_eq!(disk.cloned.load(Ordering::Relaxed), 3, "one clone_value call per block entry");
+        assert!(c.load(Some(&disk)).block.is_some(), "the CoW'd copy is still a block leaf (Task 6)");
         assert_eq!(c.page_id(), None, "a CoW'd node is dirty");
         drop(node);
     }

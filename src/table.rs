@@ -960,6 +960,18 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// depending on whether a prior record exists at the key), and advances
     /// the auto-increment counter past the key on `AutoKey` tables so a later
     /// `insert` cannot reissue it. Used at commit by the per-key merge path.
+    /// The row tree, for crate-internal tests only.
+    ///
+    /// `store.rs`'s paged block-leaf tests need to walk the tree's *node
+    /// representation* (`BTree::leaf_representation`) after driving a real
+    /// `Table` workload — whether a leaf's values live in a block or behind
+    /// per-entry `Arc`s is deliberately invisible from outside the crate, so
+    /// that assertion cannot be made from `tests/`.
+    #[cfg(test)]
+    pub(crate) fn data_tree(&self) -> &BTree<K, R> {
+        &self.data
+    }
+
     pub(crate) fn upsert_arc(&mut self, key: K, arc: Arc<R>) -> Result<()> {
         // `upsert_arc` is the MultiWriter commit-merge helper
         // (`merge_keys_from`, which already debug_asserts the overlay is

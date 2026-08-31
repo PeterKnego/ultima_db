@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Task 5 equivalence oracle for value-block leaves (spec §8.1).
+//! Task 5/6 equivalence oracle for value-block leaves (spec §8.1).
 //!
 //! A paged table's leaves come back from `NodeCodec::decode` **block**-shaped
 //! (task 4): the values live inline in the node's `block`, not behind
@@ -12,17 +12,27 @@
 //! `checkpoint()` + reopen + `recover()`, which is what forces the *cold*
 //! reads back through freshly decoded block leaves.
 //!
-//! Scope note (why the interesting assertions live in two places): the
-//! representation half of Task 5 — "an immutable-path mutation of a block
-//! leaf produces a block leaf" — is asserted in `src/btree.rs`'s
-//! `btree::tests::block_leaves` module, which can walk `BTreeNode` and see
-//! whether `block` is `Some`; nothing on the public surface exposes that.
-//! `Table` also drives the *in-place* (`_mut`) family, not the immutable
-//! one, so what this file covers at store level is the shared rebalance
-//! code (`fix_underfull_child` -> `rotate_right`/`rotate_left` /
-//! `merge_with_left`/`merge_with_right` -> `absorb`), which Task 5 made
-//! block-preserving on both paths, plus the whole
-//! decode -> mutate -> encode -> decode round trip.
+//! Scope note (why the interesting assertions live in two places): whether
+//! a leaf is block-backed is invisible from outside the crate — no public
+//! API exposes it — so every *representation* assertion lives in a test
+//! module inside `src/`, and this file asserts behaviour (values) only.
+//! Since Task 6 the representation half is pinned at two levels:
+//!
+//! - `src/btree.rs`'s `btree::tests::block_leaves` — both mutation paths at
+//!   `BTree` level, plus the exact `clone_value` counts that pin spec §4's
+//!   one-pass rule;
+//! - `src/store.rs`'s
+//!   `paged_table_leaves_stay_block_backed_across_a_mixed_table_workload` —
+//!   the end-to-end claim, that a real `Store`/`Table` workload over a
+//!   recovered paged table leaves **every** data leaf block-backed. That is
+//!   the store-level assertion Task 5's review asked for (warning 3) and
+//!   what this file cannot make.
+//!
+//! `Table` drives the in-place (`_mut`) mutation family, which Task 6 made
+//! block-aware, plus the rebalance code it shares with the immutable path
+//! (`fix_underfull_child` -> `rotate_right`/`rotate_left` /
+//! `merge_with_left`/`merge_with_right` -> `absorb`, block-preserving since
+//! Task 5) — and the whole decode -> mutate -> encode -> decode round trip.
 //!
 //! `WriterMode::MultiWriter` throughout, for the reason
 //! `tests/paged_write_after_recover.rs` documents: the SingleWriter write
@@ -249,4 +259,38 @@ fn deleting_a_recovered_tree_down_through_merges_matches_the_oracle() {
     let again = reopen_and_recover(dir.path());
     assert_tables_equal(&again, &plain, "after recover of the merged tree");
     assert_eq!(dump(&again).len(), 200);
+}
+
+/// Deterministic companion aimed at the in-place **update** hot path
+/// (Task 6): every key of a recovered, block-shaped table is overwritten,
+/// twice, one transaction at a time. A `block[pos] = v` store that used the
+/// wrong slot — the failure mode a rebuild-based path cannot have, and the
+/// one an op-mix proptest only hits by luck — shows up here as a value
+/// mismatch on a *neighbouring* key, and survives into the next checkpoint.
+#[test]
+fn updating_every_key_of_a_recovered_tree_in_place_matches_the_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = plain_store();
+    let ops: Vec<Op> = (0..800u64).map(|k| Op::Put(k, k)).collect();
+    {
+        let paged = paged_store(dir.path());
+        apply_ops(&paged, &ops);
+        apply_ops(&plain, &ops);
+        paged.checkpoint().unwrap();
+    }
+    let s = reopen_and_recover(dir.path());
+    assert_tables_equal(&s, &plain, "after recover");
+
+    for round in 1..=2u64 {
+        let updates: Vec<Op> = (0..800u64).map(|k| Op::UpdateIfPresent(k, k + round * 1_000)).collect();
+        apply_ops(&s, &updates);
+        apply_ops(&plain, &updates);
+        assert_tables_equal(&s, &plain, "after in-place update round");
+    }
+
+    s.checkpoint().unwrap();
+    drop(s);
+    let again = reopen_and_recover(dir.path());
+    assert_tables_equal(&again, &plain, "after recover of the updated tree");
+    assert_eq!(dump(&again), (0..800u64).map(|k| (k, k + 2_000)).collect::<Vec<_>>());
 }
