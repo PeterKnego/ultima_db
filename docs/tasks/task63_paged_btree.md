@@ -241,3 +241,100 @@ out-of-bounds-range defense — included here for completeness).
 `src/registry.rs`, `src/metrics.rs`, `src/lib.rs`, `src/error.rs`, `src/mutation.rs` — plus the
 `tests/paged_*.rs` suite (§9), `CLAUDE.md`, `README.md`, and this file. Base `2a74c3d` (plan
 commit) through `f17aa88` (Task 13 head) for Tasks 1–13; Task 14's own commit follows this file.
+
+## Measured (Task 15 gates, local)
+
+Regression gates run 2026-08-30/31 at HEAD `53ab598` (branch `feat/paged-btree`), on the Claude
+sandbox host — not the NVMe bench host. Every number below is **local, ±2×, sanity only** per
+the repo's bench A/B methodology; none of it is a "faster/slower" conclusion and none of it
+re-records a committed baseline.
+
+### `make perf/check` — FAIL (environmental, not a code regression call)
+
+- `smr-apply-microbench`: **PASS** — "perf check OK (10 metrics within tolerance)".
+- `mw-commit-microbench`: **FAIL** — 2 of 7 gated metrics outside tolerance:
+  - `mw_scaling_8x`: 26103.4 vs baseline 13316.2 (+96.0%)
+  - `mw_scaling_efficiency`: 0.7 vs baseline 0.4 (+60.8%)
+  - The other 5 metrics on this task (`mw_commit_p99_ns`, `mw_commit_throughput`,
+    `mw_conflict_rate`, `mw_disjoint_throughput`, `read_p99_under_load_ns`) were within tolerance.
+- The baseline file (`autobench/baselines/multiwriter-commit.json`) carries its own note, verbatim:
+  "NVMe-host values: `make perf/check` on the noisy virtualized sandbox WILL fail by design
+  (different host shape, not a regression) — re-record locally with `make perf/baseline` if you
+  need a sandbox gate." Baseline was recorded 2026-07-26 on an AWS c6id.2xlarge NVMe host at
+  `b48295e`, unrelated to this feature branch. Per task rules, this FAIL is reported as-is; no
+  baseline was re-recorded and no code was changed to chase it. Re-run on the NVMe bench host
+  (`bench-infra/`) is the only way to get a trustworthy verdict on this cell.
+
+### `cargo bench --bench btree_get_bench` / `btree_insert_mut_bench` — HEAD `53ab598` vs base `2a74c3d`, local, ±2×, sanity only
+
+Base built in a worktree (`git worktree add .../base-wt 2a74c3d`) against the same shared
+`CARGO_TARGET_DIR`; criterion's own baseline mechanism (HEAD run saved first, base run compared
+against it) cross-checks the manually-computed deltas below and agrees in direction throughout.
+
+**`btree_get_bench`** (random-key `get`, median times):
+
+| bench | HEAD `53ab598` | base `2a74c3d` | delta (base→HEAD) |
+|---|---|---|---|
+| get_random/get/100000 | 3.6272 ms (27.57 Melem/s) | 4.2364 ms (23.61 Melem/s) | HEAD ~14% faster |
+| get_random/get/1000000 | 99.965 ms (10.00 Melem/s) | 112.67 ms (8.88 Melem/s) | HEAD ~11% faster (criterion: not statistically significant, p=0.11, high sample variance/outliers on both sides) |
+
+**`btree_insert_mut_bench`** (median times; `immutable` = CoW `insert`, `in_place` = mutable
+fast-path append):
+
+| bench | HEAD `53ab598` | base `2a74c3d` | delta (base→HEAD) |
+|---|---|---|---|
+| insert_ascending/immutable/1000 | 874.08 µs | 864.42 µs | HEAD ~1% slower |
+| insert_ascending/immutable/100000 | 224.15 ms | 211.72 ms | HEAD ~6% slower |
+| insert_ascending/immutable/1000000 | 2.7518 s | 2.5860 s | HEAD ~6% slower |
+| insert_ascending/in_place/1000 | 55.632 µs | 61.288 µs | HEAD ~9% faster |
+| insert_ascending/in_place/100000 | 8.1611 ms | 8.6384 ms | HEAD ~6% faster |
+| insert_ascending/in_place/1000000 | 98.859 ms | 103.97 ms | HEAD ~5% faster |
+| insert_random/immutable/1000 | 856.29 µs | 884.99 µs | HEAD ~3% faster |
+| insert_random/immutable/100000 | 200.56 ms | 195.24 ms | HEAD ~3% slower |
+| insert_random/immutable/1000000 | 3.0024 s | 2.8542 s | HEAD ~5% slower |
+| insert_random/in_place/1000 | 65.310 µs | 130.56 µs | HEAD ~50% faster |
+| insert_random/in_place/100000 | 10.769 ms | 17.270 ms | HEAD ~38% faster |
+| insert_random/in_place/1000000 | 230.92 ms | 294.09 ms | HEAD ~21% faster |
+| insert_mixed_snapshot/immutable/100000 | 224.35 ms | 212.04 ms | HEAD ~6% slower |
+| insert_mixed_snapshot/immutable/1000000 | 2.7496 s | 2.5909 s | HEAD ~6% slower |
+| insert_mixed_snapshot/in_place/100000 | 7.5229 ms | 8.1925 ms | HEAD ~8% faster |
+| insert_mixed_snapshot/in_place/1000000 | 96.398 ms | 100.59 ms | HEAD ~4% faster |
+
+Shape observed (local, sanity only): the `in_place` mutable fast-path is consistently faster at
+HEAD than at the pre-feature base across every size — the `insert_random/in_place` column lands
+in the +21%..+50% range, consistent with the brief's "Task 2b recovered +21-28%" signal at the
+100k/1M sizes. The `immutable`/CoW path shows the opposite shape at 100k/1M sizes — consistently
+~3-6% slower at HEAD than base, plausibly the `Child` indirection/page-bookkeeping overhead the
+paged-btree feature adds to the CoW path; at the 1000-row size the immutable delta is small and
+sign-mixed. None of this is a "regression" claim — it is a same-host, same-run-order shape
+comparison at ±2× sandbox noise, offered as a sanity check, not a verdict.
+
+### `formal/scripts/check-cites.py` and `formal/scripts/check-drift.sh` — both PASS
+
+- `check-cites.py`: "cite-check: all anchors verified — ok." (66 distinct `src/*.rs` anchors, 66
+  manifest rows, cited sources `src/persistence.rs`, `src/store.rs`, `src/wal.rs`). No re-anchoring
+  was needed.
+- `check-drift.sh`: "formal drift-check: src/btree.rs src/persistence.rs src/store.rs src/wal.rs
+  and formal/ both changed — ok."
+
+### `make consistency/elle` — PASS (java available)
+
+All three history classes (point, scan-ratio 0.5, predicate-ratio 0.5/4 buckets) passed under
+both SI and Serializable isolation: known-bad write-skew fixture correctly rejected under
+serializable / accepted under SI; SI histories satisfy snapshot-isolation with anomalies ⊆
+{G2-item} (write skew only, nothing worse); SSI histories satisfy serializable with no anomaly
+types. "elle consistency check passed" printed three times (once per history class).
+
+### Full suite — all PASS
+
+| suite | result |
+|---|---|
+| `cargo test` | ok, 0 failed across all ~30 unit+integration binaries (677 lib unit tests + all integration suites) |
+| `cargo test --features persistence` | ok, 0 failed — identical binary/test-count set to plain `cargo test`, because workspace-wide feature unification already activates `ultima-db/persistence` for the plain run (`bench_workloads`, `compare_benches`, and `autobench` all depend on `ultima-db` with `features=["persistence"]`, and `cargo test` at the workspace root builds/tests all members together) |
+| `cargo test --features persistence,mutation-testing` | ok, 0 failed — 682 lib unit tests (5 more than the base runs) plus the mutation-testing-only integration tests activate |
+| `cargo test --features persistence,metrics` | ok, 0 failed |
+| `cargo test -p ultima-vector` | ok, 0 failed (60 unit + doctest + integration suites, including `results_stay_inside_filter`) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | clean, zero warnings/errors — `--all-features` (including `wal-iouring`) built and checked without conflict, so no fallback to the four documented configs was needed |
+| `cargo bench --no-run -p compare-benches` | compiles clean — all YCSB/SmallBank/paging_matrix bench binaries built |
+
+No test failures were encountered at any point in this task; nothing was patched.
