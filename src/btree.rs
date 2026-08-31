@@ -470,10 +470,17 @@ impl<K, V> BTreeNode<K, V> {
         match &self.block {
             None => self.clone(),
             Some(b) => {
-                let src = src.expect("I-B: block leaf on a sourceless tree");
+                // I-B says block leaves exist only on a *cloning* source, not
+                // merely that this call site passed one — a caller (e.g.
+                // `demote_leaves`) may legitimately pass `src: None` on a
+                // sourced tree when it knows the node it's CoW-ing can't be a
+                // block leaf. Landing here with `None` (or a `Some` whose
+                // `clone_value` returns `None`) means that promise was broken
+                // for *this* node specifically.
+                let src = src.expect("block leaf requires a source to clone values");
                 let block: Box<[V]> = b
                     .iter()
-                    .map(|v| src.clone_value(v).expect("I-B: block leaf on a non-cloning source"))
+                    .map(|v| src.clone_value(v).expect("block leaf requires a source to clone values"))
                     .collect();
                 BTreeNode { entries: self.entries.clone(), children: self.children.clone(), block: Some(block) }
             }
@@ -1039,6 +1046,11 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 // data — it's bookkeeping, not a write — and
                 // `restore_unchanged_ids` gives the id back afterward if
                 // nothing actually changed.
+                // `None` is safe here specifically because `depth == 1` means
+                // `slot` is a leaf's *parent* (an inner node) — the loop below
+                // only ever demotes its `children` (the leaves) by page id,
+                // never CoWs a leaf itself. `make_mut(None)` must never reach
+                // a block leaf (see I-B / `BTreeNode::clone_with`).
                 let n = slot.make_mut(None);
                 for c in n.children.iter_mut() {
                     if let (true, Some(id)) = (c.is_loaded(), c.page_id()) {
@@ -1055,6 +1067,9 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                 return *left == 0;
             }
             slot.load(src); // ensure resident; may fault a never-visited branch
+            // `None` is safe here for the same reason as the depth == 1 arm
+            // above: `depth > 1` means `slot` is an internal node, never a
+            // leaf, so this CoW can never reach a block leaf.
             let n = slot.make_mut(None);
             for c in n.children.iter_mut() {
                 if go(c, depth - 1, src, cursor, left, demoted, last) {

@@ -342,14 +342,41 @@ impl<K: Clone, V> Child<K, V> {
         let was_clean = self.page_id().is_some();
         let p = *self.node.get_mut();
         // SAFETY: caller already ensured residency (via `load`/`load_quiet`), so p is non-null.
-        let mut arc = unsafe { Arc::from_raw(p) };
-        // `Arc::make_mut` would clone through plain `Clone`, which cannot
-        // duplicate a value block (no `V: Clone` bound on the tree) — go
-        // through `clone_with`, which routes block values via the source.
-        if Arc::get_mut(&mut arc).is_none() {
-            arc = Arc::new(arc.clone_with(src));
-        }
-        let raw = Arc::into_raw(arc) as *mut BTreeNode<K, V>;
+        // Held in `ManuallyDrop` so an unwind out of either clone below cannot
+        // release the strong count that `self.node`'s pointer (still `p` at
+        // that point) nominally owns — dropping it here *and* again in
+        // `Child::drop` would be a double free. `clone_with`'s block branch
+        // can panic (I-B violation via a non-cloning source), and even the
+        // non-block `Arc::make_mut` branch calls caller-supplied `K::Clone`,
+        // which is not guaranteed panic-free.
+        let mut arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(p) });
+        let raw = if arc.block.is_none() {
+            // Non-block node: unchanged from the pre-Value<V> code — `Arc::make_mut`
+            // clones (iff shared) directly into the fresh allocation instead of
+            // building a whole `BTreeNode` on the stack first. `Arc::make_mut`
+            // leaves `*arc` valid and still owning its count if the inner clone
+            // panics, so it composes with the `ManuallyDrop` guard exactly like
+            // the block branch below.
+            Arc::make_mut(&mut arc); // clones iff shared; no-op (in place) if unique
+            Arc::into_raw(std::mem::ManuallyDrop::into_inner(arc)) as *mut BTreeNode<K, V>
+        } else if Arc::get_mut(&mut arc).is_some() {
+            // Unique owner (block leaf included): mutate in place, pointer identity preserved.
+            //
+            // NOTE: `Arc::get_mut(..).is_some()` is not exactly `Arc::make_mut`'s
+            // uniqueness condition — they diverge when `strong == 1 && weak > 1`
+            // (`make_mut` moves into a fresh allocation without cloning; `get_mut`
+            // returns `None` here, so this falls into the clone branch below).
+            // Unobservable today: nothing in this crate ever creates a
+            // `Weak<BTreeNode<K, V>>`. Worth revisiting if that ever changes.
+            Arc::into_raw(std::mem::ManuallyDrop::into_inner(arc)) as *mut BTreeNode<K, V>
+        } else {
+            // Shared block leaf: plain `Clone` can't duplicate a value block
+            // (no `V: Clone` bound on the tree) — go through `clone_with`,
+            // which routes block values via the source.
+            let fresh = Arc::new(arc.clone_with(src)); // may panic; `arc` is not dropped if it does
+            drop(std::mem::ManuallyDrop::into_inner(arc)); // release the slot's old share, exactly once
+            Arc::into_raw(fresh) as *mut BTreeNode<K, V>
+        };
         *self.node.get_mut() = raw;
         // Whether cloned or edited in place, the contents now diverge from the page.
         *self.meta.get_mut() = (*self.meta.get_mut() & ACCESSED) | NO_PAGE;
@@ -413,8 +440,14 @@ pub(crate) mod tests {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let pages = self.pages.lock().unwrap();
             let n = pages.get(&id).ok_or_else(|| crate::Error::Persistence(format!("no page {id}")))?;
-            // A fresh Arc, like a real decode.
-            Ok(Arc::new((**n).clone()))
+            // A fresh Arc, like a real decode. Goes through `clone_with`
+            // (not plain `Clone`) so a block leaf can be faulted in from
+            // "disk" too — a real decode never clones at all (it builds a
+            // fresh node straight from bytes), but reusing `clone_with` is
+            // the simplest faithful "fresh copy" this mock needs; for a
+            // non-block node it's exactly the old plain-`Clone` behavior
+            // (`clone_with`'s `None` branch is `self.clone()`).
+            Ok(Arc::new(n.clone_with(Some(self))))
         }
         fn note_dirty(&self, bytes: usize) {
             self.dirty_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -568,6 +601,11 @@ pub(crate) mod tests {
         let before_ptr = c.load(Some(&disk)) as *const _;
         let n = c.make_mut(Some(&disk));
         assert_eq!(n as *const _, before_ptr, "unique owner: in place");
+        for (i, k) in [1u64, 2].into_iter().enumerate() {
+            assert_eq!(*n.value_at(i), k * 10, "block content unchanged by the in-place path");
+        }
+        // `n`'s mutable borrow of `c` ends at its last use above; only now
+        // can `c` be borrowed again (immutably) below.
         assert_eq!(disk.cloned.load(Ordering::Relaxed), 0, "no clone on the unique-owner path");
         assert_eq!(c.page_id(), None);
     }
@@ -584,7 +622,96 @@ pub(crate) mod tests {
         let mut c: Child<u64, u64> = Child::resident(node.clone()); // `node` is the second owner
         let n = c.make_mut(Some(&disk));
         assert_ne!(n as *const _, before_ptr, "shared owner: cloned, not mutated in place");
+        for (i, k) in [1u64, 2, 3].into_iter().enumerate() {
+            assert_eq!(*n.value_at(i), k * 10, "cloned block preserves values and order");
+            assert_eq!(*node.value_at(i), k * 10, "the original (surviving) node is unmutated");
+        }
         assert_eq!(disk.cloned.load(Ordering::Relaxed), 3, "one clone_value call per block entry");
+        assert_eq!(c.page_id(), None, "a CoW'd node is dirty");
+        drop(node);
+    }
+
+    #[test]
+    fn make_mut_shared_block_leaf_on_disk_marks_dirty() {
+        // The `was_clean -> note_dirty` tail (already covered for a plain
+        // node by `make_mut_on_shared_node_clones_and_marks_dirty`) must
+        // fire for a block leaf too.
+        let disk = MockDisk::new();
+        disk.put(1, block_leaf(&[1, 2, 3]));
+        let mut c: Child<u64, u64> = Child::on_disk(1);
+        c.load(Some(&disk));
+        // `MockDisk::read_node`'s own "fresh decode" simulation goes through
+        // `clone_with` too (see its comment), so faulting in already cost 3
+        // `clone_value` calls; only the delta from here on is the CoW's cost.
+        let cloned_before_cow = disk.cloned.load(Ordering::Relaxed);
+        let keep = c.load_arc(Some(&disk)); // second owner: forces the clone branch
+        let n = c.make_mut(Some(&disk));
+        for (i, k) in [1u64, 2, 3].into_iter().enumerate() {
+            assert_eq!(*n.value_at(i), k * 10);
+        }
+        assert_eq!(keep.entries.len(), 3, "old owner unaffected");
+        assert!(disk.dirty_bytes.load(Ordering::Relaxed) > 0, "was_clean -> note_dirty must fire for a block leaf");
+        assert_eq!(
+            disk.cloned.load(Ordering::Relaxed) - cloned_before_cow,
+            3,
+            "one clone_value call per block entry during the CoW"
+        );
+        assert_eq!(c.page_id(), None, "a CoW'd node is dirty");
+    }
+
+    #[test]
+    fn make_mut_quiet_shared_block_leaf_clones_via_source() {
+        // `make_mut_quiet` is used by `BulkBuilder`'s right-spine fix-up
+        // (`btree.rs:2886`-ish) — it must also route a shared block leaf CoW
+        // through `clone_with`, not `Arc::make_mut`, same as `make_mut`.
+        let disk = MockDisk::new();
+        let node = block_leaf(&[5, 6]);
+        let before_ptr = Arc::as_ptr(&node);
+        let mut c: Child<u64, u64> = Child::resident(node.clone()); // `node` is the second owner
+        assert!(!c.take_accessed(), "resident starts with the accessed bit clear");
+        let n = c.make_mut_quiet(Some(&disk));
+        assert_ne!(n as *const _, before_ptr, "shared owner: cloned via source");
+        for (i, k) in [5u64, 6].into_iter().enumerate() {
+            assert_eq!(*n.value_at(i), k * 10);
+        }
+        assert_eq!(disk.cloned.load(Ordering::Relaxed), 2, "one clone_value call per block entry");
+        assert!(
+            !c.take_accessed(),
+            "make_mut_quiet must not mark accessed on an already-resident node"
+        );
+        drop(node);
+    }
+
+    #[test]
+    fn make_mut_panic_during_clone_with_does_not_double_free() {
+        // Regression for the double-free the pre-`ManuallyDrop`
+        // `make_mut_after_load` had (found in review of this task): a
+        // `NodeSource` that violates I-B — holds a block leaf but its
+        // `clone_value` returns `None` (the trait default, left unwired
+        // here on purpose) — makes `clone_with` panic mid-clone. Before the
+        // `ManuallyDrop` guard, that panic-unwind released the slot's strong
+        // count early and the drops below then double-freed it (observed as
+        // glibc "corrupted double-linked list", SIGABRT, killing the whole
+        // test process rather than failing this one test). After the fix,
+        // the panic is just a panic: both drops below run cleanly and this
+        // test passes.
+        struct NonCloningDisk;
+        impl NodeSource<u64, u64> for NonCloningDisk {
+            fn read_node(&self, _id: PageId) -> crate::Result<Arc<BTreeNode<u64, u64>>> {
+                unreachable!("not exercised by this test")
+            }
+            // `clone_value` intentionally left at the trait default (`None`).
+        }
+        let disk = NonCloningDisk;
+        let node = block_leaf(&[1, 2]);
+        let mut c: Child<u64, u64> = Child::resident(node.clone()); // second owner: forces the clone branch
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.make_mut(Some(&disk));
+        }));
+        assert!(result.is_err(), "must panic: I-B violated (non-cloning source holds a block leaf)");
+        // Neither drop below must double-free: `c`'s slot still owns exactly
+        // its one legitimate share of the original node; `node` owns the other.
+        drop(c);
         drop(node);
     }
 
