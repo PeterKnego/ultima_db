@@ -307,3 +307,43 @@ fn no_budget_never_demotes() {
     s.checkpoint().unwrap();
     assert_eq!(s.paged_stats().unwrap().leaves_demoted, 0);
 }
+
+/// F1 regression (spike/paged-write-path, fixed in `checkpoint_impl_paged`'s
+/// reconciliation): a store BUILT BY WRITES never credits
+/// `resident_leaf_bytes` at node creation, while the demote debit is
+/// unconditional — pre-fix, a demote-everything checkpoint drove the i64
+/// counter hugely negative, the `.max(0)` clamp reported 0, and every later
+/// fault-in credited from that negative base: the estimate stayed 0 forever
+/// and the memory-budget trigger (`due_mem`) plus the fault-in budget wake
+/// were structurally dead. The checkpoint-end reconciliation re-bases the
+/// counter from the exact per-table walk, so fault-ins after full demotion
+/// must RAISE the estimate above zero.
+#[test]
+fn refaulted_leaves_raise_resident_estimate_after_full_demotion() {
+    let dir = tempfile::tempdir().unwrap();
+    // Budget large enough that the test's own fault-ins never cross it (no
+    // background checkpointer wake racing the final assertion) — the budget
+    // being `Some` is what makes each `checkpoint()` run its demote pass.
+    let s = store_with(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(1 << 30).build(),
+    );
+    write_rows(&s, 2_000); // batch build: no accessed bits (see write_rows doc)
+    s.checkpoint().unwrap(); // demotes every quiet leaf (all of them)
+    s.checkpoint().unwrap(); // sweep any stragglers
+    let est0 = s.paged_stats().unwrap().resident_leaf_bytes_est;
+    assert_eq!(est0, 0, "fully demoted tree must report 0 resident leaf bytes");
+
+    // Fault a spread of distinct leaves back in.
+    let r = s.begin_read(None).unwrap();
+    let t = r.open_table::<Row>("rows").unwrap();
+    for k in (1..2_000u64).step_by(100) {
+        assert!(t.get(k).is_some(), "key {k} missing");
+    }
+    let est1 = s.paged_stats().unwrap().resident_leaf_bytes_est;
+    assert!(
+        est1 > 0,
+        "refaulted leaves must raise the resident estimate (pre-F1-fix it \
+         stayed clamped at 0 off a negative-saturated counter): est1={est1}"
+    );
+}
