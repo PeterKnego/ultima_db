@@ -1324,7 +1324,7 @@ fn resident_table_never_demotes() {
   // backstop so no configuration leaves every checkpointer trigger structurally false (see
   // spec §8's "checkpoint_interval default" note); PagedOptionsBuilder::checkpoint_interval_disabled()
   // opts back out to None.
-  impl Persistence { pub fn paged(self, opts: PagedOptions) -> Self; pub(crate) fn paged_opts(&self) -> Option<&PagedOptions>; }
+  impl Persistence { pub fn paged(self, opts: PagedOptions) -> Result<Self>; pub(crate) fn paged_opts(&self) -> Option<&PagedOptions>; }
   // Persistence::Standalone / Smr gain a field `paged: Option<PagedOptions>` (non_exhaustive, so additive)
   // StoreInner gains `paged: Option<PagedState>` where
   pub(crate) struct PagedState { pub file: Arc<PageFile>, pub stats: Arc<PagedStats>, pub opts: PagedOptions, pub last_root: Option<(Arc<Snapshot>, u64 /*version*/)>, pub last_checkpoint_at: Instant }

@@ -13,11 +13,6 @@ use crate::{Error, Result};
 /// What a page's payload holds. Distinguishes the paged B-tree's four leaf/
 /// inner shapes (data tree vs. an index's own tree) so `read` can hand back
 /// the right decoder without a second lookup.
-// No production caller yet — this is the first, tree-independent task of the
-// disk layer (see the module doc); the paged B-tree's checkpoint writer and
-// `NodeSource` reader are later tasks in this stage. Exercised today by this
-// module's own unit tests.
-#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PageKind {
@@ -44,27 +39,23 @@ impl TryFrom<u8> for PageKind {
 /// Fixed-width and CRC'd separately from the payload so a torn/garbage tail
 /// (recovery re-appending over a crash-truncated `pages.bin`) is detected
 /// without reading past the declared length.
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 pub(crate) const PAGE_HEADER_LEN: usize = 12;
 /// The only page format this build writes or reads; a mismatch here means a
 /// future on-disk layout this binary doesn't understand, not corruption.
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 pub(crate) const PAGE_FMT_V1: u8 = 1;
 
 /// Upper bound on a page's payload, checked in `read` before trusting a
 /// decoded `payload_len` enough to allocate for it. Keys are capped at 64
 /// KiB by `check_encoded_key_len`; a node beyond 64 MiB is a corruption
 /// signal, not a workload — one constant, one place to change.
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 pub(crate) const MAX_PAGE_BYTES: usize = 64 << 20;
 
 /// The mutable append state, behind one `Mutex` so concurrent `append`s
-/// serialize on the single write cursor (reads never take this lock).
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
+/// serialize on the single write cursor. Reads take this lock too, but only
+/// briefly — a `capacity` snapshot to bound-check a decoded `payload_len`
+/// against the file's known physical extent (`read`/`read_len`) — not for
+/// the read itself; the comment this superseded ("reads never take this
+/// lock") predated that bound-check being added (I-4, final-review wave).
 struct WriteHead {
     /// Next byte offset to write at == this page file's logical end.
     cursor: u64,
@@ -78,8 +69,6 @@ struct WriteHead {
 /// are never moved, so an id stays valid for the file's lifetime (until a
 /// hole is punched under it, at which point re-reading it is a bug in the
 /// caller, not in `PageFile`).
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 pub(crate) struct PageFile {
     file: File,
     w: Mutex<WriteHead>,
@@ -95,15 +84,10 @@ pub(crate) struct PageFile {
 
 /// The fixed on-disk filename inside a store's persistence directory,
 /// matching `wal.bin`/`checkpoint-*.bin`'s sibling-file convention.
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 pub(crate) fn page_file_path(dir: &Path) -> PathBuf {
     dir.join("pages.bin")
 }
 
-// No production caller yet — see the `PageKind` note above; applies to
-// every method below.
-#[allow(dead_code)]
 impl PageFile {
     /// Open (creating if absent) the page file at `path`. `cursor` is the
     /// logical write head to resume at — 0 for a fresh file, or the last
@@ -321,8 +305,6 @@ impl PageFile {
 /// read can return fewer bytes than requested even short of EOF) and
 /// `Interrupted` errors. `page_id` is only for the error message. Returns
 /// the number of bytes actually read (< `buf.len()` at EOF).
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 fn read_fully_at(f: &File, buf: &mut [u8], mut off: u64, page_id: PageId) -> Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -342,8 +324,6 @@ fn read_fully_at(f: &File, buf: &mut [u8], mut off: u64, page_id: PageId) -> Res
 /// Advise the OS this file is read randomly (pages are fetched by id, not
 /// scanned sequentially), disabling readahead that would otherwise waste
 /// I/O on a workload with no locality.
-// No production caller yet — see the `PageKind` note above.
-#[allow(dead_code)]
 fn fadvise_random(f: &File) {
     use std::os::fd::AsRawFd;
     // SAFETY: plain syscall on our own open fd; a failed hint is harmless.

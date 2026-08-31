@@ -35,12 +35,20 @@ summary; this doc is the design-decision and review record.
   is inert in paged mode (`Store::checkpoint_impl` branches to `checkpoint_impl_paged` before the
   knob is ever read; `tests/paged_config.rs::checkpoint_chain_max_is_inert_in_paged_mode` pins
   this).
-- **Panic-on-fault.** A corrupt or unreadable on-disk page found during fault-in **panics** rather
-  than returning `Err` — the same lazy-read contract every paged read follows (`Child::load`'s
-  doc, `TableWriter::define_persisted_index`'s doc). A `Result`-returning fault-in would push the
-  decision of "what does a caller do with a corrupt B-tree node mid-traversal" onto every read
-  call site in the crate; the design instead treats on-disk corruption the same as an in-memory
-  invariant violation elsewhere in the B-tree (panic, not propagate).
+- **Panic-on-fault for LAZY reads; `Err` for EAGER loads (revised, final-review wave I-1).** A
+  corrupt or unreadable on-disk page found during a workload-triggered fault-in (`Child::load`/
+  `load_quiet`, a leaf a read actually touches) still **panics** rather than returning `Err` — a
+  `Result`-returning fault-in would push the decision of "what does a caller do with a corrupt
+  B-tree node mid-traversal" onto every read call site in the crate, and there is no
+  `Result`-returning path through the B-tree's existing `&V`-returning API to propagate one
+  anyway. But `recover()`'s and index-attach's EAGER loads — `Table::from_paged_entry`'s inner-
+  level fault-in and `UniqueStorage`/`NonUniqueStorage::from_root_page`'s full-tree fault-in,
+  which run once, up front, with a `Result`-returning signature already in hand — return `Err`
+  instead: `Child::try_load` (sharing `fault_in`'s body) backs `BTree::try_load_inner_levels`/
+  `try_load_all`, and a corrupt page there fails `recover()`/`define_persisted_index` cleanly
+  rather than crashing the process on startup. The infallible `load_inner_levels`/`load_all`
+  remain for paths that run *after* a paged store has already recovered successfully (index
+  `paged_reachable_ids`'s residency re-assertion), where the invariant is already known to hold.
 - **Demotion is a same-version re-publish, not a new commit.** `Store::install_paged_tables`
   swaps a table's `Arc` into the *current* `latest_version`'s snapshot — no WAL entry, no
   write-set bookkeeping, no version bump. `Store::demote_pass`, `Store::checkpoint_impl_paged`'s
@@ -186,6 +194,14 @@ record; summarized by theme rather than reproduced line-for-line:
   "reclaim doesn't happen," never to a live page being punched or data being lost.
 - **Style-only**: a missing `pub(crate)` on one module declaration, an `allow(too_many_arguments)`,
   a couple of unused-but-documented accessor methods.
+- **`fanout-t8` cross-build portability (final-review wave, I-2(b))**: paged mode composes with
+  `fanout-t8` *within a build* — a `pages.bin` written under one fanout setting is not portable
+  across the flag. Reading a T=32-written page file with a `fanout-t8` build (or vice versa) is
+  undiagnosed today: `NodeCodec::decode`'s entry-count bound-check (I-2(a)) turns an
+  over-capacity node into a clean `CheckpointCorrupted` `Err` rather than a `FixedVec::push`
+  panic, but nothing yet detects the *mismatch itself* up front or names it in the error. Stamping
+  the build's fanout (`T`) in the root record so `recover()` can refuse a fanout mismatch by name
+  is a planned follow-up, not yet scheduled.
 
 None of these block Task 15/16 — they are recorded here as the place a future cleanup pass would
 start, per this task's brief.

@@ -74,17 +74,11 @@ impl<K, V> Clone for NodeCodec<K, V> {
 /// Build an `Error::CheckpointCorrupted` naming the byte offset a decode
 /// failed at — every truncation/overrun path below goes through this so a
 /// malformed payload is always an `Err`, never a panic or an OOB read.
-// No production caller yet — these are `NodeCodec::decode`'s internals, and
-// that has no production caller yet either (see the note on the impl block
-// below). Exercised today by this module's own unit tests.
-#[allow(dead_code)]
 fn corrupt(offset: usize, what: &str) -> Error {
     Error::CheckpointCorrupted(format!("page payload: {what} truncated at offset {offset}"))
 }
 
 /// Read a little-endian `u16` at `*at`, advancing `*at` past it.
-// No production caller yet — see `corrupt` above.
-#[allow(dead_code)]
 fn read_u16(buf: &[u8], at: &mut usize) -> Result<u16> {
     let end = at.checked_add(2).ok_or_else(|| corrupt(*at, "u16 field"))?;
     let bytes: [u8; 2] = buf.get(*at..end).ok_or_else(|| corrupt(*at, "u16 field"))?.try_into().unwrap();
@@ -93,8 +87,6 @@ fn read_u16(buf: &[u8], at: &mut usize) -> Result<u16> {
 }
 
 /// Read a little-endian `u32` at `*at`, advancing `*at` past it.
-// No production caller yet — see `corrupt` above.
-#[allow(dead_code)]
 fn read_u32(buf: &[u8], at: &mut usize) -> Result<u32> {
     let end = at.checked_add(4).ok_or_else(|| corrupt(*at, "u32 field"))?;
     let bytes: [u8; 4] = buf.get(*at..end).ok_or_else(|| corrupt(*at, "u32 field"))?.try_into().unwrap();
@@ -103,8 +95,6 @@ fn read_u32(buf: &[u8], at: &mut usize) -> Result<u32> {
 }
 
 /// Read a little-endian `u64` at `*at`, advancing `*at` past it.
-// No production caller yet — see `corrupt` above.
-#[allow(dead_code)]
 fn read_u64(buf: &[u8], at: &mut usize) -> Result<u64> {
     let end = at.checked_add(8).ok_or_else(|| corrupt(*at, "u64 field"))?;
     let bytes: [u8; 8] = buf.get(*at..end).ok_or_else(|| corrupt(*at, "u64 field"))?.try_into().unwrap();
@@ -113,8 +103,6 @@ fn read_u64(buf: &[u8], at: &mut usize) -> Result<u64> {
 }
 
 /// Read `len` bytes at `*at`, advancing `*at` past them.
-// No production caller yet — see `corrupt` above.
-#[allow(dead_code)]
 fn read_bytes<'a>(buf: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = at.checked_add(len).ok_or_else(|| corrupt(*at, "byte field"))?;
     let s = buf.get(*at..end).ok_or_else(|| corrupt(*at, "byte field"))?;
@@ -122,11 +110,6 @@ fn read_bytes<'a>(buf: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8]>
     Ok(s)
 }
 
-// No production caller yet — a later task wires `NodeCodec` into a table's
-// or index's `BTree::source` for checkpoint-backed pages (see
-// `PagedSource`'s note below). Exercised today by this module's own unit
-// tests.
-#[allow(dead_code)]
 impl<K: PrimaryKey, V> NodeCodec<K, V> {
     /// A data table's codec: values are bincode-serialized [`Record`]s,
     /// pages are `Data{Leaf,Inner}`.
@@ -233,9 +216,15 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
     /// Never panics on malformed bytes: every length read is bounds-checked
     /// against the remaining payload before being trusted, a short read
     /// anywhere returns `Err(Error::CheckpointCorrupted)` naming the offset,
-    /// and trailing bytes left over after a structurally well-formed parse
+    /// trailing bytes left over after a structurally well-formed parse
     /// (garbage appended past a valid payload) are rejected the same way —
-    /// a well-formed prefix is not a well-formed payload.
+    /// a well-formed prefix is not a well-formed payload — and the decoded
+    /// entry count `n` is bound-checked against this build's actual node
+    /// capacity (`MAX_KEYS + 1`, I-2(a)) *before* anything is pushed into a
+    /// `FixedVec`: an oversized `n` (a bit-flipped `u16`, or a `pages.bin`
+    /// written under a different `fanout-t8` setting than this build's) is
+    /// reported the same way rather than hitting `FixedVec::push`'s release
+    /// assert.
     pub(crate) fn decode(&self, kind: PageKind, payload: &[u8]) -> Result<BTreeNode<K, V>> {
         let is_index_kind = matches!(kind, PageKind::IndexLeaf | PageKind::IndexInner);
         if is_index_kind != self.index {
@@ -246,6 +235,23 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
         let is_inner = matches!(kind, PageKind::DataInner | PageKind::IndexInner);
         let mut at = 0usize;
         let n = read_u16(payload, &mut at)? as usize;
+        // Bound-check the decoded entry count against this build's actual
+        // fanout *before* it drives any allocation or `FixedVec` push (I-2(a)):
+        // `Entries`'s capacity is `MAX_KEYS + 1` (`Children`'s is `n + 1` of
+        // that, `MAX_KEYS + 2`), so an `n` beyond that release-asserts inside
+        // `FixedVec::push` — a panic, not the `Err` this function's own doc
+        // promises for every malformed payload. Left unchecked, a bit-flipped
+        // count (up to 65535, `u16`'s range) panics on the very first
+        // overflowing push, and a `fanout-t8` build reading a `pages.bin`
+        // written under the default T=32 fanout panics on its first
+        // >=16-entry node even with byte-perfect, uncorrupted bytes.
+        if n > crate::btree::MAX_KEYS + 1 {
+            return Err(Error::CheckpointCorrupted(format!(
+                "page payload: entry count {n} exceeds this build's node capacity \
+                 ({} entries max — MAX_KEYS+1)",
+                crate::btree::MAX_KEYS + 1
+            )));
+        }
         let mut entries = Vec::with_capacity(n);
         for _ in 0..n {
             let key_len = read_u16(payload, &mut at)? as usize;
@@ -279,22 +285,13 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
 #[derive(Default)]
 pub(crate) struct PagedStats {
     /// Total pages faulted in by [`PagedSource::read_node`] (data + index).
-    // No production caller yet — see `PagedSource`'s note below.
-    #[allow(dead_code)]
     pub page_faults: AtomicU64,
     /// Of `page_faults`, how many were `Data{Leaf,Inner}` pages.
-    // No production caller yet — Task 13's paging-metrics surface reads
-    // this split; added now so that later task needs no schema change.
-    #[allow(dead_code)]
     pub data_page_faults: AtomicU64,
     /// Of `page_faults`, how many were `Index{Leaf,Inner}` pages.
-    // No production caller yet — see `data_page_faults` above.
-    #[allow(dead_code)]
     pub index_page_faults: AtomicU64,
     /// Bytes reported dirty via `note_dirty` (a clean node CoW'd by
     /// `Child::make_mut`).
-    // No production caller yet — see `PagedSource`'s note below.
-    #[allow(dead_code)]
     pub dirty_bytes: AtomicU64,
     /// Signed running total of resident leaf bytes (grows on fault-in via
     /// [`PagedSource::read_node`], shrinks on demotion via
@@ -308,13 +305,9 @@ pub(crate) struct PagedStats {
     /// read rather than reporting the raw (nonsensical, wrapped-looking)
     /// negative as a `u64`.
     pub resident_leaf_bytes: AtomicI64,
-    /// Pages written by a later task's checkpoint writer.
-    // No production caller yet — see `resident_leaf_bytes` above.
-    #[allow(dead_code)]
+    /// Pages written by the checkpoint writer.
     pub pages_written: AtomicU64,
-    /// Leaves demoted back to on-disk by a later task's evictor.
-    // No production caller yet — see `resident_leaf_bytes` above.
-    #[allow(dead_code)]
+    /// Leaves demoted back to on-disk by a demote pass.
     pub leaves_demoted: AtomicU64,
     /// Dead-page byte ranges actually hole-punched (task11) — counted in
     /// ranges, not bytes, matching `PagedRoot::dead_pages`'s own unit. Only
@@ -339,6 +332,22 @@ pub(crate) struct PagedStats {
     /// the thread, not application-driven `Store::checkpoint()` calls, and
     /// not "work done" the way `pages_written`/`leaves_demoted` do.
     pub checkpointer_runs: AtomicU64,
+    /// Set once the background checkpointer thread has caught a panic out of
+    /// a `checkpoint_impl` call (final-review wave, I-5) — e.g. a corrupt
+    /// on-disk page reached through the LAZY `Child::load`/`load_quiet` fault
+    /// path during a dirty-node walk, which still panics rather than
+    /// returning `Err` (see `Child::try_load`'s doc — only the EAGER
+    /// recovery/attach loads were changed to `Err`). The thread wraps each
+    /// iteration's checkpoint call in `std::panic::catch_unwind` specifically
+    /// so one bad page cannot silently kill the whole background thread
+    /// (leaving a paged store to accumulate dirty bytes/leaves forever with
+    /// no checkpoint ever running again); on a caught panic this flag is set
+    /// (sticky — never cleared back to `false`, since the underlying corrupt
+    /// page does not go away on its own) and the loop continues to its next
+    /// tick, where a `checkpoint_impl` that never touches the offending page
+    /// again can still succeed. Surfaced to callers via
+    /// [`crate::store::PagedStatsSnapshot::checkpointer_panicked`].
+    pub checkpointer_panicked: AtomicBool,
     /// The background checkpointer's wake signal (task12): `(has_work,
     /// condvar)`. Set exactly once, by `Store::new`'s paged branch,
     /// immediately after the checkpointer thread is spawned — every paged
@@ -418,10 +427,6 @@ impl PagedStats {
 /// A [`NodeSource`] that reads pages off a [`PageFile`] and decodes them
 /// through a [`NodeCodec`], counting faults and dirty bytes into a shared
 /// [`PagedStats`].
-// No production caller yet — a later task wires this into `BTree::source`
-// for a checkpoint-backed table/index. Exercised today by this module's own
-// unit tests.
-#[allow(dead_code)]
 pub(crate) struct PagedSource<K, V> {
     pub(crate) file: Arc<PageFile>,
     pub(crate) codec: NodeCodec<K, V>,
@@ -637,6 +642,27 @@ mod tests {
         assert_eq!(stats.page_faults.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(stats.data_page_faults.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(stats.index_page_faults.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// I-2(a): an entry count beyond this build's node capacity (`MAX_KEYS +
+    /// 1`) must be rejected as `CheckpointCorrupted` *before* `decode` tries
+    /// to push anything into a `FixedVec` — a bare `n = MAX_KEYS + 2` header
+    /// (no entries following) is enough to prove the bound-check runs first:
+    /// without it, this would have panicked inside `FixedVec::push`'s
+    /// release assert on the loop's first iteration instead of returning
+    /// `Err`.
+    #[test]
+    fn decode_rejects_entry_count_over_node_capacity() {
+        let c = NodeCodec::<u64, Row>::records::<Row>();
+        let n = (crate::btree::MAX_KEYS + 2) as u16;
+        let payload = n.to_le_bytes().to_vec();
+        match c.decode(PageKind::DataLeaf, &payload) {
+            Err(Error::CheckpointCorrupted(msg)) => {
+                assert!(msg.contains(&n.to_string()), "error should name the oversized count: {msg}");
+            }
+            Ok(_) => panic!("expected CheckpointCorrupted, got Ok"),
+            Err(e) => panic!("expected CheckpointCorrupted, got {e}"),
+        }
     }
 
     /// Decode-robustness: truncate a valid payload at every possible length

@@ -425,3 +425,41 @@ fn recovery_tolerates_an_unreadable_older_retained_root() {
     let r2 = s2.begin_read(None).unwrap();
     assert_eq!(r2.open_table::<Row>("rows").unwrap().len(), 20_000);
 }
+
+/// I-3: `retained_checkpoints(0)` must not mean "delete every root,
+/// including the one just written." Taken literally, the second checkpoint
+/// below would prune both the root it just wrote *and* everything before
+/// it, leaving nothing on disk to recover from — a silent, total data loss
+/// a caller who (mis)configured `0` would only discover on the next
+/// restart. The fix clamps to a floor of 1 at the `cleanup_old_roots` call
+/// site (`Store::checkpoint_impl_paged`); this test checkpoints twice under
+/// `retained_checkpoints(0)` and confirms the newest root survives and
+/// `recover()` still sees every row.
+#[test]
+fn retained_checkpoints_zero_is_treated_as_one() {
+    let d = tempfile::tempdir().unwrap();
+    let s = store_with(d.path(), PagedOptions::builder().retained_checkpoints(0).build());
+
+    write_rows(&s, 1_000);
+    let v1 = s.checkpoint().unwrap();
+    assert!(
+        d.path().join(format!("checkpoint_{v1}.root")).exists(),
+        "the very first checkpoint must not delete itself"
+    );
+
+    write_one_update(&s);
+    let v2 = s.checkpoint().unwrap();
+    assert!(
+        d.path().join(format!("checkpoint_{v2}.root")).exists(),
+        "retained_checkpoints(0) must still keep the root this checkpoint just wrote \
+         (clamped to a floor of 1), not prune it along with everything older"
+    );
+    drop(s);
+
+    let s2 = store_with(d.path(), PagedOptions::builder().retained_checkpoints(0).build());
+    s2.recover().unwrap();
+    let r = s2.begin_read(None).unwrap();
+    let t = r.open_table::<Row>("rows").unwrap();
+    assert_eq!(t.len(), 1_000, "recover() must not start from a pruned-away empty state");
+    assert_eq!(t.get(1).map(|row| row.v), Some(999_999));
+}

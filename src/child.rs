@@ -93,10 +93,15 @@ impl<K, V> Child<K, V> {
     }
 
     /// A slot that references a page but has not been faulted in yet.
-    // No production caller yet: this task threads `Child` through `BTree`
-    // with every slot built via `resident` (source is always `None`); a
-    // later task's page store is what will construct `on_disk` slots. Used
-    // today by this module's own unit tests.
+    // Real (non-test) callers are all in `persistence`-gated code
+    // (`NodeCodec::decode`, `BTree::from_root_page`/`write_dirty`) — this
+    // module compiles unconditionally (`child` has no `#[cfg]` at its `mod`
+    // declaration in lib.rs, unlike `pagecodec`/`pagefile`), so without the
+    // feature this would otherwise warn as dead (final-review wave, I-4
+    // re-check: an earlier pass of this doc sweep removed this allow on the
+    // mistaken assumption that "has a real caller" was the same question as
+    // "has a caller reachable in every feature combination" — `cargo check
+    // --no-default-features --lib` caught the difference).
     #[allow(dead_code)]
     pub(crate) fn on_disk(id: PageId) -> Self {
         debug_assert!(id < NO_PAGE);
@@ -116,9 +121,6 @@ impl<K, V> Child<K, V> {
     }
 
     /// Whether the node is currently in memory (resident, clean or dirty).
-    // No production caller yet — a page evictor is a later task. Used today
-    // by this module's own unit tests.
-    #[allow(dead_code)]
     pub(crate) fn is_loaded(&self) -> bool {
         !self.node.load(Ordering::Acquire).is_null()
     }
@@ -127,8 +129,9 @@ impl<K, V> Child<K, V> {
     /// Only legal on a dirty slot — going from `NO_PAGE` to a real id; a
     /// slot that already has a page id must go through `make_mut` (which
     /// resets it to `NO_PAGE`) before it can be reassigned.
-    // No production caller yet — recording a checkpoint's page id is a later
-    // task's checkpoint-writer. Used today by this module's own unit tests.
+    // Real callers (`BTree::write_dirty`, `restore_unchanged_ids`) are both
+    // only reachable from `persistence`-gated code — see `on_disk`'s note
+    // above for why that still needs `#[allow(dead_code)]` here.
     #[allow(dead_code)]
     pub(crate) fn set_page_id(&self, id: PageId) {
         debug_assert!(id < NO_PAGE);
@@ -151,8 +154,8 @@ impl<K, V> Child<K, V> {
     }
 
     /// Read the second-chance bit and clear it — the evictor's sweep step.
-    // No production caller yet — the page evictor is a later task. Used
-    // today by this module's own unit tests.
+    // Real caller (`BTree::demote_leaves`) is only reachable from
+    // `persistence`-gated code — see `on_disk`'s note above.
     #[allow(dead_code)]
     pub(crate) fn take_accessed(&self) -> bool {
         self.meta.fetch_and(!ACCESSED, Ordering::Relaxed) & ACCESSED != 0
@@ -191,18 +194,52 @@ impl<K, V> Child<K, V> {
 
     #[cold]
     fn fault_in(&self, src: Option<&dyn NodeSource<K, V>>) -> &BTreeNode<K, V> {
-        let id = self.page_id().expect("Child: null pointer and NO_PAGE (corrupt slot)");
-        let src = src.unwrap_or_else(|| panic!("Child: page {id} referenced but the tree has no NodeSource"));
-        let fresh = match src.read_node(id) {
+        match self.try_load(src) {
             Ok(n) => n,
-            Err(e) => panic!("ultima_db: cannot load page {id} of {}: {e}", src.name()),
-        };
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Like [`Self::fault_in`], but reports a corrupt slot, a missing
+    /// [`NodeSource`], or a failed `read_node` as `Err` instead of
+    /// panicking — the EAGER load paths (`recover()`'s inner-level faults,
+    /// index attach) need a `Result` to propagate rather than crash the
+    /// process on a corrupt page. [`Self::fault_in`] is now a thin panicking
+    /// wrapper around this (same message text: `Display` on the returned
+    /// error reproduces exactly what `fault_in` used to `panic!` directly).
+    /// The LAZY path ([`Self::load`]/[`Self::load_quiet`]) keeps calling
+    /// `fault_in` and stays panicking — there is no `Result`-returning path
+    /// through the B-tree's existing `&V`-returning API for those (see
+    /// `fault_in`'s original doc, preserved on [`Self::load`]).
+    #[cold]
+    pub(crate) fn try_load(&self, src: Option<&dyn NodeSource<K, V>>) -> crate::Result<&BTreeNode<K, V>> {
+        // Mirror `load`'s fast path: a resident-dirty slot has no page id
+        // (`page_id()` returns `None` for it), so the `page_id()` check
+        // below alone would misreport it as a corrupt slot. Checking the
+        // pointer first, exactly like `load`/`load_quiet` do, is what makes
+        // this a true fallible equivalent of "get or fault" rather than
+        // just a fallible `fault_in`.
+        let p = self.node.load(Ordering::Acquire);
+        if !p.is_null() {
+            self.mark_accessed();
+            // SAFETY: set once, never cleared; the Arc it came from is owned by this slot.
+            return Ok(unsafe { &*p });
+        }
+        let id = self
+            .page_id()
+            .ok_or_else(|| crate::Error::Persistence("Child: null pointer and NO_PAGE (corrupt slot)".to_string()))?;
+        let src = src.ok_or_else(|| {
+            crate::Error::Persistence(format!("Child: page {id} referenced but the tree has no NodeSource"))
+        })?;
+        let fresh = src
+            .read_node(id)
+            .map_err(|e| crate::Error::Persistence(format!("ultima_db: cannot load page {id} of {}: {e}", src.name())))?;
         let raw = Arc::into_raw(fresh) as *mut BTreeNode<K, V>;
         match self.node.compare_exchange(std::ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
                 self.mark_accessed();
                 // SAFETY: this thread's CAS won; `raw` is the pointer now stored.
-                unsafe { &*raw }
+                Ok(unsafe { &*raw })
             }
             Err(winner) => {
                 // Lost the race: another thread's read got there first. Drop
@@ -211,7 +248,7 @@ impl<K, V> Child<K, V> {
                 unsafe { drop(Arc::from_raw(raw)) };
                 self.mark_accessed();
                 // SAFETY: `winner` is non-null (we lost to a successful CAS) and set-once.
-                unsafe { &*winner }
+                Ok(unsafe { &*winner })
             }
         }
     }

@@ -512,9 +512,28 @@ pub(crate) struct PagedState {
     pub(crate) opts: crate::persistence::PagedOptions,
     /// The snapshot and version the last successful paged checkpoint wrote
     /// — `None` before the first one. Holding the `Arc` keeps that
-    /// snapshot's tree nodes alive for a later task's dead-page diff, the
-    /// same way [`StoreInner::checkpoint_base`] keeps a row-format base
-    /// alive.
+    /// snapshot's tree nodes alive for the next checkpoint's dead-page diff
+    /// (`Store::checkpoint_impl_paged`'s `last_root_before`/`changed_page_ids`
+    /// use), the same way [`StoreInner::checkpoint_base`] keeps a row-format
+    /// base alive.
+    ///
+    /// Interaction with demotion (M-1, final-review wave): a demote pass
+    /// (`Store::demote_pass`, run as `checkpoint_impl_paged`'s phase 3) is a
+    /// same-version re-publish — it does not change which version is
+    /// `latest_version`, it swaps a table's `Arc` for a demoted one *within*
+    /// the version it already occupies (see `Store::install_paged_tables`).
+    /// So a demote pass immediately following the checkpoint that set this
+    /// field would, if this field were left alone, keep pinning the
+    /// *pre*-demotion snapshot alive here — every leaf just demoted stays
+    /// resident in memory through this `Arc` for a whole extra checkpoint
+    /// cycle, defeating the point of demoting them early. `checkpoint_impl_paged`
+    /// re-reads the live snapshot at the same version and re-points this
+    /// field at it right after `demote_pass` returns, specifically to avoid
+    /// that. This is sound because demotion only ever touches leaf
+    /// residency, never a page id or the tree's inner levels (data-tree
+    /// inner levels are always `Resident` — see `Residency`'s doc), so the
+    /// refreshed snapshot's tree still satisfies whatever precondition the
+    /// next checkpoint's `changed_page_ids`/`load_inner_levels` call needs.
     pub(crate) last_root: Option<(Arc<Snapshot>, u64)>,
     /// Retention-gated hole-punch schedule (task11). Keyed by the version of
     /// the root a dead-page range was computed *against* (its predecessor at
@@ -650,6 +669,18 @@ pub struct PagedStatsSnapshot {
     /// step's out-of-bounds check (fix round 1, I-1). Space named by a
     /// dropped range leaks permanently — never retried.
     pub dead_pages_dropped: u64,
+    /// `true` once the background checkpointer thread has caught at least
+    /// one panic out of a `checkpoint_impl` call (final-review wave, I-5) —
+    /// see [`crate::pagecodec::PagedStats::checkpointer_panicked`]'s doc for
+    /// why this can happen (a corrupt page reached through a LAZY fault-in
+    /// during the dirty-node walk) and why the thread survives it anyway.
+    /// Sticky: never resets to `false` on its own. A monitoring/alerting
+    /// caller should treat `true` here as "a paged table has at least one
+    /// unreadable page and checkpoints may be silently skipping work" —
+    /// `checkpointer_runs` still advances on later ticks, but any tick whose
+    /// dirty-node walk revisits the same corrupt page panics (and is caught)
+    /// again.
+    pub checkpointer_panicked: bool,
 }
 
 #[cfg(feature = "persistence")]
@@ -671,6 +702,7 @@ impl PagedStatsSnapshot {
             checkpointer_runs: s.checkpointer_runs.load(Ordering::Relaxed),
             dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
             dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
+            checkpointer_panicked: s.checkpointer_panicked.load(Ordering::Relaxed),
         }
     }
 }
@@ -1238,7 +1270,12 @@ impl Store {
     ///
     /// A checkpoint is a delta against the previous one whenever
     /// [`StoreConfig::checkpoint_chain_max`] allows it; with the default of
-    /// `1` every checkpoint is full.
+    /// `1` every checkpoint is full. **Paged mode** (a store built with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged)) does
+    /// not have this chain/delta concept at all — `checkpoint_chain_max` is
+    /// inert there, and every paged checkpoint writes a self-contained
+    /// `checkpoint_{v}.root` naming each table's current root page, backed
+    /// by the append-only `pages.bin` node store instead of inline row data.
     ///
     /// Returns the version of the checkpointed snapshot.
     #[cfg(feature = "persistence")]
@@ -1255,11 +1292,11 @@ impl Store {
         let _serialize = self.checkpoint_lock.lock();
 
         // Paged checkpoints have their own dirty-node-walk + root-record
-        // path (phases 1-2 of the paged design — no leaf demotion, no
-        // recovery, no background checkpointer thread yet). `force_full`
-        // and `StoreConfig::checkpoint_chain_max` are row-format-only
-        // knobs: a paged root is always self-contained, never part of a
-        // delta chain, so neither applies.
+        // path (`checkpoint_impl_paged`) — leaf demotion, recovery, and the
+        // background checkpointer thread are all implemented (task63).
+        // `force_full` and `StoreConfig::checkpoint_chain_max` stay
+        // row-format-only knobs: a paged root is always self-contained,
+        // never part of a delta chain, so neither applies.
         if self.inner.read().paged.is_some() {
             return self.checkpoint_impl_paged();
         }
@@ -1709,6 +1746,37 @@ impl Store {
         // batch of newly-quiet leaves is demotable at once.
         if opts.memory_budget_bytes.is_some() {
             self.demote_pass()?;
+
+            // M-1 (final-review wave): `demote_pass` just published a
+            // demoted table (or several) as a same-version re-publish at
+            // `snap.version` (see `PagedState::last_root`'s doc) via
+            // `install_paged_tables` — but `last_root` above still points
+            // at `current`, the *pre*-demotion snapshot, which keeps every
+            // leaf `demote_pass` just replaced pinned alive in memory
+            // through that stale `Arc` for a whole extra checkpoint cycle
+            // (until the *next* checkpoint's `p.last_root = Some((current,
+            // ..))` finally drops it). Re-reading the live snapshot at this
+            // same version and re-pointing `last_root` at it releases that
+            // pin one checkpoint early. Safe regardless of whether
+            // `demote_pass` actually touched `snap.version` (a concurrent
+            // commit can move `latest_version` past it before `demote_pass`
+            // reads its own target — see `demote_pass_inner`'s doc): either
+            // it demoted this exact version, in which case this is exactly
+            // the freed-pin update intended, or it demoted a newer one, in
+            // which case re-reading `snap.version` yields the same content
+            // `current` already held (a harmless no-op re-point). Guarded
+            // with `if let` (not `.expect`) for the version being gone from
+            // `inner.snapshots` entirely — cannot happen from *this* call
+            // (the `Arc` `last_root` already holds keeps `gc()`'s
+            // `strong_count == 1` eviction check from ever collecting it
+            // while `checkpoint_lock` still serializes against any other
+            // checkpoint call), but costs nothing to handle rather than
+            // assume.
+            let mut inner = self.inner.write();
+            let refreshed = inner.snapshots.get(&snap.version).cloned();
+            if let (Some(p), Some(refreshed)) = (inner.paged.as_mut(), refreshed) {
+                p.last_root = Some((refreshed, snap.version));
+            }
         }
 
         // WAL prune — same call path as the row-format branch above,
@@ -1739,7 +1807,12 @@ impl Store {
             }
         }
 
-        let deleted = cleanup_old_roots(&dir, opts.retained_checkpoints)?;
+        // `.max(1)` (I-3): `retained_checkpoints(0)` must not mean "delete
+        // every root including the one just written" — that would make the
+        // very next process start find nothing, recover from cursor 0, and
+        // silently lose everything committed. `PagedOptions::retained_checkpoints`'s
+        // doc states the same floor.
+        let deleted = cleanup_old_roots(&dir, opts.retained_checkpoints.max(1))?;
 
         // Mutation-testing crash point (task11): the new root is durably
         // renamed into place and `cleanup_old_roots` has already deleted
@@ -3698,6 +3771,72 @@ fn wait_until_or_stop(wake: &(Mutex<bool>, Condvar), stop: &AtomicBool, deadline
     }
 }
 
+/// Test-only hook (I-5, final-review wave): when set, the next
+/// `checkpointer_loop` iteration's `checkpoint_impl` call panics instead of
+/// running, so the catch/continue behavior around it is exercisable without
+/// constructing an actual corrupt on-disk page. Self-clearing (`swap` back
+/// to `false`) so it fires exactly once per `true` set.
+#[cfg(all(feature = "persistence", test))]
+pub(crate) static FORCE_CHECKPOINTER_PANIC_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Record one `checkpointer_loop` iteration's `catch_unwind`ed result
+/// (either `checkpoint_impl`'s own `Result`, or the panic payload
+/// `catch_unwind` caught in its place) — shared by both the ordinary and
+/// the `#[cfg(test)]`-hook-forced call sites in `checkpointer_loop` (I-5).
+/// `last_err` is the same "log a transition, not every tick" latch the
+/// pre-I-5 code used for an `Err`; a panic now shares it, so a persistent
+/// panic (the same corrupt page hit every tick) also logs once, not once
+/// per tick, while a genuinely new failure (panic after a run of `Err`s, or
+/// vice versa) still logs since the message text differs.
+#[cfg(feature = "persistence")]
+fn report_checkpointer_result(
+    stats: &crate::pagecodec::PagedStats,
+    result: std::thread::Result<Result<u64>>,
+    last_err: &mut Option<String>,
+) {
+    match result {
+        Ok(Ok(_)) => *last_err = None,
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if last_err.as_deref() != Some(msg.as_str()) {
+                eprintln!("ultima_db: background checkpointer: {msg}");
+                *last_err = Some(msg);
+            }
+        }
+        Err(payload) => {
+            stats.checkpointer_panicked.store(true, Ordering::Relaxed);
+            let msg = panic_payload_message(&payload);
+            let logged = format!("panicked: {msg}");
+            if last_err.as_deref() != Some(logged.as_str()) {
+                eprintln!("ultima_db: background checkpointer {logged}");
+                *last_err = Some(logged);
+            }
+        }
+    }
+}
+
+/// Best-effort `String` out of a `catch_unwind` panic payload. Tries the two
+/// shapes `panic!`/`.unwrap()`/`.expect()` conventionally produce
+/// (`&'static str` for a literal, `String` for a formatted message) and
+/// falls back to a fixed placeholder for anything else — a custom
+/// `panic_any` payload, or (observed on at least one toolchain during this
+/// feature's own testing) a panic payload type this function doesn't
+/// recognize at all. Either way this must never itself panic or lose the
+/// caught-panic signal: `report_checkpointer_result`'s caller already knows
+/// *that* a panic happened (`checkpointer_panicked` is set regardless of
+/// what this returns) — this is strictly a best-effort enrichment of the
+/// log line, not load-bearing for the catch/continue behavior itself.
+#[cfg(feature = "persistence")]
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// The background checkpointer thread's body — see [`Checkpointer`]'s doc
 /// for the reference-cycle and self-join reasoning behind its shape.
 ///
@@ -3820,19 +3959,36 @@ fn checkpointer_loop(
                 table_locks: Arc::clone(&table_locks),
                 checkpoint_lock: Arc::clone(&checkpoint_lock),
             };
-            let result = store.checkpoint_impl(false);
+            // I-5 (final-review wave): `checkpoint_impl` can still panic —
+            // the dirty-node walk it drives faults pages in through the
+            // LAZY `Child::load`/`load_quiet` path (see `Child::try_load`'s
+            // doc: only the EAGER recovery/attach loads were changed to
+            // return `Err`), so a corrupt on-disk page reached mid-walk
+            // panics same as any other workload read would. Left
+            // unguarded, that panic would unwind straight through this
+            // thread's `spawn` closure and kill the background
+            // checkpointer for the rest of the process — every future
+            // dirty byte and demoted leaf would then accumulate forever
+            // with nothing ever checkpointing them again, and nothing
+            // outside this thread would ever be told. `catch_unwind`
+            // contains it to one iteration instead: `report_checkpointer_result`
+            // (below) makes the failure observable, and the loop moves on
+            // to its next tick, where a walk that doesn't revisit the same
+            // corrupt page can still succeed.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Test-only hook (I-5): a test can force exactly one
+                // iteration's `checkpoint_impl` call to panic, so the
+                // catch/continue behavior is exercisable without actually
+                // constructing a corrupt on-disk page.
+                #[cfg(test)]
+                if FORCE_CHECKPOINTER_PANIC_ONCE.swap(false, Ordering::SeqCst) {
+                    panic!("ULTIMA_TEST: forced checkpointer panic (I-5 hook)");
+                }
+                store.checkpoint_impl(false)
+            }));
             stats.checkpointer_runs.fetch_add(1, Ordering::Relaxed);
             last_run_at = Some(std::time::Instant::now());
-            match result {
-                Ok(_) => last_err = None,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if last_err.as_deref() != Some(msg.as_str()) {
-                        eprintln!("ultima_db: background checkpointer: {msg}");
-                        last_err = Some(msg);
-                    }
-                }
-            }
+            report_checkpointer_result(&stats, result, &mut last_err);
         }
     }
 }
@@ -10103,6 +10259,219 @@ mod tests {
                 .is_none(),
             "the evicted version must no longer be installable"
         );
+    }
+
+    /// I-1 (spec conformance): `recover()`'s EAGER load of a paged table's
+    /// inner levels (`Table::from_paged_entry` -> `BTree::try_load_inner_levels`)
+    /// must return `Err` on a corrupt/unreadable page, never panic. Corrupts
+    /// the data tree's root page in place (bottom-up `write_dirty` writes a
+    /// tree's root last, so for a single-table store it is exactly the last
+    /// page `checkpoint()` appended) by flipping one payload byte, which
+    /// mismatches the page's own CRC on read — same corruption class
+    /// `PageFile::read` already turns into `Error::CheckpointCorrupted` for
+    /// a live workload read; this pins that `recover()`'s EAGER path reports
+    /// it the same way instead of unwrapping/panicking.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn recover_returns_err_not_panic_on_corrupt_inner_data_page() {
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let build_persistence = || {
+            Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+                .paged(PagedOptions::builder().build())
+                .unwrap()
+        };
+
+        let version = {
+            let store = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
+            store.register_table::<String>("rows").unwrap();
+            let mut w = store.begin_write(None).unwrap();
+            let mut t = w.open_table::<String>("rows").unwrap();
+            // Enough rows to force an inner level (MAX_KEYS is 63 at T=32) —
+            // 5,000 comfortably clears that at any fanout this crate ships.
+            t.insert_batch((0..5_000u64).map(|i| i.to_string()).collect()).unwrap();
+            w.commit().unwrap();
+            store.checkpoint().unwrap()
+            // `store` dropped here: stops+joins the checkpointer thread and
+            // closes the page file handle before this test corrupts it
+            // directly on disk.
+        };
+
+        let root = crate::checkpoint::read_paged_root(&crate::checkpoint::root_path(dir.path(), version)).unwrap();
+        let entry = root.tables.iter().find(|t| t.name == "rows").expect("table entry present");
+        assert!(entry.height >= 1, "need a real inner level to corrupt; got height {}", entry.height);
+        let root_page = entry.root_page.expect("non-empty table has a root page");
+
+        // Flip one byte inside the root page's payload (past its 12-byte
+        // header), so the page's own CRC — not just the file's — catches it.
+        let page_path = crate::pagefile::page_file_path(dir.path());
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&page_path).unwrap();
+        let at = root_page + crate::pagefile::PAGE_HEADER_LEN as u64;
+        f.seek(SeekFrom::Start(at)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[byte[0] ^ 0xFF]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let store2 = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
+        store2.register_table::<String>("rows").unwrap();
+        let err = store2.recover().unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_) | Error::Persistence(_)),
+            "expected a CheckpointCorrupted-class Err, got {err:?}"
+        );
+    }
+
+    /// I-1's other half: `Table::define_persisted_index`'s attach path
+    /// (`UniqueStorage::from_root_page` -> `BTree::try_load_all`) must also
+    /// return `Err`, not panic, on a corrupt index page.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn define_persisted_index_returns_err_not_panic_on_corrupt_index_page() {
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, IndexDef, IndexKind, Persistence, WalWrite};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let build_persistence = || {
+            Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+                .paged(PagedOptions::builder().build())
+                .unwrap()
+        };
+
+        let version = {
+            let store = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
+            store.register_table::<String>("rows").unwrap();
+            {
+                let mut w = store.begin_write(None).unwrap();
+                let mut t = w.open_table::<String>("rows").unwrap();
+                t.define_persisted_index::<u64>("by_len", IndexKind::NonUnique, IndexDef::new(1), |r: &String| {
+                    r.len() as u64
+                })
+                .unwrap();
+                w.commit().unwrap();
+            }
+            let mut w = store.begin_write(None).unwrap();
+            let mut t = w.open_table::<String>("rows").unwrap();
+            t.insert_batch((0..5_000u64).map(|i| i.to_string()).collect()).unwrap();
+            w.commit().unwrap();
+            store.checkpoint().unwrap()
+            // `store` dropped here — same reasoning as the data-page test.
+        };
+
+        let root = crate::checkpoint::read_paged_root(&crate::checkpoint::root_path(dir.path(), version)).unwrap();
+        let entry = root.tables.iter().find(|t| t.name == "rows").expect("table entry present");
+        let idx = entry.indexes.iter().find(|i| i.name == "by_len").expect("index entry present");
+        assert!(idx.height >= 1, "need a real inner level to corrupt; got height {}", idx.height);
+        let idx_root_page = idx.root_page.expect("non-empty index has a root page");
+
+        let page_path = crate::pagefile::page_file_path(dir.path());
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&page_path).unwrap();
+        let at = idx_root_page + crate::pagefile::PAGE_HEADER_LEN as u64;
+        f.seek(SeekFrom::Start(at)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[byte[0] ^ 0xFF]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let store2 = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
+        store2.register_table::<String>("rows").unwrap();
+        store2.recover().unwrap();
+
+        let mut w = store2.begin_write(None).unwrap();
+        let mut t = w.open_table::<String>("rows").unwrap();
+        let err = t
+            .define_persisted_index::<u64>("by_len", IndexKind::NonUnique, IndexDef::new(1), |r: &String| {
+                r.len() as u64
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::CheckpointCorrupted(_) | Error::Persistence(_)),
+            "expected a CheckpointCorrupted-class Err, got {err:?}"
+        );
+    }
+
+    /// I-5 (final-review wave): a panic out of `checkpoint_impl` (the LAZY
+    /// fault-in path still panics on a corrupt page — see `Child::try_load`'s
+    /// doc) must not kill the background checkpointer thread. Uses the
+    /// `#[cfg(test)]`-only `FORCE_CHECKPOINTER_PANIC_ONCE` hook (real
+    /// corruption is exercised by the two `corrupt_*_page` tests above; this
+    /// one is specifically about the catch/continue behavior around
+    /// `checkpoint_impl`, which is much cheaper to force directly than to
+    /// reconstruct via a corrupt page landing exactly inside a background
+    /// tick's timing window) to force exactly one iteration to panic, then
+    /// checks: `checkpointer_panicked` is set, `checkpointer_runs` counted
+    /// that iteration, and — the actual regression this guards — a *later*
+    /// tick still runs (`checkpointer_runs` keeps advancing, proving the
+    /// thread survived and looped again). `checkpointer_panicked` and the
+    /// `eprintln!` log both live in the same `report_checkpointer_result`
+    /// match arm (`Err(payload) => { stats.checkpointer_panicked.store(...);
+    /// eprintln!(...); ... }`), so observing the flag is direct evidence the
+    /// log statement in that same arm executed too.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn checkpointer_panic_is_caught_and_the_loop_keeps_running() {
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+        use std::time::{Duration, Instant};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+            .paged(PagedOptions::builder().checkpoint_interval(Duration::from_millis(20)).build())
+            .unwrap();
+        let store = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
+        store.register_table::<String>("rows").unwrap();
+
+        // Arm the hook before any commit exists to check, so the
+        // background thread's first eligible tick is the one that panics.
+        FORCE_CHECKPOINTER_PANIC_ONCE.store(true, Ordering::SeqCst);
+
+        {
+            let mut w = store.begin_write(None).unwrap();
+            let mut t = w.open_table::<String>("rows").unwrap();
+            t.insert_batch((0..100u64).map(|i| i.to_string()).collect()).unwrap();
+            w.commit().unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let s = store.paged_stats().unwrap();
+            if s.checkpointer_panicked {
+                break;
+            }
+            assert!(Instant::now() < deadline, "checkpointer never reported a caught panic within 10s");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after_panic = store.paged_stats().unwrap();
+        assert!(after_panic.checkpointer_runs >= 1, "the panicking iteration must still count as a run");
+
+        // The actual regression under test: the thread must keep ticking
+        // after the caught panic, not have unwound out of existence.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let s = store.paged_stats().unwrap();
+            if s.checkpointer_runs > after_panic.checkpointer_runs {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "checkpointer_runs never advanced past the panicking run -- the thread died"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Sanity: the store is still fully healthy — a manual checkpoint
+        // succeeds and every row committed before the panic is still there.
+        store.checkpoint().unwrap();
+        let r = store.begin_read(None).unwrap();
+        assert_eq!(r.open_table::<String>("rows").unwrap().len(), 100);
     }
 
     /// A checkpoint taken while rows are still buffered must contain them.

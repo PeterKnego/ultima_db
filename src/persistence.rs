@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(feature = "persistence")]
 use crate::{Error, Result};
 
 /// Marker trait that centralises the bounds every record type must satisfy.
@@ -202,6 +203,18 @@ impl Persistence {
     /// directory to put `pages.bin` in; [`Persistence::None`] has none, so
     /// this rejects it with [`Error::Persistence`] rather than silently
     /// discarding `opts`.
+    ///
+    /// Gated on the `persistence` cargo feature (M-2, final-review wave): a
+    /// no-default-features build has no page-file layer at all —
+    /// `Store::new`'s paged setup and `paged_opts()` (the only production
+    /// reader of the `paged` field this sets) both live behind the same
+    /// feature — so without it this call used to compile, set `paged:
+    /// Some(opts)`, and then silently do nothing (no `pages.bin`, no paged
+    /// checkpoints, `opts` simply discarded at `Store::new` time with no
+    /// diagnostic). A no-`persistence` build now gets a compile error at
+    /// the call site instead — the option was never real without the
+    /// feature enabled.
+    #[cfg(feature = "persistence")]
     pub fn paged(self, opts: PagedOptions) -> Result<Self> {
         match self {
             Persistence::Standalone {
@@ -240,14 +253,14 @@ impl Persistence {
 #[non_exhaustive]
 pub struct PagedOptions {
     /// Soft cap on total resident (not-yet-demoted) leaf bytes across every
-    /// paged table, past which the checkpointer's demote pass (a later
-    /// task) starts evicting quiet leaves back to disk. `None` disables
-    /// demotion entirely: every leaf, once faulted in, stays resident.
-    /// Default: `None`.
+    /// paged table, past which the checkpointer's demote pass
+    /// (`Store::demote_pass`) starts evicting quiet leaves back to disk.
+    /// `None` disables demotion entirely: every leaf, once faulted in,
+    /// stays resident. Default: `None`.
     pub memory_budget_bytes: Option<u64>,
     /// A checkpoint runs once this many dirty bytes have accumulated since
-    /// the last one — the background checkpointer's (a later task) volume
-    /// trigger. Default: 256 MiB.
+    /// the last one — the background checkpointer's volume trigger.
+    /// Default: 256 MiB.
     pub checkpoint_dirty_bytes: u64,
     /// A checkpoint runs at least this often regardless of dirty volume —
     /// the background checkpointer's time trigger (task12). Default:
@@ -258,7 +271,7 @@ pub struct PagedOptions {
     /// and rely only on `checkpoint_dirty_bytes`/`memory_budget_bytes`/
     /// manual [`Store::checkpoint`](crate::Store::checkpoint) calls.
     pub checkpoint_interval: Option<Duration>,
-    /// Leaf-parents processed per demote pass batch (a later task).
+    /// Leaf-parents processed per demote pass batch (`Store::demote_pass`).
     /// Default: 1024.
     pub demote_batch: usize,
     /// First-read buffer size for a page fault — big enough that most
@@ -272,7 +285,12 @@ pub struct PagedOptions {
     /// How many `checkpoint_{v}.root` files to retain — older ones are
     /// pruned after each successful checkpoint. Default: 2 (the current
     /// root plus one prior, so a crash mid-write of the newest root still
-    /// leaves a complete, readable one).
+    /// leaves a complete, readable one). Values below 1 are treated as 1:
+    /// `0` would prune every root, including the one this checkpoint just
+    /// wrote, and the next process to start would find nothing to recover
+    /// from (cursor 0 — silent data loss), so the retention pass clamps to
+    /// a floor of 1 (`Store::checkpoint_impl_paged` applies `.max(1)` at
+    /// the `cleanup_old_roots` call site) rather than honoring `0` literally.
     pub retained_checkpoints: usize,
 }
 
@@ -387,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "persistence")]
     fn paged_rejects_persistence_none() {
         let err = Persistence::None
             .paged(PagedOptions::builder().build())

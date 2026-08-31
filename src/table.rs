@@ -52,9 +52,6 @@ use crate::{Error, Result};
 /// `MergeableTable::paged_write` and `IndexMaintainer::paged_write` take one
 /// borrow instead of two, and so a caller building a checkpoint pass owns
 /// exactly one `PageFile`/`PagedStats` pair for the whole table+index walk.
-// No production caller yet — `Store`'s checkpoint writer (Task 8+). Used
-// today by this file's `paged` test module.
-#[allow(dead_code)]
 #[cfg(feature = "persistence")]
 pub(crate) struct PagedCtx<'a> {
     pub file: &'a PageFile,
@@ -182,10 +179,7 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     ///   GC pass ever will either — so the clone comes back as `Some(..)`:
     ///   the caller (Task 8's `Store`) must install it as a same-version
     ///   re-publish, or every page just written leaks.
-    // No production caller yet — `Store`'s checkpoint writer (Task 8+).
-    // Used today by this file's `paged` test module.
     #[cfg(feature = "persistence")]
-    #[allow(dead_code)]
     fn paged_write(&self, ctx: &PagedCtx) -> Result<(PagedTableEntry, Option<Box<dyn MergeableTable>>)>;
 
     /// Demote up to `budget` leaf-parents' quiet leaves of the data tree
@@ -232,16 +226,16 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// and not by `self`'s — the ids a checkpoint GC pass can reclaim once
     /// `prev`'s root is no longer needed. An index present in `prev` but
     /// dropped in `self` contributes every page id it ever referenced.
-    // No production caller yet — see `paged_write` above.
     #[cfg(feature = "persistence")]
-    #[allow(dead_code)]
     fn paged_changed_pages(&self, prev: &dyn MergeableTable) -> Vec<PageId>;
 
     /// Estimated resident (not-yet-demoted) leaf bytes of the data tree.
-    // No production caller yet — `PagedStats::resident_leaf_bytes` (a
-    // running counter maintained on fault-in/demote) is what `Store`
-    // actually reports and budgets against; this per-call tree walk is
-    // exercised only by this file's `paged` test module.
+    // Still no caller anywhere, production or test (final-review wave, I-4
+    // re-check — the earlier "exercised by this file's paged test module"
+    // claim did not hold up to a grep: nothing calls this). `PagedStats::
+    // resident_leaf_bytes` (a running counter maintained on fault-in/demote)
+    // is what `Store` actually reports and budgets against; this per-call
+    // tree walk (`BTree::resident_leaf_estimate`) is unused on both sides.
     #[cfg(feature = "persistence")]
     #[allow(dead_code)]
     fn paged_resident_leaf_bytes(&self) -> usize;
@@ -1634,8 +1628,6 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// The `paged_write` body, operating on whichever tree/indexes the
     /// caller hands in (`self`'s own, or a flushed clone's — see
     /// `MergeableTable::paged_write`'s doc for why the choice matters).
-    // No production caller yet — see `attach_paged_source` above.
-    #[allow(dead_code)]
     #[cfg(feature = "persistence")]
     fn paged_write_tree(&self, ctx: &PagedCtx) -> Result<PagedTableEntry> {
         // Every real caller reaches this only after `attach_paged_source`,
@@ -1762,8 +1754,9 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                     BTree::from_root_page(root_page, e.len as usize, e.height as usize, source);
                 // Inner levels only — leaves fault in lazily on first read,
                 // which is the whole point of a paged root: recovery must not
-                // cost O(rows).
-                tree.load_inner_levels();
+                // cost O(rows). Fallible (I-1): a corrupt/unreadable inner
+                // page here must fail `recover()` with an `Err`, not panic.
+                tree.try_load_inner_levels()?;
                 tree
             }
             None => BTree::new(),
@@ -1920,7 +1913,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                             file,
                             stats,
                             source_name,
-                        ),
+                        )?,
                     )),
                     IndexKind::NonUnique => {
                         Box::new(ManagedIndex::<R, IK, NonUniqueStorage<IK, K>>::new(
@@ -1936,7 +1929,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                                 file,
                                 stats,
                                 source_name,
-                            ),
+                            )?,
                         ))
                     }
                     IndexKind::Custom => unreachable!("returned above"),

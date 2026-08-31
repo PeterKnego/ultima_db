@@ -24,7 +24,14 @@ const T: usize = 8;
 #[cfg(not(feature = "fanout-t8"))]
 const T: usize = 32;
 const MIN_KEYS: usize = T - 1;
-const MAX_KEYS: usize = 2 * T - 1;
+/// Steady-state max entries per node (`FixedVec` capacity is one more than
+/// this — see `Entries`/`Children`'s docs). `pub(crate)` so `pagecodec.rs`'s
+/// `NodeCodec::decode` can bound-check an untrusted on-disk entry count
+/// against this build's actual fanout before it ever reaches `FixedVec::push`
+/// (I-2(a)): a `fanout-t8` build reading a `pages.bin` written under the
+/// default T=32 fanout must reject the mismatch as `CheckpointCorrupted`,
+/// not panic on the first node wide enough to overflow T=8's capacity.
+pub(crate) const MAX_KEYS: usize = 2 * T - 1;
 
 // ---------------------------------------------------------------------------
 // Fixed-capacity inline vector (private) — backs BTreeNode's entries/children
@@ -501,7 +508,12 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     }
 
     /// Attach (or clear, via `None`) the tree's page source.
-    // No production caller yet — see `source()` above.
+    // Real callers (`Table::attach_paged_source`, index `from_root_page`
+    // constructors) are all in `persistence`-gated code; `btree` itself
+    // compiles unconditionally, so this would otherwise warn as dead in a
+    // `--no-default-features` build (final-review wave, I-4 re-check — see
+    // `Child::on_disk`'s note in `child.rs` for the general shape of this
+    // gotcha).
     #[allow(dead_code)]
     pub(crate) fn set_source(&mut self, s: Option<Arc<dyn NodeSource<K, V>>>) {
         self.source = s;
@@ -854,8 +866,8 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// `NO_PAGE` propagates back up as this call's own result — the
     /// convention a later task's checkpoint writer uses to signal a write
     /// failure through a callback that cannot itself return a `Result`.
-    // No production caller yet — the (future) page-file writer is the
-    // intended caller. Used today by this task's tests.
+    // Real callers (`PersistedIndex::write`, `Table::paged_write_tree`) are
+    // both in `persistence`-gated code — see `set_source`'s note above.
     #[allow(dead_code)]
     pub(crate) fn write_dirty(&self, write: &mut dyn FnMut(&BTreeNode<K, V>, bool) -> PageId) -> PageId {
         fn go<K, V>(
@@ -903,8 +915,8 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// CoW'd path bottom-up and gives back the old page id to any node whose
     /// children came out identical to the original's, so a pass that ends
     /// up (fully or partially) demoting nothing forces no rewrite.
-    // No production caller yet — the (future) page evictor is the intended
-    // caller. Used today by this task's tests.
+    // Real caller (`Table::paged_demote`, via `Store::demote_pass`) is in
+    // `persistence`-gated code — see `set_source`'s note above.
     #[allow(dead_code)]
     pub(crate) fn demote_leaves(&self, cursor: Option<&K>, budget: usize) -> (BTree<K, V>, usize, Option<K>) {
         let src = self.source.as_deref();
@@ -998,8 +1010,8 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// by looking at it — only a real workload touch (`get`, `insert_mut`,
     /// ...) should be able to give a leaf a second chance in
     /// [`BTree::demote_leaves`].
-    // No production caller yet — the (future) GC/page-reclaim pass is the
-    // intended caller. Used today by this task's tests.
+    // Real caller (`Table::paged_changed_pages`, via `Store::checkpoint_impl_paged`)
+    // is in `persistence`-gated code — see `set_source`'s note above.
     #[allow(dead_code)]
     pub(crate) fn changed_page_ids(&self, prev: &BTree<K, V>) -> Vec<PageId> {
         use std::collections::HashSet;
@@ -1071,8 +1083,9 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// is expected to have persisted both alongside the root id; there is
     /// no way to discover `height` from an on-disk root without faulting
     /// something, which is exactly what caching it on `BTree` avoids).
-    // No production caller yet — the (future) recovery/attach path is the
-    // intended caller. Used today by this task's tests.
+    // Real callers (`Table::from_paged_entry`, index `from_root_page`
+    // constructors) are all in `persistence`-gated code — see
+    // `set_source`'s note above.
     #[allow(dead_code)]
     pub(crate) fn from_root_page(id: PageId, len: usize, height: usize, source: Arc<dyn NodeSource<K, V>>) -> Self {
         BTree {
@@ -1084,9 +1097,9 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     }
 
     /// Fault in every non-leaf node; leaves stay on disk.
-    // No production caller yet — the (future) startup/attach path is the
-    // intended caller. Used today by this task's tests.
-    #[allow(dead_code)]
+    ///
+    /// Production caller: [`Self::changed_page_ids`] (its own doc explains
+    /// why it needs both trees' inner levels resident before it walks).
     pub(crate) fn load_inner_levels(&self) {
         let src = self.source.as_deref();
         let h = self.height();
@@ -1116,10 +1129,11 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// never matter anyway (it is never demoted), but staying `load_quiet`
     /// keeps this consistent with every other non-workload walk in this
     /// file.
-    // Called from `index.rs`'s `from_root_page` constructors (attach time)
-    // and from its `paged_reachable_ids` methods (which re-assert the same
-    // full-residency invariant on every call, since `for_each_page_id`
-    // depends on it structurally — see that method's doc), plus this
+    // Called from `index.rs`'s `paged_reachable_ids` methods (which
+    // re-assert the same full-residency invariant on every call, since
+    // `for_each_page_id` depends on it structurally — see that method's
+    // doc: a post-recovery path, where a corrupt page has already been
+    // caught by the EAGER `try_load_all` at attach time), plus this
     // module's own test below. All persistence-feature call sites, so this
     // is dead code under a build without that feature, same as
     // `load_inner_levels` above.
@@ -1135,6 +1149,61 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             for c in n.children.iter() {
                 go(c, depth - 1, src);
             }
+        }
+        go(&self.root, h, src)
+    }
+
+    /// Like [`Self::load_inner_levels`], but reports a corrupt/unreadable
+    /// page as `Err` instead of panicking (via [`Child::try_load`]) — the
+    /// EAGER load `recover()` performs while rebuilding a paged table's data
+    /// tree (`Table::from_paged_entry`) must not crash the process on a
+    /// truncated or bit-flipped inner page; a spec-conformance requirement
+    /// (I-1), unlike `load_inner_levels`'s own callers, which all run
+    /// *after* a paged store has already recovered successfully and so can
+    /// keep the panicking behavior. Same walk, same stopping rule (leaves
+    /// stay on disk) — only the fault-in call and its error path differ.
+    // Real caller (`Table::from_paged_entry`) is in `persistence`-gated
+    // code — see `set_source`'s note above.
+    #[allow(dead_code)]
+    pub(crate) fn try_load_inner_levels(&self) -> crate::Result<()> {
+        let src = self.source.as_deref();
+        let h = self.height();
+        fn go<K, V>(slot: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) -> crate::Result<()> {
+            if depth == 0 {
+                return Ok(()); // leaf slot: leave on disk
+            }
+            let n = slot.try_load(src)?;
+            for c in n.children.iter() {
+                go(c, depth - 1, src)?;
+            }
+            Ok(())
+        }
+        go(&self.root, h, src)
+    }
+
+    /// Like [`Self::load_all`], but reports a corrupt/unreadable page as
+    /// `Err` instead of panicking (via [`Child::try_load`]) — used at index
+    /// attach time (`UniqueStorage`/`NonUniqueStorage::from_root_page`, the
+    /// EAGER load Task 13's attach path performs), so `define_persisted_index`
+    /// can return `Err` on a corrupt index page instead of crashing the
+    /// process (I-1). `load_all`'s own other callers (`paged_reachable_ids`)
+    /// run post-recovery, once this invariant is already known to hold, so
+    /// they keep the panicking version.
+    // Real callers (`UniqueStorage`/`NonUniqueStorage::from_root_page`) are
+    // both in `persistence`-gated code — see `set_source`'s note above.
+    #[allow(dead_code)]
+    pub(crate) fn try_load_all(&self) -> crate::Result<()> {
+        let src = self.source.as_deref();
+        let h = self.height();
+        fn go<K, V>(slot: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) -> crate::Result<()> {
+            let n = slot.try_load(src)?;
+            if depth == 0 {
+                return Ok(()); // leaf slot: loaded above, nothing further to descend into
+            }
+            for c in n.children.iter() {
+                go(c, depth - 1, src)?;
+            }
+            Ok(())
         }
         go(&self.root, h, src)
     }
