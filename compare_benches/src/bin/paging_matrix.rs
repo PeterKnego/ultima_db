@@ -794,6 +794,13 @@ struct Args {
     /// Spike knobs (`--paged-dirty-trigger=BYTES`, `--paged-interval-secs=N`)
     /// — `--engine=ultima-paged` only.
     paged_knobs: PagedKnobs,
+    /// Spike probe (F4): `malloc_trim(0)` after load, BEFORE the barrier /
+    /// cgroup tighten. The insert load peaks far above the post-checkpoint
+    /// resident set; glibc retains the freed pages in its arenas, the
+    /// tighten swaps them out, and every run-phase allocation then reuses a
+    /// swapped page — one major fault per reuse. Trimming returns them to
+    /// the OS so run allocations get fresh zero pages instead.
+    malloc_trim: bool,
 }
 
 fn parse_args() -> Args {
@@ -814,12 +821,17 @@ fn parse_args() -> Args {
         restart: false,
         durability: Dur::Eventual,
         paged_knobs: PagedKnobs::default(),
+        malloc_trim: false,
     };
     let mut load_explicit = false;
     for arg in std::env::args().skip(1) {
         // `--restart` is a bare flag, not `--key=value`.
         if arg == "--restart" {
             a.restart = true;
+            continue;
+        }
+        if arg == "--malloc-trim" {
+            a.malloc_trim = true;
             continue;
         }
         let (k, v) = arg
@@ -1245,6 +1257,14 @@ fn main() {
         rss_after_load >> 20,
         disk_after_load.map_or("n/a".to_string(), |b| format!("{} MiB", b >> 20))
     );
+
+    if args.malloc_trim {
+        // SAFETY: malloc_trim is async-signal-unsafe but this is a plain
+        // single-point call on the main thread with no allocator activity
+        // racing it that matters (worst case it trims less).
+        let freed = unsafe { libc::malloc_trim(0) };
+        eprintln!("[{name}] malloc_trim(0) -> {freed}, rss now {} MiB", rss_bytes() >> 20);
+    }
 
     // --- barrier (driver lowers memory.max here)
     if let Some(b) = &args.barrier {
