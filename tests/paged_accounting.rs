@@ -812,7 +812,6 @@ fn hard_cap_clock_bounded_under_concurrent_random_access() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // Task 11: adaptive retention shrink under pin pressure (spec §5
 // "enforcement arm", §6 "order of weapons" step 2).
@@ -843,18 +842,25 @@ fn hard_cap_clock_bounded_under_concurrent_random_access() {
 // interaction, there handled via before/after deltas instead).
 // ---------------------------------------------------------------------------
 
-/// Same-key update+checkpoint, `rounds` times -- identical mechanism to task
-/// 9's `pinned_leaf_bytes_reflects_older_retained_snapshots` (proven
-/// reliable there, under a huge budget, to produce real nonzero pinned
-/// bytes): each commit CoWs a brand-new leaf for key 5, orphaning the
-/// previous round's leaf into a snapshot that is now non-latest. Several
-/// rounds (not just one) make the resulting pin pressure robust rather than
-/// depending on a single update's fault-in timing. Returns every version in
-/// commit order — index 0 is `baseline` (the caller-supplied version before
-/// any round ran), the rest are rounds `1..=rounds`.
-fn same_key_update_rounds(s: &Store, baseline: u64, rounds: u64) -> Vec<u64> {
+/// Same-key update+checkpoint, `rounds` times starting at round index
+/// `start` -- identical mechanism to task 9's
+/// `pinned_leaf_bytes_reflects_older_retained_snapshots` (proven reliable
+/// there, under a huge budget, to produce real nonzero pinned bytes): each
+/// commit CoWs a brand-new leaf for key 5, orphaning the previous round's
+/// leaf into a snapshot that is now non-latest. Several rounds (not just
+/// one) make the resulting pin pressure robust rather than depending on a
+/// single update's fault-in timing. Returns every version in commit order —
+/// index 0 is `baseline` (the caller-supplied version before any round in
+/// *this call* ran), the rest are rounds `start..start + rounds`.
+///
+/// `start` lets a caller land one or more rounds by hand first (e.g. to
+/// interleave a `pin_version` call between a commit and its checkpoint --
+/// see `adaptive_retention_shrink_honors_version_pin`, review M-5) and then
+/// continue the same `1_000 + i` value numbering through this helper
+/// instead of duplicating its loop body.
+fn same_key_update_rounds(s: &Store, baseline: u64, start: u64, rounds: u64) -> Vec<u64> {
     let mut versions = vec![baseline];
-    for i in 0..rounds {
+    for i in start..start + rounds {
         let mut w = s.begin_write(None).unwrap();
         {
             let mut t = w.open_table::<Row>("rows").unwrap();
@@ -868,11 +874,15 @@ fn same_key_update_rounds(s: &Store, baseline: u64, rounds: u64) -> Vec<u64> {
 }
 
 /// (a) Shrink fires: several update rounds orphan a run of older snapshots
-/// that `num_snapshots_retained(8)` alone would keep (7 total snapshots,
-/// nowhere near that window) -- but the tiny budget makes pin pressure
-/// alone the excess, so adaptive shrink collapses retention to 1. The
-/// oldest orphaned version becomes unreadable, latest stays readable, and
-/// resident+pinned settle to fit the budget.
+/// that `num_snapshots_retained(8)` alone would keep (8 total versions --
+/// the store's implicit initial empty version 0, `write_rows`' own version
+/// 1 (`v0` below), and the 6 update rounds -- landing exactly AT that
+/// window's boundary, not one below it: `gc_inner`'s fast path is
+/// `len <= retain_count`, a no-op at `len == retain_count == 8` too) -- but
+/// the tiny budget makes pin pressure alone the excess, so adaptive shrink
+/// collapses retention to 1. The oldest orphaned version becomes
+/// unreadable, latest stays readable, and resident+pinned settle to fit
+/// the budget.
 #[test]
 fn adaptive_retention_shrink_fires_under_pin_pressure() {
     const RETENTION: usize = 8;
@@ -891,19 +901,20 @@ fn adaptive_retention_shrink_fires_under_pin_pressure() {
     s.checkpoint().unwrap();
     let v0 = s.checkpoint().unwrap();
 
-    let versions = same_key_update_rounds(&s, v0, 6);
+    let versions = same_key_update_rounds(&s, v0, 0, 6);
     let v_old = versions[0]; // == v0: the oldest, first-orphaned version
     let v_new = *versions.last().unwrap();
     assert_ne!(v_old, v_new);
 
     // Ordinary commit-time auto-gc already ran inside every `commit()`
-    // above with `num_snapshots_retained(8)` -- 7 retained snapshots is
-    // nowhere near that window, so `gc_inner`'s fast path was always a
-    // no-op and v_old is still in `inner.snapshots`. Only Task 11's shrink
-    // path (triggered by the tiny BUDGET making pinned bytes the whole
-    // excess once the capped demote pass settles latest's own leaf) can
-    // evict it. Poll rather than assume a fixed call count converges (see
-    // this section's header comment for why).
+    // above with `num_snapshots_retained(8)` -- 8 total versions (the
+    // implicit initial empty version 0, `v0`, and the 6 update rounds) sit
+    // exactly AT that window's boundary, so `gc_inner`'s `len <= retain_count`
+    // fast path was always a no-op and v_old is still in `inner.snapshots`.
+    // Only Task 11's shrink path (triggered by the tiny BUDGET making
+    // pinned bytes the whole excess once the capped demote pass settles
+    // latest's own leaf) can evict it. Poll rather than assume a fixed
+    // call count converges (see this section's header comment for why).
     let mut converged = false;
     for _ in 0..50 {
         s.checkpoint().unwrap();
@@ -916,8 +927,8 @@ fn adaptive_retention_shrink_fires_under_pin_pressure() {
     assert!(
         converged,
         "v_old must eventually be gone: shrink must collapse retention despite \
-         num_snapshots_retained(8), which alone would have kept every one of these 7 \
-         snapshots (latest + 6 update rounds)"
+         num_snapshots_retained(8), which alone would have kept every one of these 8 \
+         versions (the initial empty version, v0, and 6 update rounds)"
     );
     // Settle: one more checkpoint so the reconcile reflects the converged
     // state (the loop above may have broken right after the eviction, on a
@@ -945,10 +956,14 @@ fn adaptive_retention_shrink_fires_under_pin_pressure() {
     );
 }
 
-/// (b) An explicit `VersionPin` survives adaptive shrink: pinning `v_old`
+/// (b) An explicit `VersionPin` survives adaptive shrink: pinning `v0`
 /// keeps its `Arc` strong count above 1, which `gc_inner_with_retain`'s
 /// existing filter already spares regardless of the retain count it is
-/// asked for -- Task 11 adds no second mechanism on top of it.
+/// asked for -- Task 11 adds no second mechanism on top of it. Also
+/// asserts shrink actually FIRES against `v1` (unpinned) before checking
+/// `v0` survives it -- otherwise a build in which the trigger never runs
+/// at all would pass this test identically, proving nothing about the pin
+/// (review, I-1).
 #[test]
 fn adaptive_retention_shrink_honors_version_pin() {
     const RETENTION: usize = 8;
@@ -972,14 +987,16 @@ fn adaptive_retention_shrink_honors_version_pin() {
     // would silently orphan a pin taken beforehand (a pre-existing hazard,
     // independent of Task 11: a `VersionPin` protects only the exact `Arc`
     // it cloned, and re-publish swaps that `Arc` for a fresh one under the
-    // same key). This tiny-budget setup makes that window realistic --
-    // demote_pass runs on every checkpoint whenever a budget is configured
-    // at all -- so this test sidesteps it by construction instead: pinning
-    // strictly AFTER v0 stops being latest is safe, because
-    // `demote_pass_inner` only ever reads/writes `inner.latest_version`,
-    // never an older, already-superseded version, so v0's map entry is
-    // permanently stable (same `Arc` identity) from the moment a newer
-    // commit lands.
+    // same key -- reproduced deterministically by
+    // `paged_shrink_orphans_latest_version_pin` below, and documented on
+    // `Store::pin_version`). This tiny-budget setup makes that window
+    // realistic -- demote_pass runs on every checkpoint whenever a budget
+    // is configured at all -- so this test sidesteps it by construction
+    // instead: pinning strictly AFTER v0 stops being latest is safe,
+    // because `demote_pass_inner` only ever reads/writes
+    // `inner.latest_version`, never an older, already-superseded version,
+    // so v0's map entry is permanently stable (same `Arc` identity) from
+    // the moment a newer commit lands.
     let mut w = s.begin_write(None).unwrap();
     {
         let mut t = w.open_table::<Row>("rows").unwrap();
@@ -988,32 +1005,41 @@ fn adaptive_retention_shrink_honors_version_pin() {
     let v1 = w.commit().unwrap();
     assert_ne!(v0, v1);
 
-    let pin = s.pin_version(Some(v0)).unwrap();
-    assert_eq!(pin.version(), v0);
+    // `_pin`, not `pin`: never referenced again below (only its side effect
+    // of keeping v0's `Arc` alive matters), and plain scope-end drop at the
+    // end of this function does exactly what an explicit trailing `drop`
+    // would (review, M-5).
+    let _pin = s.pin_version(Some(v0)).unwrap();
+    assert_eq!(_pin.version(), v0);
 
-    // Round 1's own checkpoint, then five more same-key update rounds --
-    // same mechanism as `same_key_update_rounds`, continuing from v1 (which
-    // is itself unprotected and expected to be shrunk away, in contrast to
-    // the pinned v0).
+    // Round 1's own checkpoint, then five more same-key update rounds via
+    // the shared helper (review, M-5: no more inlined loop-body copy),
+    // continuing from v1 (unpinned -- expected to be shrunk away, in
+    // contrast to the pinned v0).
     s.checkpoint().unwrap();
-    let mut versions = vec![v1];
-    for i in 1..6u64 {
-        let mut w = s.begin_write(None).unwrap();
-        {
-            let mut t = w.open_table::<Row>("rows").unwrap();
-            t.update(5, Row { v: 1_000 + i }).unwrap();
-        }
-        let v = w.commit().unwrap();
-        versions.push(v);
-        s.checkpoint().unwrap();
-    }
+    let versions = same_key_update_rounds(&s, v1, 1, 5);
     let v_new = *versions.last().unwrap();
 
-    // Generous, unconditional checkpoint budget -- long enough that, absent
-    // the pin, `adaptive_retention_shrink_fires_under_pin_pressure` above
-    // reliably converges well within it. No early-exit condition here: the
-    // whole point is that v0 must NOT disappear no matter how many shrink
-    // attempts run against it.
+    // I-1 (review): assert shrink actually FIRES -- bounded poll until v1
+    // (unpinned) is gone.
+    let mut fired = false;
+    for _ in 0..50 {
+        s.checkpoint().unwrap();
+        if s.begin_read(Some(v1)).is_err() {
+            fired = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        fired,
+        "shrink must actually fire: v1 (unpinned) must eventually be gone, otherwise \
+         v0's survival below proves nothing"
+    );
+
+    // Sustained pressure: several more rounds after shrink has already
+    // fired once -- the pin must keep protecting v0, not just survive up to
+    // the moment shrink first ran.
     for _ in 0..20 {
         s.checkpoint().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1024,11 +1050,10 @@ fn adaptive_retention_shrink_honors_version_pin() {
         "VersionPin must survive adaptive shrink even though retention was collapsed to 1 \
          for everything else"
     );
-    assert!(s.begin_read(Some(v_new)).is_ok());
-
-    // The pin (and therefore v0) becomes collectable once dropped --
-    // sanity, not the point of this test, so no further assertion after.
-    drop(pin);
+    assert!(
+        s.begin_read(Some(v_new)).is_ok(),
+        "latest must always be readable"
+    );
 }
 
 /// (c) `shrink_retention_under_pressure(false)`: nothing gets gc'd beyond
@@ -1063,7 +1088,7 @@ fn adaptive_retention_shrink_knob_false_leaves_store_over_budget() {
     s.checkpoint().unwrap();
     let v0 = s.checkpoint().unwrap();
 
-    let versions = same_key_update_rounds(&s, v0, 6);
+    let versions = same_key_update_rounds(&s, v0, 0, 6);
     let v_old = versions[0];
     let v_new = *versions.last().unwrap();
 
@@ -1075,9 +1100,13 @@ fn adaptive_retention_shrink_knob_false_leaves_store_over_budget() {
     assert!(
         s.begin_read(Some(v_old)).is_ok(),
         "knob false: only ordinary retention (num_snapshots_retained(8)) governs eviction, \
-         and 7 retained snapshots is nowhere near that window -- v_old must still be readable"
+         and 8 total versions (the initial empty version, v0, and 6 update rounds) sit \
+         exactly AT that window's boundary -- v_old must still be readable"
     );
-    assert!(s.begin_read(Some(v_new)).is_ok());
+    assert!(
+        s.begin_read(Some(v_new)).is_ok(),
+        "latest must always be readable"
+    );
 
     let stats = s.paged_stats().unwrap();
     assert!(
@@ -1085,4 +1114,124 @@ fn adaptive_retention_shrink_knob_false_leaves_store_over_budget() {
         "with shrink disabled, pinned_leaf_bytes must honestly report the un-shrunk excess \
          instead of the store silently freeing it out from under num_snapshots_retained"
     );
+    // I-2 (review): the brief's actual claim is "the store stays over
+    // budget" -- `pinned_leaf_bytes > 0` alone is a weaker statement (only
+    // equivalent to "over budget" by an unstated argument about leaf size
+    // vs. this tiny BUDGET). Assert the real contract the knob's own doc
+    // promises directly.
+    assert!(
+        stats.resident_leaf_bytes_est + stats.pinned_leaf_bytes > BUDGET,
+        "knob false: the store must stay over budget indefinitely under sustained pin \
+         pressure -- resident {} + pinned {} must exceed BUDGET {BUDGET}",
+        stats.resident_leaf_bytes_est, stats.pinned_leaf_bytes
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 11 review (task-11-review.md), Critical C-1.
+// ---------------------------------------------------------------------------
+
+/// UNRESOLVED — needs a ruling before it is fixed. **This is task 11's
+/// review finding C-1**, and `#[ignore]` means "reproduced, not yet ruled
+/// on", **not** "known broken, ignore forever" (same convention as task
+/// 60's F1, `tests/wal_fault_torn_tail.rs`). The test passes: it reliably
+/// reproduces the hazard now documented on `Store::pin_version`,
+/// `VersionPin`, and `PagedOptions::shrink_retention_under_pressure`.
+///
+/// # The question
+///
+/// `Store::install_paged_tables` (`src/store.rs`) always builds a *brand
+/// new* `Arc<Snapshot>` and inserts it at the same version key — this is
+/// the pre-existing "same-version re-publish" mechanism `demote_pass`'s
+/// per-table loop relies on (`Store::reconcile_paged_stats`'s own M-1
+/// doc), and it is unconditional: it runs at least once per non-`Resident`
+/// table on *every* `checkpoint()` call that has a `memory_budget_bytes`
+/// configured, whether or not anything was actually demoted. A
+/// [`VersionPin`](ultima_db::Store) taken on a version *while it is still
+/// `latest_version`* holds only the `Arc` it cloned at that moment; the
+/// very next checkpoint's re-publish (if any) installs a *different* `Arc`
+/// under the same map key, silently disconnecting the pin's copy from the
+/// store's own. From that point, `gc_inner_with_retain`'s
+/// `Arc::strong_count == 1` filter sees only the map's own (now
+/// unprotected) reference — so once that version ages out of retention
+/// (ordinary auto-gc, or, with the task-11 default
+/// `shrink_retention_under_pressure(true)`, adaptive shrink acting almost
+/// immediately under budget pressure), the map entry is collected **while
+/// the pin is still alive**. `Store::begin_read(Some(pin.version()))` then
+/// fails with `Error::VersionNotFound`, even though the pin's own `Arc`
+/// (and every leaf it reaches) is still resident in memory — dead weight,
+/// invisible to `pinned_leaf_bytes` (whose reconcile walk only ever visits
+/// `inner.snapshots`, so an orphaned pin's bytes are uncounted by exactly
+/// the mechanism spec §5 exists to make honest).
+///
+/// The root cause (re-publish) predates task 11 and is not itself a
+/// defect: it is what keeps `demote_pass` and `Store::reconcile_paged_stats`'s
+/// `last_root` refresh correct. What is unruled is what to do about the
+/// `VersionPin` contract gap it opens — candidates include re-resolving a
+/// pin against the live map entry at gc time, or restricting
+/// `pin_version` to reject pinning a version that is still latest in a
+/// budget-limited paged store. Two safe patterns already exist and are
+/// documented (`Store::pin_version`'s doc): pin only a version that is no
+/// longer latest, or set `shrink_retention_under_pressure(false)` for a
+/// pin-while-latest / SMR handoff store.
+///
+/// # Reproduction shape
+///
+/// Deterministic, not a timing race: `pin_version` is called while `v0`
+/// is still latest, then exactly one more `checkpoint()` — still before
+/// any further commit — is enough to re-publish `v0`'s map entry (the
+/// per-table loop's first batch always calls `install_paged_tables`).
+/// Several further update+checkpoint rounds and a tiny budget then let
+/// adaptive shrink (default on) collect the now-orphaned entry.
+#[test]
+#[ignore = "unresolved: see the doc comment; task 11 review C-1, do not pin until ruled on"]
+fn paged_shrink_orphans_latest_version_pin() {
+    const RETENTION: usize = 8;
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(BUDGET).build(),
+        RETENTION,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    // The unsafe pattern: pin WHILE v0 is still latest_version.
+    let pin = s.pin_version(Some(v0)).unwrap();
+    assert_eq!(pin.version(), v0);
+
+    // Deterministically orphans the pin: `demote_pass`'s per-table loop
+    // calls `install_paged_tables` at least once per non-`Resident` table
+    // on this checkpoint (still v0 == latest_version, since no further
+    // commit has landed), unconditionally building a brand-new
+    // `Arc<Snapshot>` for v0. `pin`'s `Arc` and `inner.snapshots[&v0]`'s
+    // `Arc` are now two different allocations.
+    s.checkpoint().unwrap();
+    assert!(
+        s.begin_read(Some(v0)).is_ok(),
+        "sanity: still readable immediately after the re-publish -- the map entry moved \
+         to a new Arc, but nothing has tried to evict it yet"
+    );
+
+    // Land enough further commits+checkpoints that adaptive shrink (default
+    // on, tiny budget) tries to collect the now-orphaned map entry.
+    let _versions = same_key_update_rounds(&s, v0, 0, 6);
+    for _ in 0..50 {
+        s.checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // The bug: begin_read fails even though `pin` is alive and still
+    // holding the STALE snapshot's memory.
+    assert!(
+        s.begin_read(Some(v0)).is_err(),
+        "reproduction did not reproduce: v0 was expected to become unreadable despite the \
+         live VersionPin (task 11 review, C-1) -- if this now passes, the hazard may have \
+         been fixed; update Store::pin_version's, VersionPin's, and \
+         PagedOptions::shrink_retention_under_pressure's docs, then un-ignore this test"
+    );
+    drop(pin);
 }

@@ -1021,6 +1021,31 @@ impl Store {
     /// API targets) there is no interleaved committer, so the direct call is
     /// safe.
     ///
+    /// **Paged-store caveat (task 11 finding, tracked, not yet fixed):** in a
+    /// store configured with [`Persistence::paged`](crate::persistence::Persistence::paged)
+    /// and `memory_budget_bytes`, a checkpoint's demote pass can *re-publish*
+    /// a version — installing a **new** `Arc<Snapshot>` at that version's map
+    /// key — whenever that version is still [`Store::latest_version`] at the
+    /// moment the pass runs. A [`VersionPin`] taken **before** that
+    /// re-publish keeps only the old, now-disconnected `Arc` alive; the
+    /// store's own snapshot map holds a *different* `Arc` under the same
+    /// key, which the pin does not protect. With the default
+    /// [`PagedOptions::shrink_retention_under_pressure`](crate::persistence::PagedOptions::shrink_retention_under_pressure)
+    /// (`true`), adaptive retention shrink can then collect that
+    /// now-unprotected map entry immediately, and a later
+    /// `Store::begin_read(Some(pin.version()))` fails with
+    /// [`Error::VersionNotFound`] even though the pin is still alive and
+    /// still (invisibly) holding the stale snapshot's memory — see
+    /// `paged_shrink_orphans_latest_version_pin` in
+    /// `tests/paged_accounting.rs` for a reproduction. Two safe patterns:
+    /// pin a version only **after** a newer commit has superseded it (once a
+    /// version is no longer `latest_version`, the demote pass never touches
+    /// its snapshot again, so the `Arc` identity is permanently stable); or,
+    /// for the SMR pin-while-latest handoff pattern this API targets above,
+    /// configure `shrink_retention_under_pressure(false)` so retention never
+    /// shrinks below the configured `StoreConfig::num_snapshots_retained`
+    /// window.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1036,7 +1061,10 @@ impl Store {
     ///     let store = store.clone();
     ///     move || {
     ///         // While `pin` is alive this cannot fail with VersionNotFound,
-    ///         // no matter how far the writer has committed past it.
+    ///         // no matter how far the writer has committed past it --
+    ///         // this store is neither paged nor budget-limited, so the
+    ///         // paged-store re-publish caveat documented above this
+    ///         // example does not apply here.
     ///         let rtx = store.begin_read(Some(pin.version())).unwrap();
     ///         // ... stream the snapshot from `rtx`, then drop both ...
     ///         drop(rtx);
@@ -2022,7 +2050,14 @@ impl Store {
             // (`pinned`, task 9) is invisible to it by construction. When
             // pins are large enough that they alone could cover the whole
             // remaining excess over budget, shrinking retention is the only
-            // lever left: gc down to a floor of latest plus every explicit
+            // lever left: gc down to a floor of latest — **plus possibly
+            // one more** (review fix round 1, M-2): the `reconcile_paged_stats`
+            // call just above re-points `PagedState::last_root` at
+            // `snap.version`'s live `Arc`, so if a concurrent commit moved
+            // `latest_version` past `snap.version` between that call and
+            // this gc, `snap.version`'s entry has `strong_count >= 2` (the
+            // map's own reference plus `last_root`'s) and survives this
+            // pass regardless of retention — plus every explicit
             // `VersionPin`/live `ReadTx` — `gc_inner_with_retain`'s existing
             // `Arc::strong_count == 1` filter already spares those (that
             // floor IS the spec's floor; nothing new is added here).
@@ -2038,15 +2073,22 @@ impl Store {
                 if total > budget {
                     let excess = total - budget;
                     if pinned >= excess {
-                        {
+                        let evicted = {
                             let mut inner = self.inner.write();
-                            gc_inner_with_retain(&mut inner, 1);
+                            gc_inner_with_retain(&mut inner, 1)
+                        };
+                        // "the next reconcile settles the counters": only
+                        // worth re-walking if gc actually dropped something
+                        // (review fix round 1, M-1) — the all-pinned steady
+                        // state (every retained snapshot protected by a live
+                        // `ReadTx`/`VersionPin`) evicts nothing, and the
+                        // numbers this tick's first reconcile already
+                        // published above are still accurate in that case,
+                        // so a second full snapshot walk would be pure
+                        // waste on every such tick.
+                        if evicted > 0 {
+                            self.reconcile_paged_stats(snap.version);
                         }
-                        // "the next reconcile settles the counters": gc just
-                        // dropped whatever retained snapshots it could, so
-                        // re-walk to publish the post-shrink truth rather
-                        // than leaving stale pre-shrink numbers published.
-                        self.reconcile_paged_stats(snap.version);
                     }
                 }
             }
@@ -4461,6 +4503,11 @@ fn prune_write_sets(inner: &mut StoreInner) {
 fn gc_inner(inner: &mut StoreInner) {
     // latest_version is always kept (even if num_snapshots_retained is 0).
     let retain_count = inner.config.num_snapshots_retained.max(1);
+    // Return value (how many snapshots were actually collected) is only
+    // useful to the task 11 shrink call site below, which gates a second
+    // reconcile walk on it (review fix round 1, M-1) — every other caller
+    // of this ordinary wrapper has nothing to gate on it, so it is
+    // discarded here.
     gc_inner_with_retain(inner, retain_count);
 }
 
@@ -4480,8 +4527,18 @@ fn gc_inner(inner: &mut StoreInner) {
 /// `VersionPin`") — passing `retain_count = 1` only changes how many
 /// snapshots beyond that floor this call is WILLING to keep, never whether
 /// a pinned one can be collected. No second mechanism is needed on top of
-/// the existing one.
-fn gc_inner_with_retain(inner: &mut StoreInner, retain_count: usize) {
+/// the existing one. **Documented exception, not this function's concern:**
+/// a pin taken while its target was still `latest_version` can be silently
+/// orphaned by an earlier demote-pass re-publish — see [`Store::pin_version`]'s
+/// doc. This filter still behaves exactly as specified against whichever
+/// `Arc` is actually in `inner.snapshots` at the moment it runs; the hazard
+/// is that a stale pin's `Arc` may no longer be the one there to protect.
+///
+/// Returns the number of snapshots actually removed (review fix round 1,
+/// M-1) — the task 11 shrink call site uses this to skip a second reconcile
+/// walk when a shrink attempt evicted nothing (e.g. every retained
+/// snapshot is protected by a live `ReadTx`/`VersionPin`).
+fn gc_inner_with_retain(inner: &mut StoreInner, retain_count: usize) -> usize {
     // The N most recent versions to retain unconditionally.
     // latest_version is always kept (even if retain_count is 0).
     let retain_count = retain_count.max(1);
@@ -4490,7 +4547,7 @@ fn gc_inner_with_retain(inner: &mut StoreInner, retain_count: usize) {
     let len = inner.snapshots.len();
     if len <= retain_count {
         inner.metrics.inc_gc_run();
-        return;
+        return 0;
     }
 
     // Only the oldest `len - retain_count` entries lie outside the
@@ -4513,6 +4570,7 @@ fn gc_inner_with_retain(inner: &mut StoreInner, retain_count: usize) {
     if !doomed.is_empty() {
         inner.metrics.inc_snapshots_collected(doomed.len() as u64);
     }
+    doomed.len()
 }
 
 impl Default for Store {
@@ -4530,8 +4588,14 @@ impl Default for Store {
 /// Created by [`Store::pin_version`]. Holds a strong reference to the
 /// snapshot, which is the same mechanism GC uses to protect versions held by
 /// an active [`ReadTx`] — a pinned version is never collected, regardless of
-/// [`StoreConfig::num_snapshots_retained`]. Dropping the last pin (and any
-/// clones) makes the version collectable again.
+/// [`StoreConfig::num_snapshots_retained`]. **Exception, tracked and not yet
+/// fixed:** in a paged store with `memory_budget_bytes` and the default
+/// [`PagedOptions::shrink_retention_under_pressure`](crate::persistence::PagedOptions::shrink_retention_under_pressure)
+/// (`true`), a pin taken while its version is still
+/// [`Store::latest_version`] can be silently orphaned by a later
+/// demote-pass re-publish of that same version — see [`Store::pin_version`]'s
+/// doc for the mechanism and the two safe patterns. Dropping the last pin
+/// (and any clones) makes the version collectable again.
 ///
 /// `VersionPin` is `Send + Sync + Clone`, unlike [`ReadTx`]: use it to hand a
 /// version across threads, then open a [`ReadTx`] on the receiving thread via

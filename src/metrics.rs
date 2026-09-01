@@ -22,8 +22,15 @@ pub struct MetricsSnapshot {
     /// Total `WriteTx::rollback` calls plus implicit rollbacks on `Drop`
     /// (a `WriteTx` dropped without calling `commit`).
     pub rollbacks: u64,
-    /// Total `Store::gc` invocations, regardless of how many snapshots each
-    /// run actually collected.
+    /// Total internal gc passes (`gc_inner_with_retain`), regardless of how
+    /// many snapshots each run actually collected. Despite the name, this
+    /// is not just explicit [`Store::gc`](crate::Store::gc) calls — every
+    /// caller of the shared `gc_inner`/`gc_inner_with_retain` machinery
+    /// counts here: commit-time auto-gc (`StoreConfig::auto_snapshot_gc`,
+    /// on by default) on every commit, and (task 11) a paged checkpoint's
+    /// adaptive retention shrink
+    /// (`PagedOptions::shrink_retention_under_pressure`, also on by
+    /// default) whenever it decides to gc down to a floor of 1.
     pub gc_runs: u64,
     /// Total number of retained snapshots reclaimed across all `gc` runs.
     pub snapshots_collected: u64,

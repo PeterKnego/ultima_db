@@ -308,6 +308,19 @@ pub struct PagedOptions {
     /// live `ReadTx` (the existing `Arc::strong_count == 1` gc filter
     /// already spares those; nothing new is added on top of it).
     ///
+    /// **`VersionPin` caveat (tracked, not yet fixed):** that floor holds
+    /// only for a pin taken on a version that is no longer
+    /// [`Store::latest_version`](crate::Store::latest_version) at pin time.
+    /// A demote pass can re-publish (install a new `Arc<Snapshot>` for) a
+    /// version that is *still* latest, which orphans any
+    /// [`VersionPin`](crate::VersionPin) taken on it beforehand — the pin's
+    /// `Arc` and the store's own map entry silently diverge, and this
+    /// shrink can then collect the (now unprotected) map entry even while
+    /// the pin is alive. See [`Store::pin_version`](crate::Store::pin_version)'s
+    /// doc for the full mechanism and the two safe patterns (pin only a
+    /// no-longer-latest version, or set this knob `false` for a
+    /// pin-while-latest / SMR handoff store).
+    ///
     /// **Default: `true`.** Rationale: configuring a memory budget is a
     /// declaration that bounded memory matters more than history depth,
     /// and the NVMe bench-host data
