@@ -1031,6 +1031,17 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
 
     /// Delete a record by its key. Returns the deleted record, or an error if
     /// the key does not exist.
+    ///
+    /// **Value-block leaves (task: paged-leaf-value-blocks, Task 7).** On a
+    /// block-backed leaf the removed value has no per-entry `Arc` to hand
+    /// back — `merged_get_arc` below already clones it out via `BTree::
+    /// get_arc`'s `clone_value` fallback (`get_arc_in_node`, Task 4), the
+    /// same clone-out boundary every other `Arc<R>`-returning read uses.
+    /// That single clone is the only one on this path: the subsequent
+    /// `remove_mut` (or overlay tombstone) never touches the value again —
+    /// `remove_from_block_leaf_mut` drops the removed slot in place, it does
+    /// not clone it — so `delete` on a block leaf costs exactly one clone,
+    /// not two.
     pub fn delete(&mut self, key: &K) -> Result<Arc<R>> {
         let old = self.merged_get_arc(key).ok_or(Error::KeyNotFound)?;
         // Remove from all indexes before removing from data tree.

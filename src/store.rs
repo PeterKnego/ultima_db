@@ -10857,6 +10857,22 @@ mod tests {
     /// append goes through `BulkBuilder`, which still builds all-Arc leaves
     /// — that is Task 7's scope, and including it here would assert a
     /// property this task does not yet own.
+    ///
+    /// Task 7 update: this exclusion is a permanent property of the bulk
+    /// path, not a gap to close later. `BulkBuilder::freeze_leaf`/
+    /// `freeze_internal` (`src/btree.rs`) always build `block: None` nodes
+    /// — a bulk-built (or bulk-appended) tree is all-Arc by construction,
+    /// regardless of whether it carries an attached paged source, and only
+    /// becomes block-backed the same way every other leaf does: written to
+    /// `pages.bin` by a checkpoint, then decoded back by `NodeCodec::decode`
+    /// on the next fault-in. Asserting `blocks == leaves` right after an
+    /// `insert_batch` would therefore assert something that is never true
+    /// pre-checkpoint. `tests/paged_block_leaves.rs`'s
+    /// `insert_batch_on_a_fresh_paged_table_clones_zero_values` is the
+    /// positive-side counterpart: it proves the bulk path costs zero
+    /// `clone_value` calls (there is no block to clone out of) and that the
+    /// batch still reads back correctly after checkpoint + recover, which is
+    /// where the leaves do turn block-shaped.
     #[cfg(feature = "persistence")]
     #[test]
     fn paged_table_leaves_stay_block_backed_across_a_mixed_table_workload() {

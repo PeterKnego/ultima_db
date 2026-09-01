@@ -649,6 +649,29 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// tail leaf may be packed below `MIN_KEYS`; reads, writes, and ordering
     /// are unaffected, and a delete touching that leaf restores the floor
     /// (see `from_sorted_nested_cascade_two_million_benign`).
+    ///
+    /// **Value-block leaves (task: paged-leaf-value-blocks, Task 7 ruling).**
+    /// Every leaf `from_sorted`/`extend_from_sorted` freeze — `freeze_leaf`
+    /// below — is built `block: None`, i.e. plain per-entry `Arc<V>`, no
+    /// exceptions: the caller already owns each `V` behind an `Arc` (this
+    /// takes `(K, Arc<V>)` pairs and moves them in), so there is nothing to
+    /// gain from packing a block here, and every real call site (`Store::
+    /// bulk_load` via `Table::from_bulk`, and `Table::insert_batch`'s
+    /// task51 fast path) runs *before* any page-file source is attached to
+    /// the tree being built — `Store::checkpoint_impl_paged` attaches
+    /// lazily, at checkpoint time (`registry.rs`'s `attach_paged` closure),
+    /// not at registration. A freshly bulk-built tree is therefore all-Arc
+    /// end to end and stays that way until the store checkpoints it to
+    /// `pages.bin` and something later faults a leaf back in through
+    /// `NodeCodec::decode` (the only place a leaf ever becomes block-shaped)
+    /// — one demote/fault cycle after the bulk build, never during it. The
+    /// zero-`clone_value`-calls claim for the bulk path therefore holds
+    /// trivially: there is no block to clone out of, by construction.
+    /// (`extend_from_sorted` appending onto an *already-attached, already
+    /// block-shaped* tree is the one case that does call `clone_value` —
+    /// see `seed_from_spine`/`redistribute_tail` below — but only to *read*
+    /// a block-leaf spine/sibling it did not itself build; the fresh nodes
+    /// this produces are still `block: None`.)
     pub(crate) fn from_sorted<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, Arc<V>)>,
@@ -2274,6 +2297,22 @@ impl<'a, K: Ord + Clone, V> DiffCursor<'a, K, V> {
                     // reaches this iterator. Left as `expect` (not fixed to
                     // clone via `clone_value`) since there is no live paged
                     // call site to regression-test against.
+                    //
+                    // Re-confirmed at Task 7 (boundaries/bulk/MultiWriter):
+                    // `diff_table` (the only production caller of `BTree::
+                    // diff`) is invoked from exactly one call site,
+                    // `serialize_delta` in `checkpoint.rs`, which is in turn
+                    // reachable only from `write_delta_checkpoint`, called
+                    // only inside `Store::checkpoint_impl` — the row-format
+                    // path `checkpoint_impl` itself early-returns out of
+                    // (`if inner.paged.is_some() { return self.
+                    // checkpoint_impl_paged(); }`) before ever reaching
+                    // `write_delta_checkpoint`. Both Task 5 (immutable) and
+                    // Task 6 (in-place) mutation paths now produce block
+                    // leaves, but neither changes which checkpoint path runs
+                    // on a paged store, so the claim is unchanged: no
+                    // production call graph can hand a block leaf to this
+                    // cursor.
                     return Some((k, v.as_arc().expect("diff over block leaf not yet supported (I-A)")));
                 }
                 self.stack.pop();

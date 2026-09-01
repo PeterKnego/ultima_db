@@ -294,3 +294,196 @@ fn updating_every_key_of_a_recovered_tree_in_place_matches_the_oracle() {
     assert_tables_equal(&again, &plain, "after recover of the updated tree");
     assert_eq!(dump(&again), (0..800u64).map(|k| (k, k + 2_000)).collect::<Vec<_>>());
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: API boundaries — delete clone-out, bulk-path zero-clone, and the
+// task59 MultiWriter merge, all against a recovered, block-backed table.
+// ---------------------------------------------------------------------------
+
+/// Step 1(a): `Table::delete` on a recovered, block-backed leaf returns the
+/// exact value that was removed (the `merged_get_arc` -> `BTree::get_arc`
+/// clone-out documented at `Table::delete`), and the table matches the
+/// in-memory oracle afterward. `deleting_a_recovered_tree_down_through_
+/// merges_matches_the_oracle` above already stresses delete-driven
+/// rebalancing broadly; this is the narrow, dedicated version the task
+/// brief asks for: value correctness on a handful of individually deleted,
+/// still block-shaped keys, spanning the front, middle, and tail of the
+/// tree.
+#[test]
+fn delete_on_a_recovered_block_backed_table_returns_the_correct_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = plain_store();
+    let ops: Vec<Op> = (0..300u64).map(|k| Op::Put(k, k * 7 + 1)).collect();
+    {
+        let paged = paged_store(dir.path());
+        apply_ops(&paged, &ops);
+        apply_ops(&plain, &ops);
+        paged.checkpoint().unwrap();
+    }
+    let s = reopen_and_recover(dir.path());
+    assert_tables_equal(&s, &plain, "after recover");
+
+    for k in [0u64, 1, 2, 149, 150, 151, 298, 299] {
+        let expected = k * 7 + 1;
+        let mut w = s.begin_write(None).unwrap();
+        let removed = w.open_table::<Row>("t").unwrap().delete(k).unwrap();
+        w.commit().unwrap();
+        assert_eq!(
+            removed.v, expected,
+            "delete({k}) on a block-backed leaf returned the wrong value"
+        );
+
+        let mut wp = plain.begin_write(None).unwrap();
+        wp.open_table::<Row>("t").unwrap().delete(k).unwrap();
+        wp.commit().unwrap();
+    }
+    assert_tables_equal(&s, &plain, "after targeted deletes of block-backed rows");
+
+    // A repeat delete of an already-removed key is `KeyNotFound`, not a
+    // stale clone of the old value — the negative side of the same
+    // clone-out boundary.
+    let mut w = s.begin_write(None).unwrap();
+    let err = w.open_table::<Row>("t").unwrap().delete(0u64);
+    assert!(matches!(err, Err(ultima_db::Error::KeyNotFound)));
+}
+
+/// Static clone counter for [`CountingRow`]. Module-scoped and touched by
+/// exactly one test (`insert_batch_on_a_fresh_paged_table_clones_zero_values`),
+/// so a global rather than a per-test instance is safe under the crate's
+/// default parallel test execution — no other test in this binary ever
+/// constructs a `CountingRow`.
+static COUNTING_CLONES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct CountingRow {
+    v: u64,
+}
+
+impl Clone for CountingRow {
+    fn clone(&self) -> Self {
+        COUNTING_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CountingRow { v: self.v }
+    }
+}
+
+fn counting_paged_store(dir: &Path) -> Store {
+    let p = Persistence::standalone(dir, Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().build())
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<CountingRow>("c").unwrap();
+    s
+}
+
+/// Step 1(b): the task51 `BulkBuilder` fast path (`Table::insert_batch` ->
+/// `BTree::extend_from_sorted`, taken here because the batch lands on a
+/// fresh table with no prior max key) owns every value it inserts — the
+/// caller's `Vec<R>` is moved straight into fresh `Arc`s
+/// (`records.into_iter().map(Arc::new)`) — and `BulkBuilder::freeze_leaf`/
+/// `freeze_internal` always build `block: None` nodes, so there is no block
+/// to clone out of. The bulk path must therefore cost exactly zero
+/// `R::clone` calls — the same fn `PagedSource::clone_value` rides
+/// (captured at `register_table_paged` as `<R as Clone>::clone`) —
+/// end to end: build, checkpoint (serde, not `Clone`), and cold read-back
+/// after `recover()` (zero-copy `get`, not `get_arc`). `CountingRow::clone`
+/// is the instrument.
+#[test]
+fn insert_batch_on_a_fresh_paged_table_clones_zero_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+
+    {
+        let s = counting_paged_store(dir.path());
+        let batch: Vec<CountingRow> = (0..600u64).map(|v| CountingRow { v }).collect();
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<CountingRow>("c").unwrap();
+            let ids = t.insert_batch(batch).unwrap();
+            assert_eq!(ids.len(), 600);
+        }
+        w.commit().unwrap();
+        assert_eq!(
+            COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "insert_batch on a fresh paged table must not clone any values"
+        );
+
+        s.checkpoint().unwrap();
+        assert_eq!(
+            COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "checkpoint serializes via serde, not Clone — still zero"
+        );
+    }
+
+    // Cold: this is where the leaves actually turn block-shaped
+    // (`NodeCodec::decode` on the first fault-in), the case Task 7's ruling
+    // says the bulk path itself never has to pay for.
+    let s2 = counting_paged_store(dir.path());
+    s2.recover().unwrap();
+
+    let r = s2.begin_read(None).unwrap();
+    let t = r.open_table::<CountingRow>("c").unwrap();
+    assert_eq!(t.len(), 600);
+    // Auto-increment ids start at 1; `insert_batch` assigned them in the
+    // same order the rows were built (`v` ascending from 0).
+    for id in 1..=600u64 {
+        assert_eq!(t.get(id).unwrap().v, id - 1, "row {id}");
+    }
+    assert_eq!(
+        COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "reading back cold, block-shaped rows through `get` (zero-copy) must not clone either"
+    );
+}
+
+/// Step 1(c): MultiWriter's key-level OCC merge (`Table::upsert_arc`, the
+/// per-key slow path `merge_keys_from` falls back to whenever the losing
+/// writer's base predates the table's latest committed write) against a
+/// recovered, block-backed leaf — the same disjoint-keys-both-commit shape
+/// `tests/store_integration.rs`'s
+/// `multi_writer_disjoint_keys_same_table_both_commit` and the task59 race
+/// matrix cover for an all-Arc table, replayed here on block leaves.
+#[test]
+fn multi_writer_disjoint_keys_on_a_paged_block_backed_table_both_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops: Vec<Op> = (0..200u64).map(|k| Op::Put(k, k)).collect();
+    {
+        let paged = paged_store(dir.path());
+        apply_ops(&paged, &ops);
+        paged.checkpoint().unwrap();
+    }
+    let s = reopen_and_recover(dir.path());
+
+    let mut wa = s.begin_write(None).unwrap();
+    let mut wb = s.begin_write(None).unwrap();
+
+    // Writer A updates an existing (block-backed) key in place; writer B
+    // inserts a brand-new one. Disjoint key sets on the same table, both
+    // based on the same recovered snapshot.
+    wa.open_table::<Row>("t").unwrap().update(50, Row { v: 999 }).unwrap();
+    wb.open_table::<Row>("t").unwrap().put(500, Row { v: 12_345 }).unwrap();
+
+    wa.commit().unwrap();
+    // B rebases onto A's just-committed snapshot: `merge_keys_from` clones
+    // the current latest table (O(1) CoW) and replays B's one modified key
+    // into it via `upsert_arc` — the merge path this test targets.
+    wb.commit().unwrap();
+
+    let r = s.begin_read(None).unwrap();
+    let t = r.open_table::<Row>("t").unwrap();
+    assert_eq!(t.len(), 201);
+    assert_eq!(t.get(50).unwrap().v, 999, "writer A's edit must survive the merge");
+    assert_eq!(t.get(500).unwrap().v, 12_345, "writer B's edit must survive the merge");
+    for k in 0..200u64 {
+        if k != 50 {
+            assert_eq!(t.get(k).unwrap().v, k, "row {k} must be untouched by the merge");
+        }
+    }
+}
