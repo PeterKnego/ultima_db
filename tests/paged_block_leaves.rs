@@ -347,12 +347,22 @@ fn delete_on_a_recovered_block_backed_table_returns_the_correct_value() {
     assert!(matches!(err, Err(ultima_db::Error::KeyNotFound)));
 }
 
-/// Static clone counter for [`CountingRow`]. Module-scoped and touched by
-/// exactly one test (`insert_batch_on_a_fresh_paged_table_clones_zero_values`),
-/// so a global rather than a per-test instance is safe under the crate's
-/// default parallel test execution — no other test in this binary ever
-/// constructs a `CountingRow`.
+/// Static clone counter for [`CountingRow`]. Module-scoped, and now shared
+/// by three tests (the bulk zero-clone test plus the two `delete` cost-model
+/// pins added in fix round 1) — under the crate's default parallel test
+/// execution those three would otherwise race on the same counter (a
+/// concurrently-running test's clones would leak into another's `before`/
+/// `after` delta). `COUNTING_CLONES_LOCK` below serializes them; every test
+/// that reads or resets this counter must hold it for its entire body.
 static COUNTING_CLONES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serializes every test that measures [`COUNTING_CLONES`] against the
+/// other such tests in this binary, so a `before`/`after` delta in one can
+/// never observe clones from another running concurrently. Held for the
+/// duration of each guarded test's body (`let _guard = COUNTING_CLONES_LOCK
+/// .lock().unwrap();`), not just around the measured section — the whole
+/// point is that no *other* guarded test's body can interleave with it.
+static COUNTING_CLONES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CountingRow {
@@ -395,6 +405,7 @@ fn counting_paged_store(dir: &Path) -> Store {
 /// is the instrument.
 #[test]
 fn insert_batch_on_a_fresh_paged_table_clones_zero_values() {
+    let _guard = COUNTING_CLONES_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let before = COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -486,4 +497,115 @@ fn multi_writer_disjoint_keys_on_a_paged_block_backed_table_both_commit() {
             assert_eq!(t.get(k).unwrap().v, k, "row {k} must be untouched by the merge");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (Task 7 review, Important): `Table::delete`'s true clone cost
+// on a block leaf. The review measured 33-65 `clone_value` calls per delete
+// where the doc comment claimed exactly one -- `Child::make_mut`'s CoW
+// (`clone_with`) clones every surviving entry of a *shared* block leaf
+// before `remove_from_block_leaf_mut` drops the removed one, which is
+// itself cloned once for nothing in that case. These two tests pin both
+// halves of the corrected cost model using the `CountingRow`/
+// `COUNTING_CLONES` instrument from the zero-clone bulk test above: unique
+// ownership costs exactly 1 (the `get_arc` boundary clone-out only); a
+// shared leaf costs `1 + n` where `n` is the leaf's entry count at CoW time.
+// ---------------------------------------------------------------------------
+
+/// Seed a fresh paged `CountingRow` table with `n` rows (ids `1..=n`, one
+/// leaf since `n` is kept well under `MAX_KEYS`), checkpoint, and drop the
+/// store -- leaving a cold, block-shaped leaf on disk with nothing in any
+/// live process having faulted it in yet.
+fn seed_counting_table(dir: &Path, n: u64) {
+    let s = counting_paged_store(dir);
+    let batch: Vec<CountingRow> = (0..n).map(|v| CountingRow { v }).collect();
+    let mut w = s.begin_write(None).unwrap();
+    w.open_table::<CountingRow>("c").unwrap().insert_batch(batch).unwrap();
+    w.commit().unwrap();
+    s.checkpoint().unwrap();
+}
+
+/// Delete on a leaf that is the **sole** owner of its `Arc<BTreeNode>`:
+/// nothing has read or written it since `recover()`, so `Table::delete`'s
+/// own `merged_get_arc` traversal is the very first fault of this leaf, and
+/// that fault lands in this `WriteTx`'s own freshly-forked `Child` slot --
+/// the live snapshot's slot is still unloaded and shares nothing with it.
+/// `remove_mut`'s subsequent `make_mut` therefore finds `Arc::get_mut`
+/// succeeding (unique) and edits in place: no `clone_with` CoW.
+#[test]
+fn delete_on_a_unique_block_leaf_clones_only_the_returned_value() {
+    let _guard = COUNTING_CLONES_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    seed_counting_table(dir.path(), 10);
+
+    let s = counting_paged_store(dir.path());
+    s.recover().unwrap();
+
+    let before = COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+    let mut w = s.begin_write(None).unwrap();
+    let removed = w.open_table::<CountingRow>("c").unwrap().delete(5u64).unwrap();
+    w.commit().unwrap();
+    assert_eq!(removed.v, 4, "id 5 holds CountingRow{{v: 4}} (auto-ids are 1-based)");
+
+    // Exactly 1: `merged_get_arc`'s own clone-out of the returned `Arc<R>`
+    // (`get_arc_in_node`'s `clone_value` fallback, Task 4). Nothing else on
+    // this path clones a value -- `remove_from_block_leaf_mut` drops the
+    // removed slot from an already-uniquely-owned block without touching
+    // `clone_value` at all.
+    assert_eq!(
+        COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1,
+        "delete on a uniquely-owned block leaf must cost exactly one clone (the boundary clone-out)"
+    );
+
+    let r = s.begin_read(None).unwrap();
+    assert_eq!(r.open_table::<CountingRow>("c").unwrap().len(), 9);
+}
+
+/// Delete on a leaf that is **shared** with the store's live snapshot: a
+/// plain `get` through a read transaction (zero-copy, no `clone_value` of
+/// its own) faults the leaf into the live snapshot's `Child` slot first --
+/// the ordinary case whenever anything touched the leaf before this delete
+/// (exactly what
+/// `delete_on_a_recovered_block_backed_table_returns_the_correct_value`'s
+/// preceding `assert_tables_equal` oracle pass does to every leaf). The
+/// later `WriteTx`'s table clone then shares that same `Arc<BTreeNode>`, so
+/// `make_mut` takes the `clone_with` CoW branch.
+#[test]
+fn delete_on_a_shared_block_leaf_clones_the_whole_block() {
+    let _guard = COUNTING_CLONES_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    seed_counting_table(dir.path(), 10);
+
+    let s = counting_paged_store(dir.path());
+    s.recover().unwrap();
+
+    // Prime: fault the leaf into the *live* snapshot via a read-only get
+    // (zero-copy -- contributes 0 to the counter itself).
+    {
+        let r = s.begin_read(None).unwrap();
+        assert_eq!(r.open_table::<CountingRow>("c").unwrap().get(5).unwrap().v, 4);
+    }
+    let before = COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+
+    let mut w = s.begin_write(None).unwrap();
+    let removed = w.open_table::<CountingRow>("c").unwrap().delete(5u64).unwrap();
+    w.commit().unwrap();
+    assert_eq!(removed.v, 4);
+
+    // 11 = 1 (`merged_get_arc`'s boundary clone-out) + 10 (`Child::make_mut`
+    // -> `clone_with`'s whole-block CoW: `Arc::get_mut` fails because the
+    // leaf is shared with the live snapshot from the priming read above, so
+    // every one of the 10 entries resident at CoW time -- including the one
+    // about to be removed -- is duplicated via `clone_value`, and the
+    // removed entry's copy is then dropped for nothing by
+    // `remove_from_block_leaf_mut`).
+    assert_eq!(
+        COUNTING_CLONES.load(std::sync::atomic::Ordering::Relaxed) - before,
+        11,
+        "delete on a shared block leaf costs 1 (get_arc) + n=10 (clone_with's whole-block CoW)"
+    );
+
+    let r = s.begin_read(None).unwrap();
+    assert_eq!(r.open_table::<CountingRow>("c").unwrap().len(), 9);
 }

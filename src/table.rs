@@ -1032,16 +1032,38 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
     /// Delete a record by its key. Returns the deleted record, or an error if
     /// the key does not exist.
     ///
-    /// **Value-block leaves (task: paged-leaf-value-blocks, Task 7).** On a
-    /// block-backed leaf the removed value has no per-entry `Arc` to hand
-    /// back — `merged_get_arc` below already clones it out via `BTree::
-    /// get_arc`'s `clone_value` fallback (`get_arc_in_node`, Task 4), the
-    /// same clone-out boundary every other `Arc<R>`-returning read uses.
-    /// That single clone is the only one on this path: the subsequent
-    /// `remove_mut` (or overlay tombstone) never touches the value again —
-    /// `remove_from_block_leaf_mut` drops the removed slot in place, it does
-    /// not clone it — so `delete` on a block leaf costs exactly one clone,
-    /// not two.
+    /// **Value-block leaves (task: paged-leaf-value-blocks, Task 7; cost
+    /// model corrected in fix round 1).** On a block-backed leaf the
+    /// removed value has no per-entry `Arc` to hand back — `merged_get_arc`
+    /// below already clones it out via `BTree::get_arc`'s `clone_value`
+    /// fallback (`get_arc_in_node`, Task 4), the same clone-out boundary
+    /// every other `Arc<R>`-returning read uses. That is always exactly one
+    /// `clone_value` call, but it is **not** the only one on this path in
+    /// the common case:
+    ///
+    /// - **Leaf uniquely owned** by this `WriteTx`'s freshly-forked table
+    ///   (nothing else has faulted this leaf in since the last checkpoint —
+    ///   the atypical case in practice) — the subsequent `remove_mut` ->
+    ///   `Child::make_mut` finds `Arc::get_mut` succeeds and edits in
+    ///   place; `remove_from_block_leaf_mut` drops the removed slot without
+    ///   cloning it. Total: **1** clone (the boundary clone-out above).
+    /// - **Leaf shared** with the store's live snapshot — the ordinary
+    ///   case whenever *any* prior read or write (this transaction's own or
+    ///   another's) already faulted the leaf in — `make_mut`'s CoW takes
+    ///   the `clone_with` branch (`src/btree.rs`), which clones **every**
+    ///   surviving entry of the block (up to `MAX_KEYS`) via `clone_value`
+    ///   before `remove_from_block_leaf_mut` drops the one being removed —
+    ///   including that entry's own now-wasted clone. Total: **1 + n**,
+    ///   where `n` is the leaf's entry count at CoW time. This is the same
+    ///   "whole block via `clone_with`" cost already documented and pinned
+    ///   at `rotate_right`/`rotate_left`/`merge_with_*`'s
+    ///   `TODO(perf, review round 1 Minor 1)` comments — `delete` was not
+    ///   special-cased to avoid it, and fusing it away needs the same
+    ///   `Child`-level "CoW straight into the edited shape" entry point
+    ///   those note as future work. Pinned by
+    ///   `tests/paged_block_leaves.rs`'s
+    ///   `delete_on_a_unique_block_leaf_clones_only_the_returned_value` and
+    ///   `delete_on_a_shared_block_leaf_clones_the_whole_block`.
     pub fn delete(&mut self, key: &K) -> Result<Arc<R>> {
         let old = self.merged_get_arc(key).ok_or(Error::KeyNotFound)?;
         // Remove from all indexes before removing from data tree.
