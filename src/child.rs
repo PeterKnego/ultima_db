@@ -317,6 +317,19 @@ impl<K, V> Child<K, V> {
         }
     }
 
+    /// This slot's node pointer as an opaque identity, if resident — `None`
+    /// for an on-disk (not-yet-faulted) slot. Never faults and never marks
+    /// the accessed bit (same raw read [`Self::is_loaded`] does, just
+    /// keeping the pointer instead of only its null-ness) — a pure identity
+    /// peek. Used for pointer-identity dedup across the data trees of
+    /// multiple retained snapshots that CoW-share the same leaf (task 9's
+    /// pin-aware reconciliation walk, `BTree::resident_leaf_bytes_dedup`);
+    /// same trick as [`Self::same_node`]'s resident-dirty branch.
+    pub(crate) fn resident_ptr(&self) -> Option<*const ()> {
+        let p = self.node.load(Ordering::Acquire);
+        (!p.is_null()).then_some(p as *const ())
+    }
+
     /// Size estimate reported to `note_dirty`: one node's inline storage.
     pub(crate) const NODE_BYTES: usize = std::mem::size_of::<BTreeNode<K, V>>();
 }

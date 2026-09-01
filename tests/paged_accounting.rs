@@ -237,3 +237,237 @@ fn dirty_credit_matches_fault_in_credit_for_the_same_leaf() {
          entries)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 9: pin-aware reconciliation + `pinned_leaf_bytes`.
+//
+// Retained snapshots older than the latest CoW-share pre-demotion leaves
+// with it; `demote_pass` only ever demotes the LATEST snapshot's tables
+// (`Store::demote_pass_inner` reads `inner.snapshots[&latest]`), so a leaf
+// that only an older retained snapshot still references never gets a
+// demote debit — the bytes stay resident in memory, invisible to
+// `resident_leaf_bytes_est`. `pinned_leaf_bytes` is the checkpoint-end
+// reconciliation's answer to "how much of that is there right now".
+// ---------------------------------------------------------------------------
+
+/// Like [`multiwriter_store_with`], but with a caller-chosen
+/// `num_snapshots_retained` — needed here to control exactly how many
+/// older snapshots stay retained (and therefore pinned) at a time.
+fn multiwriter_store_with_retention(dir: &std::path::Path, opts: PagedOptions, retained: usize) -> Store {
+    let p = Persistence::standalone(dir, Durability::Eventual, WalWrite::Coalesced)
+        .paged(opts)
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .num_snapshots_retained(retained)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+    s
+}
+
+/// The Step 1 scenario: `num_snapshots_retained(4)`, several commits that
+/// each CoW the SAME key's leaf (so every commit orphans the previous
+/// leaf, rather than superseding it the way distinct-key updates would —
+/// see this test's own walkthrough below), checkpoints that demote the
+/// latest snapshot's own leaves but cannot reach the 3 older retained
+/// snapshots' orphaned ones.
+///
+/// Every commit below is immediately followed by its own `checkpoint()`
+/// call, deliberately — not batched at the end. Batching would let
+/// `PagedState::last_root` (the checkpoint diff base held for the
+/// dead-page-punch schedule; it also keeps its target version's `Arc`
+/// alive across `gc()` regardless of the retention window) lag several
+/// versions behind `latest_version` for the whole batch, during which
+/// EVERY leaf any of those commits touches gets faulted in as a shared
+/// `Child` before its own commit's CoW splits it away — orphaning a copy
+/// in the stale, artificially-extended-lifetime snapshot `last_root` is
+/// still pointing at, on top of whatever this test intends to measure.
+/// Checkpointing every commit keeps `last_root == latest_version`
+/// throughout, so retention behaves exactly like "keep the `N` most
+/// recent snapshots" with no extra lag term to account for.
+///
+/// This test does NOT try to bring `pinned_leaf_bytes` back to `0` by
+/// committing more writes to this same store — see
+/// `pinned_leaf_bytes_returns_to_zero_once_not_retained` below for why
+/// that specific approach (suggested as one option in the original task
+/// brief) does not work, and what does.
+#[test]
+fn pinned_leaf_bytes_reflects_older_retained_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(1 << 30).build(),
+        4,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap(); // demote everything, second sweeps stragglers
+    let base = s.paged_stats().unwrap();
+    assert_eq!(base.resident_leaf_bytes_est, 0, "fully demoted base tree");
+    assert_eq!(base.pinned_leaf_bytes, 0, "nothing retained yet diverges from latest");
+
+    // Reference unit: the exact fault-in credit of one safely-interior leaf
+    // (key 200 — same safe pick `demote_debit_matches_fault_in_credit_across_cycles`
+    // uses), independent of the key (5) this test repeatedly updates below.
+    let unit = {
+        let before = s.paged_stats().unwrap().resident_leaf_bytes_est;
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(200).is_some());
+        s.paged_stats().unwrap().resident_leaf_bytes_est - before
+    };
+    assert!(unit > 0, "a real leaf's fault-in credit must be nonzero");
+    // Demote the key-200 leaf back out so it doesn't pollute the counts below.
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().resident_leaf_bytes_est, 0);
+    assert_eq!(s.paged_stats().unwrap().pinned_leaf_bytes, 0);
+
+    // Update the SAME key (5) six times, checkpointing after each: every
+    // commit CoWs a brand-new in-memory leaf for it, orphaning the leaf the
+    // PREVIOUS commit just created — that previous leaf is referenced only
+    // by the snapshot version that commit produced, never again touched,
+    // and never demoted (demote_pass only walks the latest snapshot's
+    // tree, and the orphaned leaf isn't part of it once superseded).
+    // `auto_snapshot_gc` (default on, runs at commit time) plus
+    // `num_snapshots_retained(4)` keeps only the most recent 4 snapshots at
+    // any point, so once six updates have gone by, exactly 3 non-latest
+    // snapshots remain, each pinning its own distinct orphaned key-5 leaf.
+    // Each commit's own checkpoint gives its freshly-touched leaf a second
+    // chance (the accessed bit set at creation/fault-in survives one
+    // sweep) rather than demoting it immediately — that's fine, it just
+    // means the LAST commit's checkpoint leaves latest's own key-5 leaf
+    // resident for one more cycle, cleaned up by the extra checkpoint
+    // below.
+    for i in 0..6u64 {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        w.commit().unwrap();
+        s.checkpoint().unwrap();
+    }
+    s.checkpoint().unwrap(); // one more pass: demotes latest's own now-quiet key-5 leaf
+
+    let stats = s.paged_stats().unwrap();
+    assert_eq!(
+        stats.resident_leaf_bytes_est, 0,
+        "latest's own key-5 leaf must be fully demoted after the extra checkpoint"
+    );
+    assert_eq!(
+        stats.pinned_leaf_bytes,
+        3 * unit,
+        "exactly the 3 non-latest retained snapshots' own orphaned key-5 leaves, each the \
+         size of one interior leaf, must be counted pinned"
+    );
+
+    // ------------------------------------------------------------------
+    // What does NOT bring this back to 0, and why (investigated, not
+    // guessed): committing more writes to keep `latest_version` moving,
+    // hoping the 3 pinning snapshots above age out of the retention
+    // window. They DO age out — but EVERY further write that touches an
+    // on-disk (previously-demoted) leaf shared with its own base snapshot
+    // faults that leaf in for BOTH before its own CoW splits them apart,
+    // permanently pinning a fresh orphan in whichever snapshot it was
+    // built from. With `num_snapshots_retained(4)` (3 non-latest slots
+    // always occupied) this is a steady-state, not a transient: each new
+    // write's own predecessor becomes a new pin at the same moment the
+    // oldest one ages out, so `pinned_leaf_bytes` holds at `3 * unit`
+    // (a DIFFERENT 3 leaves each round) for as long as writes continue —
+    // this is exactly the spec's "56x" pin phenomenon (§1), not a test
+    // artifact, and Task 11's enforcement (adaptive retention shrink)
+    // exists because ordinary retry/backoff traffic cannot self-resolve
+    // it. `s.gc()` alone doesn't help either: with exactly
+    // `num_snapshots_retained` snapshots present, `gc_inner`'s
+    // `len <= retain_count` fast path has nothing to evict — every one of
+    // the 4 present is legitimately within the configured window.
+    // ------------------------------------------------------------------
+}
+
+/// What DOES bring `pinned_leaf_bytes` back to `0`: retention no longer
+/// keeping a diverged snapshot alive at all. A fresh store with
+/// `num_snapshots_retained(1)` runs the identical divergent-update
+/// workload as the test above; once writes stop and the one WriteTx-held
+/// reference to its own base snapshot (kept alive across exactly the
+/// `gc()` call inside its own `commit()` — see the walkthrough below) is
+/// dropped, an explicit `Store::gc()` call collects it and
+/// `pinned_leaf_bytes` reads `0`.
+///
+/// The mid-loop stats prove the WriteTx-reference mechanism, not just the
+/// end state: `num_snapshots_retained(1)` still shows exactly 2 retained
+/// snapshots (`latest` and its immediate predecessor) and `pinned_leaf_bytes
+/// == unit` after every single update+checkpoint in the loop — never 0
+/// mid-stream, even though only 1 snapshot was asked to be retained. Each
+/// iteration's `WriteTx` holds its own base snapshot's `Arc` alive
+/// internally until it is dropped at the end of its scope, so the `gc()`
+/// call inside that SAME `commit()` still sees `Arc::strong_count > 1` on
+/// it and skips it; only the FOLLOWING iteration's commit (after the
+/// previous `WriteTx` has gone out of scope) finds it unprotected. A plain
+/// `checkpoint()` cannot substitute for the final explicit `gc()` here —
+/// checkpointing reconciles whatever `inner.snapshots` currently holds, it
+/// does not itself evict; only `gc()` (automatic at commit, or called
+/// explicitly) removes a map entry.
+#[test]
+fn pinned_leaf_bytes_returns_to_zero_once_not_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(1 << 30).build(),
+        1,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().resident_leaf_bytes_est, 0);
+    assert_eq!(s.paged_stats().unwrap().pinned_leaf_bytes, 0);
+
+    let unit = {
+        let before = s.paged_stats().unwrap().resident_leaf_bytes_est;
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(200).is_some());
+        s.paged_stats().unwrap().resident_leaf_bytes_est - before
+    };
+    assert!(unit > 0);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().pinned_leaf_bytes, 0);
+
+    for i in 0..6u64 {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        w.commit().unwrap();
+        s.checkpoint().unwrap();
+        s.checkpoint().unwrap();
+        let stats = s.paged_stats().unwrap();
+        assert_eq!(
+            stats.resident_leaf_bytes_est, 0,
+            "iteration {i}: latest's own leaf must be fully demoted by the second checkpoint"
+        );
+        assert_eq!(
+            stats.pinned_leaf_bytes, unit,
+            "iteration {i}: exactly one trailing snapshot (this commit's own base, still \
+             referenced by its now-out-of-scope WriteTx at commit time) stays pinned even \
+             under num_snapshots_retained(1)"
+        );
+    }
+
+    // Writes have stopped; the last iteration's WriteTx is out of scope, so
+    // nothing protects its base snapshot from gc() anymore.
+    s.gc();
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    let aged = s.paged_stats().unwrap();
+    assert_eq!(
+        aged.pinned_leaf_bytes, 0,
+        "with nothing but latest ever retained, an explicit gc() after writes stop must \
+         collect the one trailing snapshot and bring pinned_leaf_bytes to 0"
+    );
+    assert_eq!(aged.resident_leaf_bytes_est, 0);
+}

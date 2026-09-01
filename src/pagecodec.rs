@@ -342,6 +342,20 @@ pub(crate) struct PagedStats {
     /// read rather than reporting the raw (nonsensical, wrapped-looking)
     /// negative as a `u64`.
     pub resident_leaf_bytes: AtomicI64,
+    /// Resident bytes reachable ONLY from a retained snapshot older than
+    /// the latest (task 9, spec §5's "Snapshot pins"): un-evictable by
+    /// `demote_pass`, which only ever touches the latest snapshot's tables,
+    /// yet still live in memory via the older snapshot's own `Arc` share of
+    /// the CoW-shared leaf. Re-based every checkpoint by the same F1
+    /// reconciliation walk that re-bases `resident_leaf_bytes`
+    /// (`Store::checkpoint_impl_paged`), via
+    /// `BTree::resident_leaf_bytes_dedup`: `resident` is the latest
+    /// snapshot's own deduped walk total, `pinned` is however much of the
+    /// all-snapshots deduped total lies outside that. Unlike
+    /// `resident_leaf_bytes` this is a plain `AtomicU64`, not signed — an
+    /// exact walk total (not a running increment/decrement estimate), so it
+    /// can never go negative between reconciles.
+    pub pinned_leaf_bytes: AtomicU64,
     /// Pages written by the checkpoint writer.
     pub pages_written: AtomicU64,
     /// Leaves demoted back to on-disk by a demote pass.

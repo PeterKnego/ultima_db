@@ -637,6 +637,7 @@ pub struct Store {
 /// [`Store::paged_stats`].
 #[cfg(feature = "persistence")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PagedStatsSnapshot {
     /// Total pages faulted in (data + index).
     pub page_faults: u64,
@@ -652,6 +653,15 @@ pub struct PagedStatsSnapshot {
     pub dirty_bytes: u64,
     /// Estimated resident (not-yet-demoted) leaf bytes, clamped to `0`.
     pub resident_leaf_bytes_est: u64,
+    /// Resident bytes reachable ONLY from a retained snapshot older than
+    /// the latest (task 9, spec §5 "Snapshot pins") — un-evictable by
+    /// `demote_pass` as it exists today, since it only ever demotes the
+    /// latest snapshot's tables. An exact walk total (dedup'd by node
+    /// pointer across every retained snapshot), re-based every checkpoint
+    /// alongside `resident_leaf_bytes_est` — see the F1 reconciliation walk
+    /// in `Store::checkpoint_impl_paged`. `0` for a store with
+    /// `num_snapshots_retained(1)` (nothing but the latest ever retained).
+    pub pinned_leaf_bytes: u64,
     /// Number of times the background checkpointer thread (task12) has
     /// actually invoked a checkpoint — bumped once per attempt, whether or
     /// not it succeeded. `0` for a store with no memory budget, no dirty
@@ -699,6 +709,7 @@ impl PagedStatsSnapshot {
             leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
             dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
             resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
+            pinned_leaf_bytes: s.pinned_leaf_bytes.load(Ordering::Relaxed),
             checkpointer_runs: s.checkpointer_runs.load(Ordering::Relaxed),
             dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
             dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
@@ -1881,17 +1892,45 @@ impl Store {
             // concurrent fault-in's fetch_add costs at most one
             // NODE_BYTES of that bounded drift — this is a soft trigger,
             // not an invariant.
-            let latest = inner.latest_version;
-            let resident: usize = inner.snapshots[&latest]
-                .tables
-                .iter()
-                .filter(|(n, _)| inner.registry.contains(n))
-                .map(|(_, t)| t.paged_resident_leaf_bytes())
-                .sum();
+            //
+            // Task 9 (pin-aware reconciliation, spec §5 "Snapshot pins"):
+            // `demote_pass` only demotes the LATEST snapshot's tables, but a
+            // leaf it "frees" can still be reachable — same `Child` Arc —
+            // from an older snapshot `num_snapshots_retained` keeps alive;
+            // that share never gets a demote debit, so the bytes stay
+            // resident while `resident_leaf_bytes` reports them gone.
+            // Walking every retained snapshot newest-first against ONE
+            // shared ptr-identity `seen` set (the `Child::same_node`/
+            // `BTree::diff` trick, across snapshot roots) recovers the true
+            // total cheaply (CoW sharing means most of an older snapshot's
+            // walk just retraces already-`seen` pointers): the latest
+            // snapshot's own deduped total is `resident`; the rest, counted
+            // only once an older snapshot's walk runs, is `pinned` —
+            // un-evictable by `demote_pass` today (Task 11 enforces on this
+            // counter). Same no-fault-in contract as the walk above.
+            let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+            let mut resident = 0usize;
+            let mut total = 0usize;
+            // `.rev()`: `inner.snapshots` is a `BTreeMap<version, _>`, so
+            // this visits highest version (== latest) first.
+            for (i, snap) in inner.snapshots.values().rev().enumerate() {
+                let walked: usize = snap
+                    .tables
+                    .iter()
+                    .filter(|(n, _)| inner.registry.contains(n))
+                    .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                    .sum();
+                total += walked;
+                if i == 0 {
+                    resident = walked;
+                }
+            }
+            let pinned = total - resident;
             if let Some(p) = inner.paged.as_ref() {
                 p.stats
                     .resident_leaf_bytes
                     .store(resident as i64, Ordering::Relaxed);
+                p.stats.pinned_leaf_bytes.store(pinned as u64, Ordering::Relaxed);
             }
         }
 
@@ -11007,5 +11046,134 @@ mod tests {
         expect(&again);
         let (leaves, blocks) = repr(&again);
         assert_eq!(blocks, leaves, "re-encoded mutated leaves decode block-backed again");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 9: pin-aware reconciliation accounting oracle.
+    //
+    // `tests/paged_accounting.rs` (an integration test crate) has no
+    // access to `Store::inner`/`BTree::resident_leaf_bytes_dedup` — the
+    // brief's "reference implementation recomputed in the test" needs a
+    // walk that is genuinely independent of `checkpoint_impl_paged`'s own
+    // F1 reconcile call, which is only possible with same-crate access.
+    // This lives here (not in `tests/paged_accounting.rs`, which still
+    // gets the brief's black-box retention-4 scenario test) for that
+    // reason.
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "persistence")]
+    mod pin_aware_reconcile {
+        use super::*;
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Insert(u64),
+            Update(u64),
+            Checkpoint,
+            Gc,
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                3 => any::<u64>().prop_map(Op::Insert),
+                5 => any::<u64>().prop_map(Op::Update),
+                2 => Just(Op::Checkpoint),
+                1 => Just(Op::Gc),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: if cfg!(miri) { 4 } else { 40 }, ..ProptestConfig::default() })]
+            #[test]
+            fn oracle(ops in prop::collection::vec(op_strategy(), 1..25)) {
+                let dir = crate::test_scratch::scratch_dir();
+                let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+                    .paged(PagedOptions::builder().memory_budget_bytes(1 << 20).build())
+                    .unwrap();
+                let store = Store::new(
+                    StoreConfig::builder()
+                        .persistence(p)
+                        .writer_mode(WriterMode::MultiWriter)
+                        .num_snapshots_retained(3)
+                        .build(),
+                )
+                .unwrap();
+                store.register_table_paged::<String>("rows").unwrap();
+
+                let mut n_inserted: u64 = 0;
+                for op in ops {
+                    match op {
+                        Op::Insert(v) => {
+                            let mut w = store.begin_write(None).unwrap();
+                            {
+                                let mut t = w.open_table::<String>("rows").unwrap();
+                                t.insert(format!("v{v}")).unwrap();
+                            }
+                            w.commit().unwrap();
+                            n_inserted += 1;
+                        }
+                        Op::Update(k) => {
+                            if n_inserted > 0 {
+                                // Auto-increment keys start at 1 (`AutoKey
+                                // for u64`), so live keys are `1..=n_inserted`.
+                                let key = 1 + (k % n_inserted);
+                                let mut w = store.begin_write(None).unwrap();
+                                {
+                                    let mut t = w.open_table::<String>("rows").unwrap();
+                                    // No op here ever deletes, so every key
+                                    // in `1..=n_inserted` is always present.
+                                    t.update(key, format!("u{k}")).unwrap();
+                                }
+                                w.commit().unwrap();
+                            }
+                        }
+                        Op::Checkpoint => {
+                            store.checkpoint().unwrap();
+                        }
+                        Op::Gc => store.gc(),
+                    }
+                }
+                // Force a final reconcile against the sequence's exact end
+                // state, whether or not the last op was a checkpoint.
+                store.checkpoint().unwrap();
+                let stats = store.paged_stats().unwrap();
+
+                // Independent reference: a FRESH oldest-first walk (F1's
+                // own reconcile walks newest-first) over the SAME retained
+                // snapshots, deduped by its own `seen` set. Different
+                // iteration order over the same underlying data proves the
+                // deduped total is order-independent (a set, not an
+                // accumulation order artifact) -- and re-derives the total
+                // from scratch rather than trusting whatever
+                // `checkpoint_impl_paged` last stored.
+                let reference_total: u64 = {
+                    let inner = store.inner.read();
+                    let registry = &inner.registry;
+                    let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+                    inner
+                        .snapshots
+                        .values() // BTreeMap ascending by version == oldest-first
+                        .map(|snap| {
+                            snap.tables
+                                .iter()
+                                .filter(|(n, _)| registry.contains(n))
+                                .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                                .sum::<usize>() as u64
+                        })
+                        .sum()
+                };
+
+                prop_assert_eq!(
+                    stats.resident_leaf_bytes_est + stats.pinned_leaf_bytes,
+                    reference_total,
+                    "resident + pinned must equal the full dedup walk over every retained \
+                     snapshot, regardless of which order (newest-first in production, \
+                     oldest-first here) the walk visits them in"
+                );
+            }
+        }
     }
 }

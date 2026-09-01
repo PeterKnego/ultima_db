@@ -1407,6 +1407,49 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         go(&self.root, h, src)
     }
 
+    /// Like [`Self::resident_leaf_estimate`], but deduped against `seen` — a
+    /// leaf slot already counted (by another tree walked earlier against
+    /// the same `seen` set) contributes `0` the second time. Task 9's
+    /// pin-aware reconciliation: retained snapshots CoW-share pre-demotion
+    /// leaves with the latest snapshot (and with each other), so walking
+    /// each snapshot's data tree independently and summing would
+    /// double-count every shared leaf. The dedup key is the leaf's `Child`
+    /// node pointer ([`Child::resident_ptr`]) — the same ptr-identity trick
+    /// [`Child::same_node`] and [`Self::diff`]'s changed-page walk use — read
+    /// WITHOUT faulting and WITHOUT touching the accessed bit, so an
+    /// unloaded (on-disk) slot contributes `0` and is never faulted in by
+    /// this walk, exactly like [`Self::resident_leaf_estimate`]. Caller
+    /// decides `seen`'s lifetime and walk order; walking newest-snapshot
+    /// first and reusing one `seen` set across all retained snapshots is
+    /// what makes "resident" (latest's own total) and "pinned" (everything
+    /// else newly counted after that) fall out of the same walk — see
+    /// `Store::checkpoint_impl_paged`'s F1 reconciliation.
+    // Production caller: the F1 reconciliation walk in
+    // `Store::checkpoint_impl_paged` (via
+    // `Table::paged_resident_leaf_bytes_dedup`). Also exercised directly by
+    // this task's tests.
+    #[allow(dead_code)]
+    pub(crate) fn resident_leaf_bytes_dedup(&self, seen: &mut std::collections::HashSet<*const ()>) -> usize {
+        let src = self.source.as_deref();
+        let h = self.height();
+        fn go<K, V>(
+            slot: &Child<K, V>,
+            depth: usize,
+            src: Option<&dyn NodeSource<K, V>>,
+            seen: &mut std::collections::HashSet<*const ()>,
+        ) -> usize {
+            if depth == 0 {
+                return match slot.resident_ptr() {
+                    Some(ptr) if seen.insert(ptr) => slot.load_quiet(src).leaf_bytes(),
+                    _ => 0, // not resident, or already counted from another snapshot's walk
+                };
+            }
+            let n = slot.load_quiet(src);
+            n.children.iter().map(|c| go(c, depth - 1, src, seen)).sum()
+        }
+        go(&self.root, h, src, seen)
+    }
+
     /// Report every slot's own page id, in document order — a slot's id is
     /// known without a fault (`Child::page_id()`), so this reports it
     /// whether or not the slot is loaded. It only *descends* into an inner

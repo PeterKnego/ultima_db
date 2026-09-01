@@ -407,6 +407,7 @@ pub(crate) fn emit_paged_stats(s: &crate::store::PagedStatsSnapshot) {
     metrics::gauge!("ultima.paged.leaves_demoted").set(s.leaves_demoted as f64);
     metrics::gauge!("ultima.paged.dirty_bytes").set(s.dirty_bytes as f64);
     metrics::gauge!("ultima.paged.resident_leaf_bytes_est").set(s.resident_leaf_bytes_est as f64);
+    metrics::gauge!("ultima.paged.pinned_leaf_bytes").set(s.pinned_leaf_bytes as f64);
     metrics::gauge!("ultima.paged.checkpointer_runs").set(s.checkpointer_runs as f64);
     metrics::gauge!("ultima.paged.dead_pages_punched").set(s.dead_pages_punched as f64);
     metrics::gauge!("ultima.paged.dead_pages_dropped").set(s.dead_pages_dropped as f64);

@@ -251,6 +251,21 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     #[allow(dead_code)]
     fn paged_resident_leaf_bytes(&self) -> usize;
 
+    /// Like [`Self::paged_resident_leaf_bytes`], but deduped against a
+    /// shared `seen` set spanning every retained snapshot's walk (task 9's
+    /// pin-aware reconciliation — see `BTree::resident_leaf_bytes_dedup`'s
+    /// doc for the dedup mechanics). Type-erased mirror of
+    /// `merge_keys_from`'s `&dyn Any` pattern: `K`/`R` don't appear in
+    /// `MergeableTable`'s signature, so the caller's `seen:
+    /// HashSet<*const ()>` — a type independent of any table's `K`/`V`,
+    /// since the dedup key is a raw node pointer — crosses the trait object
+    /// boundary as `&mut dyn Any` and the impl downcasts it back.
+    // Production caller: the F1 reconciliation walk in
+    // `Store::checkpoint_impl_paged`.
+    #[cfg(feature = "persistence")]
+    #[allow(dead_code)]
+    fn paged_resident_leaf_bytes_dedup(&self, seen: &mut dyn Any) -> usize;
+
     /// Current residency policy — see [`Residency`].
     ///
     /// Production caller: [`crate::Store::demote_pass`].
@@ -557,6 +572,14 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
     #[cfg(feature = "persistence")]
     fn paged_resident_leaf_bytes(&self) -> usize {
         self.data.resident_leaf_estimate()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_resident_leaf_bytes_dedup(&self, seen: &mut dyn Any) -> usize {
+        let seen = seen
+            .downcast_mut::<std::collections::HashSet<*const ()>>()
+            .expect("paged_resident_leaf_bytes_dedup: seen set is always HashSet<*const ()>, independent of K/R");
+        self.data.resident_leaf_bytes_dedup(seen)
     }
 
     #[cfg(feature = "persistence")]
