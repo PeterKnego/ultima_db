@@ -1695,16 +1695,31 @@ impl Store {
             let needs_install = newly_attached || flushed.is_some() || wrote_pages > 0;
             let final_table = flushed.unwrap_or(boxed);
             // Each page this table just wrote corresponds to one dirtied
-            // node `note_dirty` already credited into `dirty_bytes` at the
-            // same `Child::NODE_BYTES`-per-node estimate (see
-            // `PagedSource::note_dirty`/`Child::make_mut`) — `paged_node_bytes`
-            // is this table's own `(K, R)` node size, the type-erased
-            // accessor `Store::demote_pass` already relies on for the same
-            // reason (`MergeableTable::paged_node_bytes`'s doc). Approximate
-            // like `resident_leaf_bytes` already is (see its doc): `wrote_pages`
-            // covers this table's secondary indexes too, whose `(IK, K)` node
-            // size can differ from the data tree's, applied uniformly here —
-            // fine for a trigger-threshold comparison, not exact accounting.
+            // node `note_dirty` already credited into `dirty_bytes` — but
+            // (task 8) not uniformly: `Child::resident_new`/`make_mut`
+            // credit a data-tree *block* leaf at its real
+            // `BTreeNode::leaf_bytes()` (`NODE_BYTES` plus its value
+            // block), and everything else (inner nodes, every node of a
+            // secondary index tree — never block-backed) at flat
+            // `Child::NODE_BYTES`. This subtraction stays flat regardless:
+            // `paged_node_bytes` is this table's own `(K, R)` node size —
+            // the same type-erased accessor `Store::demote_pass` relies on
+            // for the same reason (`MergeableTable::paged_node_bytes`'s
+            // doc) — applied uniformly to every page this call wrote,
+            // `wrote_pages` covering this table's data leaves *and* its
+            // secondary indexes' differently-shaped `(IK, K)` nodes alike.
+            // So a table with real block leaves is now credited high (real
+            // bytes) and always debited low (flat) here: `dirty_bytes`
+            // trends to over-report for such a table, and
+            // `checkpoint_dirty_bytes`-triggered checkpoints fire somewhat
+            // more eagerly than the configured threshold strictly implies.
+            // Accepted, not fixed: safe direction (an early trigger costs
+            // an extra checkpoint, never a missed one — unlike the
+            // `resident_leaf_bytes` debit task 8 *did* fix, whose old flat
+            // math could leave the memory-budget trigger silent), and
+            // matches `resident_leaf_bytes`'s own pre-task-8 doc precedent
+            // of trading exactness for a cheap, no-I/O trigger-threshold
+            // comparison rather than precise accounting.
             dirty_bytes_written = dirty_bytes_written
                 .saturating_add(wrote_pages.saturating_mul(final_table.paged_node_bytes() as u64));
             if needs_install {
