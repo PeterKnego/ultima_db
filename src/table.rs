@@ -955,11 +955,6 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         Ok(())
     }
 
-    /// Insert-or-replace at an explicit key, reusing an existing `Arc<R>`.
-    /// Maintains secondary indexes (routing to `on_insert` or `on_update`
-    /// depending on whether a prior record exists at the key), and advances
-    /// the auto-increment counter past the key on `AutoKey` tables so a later
-    /// `insert` cannot reissue it. Used at commit by the per-key merge path.
     /// The row tree, for crate-internal tests only.
     ///
     /// `store.rs`'s paged block-leaf tests need to walk the tree's *node
@@ -972,6 +967,11 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         &self.data
     }
 
+    /// Insert-or-replace at an explicit key, reusing an existing `Arc<R>`.
+    /// Maintains secondary indexes (routing to `on_insert` or `on_update`
+    /// depending on whether a prior record exists at the key), and advances
+    /// the auto-increment counter past the key on `AutoKey` tables so a later
+    /// `insert` cannot reissue it. Used at commit by the per-key merge path.
     pub(crate) fn upsert_arc(&mut self, key: K, arc: Arc<R>) -> Result<()> {
         // `upsert_arc` is the MultiWriter commit-merge helper
         // (`merge_keys_from`, which already debug_asserts the overlay is

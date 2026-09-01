@@ -2468,6 +2468,10 @@ fn split_block_mut<K, V>(n: &mut BTreeNode<K, V>) -> ((K, Value<V>), Arc<BTreeNo
     let left_block: Vec<V> = vals.by_ref().take(entries.len()).collect();
     let median_val = vals.next().expect("I-A: block length must match entries length");
     let right_block: Vec<V> = vals.collect();
+    // BOTH halves, matching `split_block` (review round 1, Minor 3): the
+    // left-half assert is what catches a `take(entries.len())` that ran on
+    // the wrong side of the median `pop`.
+    debug_assert_eq!(left_block.len(), entries.len(), "I-A");
     debug_assert_eq!(right_block.len(), right_entries.len(), "I-A");
     let right = Arc::new(BTreeNode {
         entries: right_entries,
@@ -6662,7 +6666,23 @@ mod tests {
             assert_eq!(walk_representation(&t).block_leaves, 2);
             let mut alive: Vec<u64> = (1..=MAX_KEYS as u64 + 1).collect();
             let mut k = 1u64;
-            while walk_representation(&t).leaves > 1 {
+            loop {
+                // Checked EVERY round, not just at the end (review round 1,
+                // Minor 1). The final assertion alone is insensitive: the
+                // pre-Task-6 behaviour de-blocked only the leaf being
+                // deleted from, and `absorb` re-blocks a merge whose OTHER
+                // side is still block-shaped — so a whole run of de-blocking
+                // deletes sails through a check made after the merge. Here
+                // the very first delete's de-blocking is caught.
+                let r = walk_representation(&t);
+                assert_eq!(
+                    r.block_leaves, r.leaves,
+                    "every leaf must stay block-backed while deleting towards the merge (after deleting {} keys)",
+                    k - 1
+                );
+                if r.leaves == 1 {
+                    break;
+                }
                 assert!(t.remove_mut(&k));
                 alive.retain(|x| *x != k);
                 k += 1;
