@@ -649,6 +649,21 @@ pub struct PagedStatsSnapshot {
     pub pages_written: u64,
     /// Leaves demoted back to on-disk by the evictor.
     pub leaves_demoted: u64,
+    /// Task 10, spec §6 ("Hard-cap clock eviction"): full sweeps performed
+    /// across every `demote_pass` call since the store opened, cumulative.
+    /// A pass with a memory budget configured cycles — repeats the sweep —
+    /// until the reconciled resident estimate is under budget or a whole
+    /// cycle proves nothing more is evictable (see
+    /// `Store::demote_pass_inner`'s doc), so this can jump by more than
+    /// one per checkpoint.
+    pub clock_cycles: u64,
+    /// Task 10: of `leaves_demoted`, how many were evicted on a pass's
+    /// second (or later) cycle rather than its first — leaves that were
+    /// still accessed-marked when the pass began, survived cycle 1's
+    /// second chance, and were evicted for real once nothing re-touched
+    /// them by the next cycle. `0` for a store whose demote passes never
+    /// need more than one cycle.
+    pub forced_evictions: u64,
     /// Bytes reported dirty (a clean node CoW'd by a write).
     pub dirty_bytes: u64,
     /// Estimated resident (not-yet-demoted) leaf bytes, clamped to `0`.
@@ -707,6 +722,8 @@ impl PagedStatsSnapshot {
             index_page_faults: s.index_page_faults.load(Ordering::Relaxed),
             pages_written: s.pages_written.load(Ordering::Relaxed),
             leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
+            clock_cycles: s.clock_cycles.load(Ordering::Relaxed),
+            forced_evictions: s.forced_evictions.load(Ordering::Relaxed),
             dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
             resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
             pinned_leaf_bytes: s.pinned_leaf_bytes.load(Ordering::Relaxed),
@@ -2212,9 +2229,11 @@ impl Store {
     /// batch reads `latest_version` fresh and demotes the commit's newer
     /// table instead, so the pass converges regardless.
     ///
-    /// Returns the total number of leaves demoted across every table —
-    /// counting only batches whose [`Store::install_paged_tables`] call
-    /// actually landed (see below for why that matters).
+    /// Returns the total number of leaves demoted across every table and
+    /// every cycle (see [`Store::demote_pass_inner`]'s doc for what a
+    /// "cycle" is) — counting only batches whose
+    /// [`Store::install_paged_tables`] call actually landed (see below for
+    /// why that matters).
     #[cfg(feature = "persistence")]
     pub(crate) fn demote_pass(&self) -> Result<usize> {
         self.demote_pass_inner(
@@ -2233,6 +2252,44 @@ impl Store {
     /// `None` in production (the `demote_pass` wrapper above never passes
     /// one); see `demote_pass_race_hook_dropped_install_does_not_bump_stats`
     /// in this module's test suite for the one caller that does.
+    ///
+    /// Task 10, spec §6 ("Hard-cap clock eviction"): one call to this
+    /// function is a *pass*, and when a memory budget is configured, a
+    /// pass **cycles** — it repeats the full per-table sweep below, with
+    /// every table's cursor reset back to `None`, until the reconciled
+    /// resident estimate is back under budget or a whole cycle proves
+    /// nothing more is evictable. Cycling is needed because
+    /// `BTree::demote_leaves`'s eviction is second-chance: a leaf whose
+    /// accessed bit is set survives a sweep with the bit merely cleared
+    /// (see `tests/paged_demotion.rs::accessed_leaf_survives_one_pass`),
+    /// so a tree that was read all over just before a checkpoint demotes
+    /// ~0 bytes on the first sweep no matter how far over budget it is —
+    /// the clock hand has to come back around a second time to actually
+    /// harvest what the first sweep only cleared.
+    ///
+    /// Termination: stop when `resident <= budget`, or when two
+    /// *consecutive* cycles each evict 0 bytes. One zero-byte cycle alone
+    /// does not prove nothing is left — it may be the clear half of every
+    /// leaf's second chance, with the harvest one cycle away (exactly the
+    /// scenario above). But two zero-byte cycles back to back do prove it:
+    /// if the first of the two had cleared even one leaf's accessed bit,
+    /// the very next cycle would evict that leaf for real (nonzero)
+    /// unless something re-touched it in between — so back-to-back zeros
+    /// mean the first of the two cleared nothing either, i.e. every
+    /// remaining loaded, paged leaf is exempt today (`Residency::Resident`
+    /// table, pinned by an older retained snapshot behind a different
+    /// slot, or re-touched every single cycle) rather than merely
+    /// second-chanced. No iteration cap is needed: each cycle either
+    /// reclaims bytes or, within two cycles, proves the remainder
+    /// un-evictable.
+    ///
+    /// With no budget configured (`opts.memory_budget_bytes` is `None` —
+    /// reachable only by calling this directly, as
+    /// `demote_pass_race_hook_dropped_install_does_not_bump_stats` does;
+    /// `checkpoint_impl_paged`'s phase 3 never calls `demote_pass` at all
+    /// without a budget) this runs exactly one cycle: there is no target
+    /// to converge toward, so cycling has nothing to decide by, matching
+    /// this function's pre-task-10 behavior.
     #[cfg(feature = "persistence")]
     fn demote_pass_inner(&self, #[cfg(test)] race_hook: Option<&dyn Fn()>) -> Result<usize> {
         let (registry, opts, stats) = {
@@ -2247,81 +2304,120 @@ impl Store {
             )
         };
 
-        // Only registered tables are ever paged-attached (mirrors
-        // `checkpoint_impl_paged`'s own filter) — an unregistered table's
-        // `paged_demote` would be a genuine no-op every time (never
-        // attached, so `paged_demote`'s `is_loaded() && page_id().is_some()`
-        // check on every child never holds), so skipping it here just
-        // avoids the wasted per-table lock round trip.
-        let names: Vec<String> = {
-            let inner = self.inner.read();
-            let latest = inner.latest_version;
-            inner.snapshots[&latest]
-                .table_names()
-                .into_iter()
-                .filter(|n| registry.contains(n))
-                .collect()
-        };
-
         let mut total_demoted = 0usize;
-        for name in names {
-            let mut cursor: Option<Box<dyn std::any::Any + Send>> = None;
-            loop {
-                let found = {
-                    let inner = self.inner.read();
-                    let latest = inner.latest_version;
-                    inner.snapshots[&latest]
-                        .tables
-                        .get(&name)
-                        .map(|t| (latest, Arc::clone(t)))
-                };
-                let Some((version, tbl)) = found else {
-                    break; // table no longer present at latest — nothing to demote
-                };
-                if tbl.residency() == crate::table::Residency::Resident {
-                    break;
-                }
-                #[cfg(test)]
-                if let Some(hook) = race_hook {
-                    hook();
-                }
-                let cursor_ref: Option<&dyn std::any::Any> =
-                    cursor.as_deref().map(|c| c as &dyn std::any::Any);
-                // Task 8: `paged_demote` now reports the exact bytes it
-                // demoted (`Σ BTreeNode::leaf_bytes()` over the demoted
-                // leaves, forwarded from `BTree::demote_leaves`) instead of
-                // this site multiplying `demoted * paged_node_bytes()` — the
-                // flat per-node estimate under-credited every block leaf,
-                // so the debit no longer matched the fault-in credit
-                // (`PagedSource::read_node`, task 4) or the checkpoint-end
-                // reconciliation walk (`resident_leaf_estimate`, also task
-                // 8), and the drift compounded every demote pass.
-                let (new_tbl, demoted, demoted_bytes, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
-                // `MergeableTable::paged_demote` deliberately does not touch
-                // `PagedStats` itself (see its doc): a concurrent `gc()` can
-                // evict `version` between the read above and this install,
-                // in which case `install_paged_tables` returns `None` and
-                // the demoted table this batch built is unreachable from
-                // any live snapshot. Applying the counters only when the
-                // install actually lands keeps `leaves_demoted`/
-                // `resident_leaf_bytes` in sync with what a reader can
-                // actually observe, instead of recording eviction work that
-                // never took effect.
-                if self
-                    .install_paged_tables(version, vec![(name.clone(), new_tbl)])
-                    .is_some()
-                {
-                    total_demoted += demoted;
-                    stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
-                    stats
-                        .resident_leaf_bytes
-                        .fetch_sub(demoted_bytes as i64, Ordering::Relaxed);
-                }
-                match next {
-                    Some(c) => cursor = Some(c),
-                    None => break,
+        let mut cycle = 0u64;
+        // `None` until the first cycle completes — see the termination
+        // doc above: cycle 1's own zero (if any) never stops the pass on
+        // its own, only a *second* zero right after it does.
+        let mut prev_cycle_bytes: Option<u64> = None;
+        loop {
+            cycle += 1;
+            let mut cycle_bytes = 0u64;
+
+            // Only registered tables are ever paged-attached (mirrors
+            // `checkpoint_impl_paged`'s own filter) — an unregistered
+            // table's `paged_demote` would be a genuine no-op every time
+            // (never attached, so `paged_demote`'s `is_loaded() &&
+            // page_id().is_some()` check on every child never holds), so
+            // skipping it here just avoids the wasted per-table lock round
+            // trip. Re-read every cycle (not just once outside this loop)
+            // for the same reason every batch below re-reads
+            // `latest_version`: a concurrent commit can register or drop a
+            // table between cycles.
+            let names: Vec<String> = {
+                let inner = self.inner.read();
+                let latest = inner.latest_version;
+                inner.snapshots[&latest]
+                    .table_names()
+                    .into_iter()
+                    .filter(|n| registry.contains(n))
+                    .collect()
+            };
+
+            for name in names {
+                let mut cursor: Option<Box<dyn std::any::Any + Send>> = None;
+                loop {
+                    let found = {
+                        let inner = self.inner.read();
+                        let latest = inner.latest_version;
+                        inner.snapshots[&latest]
+                            .tables
+                            .get(&name)
+                            .map(|t| (latest, Arc::clone(t)))
+                    };
+                    let Some((version, tbl)) = found else {
+                        break; // table no longer present at latest — nothing to demote
+                    };
+                    if tbl.residency() == crate::table::Residency::Resident {
+                        break;
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = race_hook {
+                        hook();
+                    }
+                    let cursor_ref: Option<&dyn std::any::Any> =
+                        cursor.as_deref().map(|c| c as &dyn std::any::Any);
+                    // Task 8: `paged_demote` now reports the exact bytes it
+                    // demoted (`Σ BTreeNode::leaf_bytes()` over the demoted
+                    // leaves, forwarded from `BTree::demote_leaves`) instead of
+                    // this site multiplying `demoted * paged_node_bytes()` — the
+                    // flat per-node estimate under-credited every block leaf,
+                    // so the debit no longer matched the fault-in credit
+                    // (`PagedSource::read_node`, task 4) or the checkpoint-end
+                    // reconciliation walk (`resident_leaf_estimate`, also task
+                    // 8), and the drift compounded every demote pass.
+                    let (new_tbl, demoted, demoted_bytes, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
+                    // `MergeableTable::paged_demote` deliberately does not touch
+                    // `PagedStats` itself (see its doc): a concurrent `gc()` can
+                    // evict `version` between the read above and this install,
+                    // in which case `install_paged_tables` returns `None` and
+                    // the demoted table this batch built is unreachable from
+                    // any live snapshot. Applying the counters only when the
+                    // install actually lands keeps `leaves_demoted`/
+                    // `resident_leaf_bytes` in sync with what a reader can
+                    // actually observe, instead of recording eviction work that
+                    // never took effect.
+                    if self
+                        .install_paged_tables(version, vec![(name.clone(), new_tbl)])
+                        .is_some()
+                    {
+                        total_demoted += demoted;
+                        cycle_bytes += demoted_bytes as u64;
+                        stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
+                        stats
+                            .resident_leaf_bytes
+                            .fetch_sub(demoted_bytes as i64, Ordering::Relaxed);
+                        // Task 10: leaves evicted on cycle >= 2 were still
+                        // resident and accessed-marked when this pass
+                        // began — cycle 1 gave them their second chance
+                        // (cleared, not evicted) and they were harvested
+                        // here only because nothing re-touched them since.
+                        if cycle >= 2 {
+                            stats
+                                .forced_evictions
+                                .fetch_add(demoted as u64, Ordering::Relaxed);
+                        }
+                    }
+                    match next {
+                        Some(c) => cursor = Some(c),
+                        None => break,
+                    }
                 }
             }
+
+            stats.clock_cycles.fetch_add(1, Ordering::Relaxed);
+
+            let Some(budget) = opts.memory_budget_bytes else {
+                break; // no budget: one cycle, matching pre-task-10 behavior
+            };
+            let resident = stats.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64;
+            if resident <= budget {
+                break;
+            }
+            if prev_cycle_bytes == Some(0) && cycle_bytes == 0 {
+                break; // two zero-byte cycles in a row: un-evictable floor proven
+            }
+            prev_cycle_bytes = Some(cycle_bytes);
         }
         Ok(total_demoted)
     }

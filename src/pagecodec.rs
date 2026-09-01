@@ -360,6 +360,20 @@ pub(crate) struct PagedStats {
     pub pages_written: AtomicU64,
     /// Leaves demoted back to on-disk by a demote pass.
     pub leaves_demoted: AtomicU64,
+    /// Task 10, spec §6 ("Hard-cap clock eviction"): full sweeps performed
+    /// across every `demote_pass` call so far, cumulative. One pass is one
+    /// or more cycles — see `Store::demote_pass_inner`'s doc for the
+    /// termination rule — so this can advance by more than one per
+    /// checkpoint when a budget is configured and the first sweep doesn't
+    /// clear it.
+    pub clock_cycles: AtomicU64,
+    /// Task 10: of `leaves_demoted`, how many were evicted on a pass's
+    /// second (or later) cycle — i.e. they were still resident and
+    /// accessed-marked when the pass began, survived cycle 1's
+    /// second-chance (accessed bit cleared, not evicted), and were then
+    /// evicted for real on a later cycle because nothing re-touched them
+    /// in between. Cumulative across every `demote_pass` call.
+    pub forced_evictions: AtomicU64,
     /// Dead-page byte ranges actually hole-punched (task11) — counted in
     /// ranges, not bytes, matching `PagedRoot::dead_pages`'s own unit. Only
     /// incremented once a range's retention gate clears (the root that

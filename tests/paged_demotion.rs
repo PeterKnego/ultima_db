@@ -85,7 +85,17 @@ fn demotion_keeps_version_and_frees_after_gc() {
 #[test]
 fn accessed_leaf_survives_one_pass() {
     let d = tempfile::tempdir().unwrap();
-    let s = store_with(d.path(), PagedOptions::builder().memory_budget_bytes(1).build());
+    // Task 10 (spec §6, hard-cap clock eviction): a `memory_budget_bytes(1)`
+    // store is *always* over budget, so `demote_pass` would now cycle past
+    // this test's single second-chance sweep and evict key 5's leaf for
+    // real on cycle 2 of the very same "second chance" `checkpoint()` call
+    // below — collapsing the exact one-pass-survives/next-pass-goes distinction
+    // this test exists to check. A budget comfortably above the resident
+    // set (one leaf is a few KB; this is 1 MiB) keeps every checkpoint
+    // here under budget after its first cycle, so cycling never engages
+    // and second-chance is exercised under no budget pressure, same as
+    // before task 10.
+    let s = store_with(d.path(), PagedOptions::builder().memory_budget_bytes(1 << 20).build());
     write_rows(&s, 20_000);
     s.checkpoint().unwrap(); // demotes everything (freshly batch-built, nothing accessed yet)
     {

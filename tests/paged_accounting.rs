@@ -620,3 +620,86 @@ fn pinned_leaf_bytes_returns_to_zero_once_not_retained() {
     );
     assert_eq!(aged.resident_leaf_bytes_est, 0);
 }
+
+/// Task 10, spec §6 ("Hard-cap clock eviction"): a single demote sweep
+/// under second-chance semantics can evict ~0 bytes even while deeply over
+/// budget — every leaf that was resident and read since the last pass
+/// survives sweep 1 with its accessed bit merely cleared, not evicted (the
+/// same mechanic `tests/paged_demotion.rs::accessed_leaf_survives_one_pass`
+/// checks at one-leaf scale, here at whole-table scale). Pre-task-10,
+/// `demote_pass` only ever swept once per `checkpoint()`, so a store like
+/// this one — read all over right before a checkpoint under real budget
+/// pressure — would stay over budget forever, one checkpoint after
+/// another, since every pass's lone sweep just re-clears the same bits
+/// its predecessor cleared without ever harvesting them. This is that red:
+/// touch every leaf, then checkpoint under a budget the whole resident set
+/// overshoots, and require the pass to converge within the ONE
+/// `checkpoint()` call — not merely make another checkpoint's worth of
+/// progress next time.
+#[test]
+fn hard_cap_clock_cycles_to_convergence() {
+    const BUDGET: u64 = 64 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(BUDGET).build());
+    write_rows(&s, 5_000);
+    // Writes every leaf to disk and assigns page ids; demotes everything
+    // (freshly batch-built, nothing accessed yet — see `write_rows`'s doc),
+    // so resident starts back at ~0 going into the read-scan below.
+    s.checkpoint().unwrap();
+
+    // Read-scan every row: faults every leaf back in and marks it
+    // accessed, right before the checkpoint this test actually measures.
+    {
+        let r = s.begin_read(None).unwrap();
+        let t = r.open_table::<Row>("rows").unwrap();
+        for k in 1..=5_000u64 {
+            assert!(t.get(k).is_some(), "key {k} missing");
+        }
+    }
+    assert!(
+        s.paged_stats().unwrap().resident_leaf_bytes_est > BUDGET,
+        "the read-scan above must put the whole table back over budget, or this test proves nothing"
+    );
+
+    s.checkpoint().unwrap();
+
+    let after = s.paged_stats().unwrap();
+    assert!(
+        after.resident_leaf_bytes_est <= BUDGET,
+        "resident {} must converge back under budget {BUDGET} within this one checkpoint's \
+         pass, not merely clear second-chance bits for a later pass to harvest",
+        after.resident_leaf_bytes_est
+    );
+    assert!(
+        after.forced_evictions > 0,
+        "leaves that survived cycle 1's second chance must be evicted on a later cycle of \
+         the SAME pass"
+    );
+    assert!(
+        after.clock_cycles >= 2,
+        "convergence here needs at least 2 cycles: cycle 1 only clears second-chance bits \
+         (every leaf was just read), cycle 2 harvests them"
+    );
+}
+
+/// Task 10 un-evictable floor: a `Residency::Resident` table is exempt
+/// from demotion outright (`demote_pass_inner`'s per-table check, from
+/// before this task) — the clock must recognize that and terminate rather
+/// than spin forever chasing bytes it can never reclaim.
+#[test]
+fn hard_cap_clock_terminates_when_nothing_is_evictable() {
+    const BUDGET: u64 = 1; // trivially, permanently over budget
+    let dir = tempfile::tempdir().unwrap();
+    let s = store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(BUDGET).build());
+    write_rows(&s, 5_000);
+    s.set_residency("rows", Residency::Resident).unwrap();
+
+    // Must return promptly, not loop forever chasing an un-evictable table.
+    s.checkpoint().unwrap();
+
+    let stats = s.paged_stats().unwrap();
+    assert!(
+        stats.resident_leaf_bytes_est > BUDGET,
+        "a Resident table is exempt from demotion, so budget pressure is never relieved"
+    );
+}
