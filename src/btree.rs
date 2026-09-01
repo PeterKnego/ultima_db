@@ -1390,9 +1390,12 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// checkpoint. Read-only: uses [`Child::load_quiet`], so measuring
     /// residency never marks anything "recently used" — see the same note
     /// on [`Self::changed_page_ids`].
-    // Production caller: the F1 reconciliation walk in
-    // `Store::checkpoint_impl_paged` (via `Table::paged_resident_leaf_bytes`).
-    // Also exercised directly by this task's tests.
+    // No longer a production caller as of Task 9 (review I-3): the F1
+    // reconciliation walk now goes through `Self::resident_leaf_bytes_dedup`
+    // (`Table::paged_resident_leaf_bytes_dedup`). Kept for its direct
+    // unit-test callers in this file (a plain, non-deduped resident-bytes
+    // walk is occasionally the simpler thing to assert against) — see
+    // `#[allow(dead_code)]` below.
     #[allow(dead_code)]
     pub(crate) fn resident_leaf_estimate(&self) -> usize {
         let src = self.source.as_deref();
@@ -1408,46 +1411,96 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     }
 
     /// Like [`Self::resident_leaf_estimate`], but deduped against `seen` — a
-    /// leaf slot already counted (by another tree walked earlier against
-    /// the same `seen` set) contributes `0` the second time. Task 9's
-    /// pin-aware reconciliation: retained snapshots CoW-share pre-demotion
-    /// leaves with the latest snapshot (and with each other), so walking
-    /// each snapshot's data tree independently and summing would
-    /// double-count every shared leaf. The dedup key is the leaf's `Child`
-    /// node pointer ([`Child::resident_ptr`]) — the same ptr-identity trick
-    /// [`Child::same_node`] and [`Self::diff`]'s changed-page walk use — read
-    /// WITHOUT faulting and WITHOUT touching the accessed bit, so an
-    /// unloaded (on-disk) slot contributes `0` and is never faulted in by
-    /// this walk, exactly like [`Self::resident_leaf_estimate`]. Caller
-    /// decides `seen`'s lifetime and walk order; walking newest-snapshot
-    /// first and reusing one `seen` set across all retained snapshots is
-    /// what makes "resident" (latest's own total) and "pinned" (everything
-    /// else newly counted after that) fall out of the same walk — see
-    /// `Store::checkpoint_impl_paged`'s F1 reconciliation.
+    /// slot already counted (by another tree walked earlier against the
+    /// same `seen` set) contributes `0` the second time, and — Task 9
+    /// review I-2 — an already-`seen` INNER slot prunes its whole subtree
+    /// rather than re-descending it: every leaf beneath a shared inner node
+    /// was necessarily counted (or skipped) already by whichever earlier
+    /// walk first reached that same inner node, since the whole subtree
+    /// beneath a shared `Child` is shared too (same argument
+    /// [`Self::diff`]'s changed-page walk relies on). This turns an older
+    /// snapshot's walk from O(its whole tree) into O(its divergent
+    /// subtrees) — most of a CoW-sharing snapshot's walk is one shared
+    /// pointer at the root, pruned immediately.
+    ///
+    /// Task 9's pin-aware reconciliation: retained snapshots CoW-share
+    /// pre-demotion leaves with the latest snapshot (and with each other),
+    /// so walking each snapshot's data tree independently and summing
+    /// would double-count every shared leaf. The dedup key is a node's
+    /// `Child` pointer ([`Child::resident_ptr`]) — the same ptr-identity
+    /// trick [`Child::same_node`] and [`Self::diff`]'s changed-page walk
+    /// use — read WITHOUT faulting and WITHOUT touching the accessed bit,
+    /// so an unloaded (on-disk) slot contributes `0` and is never faulted
+    /// in by this walk, exactly like [`Self::resident_leaf_estimate`] (an
+    /// inner slot found on-disk is defensive-only: today's architecture
+    /// keeps every data-tree inner level always resident, so this arm is
+    /// never reached in practice, but the walk must not fault even if that
+    /// ever changed). Caller decides `seen`'s lifetime and walk order;
+    /// walking newest-snapshot first and reusing one `seen` set across all
+    /// retained snapshots is what makes "resident" (latest's own total) and
+    /// "pinned" (everything else newly counted after that) fall out of the
+    /// same walk — see `Store::checkpoint_impl_paged`'s F1 reconciliation.
     // Production caller: the F1 reconciliation walk in
     // `Store::checkpoint_impl_paged` (via
     // `Table::paged_resident_leaf_bytes_dedup`). Also exercised directly by
-    // this task's tests.
+    // this task's tests, including the visited-slot-count variant just
+    // below (test-only: proves the pruning above actually happens).
     #[allow(dead_code)]
     pub(crate) fn resident_leaf_bytes_dedup(&self, seen: &mut std::collections::HashSet<*const ()>) -> usize {
-        let src = self.source.as_deref();
-        let h = self.height();
-        fn go<K, V>(
-            slot: &Child<K, V>,
-            depth: usize,
-            src: Option<&dyn NodeSource<K, V>>,
-            seen: &mut std::collections::HashSet<*const ()>,
-        ) -> usize {
-            if depth == 0 {
-                return match slot.resident_ptr() {
-                    Some(ptr) if seen.insert(ptr) => slot.load_quiet(src).leaf_bytes(),
-                    _ => 0, // not resident, or already counted from another snapshot's walk
-                };
-            }
-            let n = slot.load_quiet(src);
-            n.children.iter().map(|c| go(c, depth - 1, src, seen)).sum()
+        let mut visited = 0usize;
+        Self::resident_leaf_bytes_dedup_go(&self.root, self.height(), self.source.as_deref(), seen, &mut visited)
+    }
+
+    /// Test-only twin of [`Self::resident_leaf_bytes_dedup`] that also
+    /// reports how many slots the walk actually visited — the review-I-2
+    /// regression guard: on a re-walk of an already-fully-`seen` tree, a
+    /// pruning walk visits O(1) slots (just the root, immediately pruned)
+    /// while a non-pruning one would still visit every slot.
+    #[cfg(test)]
+    pub(crate) fn resident_leaf_bytes_dedup_with_visits(
+        &self,
+        seen: &mut std::collections::HashSet<*const ()>,
+    ) -> (usize, usize) {
+        let mut visited = 0usize;
+        let bytes =
+            Self::resident_leaf_bytes_dedup_go(&self.root, self.height(), self.source.as_deref(), seen, &mut visited);
+        (bytes, visited)
+    }
+
+    /// Shared recursive body for [`Self::resident_leaf_bytes_dedup`] and
+    /// [`Self::resident_leaf_bytes_dedup_with_visits`] — one implementation
+    /// so the test-only visit count can never drift from what production
+    /// actually walks.
+    fn resident_leaf_bytes_dedup_go(
+        slot: &Child<K, V>,
+        depth: usize,
+        src: Option<&dyn NodeSource<K, V>>,
+        seen: &mut std::collections::HashSet<*const ()>,
+        visited: &mut usize,
+    ) -> usize {
+        *visited += 1;
+        if depth == 0 {
+            return match slot.resident_ptr() {
+                Some(ptr) if seen.insert(ptr) => slot.load_quiet(src).leaf_bytes(),
+                _ => 0, // not resident, or already counted from another snapshot's walk
+            };
         }
-        go(&self.root, h, src, seen)
+        match slot.resident_ptr() {
+            // Not resident: nothing beneath an on-disk inner slot can be
+            // resident either (see the doc above) — 0, no fault, no descend.
+            None => 0,
+            // Already seen: the whole subtree below this inner node was
+            // already walked (or pruned) once elsewhere — skip it, the
+            // I-2 pruning step.
+            Some(p) if !seen.insert(p) => 0,
+            Some(_) => {
+                let n = slot.load_quiet(src);
+                n.children
+                    .iter()
+                    .map(|c| Self::resident_leaf_bytes_dedup_go(c, depth - 1, src, seen, visited))
+                    .sum()
+            }
+        }
     }
 
     /// Report every slot's own page id, in document order — a slot's id is
@@ -6990,6 +7043,34 @@ mod tests {
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 3);
             // Old version untouched and fully resident.
             assert!(t.resident_leaf_estimate() > t2.resident_leaf_estimate());
+        }
+
+        /// Task 9 review I-2: an already-`seen` INNER slot must prune its
+        /// whole subtree, not just skip leaves one at a time — the cost
+        /// property spec §5 claims ("CoW sharing means most of an older
+        /// snapshot's walk retraces pointers the newer walk already marked
+        /// seen"). A fully in-memory tree (no `NodeSource` attached) has
+        /// every `Child` always resident, so `resident_ptr()` is `Some`
+        /// everywhere — no paged store needed to exercise this.
+        #[test]
+        fn resident_leaf_bytes_dedup_prunes_already_seen_subtrees() {
+            let t = tree(20_000);
+            let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+            let (bytes1, visited1) = t.resident_leaf_bytes_dedup_with_visits(&mut seen);
+            assert!(bytes1 > 0, "a real tree must report nonzero resident bytes");
+            assert!(visited1 > 300, "20k rows visits every leaf (≈318) plus every inner level at least once");
+
+            // Re-walk the SAME tree against the SAME (now fully populated)
+            // `seen` set: every node, leaf and inner, was already seen on
+            // the first walk, so a pruning walk must stop at the root
+            // without descending into a single child.
+            let (bytes2, visited2) = t.resident_leaf_bytes_dedup_with_visits(&mut seen);
+            assert_eq!(bytes2, 0, "everything already counted once");
+            assert_eq!(visited2, 1, "the root is `seen`; pruned before any child is even loaded");
+            assert!(
+                visited2 * 100 < visited1,
+                "second walk (visited={visited2}) must visit far fewer slots than the first                  (visited={visited1}) -- a walk that only dedups leaves (no inner-node pruning)                  would still visit every inner node on the second pass too"
+            );
         }
 
         #[test]

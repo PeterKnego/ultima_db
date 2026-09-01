@@ -1909,21 +1909,47 @@ impl Store {
             // un-evictable by `demote_pass` today (Task 11 enforces on this
             // counter). Same no-fault-in contract as the walk above.
             let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-            let mut resident = 0usize;
-            let mut total = 0usize;
             // `.rev()`: `inner.snapshots` is a `BTreeMap<version, _>`, so
-            // this visits highest version (== latest) first.
-            for (i, snap) in inner.snapshots.values().rev().enumerate() {
-                let walked: usize = snap
+            // this visits highest version first. First iteration peeled out
+            // (review M-3): "resident" IS "the latest snapshot's own walk",
+            // and writing that directly (rather than an `if i == 0` inside
+            // a loop that runs for every snapshot) says so.
+            let mut retained = inner.snapshots.values().rev();
+            let resident = match retained.next() {
+                Some(latest_snap) => {
+                    // Review M-1: the split above between "first iteration
+                    // = latest" and "the rest = older, retained" relies on
+                    // `inner.snapshots`' max key always being
+                    // `latest_version` — true by construction (every
+                    // insert site pairs with `latest_version = v.max(..)`),
+                    // but only ever stated in prose before this. Enforce it.
+                    debug_assert_eq!(
+                        latest_snap.version, inner.latest_version,
+                        "F1 reconcile: the highest-versioned retained snapshot must be \
+                         latest_version -- resident is only correct as latest's own walk \
+                         if this holds"
+                    );
+                    latest_snap
+                        .tables
+                        .iter()
+                        .filter(|(n, _)| inner.registry.contains(n))
+                        .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                        .sum::<usize>()
+                }
+                // No snapshots at all: nothing to reconcile. Shouldn't
+                // happen in practice (a store always has at least its
+                // initial version), but a walk over nothing is a
+                // well-defined 0, not a panic.
+                None => 0,
+            };
+            let mut total = resident;
+            for retained_snap in retained {
+                total += retained_snap
                     .tables
                     .iter()
                     .filter(|(n, _)| inner.registry.contains(n))
                     .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
-                    .sum();
-                total += walked;
-                if i == 0 {
-                    resident = walked;
-                }
+                    .sum::<usize>();
             }
             let pinned = total - resident;
             if let Some(p) = inner.paged.as_ref() {
