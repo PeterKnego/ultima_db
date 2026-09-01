@@ -2207,8 +2207,16 @@ impl Store {
                 }
                 let cursor_ref: Option<&dyn std::any::Any> =
                     cursor.as_deref().map(|c| c as &dyn std::any::Any);
-                let node_bytes = tbl.paged_node_bytes();
-                let (new_tbl, demoted, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
+                // Task 8: `paged_demote` now reports the exact bytes it
+                // demoted (`Σ BTreeNode::leaf_bytes()` over the demoted
+                // leaves, forwarded from `BTree::demote_leaves`) instead of
+                // this site multiplying `demoted * paged_node_bytes()` — the
+                // flat per-node estimate under-credited every block leaf,
+                // so the debit no longer matched the fault-in credit
+                // (`PagedSource::read_node`, task 4) or the checkpoint-end
+                // reconciliation walk (`resident_leaf_estimate`, also task
+                // 8), and the drift compounded every demote pass.
+                let (new_tbl, demoted, demoted_bytes, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
                 // `MergeableTable::paged_demote` deliberately does not touch
                 // `PagedStats` itself (see its doc): a concurrent `gc()` can
                 // evict `version` between the read above and this install,
@@ -2227,7 +2235,7 @@ impl Store {
                     stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
                     stats
                         .resident_leaf_bytes
-                        .fetch_sub(demoted as i64 * node_bytes as i64, Ordering::Relaxed);
+                        .fetch_sub(demoted_bytes as i64, Ordering::Relaxed);
                 }
                 match next {
                     Some(c) => cursor = Some(c),

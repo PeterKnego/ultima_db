@@ -1051,7 +1051,13 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     /// Build a new version in which leaf slots with a page id and a clear
     /// accessed bit are on-disk. Processes at most `budget` leaf-parents,
     /// starting after `cursor` (the max key of the last parent processed).
-    /// Returns (new tree, leaves demoted, next cursor / `None` when done).
+    /// Returns (new tree, leaves demoted, demoted bytes, next cursor / `None`
+    /// when done). The bytes figure is `Σ BTreeNode::leaf_bytes()` of every
+    /// leaf actually demoted this call — computed from the demoted leaf
+    /// itself, symmetric by construction with the fault-in credit
+    /// (`PagedSource::read_node`, task 4) and the dirty-bytes credit
+    /// (`Child::resident_new`/`make_mut`, task 8) that both already speak
+    /// `leaf_bytes()`. Task 8, spec §5.
     ///
     /// Demotion never assigns a *new* page id — a leaf keeps whatever id it
     /// already had, it just stops being resident — so a demote pass never
@@ -1067,19 +1073,21 @@ impl<K: Ord + Clone, V> BTree<K, V> {
     // Real caller (`Table::paged_demote`, via `Store::demote_pass`) is in
     // `persistence`-gated code — see `set_source`'s note above.
     #[allow(dead_code)]
-    pub(crate) fn demote_leaves(&self, cursor: Option<&K>, budget: usize) -> (BTree<K, V>, usize, Option<K>) {
+    pub(crate) fn demote_leaves(&self, cursor: Option<&K>, budget: usize) -> (BTree<K, V>, usize, usize, Option<K>) {
         let src = self.source.as_deref();
         let h = self.height();
         if h == 0 {
-            return (self.clone(), 0, None);
+            return (self.clone(), 0, 0, None);
         }
         let mut out = self.clone();
         let mut demoted = 0usize;
+        let mut demoted_bytes = 0usize;
         let mut left = budget;
         let mut last: Option<K> = None;
 
         // depth counts down; at depth 1 a node's children are leaves.
         // Returns whether the budget was exhausted (there is more to do).
+        #[allow(clippy::too_many_arguments)]
         fn go<K: Ord + Clone, V>(
             slot: &mut Child<K, V>,
             depth: usize,
@@ -1087,6 +1095,7 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             cursor: Option<&K>,
             left: &mut usize,
             demoted: &mut usize,
+            demoted_bytes: &mut usize,
             last: &mut Option<K>,
         ) -> bool {
             if *left == 0 {
@@ -1120,6 +1129,11 @@ impl<K: Ord + Clone, V> BTree<K, V> {
                         if c.take_accessed() {
                             // second chance: bit cleared, stays resident
                         } else {
+                            // Bytes before the slot is overwritten (task 8):
+                            // `c` is already loaded, so this is a plain peek
+                            // (`load_quiet`, no fault, no accessed bump) at
+                            // the exact leaf about to be dropped.
+                            *demoted_bytes += c.load_quiet(src).leaf_bytes();
                             *c = Child::on_disk(id);
                             *demoted += 1;
                         }
@@ -1135,15 +1149,15 @@ impl<K: Ord + Clone, V> BTree<K, V> {
             // leaf, so this CoW can never reach a block leaf.
             let n = slot.make_mut(None);
             for c in n.children.iter_mut() {
-                if go(c, depth - 1, src, cursor, left, demoted, last) {
+                if go(c, depth - 1, src, cursor, left, demoted, demoted_bytes, last) {
                     return true;
                 }
             }
             false
         }
-        let exhausted = go(&mut out.root, h, src, cursor, &mut left, &mut demoted, &mut last);
+        let exhausted = go(&mut out.root, h, src, cursor, &mut left, &mut demoted, &mut demoted_bytes, &mut last);
         restore_unchanged_ids(&out.root, &self.root, h, src);
-        (out, demoted, if exhausted { last } else { None })
+        (out, demoted, demoted_bytes, if exhausted { last } else { None })
     }
 
     /// Page ids referenced by `prev` and not by `self`, walking only inner
@@ -1365,19 +1379,27 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         go(&self.root, h, src)
     }
 
-    /// Bytes of resident leaves, estimated as loaded-leaf-slots × NODE_BYTES.
-    /// Read-only: uses [`Child::load_quiet`], so measuring residency never
-    /// marks anything "recently used" — see the same note on
-    /// [`Self::changed_page_ids`].
-    // No production caller yet — the (future) page evictor's budget check is
-    // the intended caller. Used today by this task's tests.
+    /// Bytes of resident leaves, summed as `BTreeNode::leaf_bytes()` over
+    /// every loaded leaf slot — the same unit the fault-in credit
+    /// (`PagedSource::read_node`, task 4), the demote-side debit
+    /// ([`Self::demote_leaves`], task 8), and the dirty-bytes credit
+    /// (`Child::resident_new`/`make_mut`, task 8) all speak, so this walk's
+    /// total lines up exactly with what those bump/subtract at runtime. The
+    /// checkpoint-end F1 reconciliation (`Store::checkpoint_impl_paged`)
+    /// re-bases the live `resident_leaf_bytes` counter from this walk every
+    /// checkpoint. Read-only: uses [`Child::load_quiet`], so measuring
+    /// residency never marks anything "recently used" — see the same note
+    /// on [`Self::changed_page_ids`].
+    // Production caller: the F1 reconciliation walk in
+    // `Store::checkpoint_impl_paged` (via `Table::paged_resident_leaf_bytes`).
+    // Also exercised directly by this task's tests.
     #[allow(dead_code)]
     pub(crate) fn resident_leaf_estimate(&self) -> usize {
         let src = self.source.as_deref();
         let h = self.height();
         fn go<K, V>(slot: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) -> usize {
             if depth == 0 {
-                return if slot.is_loaded() { Child::<K, V>::NODE_BYTES } else { 0 };
+                return if slot.is_loaded() { slot.load_quiet(src).leaf_bytes() } else { 0 };
             }
             let n = slot.load_quiet(src);
             n.children.iter().map(|c| go(c, depth - 1, src)).sum()
@@ -6913,9 +6935,10 @@ mod tests {
             let mut next = 0;
             flush(&t, &disk, &mut next);
             t.set_source(Some(disk.clone()));
-            let (t2, demoted, cursor) = t.demote_leaves(None, usize::MAX);
+            let (t2, demoted, demoted_bytes, cursor) = t.demote_leaves(None, usize::MAX);
             assert!(cursor.is_none());
             assert!(demoted > 300, "20k rows ≈ 318 leaves, all quiet");
+            assert!(demoted_bytes > 0, "a real demote pass must report nonzero bytes");
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 0, "demotion loads nothing");
             for k in [1u64, 2, 3, 10_000, 19_999] {
                 assert_eq!(t2.get(&k), Some(&k));
@@ -6967,15 +6990,25 @@ mod tests {
             t.set_source(Some(disk.clone()));
             t.get(&5); // marks the leftmost leaf accessed
             let before = t.resident_leaf_estimate(); // is_loaded()-based, does not mark
-            let (t2, _d1, _) = t.demote_leaves(None, usize::MAX);
+            let (t2, _d1, _b1, _) = t.demote_leaves(None, usize::MAX);
+            // Task 8: `resident_leaf_estimate` now sums `leaf_bytes()`
+            // (`NODE_BYTES` + one `size_of::<V>()` per entry), not flat
+            // `NODE_BYTES` — the leftmost leaf `from_sorted` packs densely
+            // (see `from_sorted_tail_underfull`'s doc: only the *tail* leaf
+            // is left underfull), so it holds exactly `MAX_KEYS` entries.
             assert_eq!(
                 t2.resident_leaf_estimate(),
-                Child::<u64, u64>::NODE_BYTES,
+                Child::<u64, u64>::NODE_BYTES + MAX_KEYS * std::mem::size_of::<u64>(),
                 "exactly the accessed leaf survived pass 1"
             );
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 0);
-            let (t3, d2, _) = t2.demote_leaves(None, usize::MAX);
+            let (t3, d2, b2, _) = t2.demote_leaves(None, usize::MAX);
             assert_eq!(d2, 1, "second pass takes it");
+            assert_eq!(
+                b2,
+                Child::<u64, u64>::NODE_BYTES + MAX_KEYS * std::mem::size_of::<u64>(),
+                "the one demoted leaf's bytes match its own leaf_bytes(), same as the estimate above"
+            );
             assert_eq!(t3.get(&5), Some(&5));
             assert_eq!(disk.reads.load(std::sync::atomic::Ordering::Relaxed), 1, "and now it faults");
             let _ = before;
@@ -6988,11 +7021,13 @@ mod tests {
             let mut next = 0;
             flush(&t, &disk, &mut next);
             t.set_source(Some(disk.clone()));
-            let (t2, d1, c1) = t.demote_leaves(None, 2);
+            let (t2, d1, b1, c1) = t.demote_leaves(None, 2);
             assert!(c1.is_some() && d1 <= 2 * 64);
-            let (t3, d2, c2) = t2.demote_leaves(c1.as_ref(), usize::MAX);
+            assert!(b1 > 0, "a real demote pass must report nonzero bytes");
+            let (t3, d2, b2, c2) = t2.demote_leaves(c1.as_ref(), usize::MAX);
             assert!(c2.is_none());
             assert!(d1 + d2 > 300);
+            assert!(b1 + b2 > 0, "cumulative bytes must be nonzero too");
             assert_eq!(t3.len(), 20_000);
         }
 
@@ -7007,8 +7042,9 @@ mod tests {
             for k in 1..=5_000u64 {
                 t.get(&k);
             }
-            let (t2, demoted, _) = t.demote_leaves(None, usize::MAX);
+            let (t2, demoted, demoted_bytes, _) = t.demote_leaves(None, usize::MAX);
             assert_eq!(demoted, 0, "every leaf was accessed; none should be demoted");
+            assert_eq!(demoted_bytes, 0, "nothing demoted, nothing debited");
             let mut writes = 0;
             t2.write_dirty(&mut |_, _| {
                 writes += 1;
@@ -7150,8 +7186,9 @@ mod tests {
             // touched leaves survive on their second chance — which clears
             // their accessed bit. The tree is now effectively fully
             // demoted except those two survivors.
-            let (t2, da, _) = t.demote_leaves(None, usize::MAX);
+            let (t2, da, ba, _) = t.demote_leaves(None, usize::MAX);
             assert!(da > 300, "everything but the two touched leaves demotes");
+            assert!(ba > 0, "a real demote pass must report nonzero bytes");
             // Walk it exactly the way a checkpoint diff / punch pass would:
             // compare against a deliberately unrelated tree (so
             // `changed_page_ids` can't skip via matching ids and is forced
@@ -7176,8 +7213,9 @@ mod tests {
             // re-armed them, the two leaves' second chance is used up and
             // they demote now — and only they, since everything else was
             // already on disk (free `!any` skip, nothing left to consider).
-            let (t3, db, _) = t2.demote_leaves(None, usize::MAX);
+            let (t3, db, bb, _) = t2.demote_leaves(None, usize::MAX);
             assert_eq!(db, 2, "exactly the two leaves the walks must not have re-armed");
+            assert!(bb > 0, "a real demote pass must report nonzero bytes");
             let _ = t3;
         }
 
@@ -7219,8 +7257,9 @@ mod tests {
             let mut next = 0;
             flush(&t, &disk, &mut next);
             t.set_source(Some(disk.clone()));
-            let (mut t2, demoted, _) = t.demote_leaves(None, usize::MAX);
+            let (mut t2, demoted, demoted_bytes, _) = t.demote_leaves(None, usize::MAX);
             assert!(demoted > 0, "need at least one on-disk leaf for this test to mean anything");
+            assert!(demoted_bytes > 0, "a real demote pass must report nonzero bytes");
             t2.extend_from_sorted((1_001..=1_010).map(|k| (k, Arc::new(k))));
             // Key 1 lives in the leftmost leaf, untouched by
             // `extend_from_sorted` (which only ever rewrites the right

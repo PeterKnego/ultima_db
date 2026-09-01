@@ -94,9 +94,16 @@ impl<K, V> Child<K, V> {
     /// clean page. `src: None` (an unattached tree) credits nothing, which
     /// is correct: there is no checkpoint to owe bytes to yet. See
     /// `docs/tasks/task12_background_checkpointer.md`.
+    ///
+    /// Task 8 (spec §4's dirty-bytes clause): a block leaf's real cost is
+    /// `BTreeNode::leaf_bytes()` (`NODE_BYTES` plus its value block), not
+    /// the flat `NODE_BYTES` a non-block node still credits — matching the
+    /// demote-side debit and the fault-in credit (`PagedSource::read_node`,
+    /// task 4) so all three speak the same unit.
     pub(crate) fn resident_new(node: Arc<BTreeNode<K, V>>, src: Option<&dyn NodeSource<K, V>>) -> Self {
         if let Some(s) = src {
-            s.note_dirty(Self::NODE_BYTES);
+            let bytes = if node.block.is_some() { node.leaf_bytes() } else { Self::NODE_BYTES };
+            s.note_dirty(bytes);
         }
         Self::resident(node)
     }
@@ -391,7 +398,14 @@ impl<K: Clone, V> Child<K, V> {
         if was_clean
             && let Some(s) = src
         {
-            s.note_dirty(Self::NODE_BYTES);
+            // Task 8 (spec §4): a block leaf's real cost is
+            // `leaf_bytes()`, not the flat `NODE_BYTES` a non-block node
+            // still credits — `raw` is the post-mutation node, already in
+            // hand. See the matching note on `resident_new` above.
+            // SAFETY: `raw` is the pointer just stored in `self.node`, non-null.
+            let node_ref = unsafe { &*raw };
+            let bytes = if node_ref.block.is_some() { node_ref.leaf_bytes() } else { Self::NODE_BYTES };
+            s.note_dirty(bytes);
         }
         // SAFETY: raw is the pointer just stored in `self.node`, non-null, uniquely owned by `arc`.
         //
