@@ -811,3 +811,278 @@ fn hard_cap_clock_bounded_under_concurrent_random_access() {
         after.resident_leaf_bytes_est
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Task 11: adaptive retention shrink under pin pressure (spec §5
+// "enforcement arm", §6 "order of weapons" step 2).
+//
+// Task 9's own tests above (`pinned_leaf_bytes_reflects_older_retained_snapshots`
+// et al.) deliberately configure `memory_budget_bytes(1 << 30)` -- a budget
+// the store never gets anywhere near -- precisely so this task's default-on
+// shrink never fires for them; they stay untouched here. These tests use a
+// TINY budget instead, small enough that a single leaf's pinned bytes alone
+// puts the store over it, and a `num_snapshots_retained` window wide enough
+// (8) that ORDINARY commit-time auto-gc (`gc_inner`, unconditional on
+// budget) would keep every retained snapshot on its own -- so any eviction
+// these tests observe is specifically Task 11's shrink path, not ordinary
+// retention aging a version out.
+//
+// A paged store with `memory_budget_bytes` configured always runs a
+// background checkpointer thread (`Checkpointer::start`, spawned
+// unconditionally alongside `inner.paged`, independent of
+// `checkpoint_interval` -- see its own doc), which races these tests' own
+// explicit `checkpoint()` calls: the tiny budget below wakes it almost
+// immediately (`due_mem`), and a background run can land at any point in
+// the sequence, including mid-commit. `checkpoint_impl_paged` serializes
+// every caller (foreground or background) through the same
+// `checkpoint_lock`, so calls never truly overlap, but which thread's call
+// lands at which moment is not deterministic -- so these tests poll for
+// convergence with a generous bound instead of assuming a fixed call count
+// (see `hard_cap_clock_cycles_to_convergence`'s own doc for the same
+// interaction, there handled via before/after deltas instead).
+// ---------------------------------------------------------------------------
+
+/// Same-key update+checkpoint, `rounds` times -- identical mechanism to task
+/// 9's `pinned_leaf_bytes_reflects_older_retained_snapshots` (proven
+/// reliable there, under a huge budget, to produce real nonzero pinned
+/// bytes): each commit CoWs a brand-new leaf for key 5, orphaning the
+/// previous round's leaf into a snapshot that is now non-latest. Several
+/// rounds (not just one) make the resulting pin pressure robust rather than
+/// depending on a single update's fault-in timing. Returns every version in
+/// commit order — index 0 is `baseline` (the caller-supplied version before
+/// any round ran), the rest are rounds `1..=rounds`.
+fn same_key_update_rounds(s: &Store, baseline: u64, rounds: u64) -> Vec<u64> {
+    let mut versions = vec![baseline];
+    for i in 0..rounds {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        let v = w.commit().unwrap();
+        versions.push(v);
+        s.checkpoint().unwrap();
+    }
+    versions
+}
+
+/// (a) Shrink fires: several update rounds orphan a run of older snapshots
+/// that `num_snapshots_retained(8)` alone would keep (7 total snapshots,
+/// nowhere near that window) -- but the tiny budget makes pin pressure
+/// alone the excess, so adaptive shrink collapses retention to 1. The
+/// oldest orphaned version becomes unreadable, latest stays readable, and
+/// resident+pinned settle to fit the budget.
+#[test]
+fn adaptive_retention_shrink_fires_under_pin_pressure() {
+    const RETENTION: usize = 8;
+    // Small enough that a single interior leaf's fault-in credit alone
+    // exceeds it -- see `store_with`'s Row (one u64 field): a real leaf at
+    // T=32 is comfortably larger than this.
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(BUDGET).build(),
+        RETENTION,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    let versions = same_key_update_rounds(&s, v0, 6);
+    let v_old = versions[0]; // == v0: the oldest, first-orphaned version
+    let v_new = *versions.last().unwrap();
+    assert_ne!(v_old, v_new);
+
+    // Ordinary commit-time auto-gc already ran inside every `commit()`
+    // above with `num_snapshots_retained(8)` -- 7 retained snapshots is
+    // nowhere near that window, so `gc_inner`'s fast path was always a
+    // no-op and v_old is still in `inner.snapshots`. Only Task 11's shrink
+    // path (triggered by the tiny BUDGET making pinned bytes the whole
+    // excess once the capped demote pass settles latest's own leaf) can
+    // evict it. Poll rather than assume a fixed call count converges (see
+    // this section's header comment for why).
+    let mut converged = false;
+    for _ in 0..50 {
+        s.checkpoint().unwrap();
+        if s.begin_read(Some(v_old)).is_err() {
+            converged = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        converged,
+        "v_old must eventually be gone: shrink must collapse retention despite \
+         num_snapshots_retained(8), which alone would have kept every one of these 7 \
+         snapshots (latest + 6 update rounds)"
+    );
+    // Settle: one more checkpoint so the reconcile reflects the converged
+    // state (the loop above may have broken right after the eviction, on a
+    // call whose OWN reconcile ran before the eviction it triggered -- see
+    // `Store::reconcile_paged_stats`'s doc: shrink's own gc happens between
+    // that call's first and second reconcile, so the SAME call's second
+    // reconcile already reflects it, but an extra call costs nothing and
+    // removes any doubt).
+    s.checkpoint().unwrap();
+
+    assert!(
+        s.begin_read(Some(v_new)).is_ok(),
+        "latest must always survive adaptive shrink"
+    );
+
+    let stats = s.paged_stats().unwrap();
+    assert_eq!(
+        stats.pinned_leaf_bytes, 0,
+        "no non-latest snapshot remains after shrink -- nothing left to pin"
+    );
+    assert!(
+        stats.resident_leaf_bytes_est <= BUDGET,
+        "resident {} must fit the budget once shrink settles (pins were the only excess)",
+        stats.resident_leaf_bytes_est
+    );
+}
+
+/// (b) An explicit `VersionPin` survives adaptive shrink: pinning `v_old`
+/// keeps its `Arc` strong count above 1, which `gc_inner_with_retain`'s
+/// existing filter already spares regardless of the retain count it is
+/// asked for -- Task 11 adds no second mechanism on top of it.
+#[test]
+fn adaptive_retention_shrink_honors_version_pin() {
+    const RETENTION: usize = 8;
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(BUDGET).build(),
+        RETENTION,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    // Land the first update commit BEFORE pinning v0 -- pinning while v0 is
+    // still `latest_version` would race `demote_pass`'s own "same-version
+    // re-publish" (`install_paged_tables`; see `Store::reconcile_paged_stats`'s
+    // M-1 doc): a demote pass that re-publishes v0 while it is STILL latest
+    // installs a brand-new `Arc<Snapshot>` at that version's map key, which
+    // would silently orphan a pin taken beforehand (a pre-existing hazard,
+    // independent of Task 11: a `VersionPin` protects only the exact `Arc`
+    // it cloned, and re-publish swaps that `Arc` for a fresh one under the
+    // same key). This tiny-budget setup makes that window realistic --
+    // demote_pass runs on every checkpoint whenever a budget is configured
+    // at all -- so this test sidesteps it by construction instead: pinning
+    // strictly AFTER v0 stops being latest is safe, because
+    // `demote_pass_inner` only ever reads/writes `inner.latest_version`,
+    // never an older, already-superseded version, so v0's map entry is
+    // permanently stable (same `Arc` identity) from the moment a newer
+    // commit lands.
+    let mut w = s.begin_write(None).unwrap();
+    {
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update(5, Row { v: 1_000 }).unwrap();
+    }
+    let v1 = w.commit().unwrap();
+    assert_ne!(v0, v1);
+
+    let pin = s.pin_version(Some(v0)).unwrap();
+    assert_eq!(pin.version(), v0);
+
+    // Round 1's own checkpoint, then five more same-key update rounds --
+    // same mechanism as `same_key_update_rounds`, continuing from v1 (which
+    // is itself unprotected and expected to be shrunk away, in contrast to
+    // the pinned v0).
+    s.checkpoint().unwrap();
+    let mut versions = vec![v1];
+    for i in 1..6u64 {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        let v = w.commit().unwrap();
+        versions.push(v);
+        s.checkpoint().unwrap();
+    }
+    let v_new = *versions.last().unwrap();
+
+    // Generous, unconditional checkpoint budget -- long enough that, absent
+    // the pin, `adaptive_retention_shrink_fires_under_pin_pressure` above
+    // reliably converges well within it. No early-exit condition here: the
+    // whole point is that v0 must NOT disappear no matter how many shrink
+    // attempts run against it.
+    for _ in 0..20 {
+        s.checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(
+        s.begin_read(Some(v0)).is_ok(),
+        "VersionPin must survive adaptive shrink even though retention was collapsed to 1 \
+         for everything else"
+    );
+    assert!(s.begin_read(Some(v_new)).is_ok());
+
+    // The pin (and therefore v0) becomes collectable once dropped --
+    // sanity, not the point of this test, so no further assertion after.
+    drop(pin);
+}
+
+/// (c) `shrink_retention_under_pressure(false)`: nothing gets gc'd beyond
+/// the configured `num_snapshots_retained` window. The store stays over
+/// budget, and `pinned_leaf_bytes` reports the excess honestly instead of
+/// silently shrinking around it.
+#[test]
+fn adaptive_retention_shrink_knob_false_leaves_store_over_budget() {
+    const RETENTION: usize = 8;
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(
+            PagedOptions::builder()
+                .memory_budget_bytes(BUDGET)
+                .shrink_retention_under_pressure(false)
+                .build(),
+        )
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .num_snapshots_retained(RETENTION)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    let versions = same_key_update_rounds(&s, v0, 6);
+    let v_old = versions[0];
+    let v_new = *versions.last().unwrap();
+
+    for _ in 0..10 {
+        s.checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(
+        s.begin_read(Some(v_old)).is_ok(),
+        "knob false: only ordinary retention (num_snapshots_retained(8)) governs eviction, \
+         and 7 retained snapshots is nowhere near that window -- v_old must still be readable"
+    );
+    assert!(s.begin_read(Some(v_new)).is_ok());
+
+    let stats = s.paged_stats().unwrap();
+    assert!(
+        stats.pinned_leaf_bytes > 0,
+        "with shrink disabled, pinned_leaf_bytes must honestly report the un-shrunk excess \
+         instead of the store silently freeing it out from under num_snapshots_retained"
+    );
+}

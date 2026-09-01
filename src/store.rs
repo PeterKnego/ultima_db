@@ -1567,6 +1567,152 @@ impl Store {
         Ok(version)
     }
 
+    /// Task 9's F1 reconciliation walk (pin-aware, spec §5 "Fault-in,
+    /// demotion, and pin-aware accounting") plus the M-1 `last_root`
+    /// refresh, factored out of `checkpoint_impl_paged`'s phase 3 so task
+    /// 11's shrink decision (spec §6 "order of weapons") can call this
+    /// TWICE within one checkpoint tick: once right after `demote_pass` to
+    /// learn the FRESH `resident_leaf_bytes`/`pinned_leaf_bytes` that
+    /// decision needs (`demote_pass` only ever updates `resident_leaf_bytes`
+    /// live, via its own per-batch `fetch_sub` — `pinned_leaf_bytes` is
+    /// exclusively this walk's output), and again afterward — "the next
+    /// reconcile settles the counters" — to publish the post-shrink truth.
+    /// Safe to call any number of times in a row: the M-1 `last_root`
+    /// re-point is idempotent (a harmless no-op re-point when nothing
+    /// changed since the last call — see its own comment below), and the F1
+    /// walk always re-derives both counters from scratch against whatever
+    /// `inner.snapshots` currently holds.
+    ///
+    /// `version` is the version whose live snapshot `last_root` should
+    /// point at — always `checkpoint_impl_paged`'s own `snap.version`, the
+    /// version this checkpoint call is naming.
+    ///
+    /// Returns the `(resident, pinned)` pair it just stored (in
+    /// `PagedStats`' own units — `resident_leaf_bytes` is a signed counter
+    /// that can transiently go negative, see the F1 comment below, but a
+    /// walk-derived value never is) so a caller that needs the numbers
+    /// (task 11's shrink decision) doesn't have to re-load the atomics
+    /// right back out.
+    #[cfg(feature = "persistence")]
+    fn reconcile_paged_stats(&self, version: u64) -> (u64, u64) {
+        // M-1 (final-review wave): `demote_pass` just published a demoted
+        // table (or several) as a same-version re-publish at `version` (see
+        // `PagedState::last_root`'s doc) via `install_paged_tables` — but
+        // `last_root` may still point at the *pre*-demotion snapshot, which
+        // keeps every leaf `demote_pass` just replaced pinned alive in
+        // memory through that stale `Arc` for a whole extra checkpoint
+        // cycle (until the *next* checkpoint's `p.last_root = Some((current,
+        // ..))` finally drops it). Re-reading the live snapshot at this
+        // same version and re-pointing `last_root` at it releases that pin
+        // one checkpoint early. Safe regardless of whether `demote_pass`
+        // actually touched `version` (a concurrent commit can move
+        // `latest_version` past it before `demote_pass` reads its own
+        // target — see `demote_pass_inner`'s doc): either it demoted this
+        // exact version, in which case this is exactly the freed-pin update
+        // intended, or it demoted a newer one, in which case re-reading
+        // `version` yields the same content `last_root` already held (a
+        // harmless no-op re-point). Guarded with `if let` (not `.expect`)
+        // for the version being gone from `inner.snapshots` entirely —
+        // cannot happen from `checkpoint_impl_paged`'s own calls (the `Arc`
+        // `last_root` already holds keeps `gc()`'s `strong_count == 1`
+        // eviction check from ever collecting it while `checkpoint_lock`
+        // still serializes against any other checkpoint call), but costs
+        // nothing to handle rather than assume.
+        let mut inner = self.inner.write();
+        let refreshed = inner.snapshots.get(&version).cloned();
+        if let (Some(p), Some(refreshed)) = (inner.paged.as_mut(), refreshed) {
+            p.last_root = Some((refreshed, version));
+        }
+
+        // F1 (spike/paged-write-path, 2026-08-31): reconcile the
+        // resident-leaf soft counter against an exact walk of the
+        // post-demote tables. `Child::resident_new` credits only
+        // `dirty_bytes` — a node CREATED in memory (bulk load, insert
+        // traffic, CoW splits) never credits `resident_leaf_bytes`, while
+        // the demote debit is unconditional, so a store built by writes
+        // drives the i64 counter permanently negative after its first
+        // demote-everything checkpoint. The `.max(0)` clamp then reads 0
+        // forever: `due_mem` (the checkpointer's memory-budget trigger) and
+        // the fault-in budget wake in `PagedSource::read_node` both go
+        // structurally silent, so between interval ticks nothing ever
+        // demotes and the resident set grows unbounded under write load —
+        // kernel-swap thrash in any bounded-memory deployment. Re-basing
+        // the counter here (the walk touches only always-resident inner
+        // levels via `load_quiet` + `is_loaded` leaf checks — no fault-ins)
+        // makes fault-in credits start from an accurate floor each
+        // checkpoint; drift until the next reconcile is only the
+        // CoW-created leaves of the interval, and the store() racing a
+        // concurrent fault-in's fetch_add costs at most one NODE_BYTES of
+        // that bounded drift — this is a soft trigger, not an invariant.
+        //
+        // Task 9 (pin-aware reconciliation, spec §5 "Snapshot pins"):
+        // `demote_pass` only demotes the LATEST snapshot's tables, but a
+        // leaf it "frees" can still be reachable — same `Child` Arc — from
+        // an older snapshot `num_snapshots_retained` keeps alive; that
+        // share never gets a demote debit, so the bytes stay resident while
+        // `resident_leaf_bytes` reports them gone. Walking every retained
+        // snapshot newest-first against ONE shared ptr-identity `seen` set
+        // (the `Child::same_node`/`BTree::diff` trick, across snapshot
+        // roots) recovers the true total cheaply (CoW sharing means most of
+        // an older snapshot's walk just retraces already-`seen` pointers):
+        // the latest snapshot's own deduped total is `resident`; the rest,
+        // counted only once an older snapshot's walk runs, is `pinned` —
+        // un-evictable by `demote_pass` today, enforced on directly by task
+        // 11 (this function's caller). Same no-fault-in contract as the
+        // walk above.
+        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        // `.rev()`: `inner.snapshots` is a `BTreeMap<version, _>`, so this
+        // visits highest version first. First iteration peeled out (review
+        // M-3): "resident" IS "the latest snapshot's own walk", and writing
+        // that directly (rather than an `if i == 0` inside a loop that runs
+        // for every snapshot) says so.
+        let mut retained = inner.snapshots.values().rev();
+        let resident = match retained.next() {
+            Some(latest_snap) => {
+                // Review M-1: the split above between "first iteration =
+                // latest" and "the rest = older, retained" relies on
+                // `inner.snapshots`' max key always being `latest_version`
+                // — true by construction (every insert site pairs with
+                // `latest_version = v.max(..)`), but only ever stated in
+                // prose before this. Enforce it.
+                debug_assert_eq!(
+                    latest_snap.version, inner.latest_version,
+                    "F1 reconcile: the highest-versioned retained snapshot must be \
+                     latest_version -- resident is only correct as latest's own walk \
+                     if this holds"
+                );
+                latest_snap
+                    .tables
+                    .iter()
+                    .filter(|(n, _)| inner.registry.contains(n))
+                    .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                    .sum::<usize>()
+            }
+            // No snapshots at all: nothing to reconcile. Shouldn't happen
+            // in practice (a store always has at least its initial
+            // version), but a walk over nothing is a well-defined 0, not a
+            // panic.
+            None => 0,
+        };
+        let mut total = resident;
+        for retained_snap in retained {
+            total += retained_snap
+                .tables
+                .iter()
+                .filter(|(n, _)| inner.registry.contains(n))
+                .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                .sum::<usize>();
+        }
+        let pinned = total - resident;
+        if let Some(p) = inner.paged.as_ref() {
+            p.stats
+                .resident_leaf_bytes
+                .store(resident as i64, Ordering::Relaxed);
+            p.stats.pinned_leaf_bytes.store(pinned as u64, Ordering::Relaxed);
+        }
+        (resident as u64, pinned as u64)
+    }
+
     /// The paged checkpoint path: writes every registered table's dirty
     /// (never-yet-on-disk) B-tree nodes to the page file, then a single
     /// root record (`checkpoint_{version}.root`) naming each table's
@@ -1855,127 +2001,54 @@ impl Store {
         // `write_dirty` assigned them ids above, so a demote pass run right
         // after a checkpoint is the point at which the largest possible
         // batch of newly-quiet leaves is demotable at once.
-        if opts.memory_budget_bytes.is_some() {
+        if let Some(budget) = opts.memory_budget_bytes {
             self.demote_pass()?;
 
-            // M-1 (final-review wave): `demote_pass` just published a
-            // demoted table (or several) as a same-version re-publish at
-            // `snap.version` (see `PagedState::last_root`'s doc) via
-            // `install_paged_tables` — but `last_root` above still points
-            // at `current`, the *pre*-demotion snapshot, which keeps every
-            // leaf `demote_pass` just replaced pinned alive in memory
-            // through that stale `Arc` for a whole extra checkpoint cycle
-            // (until the *next* checkpoint's `p.last_root = Some((current,
-            // ..))` finally drops it). Re-reading the live snapshot at this
-            // same version and re-pointing `last_root` at it releases that
-            // pin one checkpoint early. Safe regardless of whether
-            // `demote_pass` actually touched `snap.version` (a concurrent
-            // commit can move `latest_version` past it before `demote_pass`
-            // reads its own target — see `demote_pass_inner`'s doc): either
-            // it demoted this exact version, in which case this is exactly
-            // the freed-pin update intended, or it demoted a newer one, in
-            // which case re-reading `snap.version` yields the same content
-            // `current` already held (a harmless no-op re-point). Guarded
-            // with `if let` (not `.expect`) for the version being gone from
-            // `inner.snapshots` entirely — cannot happen from *this* call
-            // (the `Arc` `last_root` already holds keeps `gc()`'s
-            // `strong_count == 1` eviction check from ever collecting it
-            // while `checkpoint_lock` still serializes against any other
-            // checkpoint call), but costs nothing to handle rather than
-            // assume.
-            let mut inner = self.inner.write();
-            let refreshed = inner.snapshots.get(&snap.version).cloned();
-            if let (Some(p), Some(refreshed)) = (inner.paged.as_mut(), refreshed) {
-                p.last_root = Some((refreshed, snap.version));
-            }
+            // Fresh reconcile right after the capped demote pass — Task 11
+            // (spec §6 "order of weapons", step 2) needs an up-to-date
+            // `pinned_leaf_bytes` to decide whether to shrink, and
+            // `demote_pass` never updates that counter itself (only this
+            // walk does): without running it here first, the decision below
+            // would be judging pin pressure off whatever the PREVIOUS
+            // checkpoint's walk happened to leave behind. See
+            // `Store::reconcile_paged_stats`'s doc for the walk itself.
+            let (resident, pinned) = self.reconcile_paged_stats(snap.version);
 
-            // F1 (spike/paged-write-path, 2026-08-31): reconcile the
-            // resident-leaf soft counter against an exact walk of the
-            // post-demote tables. `Child::resident_new` credits only
-            // `dirty_bytes` — a node CREATED in memory (bulk load, insert
-            // traffic, CoW splits) never credits `resident_leaf_bytes`,
-            // while the demote debit above is unconditional, so a store
-            // built by writes drives the i64 counter permanently negative
-            // after its first demote-everything checkpoint. The `.max(0)`
-            // clamp then reads 0 forever: `due_mem` (the checkpointer's
-            // memory-budget trigger) and the fault-in budget wake in
-            // `PagedSource::read_node` both go structurally silent, so
-            // between interval ticks nothing ever demotes and the resident
-            // set grows unbounded under write load — kernel-swap thrash in
-            // any bounded-memory deployment. Re-basing the counter here
-            // (the walk touches only always-resident inner levels via
-            // `load_quiet` + `is_loaded` leaf checks — no fault-ins) makes
-            // fault-in credits start from an accurate floor each
-            // checkpoint; drift until the next reconcile is only the
-            // CoW-created leaves of the interval, and the store() racing a
-            // concurrent fault-in's fetch_add costs at most one
-            // NODE_BYTES of that bounded drift — this is a soft trigger,
-            // not an invariant.
+            // Task 11 (spec §5 "enforcement arm" / §6 "order of weapons"
+            // step 2, `PagedOptions::shrink_retention_under_pressure`,
+            // default ON — Peter's ruling): the capped demote pass above
+            // only ever walks LATEST's own tree, so a leaf orphaned by
+            // writes and kept alive only by an older RETAINED snapshot
+            // (`pinned`, task 9) is invisible to it by construction. When
+            // pins are large enough that they alone could cover the whole
+            // remaining excess over budget, shrinking retention is the only
+            // lever left: gc down to a floor of latest plus every explicit
+            // `VersionPin`/live `ReadTx` — `gc_inner_with_retain`'s existing
+            // `Arc::strong_count == 1` filter already spares those (that
+            // floor IS the spec's floor; nothing new is added here).
             //
-            // Task 9 (pin-aware reconciliation, spec §5 "Snapshot pins"):
-            // `demote_pass` only demotes the LATEST snapshot's tables, but a
-            // leaf it "frees" can still be reachable — same `Child` Arc —
-            // from an older snapshot `num_snapshots_retained` keeps alive;
-            // that share never gets a demote debit, so the bytes stay
-            // resident while `resident_leaf_bytes` reports them gone.
-            // Walking every retained snapshot newest-first against ONE
-            // shared ptr-identity `seen` set (the `Child::same_node`/
-            // `BTree::diff` trick, across snapshot roots) recovers the true
-            // total cheaply (CoW sharing means most of an older snapshot's
-            // walk just retraces already-`seen` pointers): the latest
-            // snapshot's own deduped total is `resident`; the rest, counted
-            // only once an older snapshot's walk runs, is `pinned` —
-            // un-evictable by `demote_pass` today (Task 11 enforces on this
-            // counter). Same no-fault-in contract as the walk above.
-            let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-            // `.rev()`: `inner.snapshots` is a `BTreeMap<version, _>`, so
-            // this visits highest version first. First iteration peeled out
-            // (review M-3): "resident" IS "the latest snapshot's own walk",
-            // and writing that directly (rather than an `if i == 0` inside
-            // a loop that runs for every snapshot) says so.
-            let mut retained = inner.snapshots.values().rev();
-            let resident = match retained.next() {
-                Some(latest_snap) => {
-                    // Review M-1: the split above between "first iteration
-                    // = latest" and "the rest = older, retained" relies on
-                    // `inner.snapshots`' max key always being
-                    // `latest_version` — true by construction (every
-                    // insert site pairs with `latest_version = v.max(..)`),
-                    // but only ever stated in prose before this. Enforce it.
-                    debug_assert_eq!(
-                        latest_snap.version, inner.latest_version,
-                        "F1 reconcile: the highest-versioned retained snapshot must be \
-                         latest_version -- resident is only correct as latest's own walk \
-                         if this holds"
-                    );
-                    latest_snap
-                        .tables
-                        .iter()
-                        .filter(|(n, _)| inner.registry.contains(n))
-                        .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
-                        .sum::<usize>()
+            // `excess = total - budget`, `pinned >= excess` — algebraically
+            // this also covers (and simplifies to) the common case where
+            // `demote_pass` already converged `resident <= budget` on its
+            // own and `pinned` alone is now the entire reason the store is
+            // still over budget, which is exactly the scenario this task
+            // exists to fix (spec §1: the NVMe 56x pin lever).
+            if opts.shrink_retention_under_pressure {
+                let total = resident.saturating_add(pinned);
+                if total > budget {
+                    let excess = total - budget;
+                    if pinned >= excess {
+                        {
+                            let mut inner = self.inner.write();
+                            gc_inner_with_retain(&mut inner, 1);
+                        }
+                        // "the next reconcile settles the counters": gc just
+                        // dropped whatever retained snapshots it could, so
+                        // re-walk to publish the post-shrink truth rather
+                        // than leaving stale pre-shrink numbers published.
+                        self.reconcile_paged_stats(snap.version);
+                    }
                 }
-                // No snapshots at all: nothing to reconcile. Shouldn't
-                // happen in practice (a store always has at least its
-                // initial version), but a walk over nothing is a
-                // well-defined 0, not a panic.
-                None => 0,
-            };
-            let mut total = resident;
-            for retained_snap in retained {
-                total += retained_snap
-                    .tables
-                    .iter()
-                    .filter(|(n, _)| inner.registry.contains(n))
-                    .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
-                    .sum::<usize>();
-            }
-            let pinned = total - resident;
-            if let Some(p) = inner.paged.as_ref() {
-                p.stats
-                    .resident_leaf_bytes
-                    .store(resident as i64, Ordering::Relaxed);
-                p.stats.pinned_leaf_bytes.store(pinned as u64, Ordering::Relaxed);
             }
         }
 
@@ -4380,11 +4453,38 @@ fn prune_write_sets(inner: &mut StoreInner) {
     }
 }
 
-/// Run GC on an already-locked `StoreInner`.
+/// Run GC on an already-locked `StoreInner`, retaining
+/// `inner.config.num_snapshots_retained` recent versions — the ordinary,
+/// configured-retention entry point every ordinary caller uses (`Store::gc`,
+/// commit-time auto-gc, etc). A thin wrapper over
+/// [`gc_inner_with_retain`], which see for the actual eviction logic.
 fn gc_inner(inner: &mut StoreInner) {
-    // The N most recent versions to retain unconditionally.
     // latest_version is always kept (even if num_snapshots_retained is 0).
     let retain_count = inner.config.num_snapshots_retained.max(1);
+    gc_inner_with_retain(inner, retain_count);
+}
+
+/// [`gc_inner`]'s body, parameterized on the retain count instead of always
+/// reading it from `inner.config.num_snapshots_retained`. Added for task 11
+/// (adaptive retention shrink under pin pressure, spec §5 "enforcement
+/// arm"): `Store::checkpoint_impl_paged` calls this directly with
+/// `retain = 1` when pin pressure (`PagedStats::pinned_leaf_bytes`, task 9)
+/// is keeping a paged store over its configured `memory_budget_bytes` even
+/// after the checkpointer's hard-capped demote pass — see that call site's
+/// doc for the full trigger condition ("order of weapons", spec §6).
+///
+/// The `Arc::strong_count == 1` filter below is unconditional either way:
+/// it already spares every live `ReadTx`/`VersionPin` holder regardless of
+/// what `retain_count` is asked for, which is exactly the floor spec §5
+/// requires ("a floor of the latest version plus every explicit
+/// `VersionPin`") — passing `retain_count = 1` only changes how many
+/// snapshots beyond that floor this call is WILLING to keep, never whether
+/// a pinned one can be collected. No second mechanism is needed on top of
+/// the existing one.
+fn gc_inner_with_retain(inner: &mut StoreInner, retain_count: usize) {
+    // The N most recent versions to retain unconditionally.
+    // latest_version is always kept (even if retain_count is 0).
+    let retain_count = retain_count.max(1);
 
     // Fast path: nothing to collect.
     let len = inner.snapshots.len();

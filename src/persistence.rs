@@ -292,6 +292,34 @@ pub struct PagedOptions {
     /// a floor of 1 (`Store::checkpoint_impl_paged` applies `.max(1)` at
     /// the `cleanup_old_roots` call site) rather than honoring `0` literally.
     pub retained_checkpoints: usize,
+    /// **Deliberate behavior default (Peter's ruling, 2026-08-31) — read
+    /// this before turning it off.** Task 11, spec §5 ("Fault-in,
+    /// demotion, and pin-aware accounting" — enforcement arm) and §6
+    /// ("Hard-cap clock eviction" — order of weapons, step 2): when
+    /// `memory_budget_bytes` is set and, after the checkpointer's
+    /// hard-capped demote pass, the store is *still* over budget because
+    /// bytes pinned by RETAINED (non-latest) snapshots
+    /// (`PagedStats::pinned_leaf_bytes`, task 9) are the whole reason —
+    /// demotion only ever walks the latest snapshot's own tree, so an
+    /// orphaned leaf kept alive by an older retained snapshot is
+    /// structurally invisible to it — the checkpointer shrinks retention
+    /// for that one collection pass, down to a floor of the latest
+    /// version plus every explicit [`VersionPin`](crate::VersionPin) /
+    /// live `ReadTx` (the existing `Arc::strong_count == 1` gc filter
+    /// already spares those; nothing new is added on top of it).
+    ///
+    /// **Default: `true`.** Rationale: configuring a memory budget is a
+    /// declaration that bounded memory matters more than history depth,
+    /// and the NVMe bench-host data
+    /// (`docs/benchmarks/fs-paged-nvme-2026-08-31.md`) showed that
+    /// leaving pins unenforced misses that declaration by **56x** (237
+    /// vs. 13,343 ops/s at retention 10 vs. 1) — see spec §1 ("Pins
+    /// (NVMe dominant)"). Set `false` to keep
+    /// [`StoreConfig::num_snapshots_retained`](crate::StoreConfig) an
+    /// unconditional floor regardless of budget pressure; the store then
+    /// stays over budget indefinitely under sustained pin pressure, and
+    /// `PagedStats::pinned_leaf_bytes` reports the excess.
+    pub shrink_retention_under_pressure: bool,
 }
 
 impl Default for PagedOptions {
@@ -304,6 +332,7 @@ impl Default for PagedOptions {
             page_prefetch_bytes: 4096,
             prealloc_chunk_bytes: 16 << 20,
             retained_checkpoints: 2,
+            shrink_retention_under_pressure: true,
         }
     }
 }
@@ -368,6 +397,14 @@ impl PagedOptionsBuilder {
         self.opts.retained_checkpoints = n;
         self
     }
+    /// See [`PagedOptions::shrink_retention_under_pressure`] — **read that
+    /// field's doc before calling this with `false`**: the default (`true`)
+    /// is a deliberate behavior choice (spec §5, Peter's ruling), not an
+    /// arbitrary default.
+    pub fn shrink_retention_under_pressure(mut self, enabled: bool) -> Self {
+        self.opts.shrink_retention_under_pressure = enabled;
+        self
+    }
     /// Finalize the configuration.
     pub fn build(self) -> PagedOptions {
         self.opts
@@ -428,6 +465,14 @@ mod tests {
     }
 
     #[test]
+    fn shrink_retention_under_pressure_builder_setter() {
+        let o = PagedOptions::builder().shrink_retention_under_pressure(false).build();
+        assert!(!o.shrink_retention_under_pressure);
+        let o = PagedOptions::builder().shrink_retention_under_pressure(true).build();
+        assert!(o.shrink_retention_under_pressure);
+    }
+
+    #[test]
     fn paged_options_builder_defaults() {
         let o = PagedOptions::builder().build();
         assert_eq!(o.memory_budget_bytes, None);
@@ -441,6 +486,11 @@ mod tests {
         assert_eq!(o.page_prefetch_bytes, 4096);
         assert_eq!(o.prealloc_chunk_bytes, 16 << 20);
         assert_eq!(o.retained_checkpoints, 2);
+        assert!(
+            o.shrink_retention_under_pressure,
+            "task11: adaptive retention shrink under pin pressure is ON by default -- \
+             spec §5, Peter's ruling (2026-08-31)"
+        );
 
         assert_eq!(
             PagedOptions::builder().checkpoint_interval_disabled().build().checkpoint_interval,
