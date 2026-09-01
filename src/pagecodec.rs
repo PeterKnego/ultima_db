@@ -367,12 +367,20 @@ pub(crate) struct PagedStats {
     /// checkpoint when a budget is configured and the first sweep doesn't
     /// clear it.
     pub clock_cycles: AtomicU64,
-    /// Task 10: of `leaves_demoted`, how many were evicted on a pass's
-    /// second (or later) cycle — i.e. they were still resident and
-    /// accessed-marked when the pass began, survived cycle 1's
-    /// second-chance (accessed bit cleared, not evicted), and were then
-    /// evicted for real on a later cycle because nothing re-touched them
-    /// in between. Cumulative across every `demote_pass` call.
+    /// Task 10: of `leaves_demoted`, how many landed on a pass's second (or
+    /// later) cycle rather than its first. Cumulative across every
+    /// `demote_pass` call. The dominant source is second-chance survivors:
+    /// a leaf still resident and accessed-marked when the pass began
+    /// clears its bit (not evicted) on cycle 1, then is evicted for real
+    /// on a later cycle once nothing re-touches it. Fix round 1
+    /// (review Minor-5): not the *only* source — a table first listed on
+    /// cycle 2 (a concurrent commit registered it mid-pass; `names` is
+    /// re-read every cycle) or a cycle-1 batch whose `install_paged_tables`
+    /// was dropped (a concurrent `gc()` raced it, see
+    /// `Store::demote_pass_inner`'s doc) also count leaves here without
+    /// ever having had a cycle-1 second chance. Both are rare, cost only a
+    /// small over-count, and don't change the field's use as a signal that
+    /// cycling did real work beyond sweep 1.
     pub forced_evictions: AtomicU64,
     /// Dead-page byte ranges actually hole-punched (task11) — counted in
     /// ranges, not bytes, matching `PagedRoot::dead_pages`'s own unit. Only

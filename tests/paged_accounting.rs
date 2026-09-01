@@ -636,12 +636,32 @@ fn pinned_leaf_bytes_returns_to_zero_once_not_retained() {
 /// overshoots, and require the pass to converge within the ONE
 /// `checkpoint()` call — not merely make another checkpoint's worth of
 /// progress next time.
+///
+/// Fix round 1 (review Important-2, Important-3): a `Store` with
+/// `memory_budget_bytes` set wakes the background checkpointer the moment
+/// a fault-in crosses budget (`PagedSource::read_node`, edge-triggered —
+/// see `PagedStats::wake_checkpointer`), and that thread's own
+/// `checkpoint()` call runs its own cycling `demote_pass` concurrently
+/// with the read-scan below — the review instrumented this exact test
+/// body and measured `clock_cycles`/`forced_evictions` already nonzero
+/// (3 / 29) by the time the scan finished, so asserting on raw totals
+/// after the *measured* `checkpoint()` call cannot tell that call's own
+/// work apart from the background thread's. Both counters are captured
+/// immediately before the measured call and asserted as **deltas**. The
+/// review also measured the pre-measurement precondition
+/// (`resident_leaf_bytes_est > BUDGET`) holding by only a ~2x margin at
+/// 5,000 rows (126,960 vs 65,536) even after that background activity —
+/// thin enough that a slightly more effective background pass could shave
+/// it under budget before the measured call ever starts pressure. 50,000
+/// rows (10x the tree) widens that margin by roughly the same factor,
+/// without changing what either counter measures.
 #[test]
 fn hard_cap_clock_cycles_to_convergence() {
     const BUDGET: u64 = 64 * 1024;
+    const ROWS: u64 = 50_000;
     let dir = tempfile::tempdir().unwrap();
     let s = store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(BUDGET).build());
-    write_rows(&s, 5_000);
+    write_rows(&s, ROWS);
     // Writes every leaf to disk and assigns page ids; demotes everything
     // (freshly batch-built, nothing accessed yet — see `write_rows`'s doc),
     // so resident starts back at ~0 going into the read-scan below.
@@ -652,13 +672,16 @@ fn hard_cap_clock_cycles_to_convergence() {
     {
         let r = s.begin_read(None).unwrap();
         let t = r.open_table::<Row>("rows").unwrap();
-        for k in 1..=5_000u64 {
+        for k in 1..=ROWS {
             assert!(t.get(k).is_some(), "key {k} missing");
         }
     }
+    let before = s.paged_stats().unwrap();
     assert!(
-        s.paged_stats().unwrap().resident_leaf_bytes_est > BUDGET,
-        "the read-scan above must put the whole table back over budget, or this test proves nothing"
+        before.resident_leaf_bytes_est > BUDGET,
+        "the read-scan above must put the whole table back over budget, or this test proves \
+         nothing (resident {}, budget {BUDGET})",
+        before.resident_leaf_bytes_est
     );
 
     s.checkpoint().unwrap();
@@ -671,14 +694,17 @@ fn hard_cap_clock_cycles_to_convergence() {
         after.resident_leaf_bytes_est
     );
     assert!(
-        after.forced_evictions > 0,
+        after.forced_evictions - before.forced_evictions > 0,
         "leaves that survived cycle 1's second chance must be evicted on a later cycle of \
-         the SAME pass"
+         THIS pass — before={}, after={}",
+        before.forced_evictions, after.forced_evictions
     );
     assert!(
-        after.clock_cycles >= 2,
-        "convergence here needs at least 2 cycles: cycle 1 only clears second-chance bits \
-         (every leaf was just read), cycle 2 harvests them"
+        after.clock_cycles - before.clock_cycles >= 2,
+        "convergence here needs at least 2 cycles within THIS pass: cycle 1 only clears \
+         second-chance bits (every leaf was just read), cycle 2 harvests them — before={}, \
+         after={}",
+        before.clock_cycles, after.clock_cycles
     );
 }
 
@@ -686,20 +712,102 @@ fn hard_cap_clock_cycles_to_convergence() {
 /// from demotion outright (`demote_pass_inner`'s per-table check, from
 /// before this task) — the clock must recognize that and terminate rather
 /// than spin forever chasing bytes it can never reclaim.
+///
+/// Fix round 1 (review Important-4): a lone `Resident` table short-circuits
+/// `demote_pass_inner`'s per-table loop before it ever calls `paged_demote`
+/// or looks at a single leaf (`src/store.rs`, the `if tbl.residency() ==
+/// Residency::Resident { break; }` check) — so the original version of
+/// this test only proved the pass terminates when there is *nothing to
+/// sweep at all*. It never exercised "swept a real tree, every leaf came
+/// back second-chanced or pinned", which is exactly Critical-1's shape
+/// (this same `Resident`-floor-over-budget setup, but with a SECOND,
+/// evictable table under concurrent *random-key* point reads that keep
+/// re-arming its leaves' accessed bits every cycle — a sequential reader
+/// would settle into the zero-cycle exit; random access does not). Before
+/// the `Store::MAX_DEMOTE_CYCLES` hard cap landed, this exact
+/// configuration measured 60k+ cycles / 6+ seconds in review, returning
+/// only when the reader workload stopped — a regression here would hang,
+/// not fail, so this now asserts the pass is bounded by the cap rather
+/// than merely "eventually returns" (which a hang trivially also does,
+/// from the test harness's perspective, once it times out).
 #[test]
-fn hard_cap_clock_terminates_when_nothing_is_evictable() {
-    const BUDGET: u64 = 1; // trivially, permanently over budget
+fn hard_cap_clock_bounded_under_concurrent_random_access() {
+    // Mirrors `Store::MAX_DEMOTE_CYCLES` (private to the crate, not part
+    // of the public API — hardcoded here, not imported).
+    const MAX_DEMOTE_CYCLES: u64 = 8;
+    const BUDGET: u64 = 64 * 1024;
+    const HOT_ROWS: u64 = 200_000; // un-evictable floor, well over BUDGET alone
+    const COLD_ROWS: u64 = 200_000; // evictable, spread across many leaves -- scale matters:
+    // review's repro needed ~200k rows (thousands of leaves) for random-key
+    // reader pressure to reliably outrun the sweep; smaller trees (tried
+    // 20k) sometimes settle under the cap on their own even without it,
+    // which would make this a flaky, not reliable, regression check.
+
     let dir = tempfile::tempdir().unwrap();
-    let s = store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(BUDGET).build());
-    write_rows(&s, 5_000);
-    s.set_residency("rows", Residency::Resident).unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().memory_budget_bytes(BUDGET).build())
+        .unwrap();
+    let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
+    s.register_table_paged::<Row>("hot").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
 
-    // Must return promptly, not loop forever chasing an un-evictable table.
-    s.checkpoint().unwrap();
+    {
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("hot").unwrap();
+        t.insert_batch((0..HOT_ROWS).map(|v| Row { v }).collect()).unwrap();
+        w.commit().unwrap();
+    }
+    write_rows(&s, COLD_ROWS);
+    s.checkpoint().unwrap(); // writes+demotes both tables while still Lazy
+    s.set_residency("hot", Residency::Resident).unwrap();
 
-    let stats = s.paged_stats().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..4u64)
+        .map(|seed| {
+            let s = s.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // xorshift64 — no external RNG dependency, deterministic
+                // per-thread seed, genuinely non-sequential key order
+                // (the property Critical-1's repro needs; a sequential
+                // scan would re-touch each leaf in a tight window and
+                // settle into the zero-cycle exit instead).
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (seed.wrapping_mul(0x1000_0001) | 1);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let k = 1 + (x % COLD_ROWS);
+                    let r = s.begin_read(None).unwrap();
+                    let _ = r.open_table::<Row>("rows").unwrap().get(k);
+                }
+            })
+        })
+        .collect();
+
+    // Give the readers a moment to actually start hammering before the
+    // measured checkpoint begins.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let before = s.paged_stats().unwrap();
+    s.checkpoint().unwrap(); // must return, bounded by MAX_DEMOTE_CYCLES
+    let after = s.paged_stats().unwrap();
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in readers {
+        h.join().unwrap();
+    }
+
     assert!(
-        stats.resident_leaf_bytes_est > BUDGET,
-        "a Resident table is exempt from demotion, so budget pressure is never relieved"
+        after.clock_cycles - before.clock_cycles <= MAX_DEMOTE_CYCLES,
+        "one demote_pass must never exceed MAX_DEMOTE_CYCLES ({MAX_DEMOTE_CYCLES}) cycles, \
+         even under sustained concurrent random-key pressure — before={}, after={}",
+        before.clock_cycles, after.clock_cycles
+    );
+    assert!(
+        after.resident_leaf_bytes_est > BUDGET,
+        "the un-evictable 'hot' table alone exceeds budget, so pressure must remain even \
+         after the pass returns (resident {})",
+        after.resident_leaf_bytes_est
     );
 }

@@ -657,12 +657,14 @@ pub struct PagedStatsSnapshot {
     /// `Store::demote_pass_inner`'s doc), so this can jump by more than
     /// one per checkpoint.
     pub clock_cycles: u64,
-    /// Task 10: of `leaves_demoted`, how many were evicted on a pass's
-    /// second (or later) cycle rather than its first — leaves that were
-    /// still accessed-marked when the pass began, survived cycle 1's
-    /// second chance, and were evicted for real once nothing re-touched
-    /// them by the next cycle. `0` for a store whose demote passes never
-    /// need more than one cycle.
+    /// Task 10: of `leaves_demoted`, how many landed on a pass's second
+    /// (or later) cycle rather than its first. `0` for a store whose
+    /// demote passes never need more than one cycle. The dominant source
+    /// is leaves still accessed-marked when the pass began, second-chanced
+    /// on cycle 1, evicted for real once nothing re-touched them by a
+    /// later cycle — but see [`crate::pagecodec::PagedStats::forced_evictions`]'s
+    /// doc (fix round 1, review Minor-5) for two rarer, non-second-chance
+    /// sources of the same counter.
     pub forced_evictions: u64,
     /// Bytes reported dirty (a clean node CoW'd by a write).
     pub dirty_bytes: u64,
@@ -2242,6 +2244,24 @@ impl Store {
         )
     }
 
+    /// Task 10 hard cap (fix round 1, review Critical-1): the maximum
+    /// cycles one [`Store::demote_pass_inner`] call runs before returning
+    /// regardless of `resident <= budget` or the two-consecutive-zero
+    /// termination clause — see that function's doc for why, under
+    /// concurrent readers, both of those can stay unsatisfied forever.
+    /// This is the backstop that makes `demote_pass_inner` (and so
+    /// `checkpoint()`, which holds `checkpoint_lock` across it) always
+    /// return. The documented convergence case needs exactly 2 cycles;
+    /// this is pure headroom for multi-table staggering (one table's own
+    /// convergence landing on a different cycle than another's), not a
+    /// value tuned to any specific workload — raising it only trades a
+    /// longer worst-case pass for a better chance of landing exactly on
+    /// budget, never correctness (a pass that hits the cap still leaves
+    /// the store correct, just possibly still over budget until the next
+    /// checkpoint's pass tries again).
+    #[cfg(feature = "persistence")]
+    const MAX_DEMOTE_CYCLES: u64 = 8;
+
     /// [`Store::demote_pass`]'s real body. Split out so tests can pass a
     /// `race_hook` — invoked once per batch, right after that batch's
     /// `(version, tbl)` is captured but before `paged_demote`/
@@ -2268,20 +2288,42 @@ impl Store {
     /// harvest what the first sweep only cleared.
     ///
     /// Termination: stop when `resident <= budget`, or when two
-    /// *consecutive* cycles each evict 0 bytes. One zero-byte cycle alone
+    /// *consecutive* cycles each evict 0 bytes, or when
+    /// [`Self::MAX_DEMOTE_CYCLES`] is reached. One zero-byte cycle alone
     /// does not prove nothing is left — it may be the clear half of every
     /// leaf's second chance, with the harvest one cycle away (exactly the
-    /// scenario above). But two zero-byte cycles back to back do prove it:
-    /// if the first of the two had cleared even one leaf's accessed bit,
-    /// the very next cycle would evict that leaf for real (nonzero)
-    /// unless something re-touched it in between — so back-to-back zeros
-    /// mean the first of the two cleared nothing either, i.e. every
-    /// remaining loaded, paged leaf is exempt today (`Residency::Resident`
-    /// table, pinned by an older retained snapshot behind a different
-    /// slot, or re-touched every single cycle) rather than merely
-    /// second-chanced. No iteration cap is needed: each cycle either
-    /// reclaims bytes or, within two cycles, proves the remainder
-    /// un-evictable.
+    /// scenario above). But two zero-byte cycles back to back do prove it
+    /// **single-threaded**: if the first of the two had cleared even one
+    /// leaf's accessed bit, the very next cycle would evict that leaf for
+    /// real (nonzero) unless something re-touched it in between — so
+    /// back-to-back zeros mean the first of the two cleared nothing
+    /// either, i.e. every remaining
+    /// loaded, paged leaf is exempt from demotion today (a
+    /// `Residency::Resident` table, skipped wholesale before any leaf is
+    /// even looked at, or a leaf re-touched every single cycle). Note what
+    /// is *not* in that list: a leaf pinned by an older retained snapshot
+    /// (task 9) is still demoted from latest and debited normally — pinning
+    /// exempts it from *freeing memory* (another snapshot's `Arc` keeps the
+    /// bytes resident), not from this pass's eviction, so it produces a
+    /// nonzero cycle, never a zero one, and was wrongly listed here before
+    /// fix round 1 (review Minor-7).
+    ///
+    /// Fix round 1 (review Critical-1): the two-consecutive-zero argument
+    /// above assumes nothing re-credits `resident_leaf_bytes` mid-pass —
+    /// true only single-threaded. This function holds no lock that
+    /// excludes concurrent readers (just a brief `inner.read()` per batch,
+    /// `inner.write()` only inside `install_paged_tables`), and every
+    /// data-leaf fault-in credits `resident_leaf_bytes`
+    /// (`PagedSource::read_node`). A `Residency::Resident` (or otherwise
+    /// permanently un-evictable) floor that alone exceeds budget, combined
+    /// with concurrent *random-key* reads against a different, evictable
+    /// table, keeps `resident <= budget` false and re-arms that table's
+    /// leaves' accessed bits every cycle (cycle N clears one, cycle N+1
+    /// evicts it — nonzero), so neither exit clause ever fires. Reproduced
+    /// in review: 62k+ cycles, 6+ seconds, `checkpoint_impl`'s
+    /// `checkpoint_lock` held the whole time, returning only when the read
+    /// workload stopped. `MAX_DEMOTE_CYCLES` is the backstop that makes
+    /// this function unconditionally return regardless.
     ///
     /// With no budget configured (`opts.memory_budget_bytes` is `None` —
     /// reachable only by calling this directly, as
@@ -2387,11 +2429,14 @@ impl Store {
                         stats
                             .resident_leaf_bytes
                             .fetch_sub(demoted_bytes as i64, Ordering::Relaxed);
-                        // Task 10: leaves evicted on cycle >= 2 were still
-                        // resident and accessed-marked when this pass
-                        // began — cycle 1 gave them their second chance
-                        // (cleared, not evicted) and they were harvested
-                        // here only because nothing re-touched them since.
+                        // Task 10: leaves landing here on cycle >= 2 are
+                        // usually second-chance survivors — still resident
+                        // and accessed-marked when this pass began, cycle
+                        // 1 cleared their bit instead of evicting, and
+                        // this cycle harvested them because nothing
+                        // re-touched them since. Not the only source (fix
+                        // round 1, review Minor-5): see
+                        // `PagedStats::forced_evictions`'s doc.
                         if cycle >= 2 {
                             stats
                                 .forced_evictions
@@ -2410,6 +2455,15 @@ impl Store {
             let Some(budget) = opts.memory_budget_bytes else {
                 break; // no budget: one cycle, matching pre-task-10 behavior
             };
+            // Fix round 1 (review Critical-1): checked before either
+            // "real" exit clause below can look at concurrently-mutated
+            // state — a hard, workload-independent bound so this function
+            // always returns. See `Self::MAX_DEMOTE_CYCLES`'s doc for why
+            // the two clauses below cannot be trusted to do that alone
+            // under concurrent readers.
+            if cycle >= Self::MAX_DEMOTE_CYCLES {
+                break;
+            }
             let resident = stats.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64;
             if resident <= budget {
                 break;
