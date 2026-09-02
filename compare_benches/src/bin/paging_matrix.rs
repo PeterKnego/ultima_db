@@ -942,6 +942,22 @@ struct Trajectory {
     t_secs: f64,
     ops: u64,
     majflt: u64,
+    /// `ultima-paged` only (task64 §7c): the resident-leaf soft counter and
+    /// the checkpointer run count at this sample. The end-of-run value alone
+    /// is a phase sample — where the workload is between one demote pass
+    /// landing and the next — so the gate reads the series (trough after
+    /// the first checkpoint, max, mean), not the last point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_leaf_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpointer_runs: Option<u64>,
+}
+
+fn paged_sample(engine: &dyn Engine) -> (Option<u64>, Option<u64>) {
+    match engine.paged_snapshot() {
+        Some(s) => (Some(s.resident_leaf_bytes_est), Some(s.checkpointer_runs)),
+        None => (None, None),
+    }
 }
 
 #[derive(Serialize)]
@@ -1105,10 +1121,13 @@ fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutco
         if ops & 0xFF == 0 {
             let el = run_start.elapsed();
             if el >= next_sample {
+                let (resident_leaf_bytes, checkpointer_runs) = paged_sample(engine);
                 trajectory.push(Trajectory {
                     t_secs: el.as_secs_f64(),
                     ops,
                     majflt: majflt() - majflt0,
+                    resident_leaf_bytes,
+                    checkpointer_runs,
                 });
                 next_sample += Duration::from_secs(5);
             }
@@ -1123,10 +1142,13 @@ fn run_workload(engine: &mut dyn Engine, args: &Args, rng_seed: u64) -> RunOutco
     let minflt_run = minflt() - minflt0;
     let pswpin_run = vmstat("pswpin") - pswpin0;
     let pswpout_run = vmstat("pswpout") - pswpout0;
+    let (resident_leaf_bytes, checkpointer_runs) = paged_sample(engine);
     trajectory.push(Trajectory {
         t_secs: run_secs,
         ops,
         majflt: majflt_run,
+        resident_leaf_bytes,
+        checkpointer_runs,
     });
     let pf_per_op = pf0
         .zip(engine.paged_data_faults())

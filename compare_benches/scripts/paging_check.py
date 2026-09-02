@@ -16,6 +16,12 @@
 #   A-cell pf_per_op <= 3.0
 #   recover_secs    <= RECOVER_SECS_MAX (both cells, when --restart was passed;
 #                       see the disclosure comment above that constant)
+#   paged_run.checkpointer_runs >= 1, paged_run.leaves_demoted > 0 and
+#   min over trajectory samples taken after the first checkpointer run of
+#   resident_leaf_bytes <= RESIDENT_TROUGH_MAX x paged_budget_bytes
+#                       (both cells, when the report carries a paged budget;
+#                       see the comment above that constant — the series
+#                       max/mean are printed as disclosure, not asserted)
 #
 # Prints one PASS/FAIL line per assertion and exits nonzero if any assertion
 # failed. Per task rules, thresholds are never adjusted here to force a pass.
@@ -32,6 +38,33 @@ import sys
 # the unimplementable formula; the NVMe-host rerun (spec follow-on 7) is
 # what sets real, published bounds.
 RECOVER_SECS_MAX = 5.0
+
+# task64 §14.1 "why the gate is blind": until 2026-09-02 this checker never
+# compared the paged store's resident data-leaf bytes against the budget it
+# was given, so the budget miss diagnosed there (resident 2.6-3.3x budget in
+# both cells, ZERO leaves demoted during the run) passed every assertion.
+#
+# What is gated, and why the TROUGH: the soft counter
+# `PagedStatsSnapshot::resident_leaf_bytes_est` (re-based from an exact walk
+# at every checkpoint, then fault-in credits minus demote debits) is sampled
+# into the trajectory every 5 s. Its value at any one instant is a phase
+# sample of a saw-tooth: a demote pass lands and pulls it to <= budget, then
+# the workload faults leaves back in until the next pass lands. The END
+# value alone was tried first and is useless as a gate — two runs of the
+# same C/uniform cell on the same tree ended at 1.44x and 4.20x budget with
+# every other metric (ops, pf/op, swap-ins, runs, leaves demoted) within
+# noise of each other. The trough after the first checkpoint is the robust
+# assertion: it witnesses that passes land AND get the tree under budget
+# (post-fix cells trough at 0.8-1.0x; the pre-fix ones never left 2.6x+).
+# The series max and mean are printed, not asserted: they measure the
+# steady-state overshoot (how far the workload runs past the budget while
+# a swap-bound tick is in flight — task64 §14 item 5), which is the open
+# item, and hiding it behind a loose bound helps nobody. `leaves_demoted >
+# 0` is the direct witness for the diagnosed failure (passes that never
+# land); `checkpointer_runs >= 1` keeps the trough from passing vacuously
+# (before the first checkpoint the counter has never been credited for a
+# built leaf — task63 F1 gap — and reads 0 whatever is resident).
+RESIDENT_TROUGH_MAX = 1.25
 
 
 def load(path):
@@ -100,6 +133,65 @@ def main():
                 f"{label} recover_secs <= {RECOVER_SECS_MAX}",
                 rs is not None and rs <= RECOVER_SECS_MAX,
                 f"recover_secs={rs}",
+            )
+        )
+
+    for label, report in (("C/uniform", c), ("A/zipf", a)):
+        pr = report.get("paged_run")
+        budget = report.get("paged_budget_bytes")
+        if pr is None or not budget:
+            print(f"[paging/check] SKIP: {label} resident-vs-budget — no paged_run/paged_budget_bytes in this report")
+            continue
+        runs = pr.get("checkpointer_runs")
+        demoted = pr.get("leaves_demoted")
+        results.append(
+            check(
+                f"{label} checkpointer_runs >= 1",
+                runs is not None and runs >= 1,
+                f"checkpointer_runs={runs}",
+            )
+        )
+        results.append(
+            check(
+                f"{label} leaves_demoted > 0",
+                demoted is not None and demoted > 0,
+                f"leaves_demoted={demoted}",
+            )
+        )
+        # Samples after the first checkpointer run of the run phase: the
+        # trajectory's `checkpointer_runs` is the store's cumulative count,
+        # so "after the first run of THIS phase" is `> runs_at_start`, and
+        # `runs_at_start = cumulative_end - paged_run.checkpointer_runs`.
+        traj = report.get("trajectory") or []
+        end_runs = next((t["checkpointer_runs"] for t in reversed(traj) if t.get("checkpointer_runs") is not None), None)
+        if end_runs is None or runs is None:
+            # Not a SKIP: a paged report whose trajectory carries no counter
+            # samples cannot witness the budget at all, and this checker's
+            # whole reason to exist is not passing vacuously.
+            results.append(check(f"{label} resident trough <= {RESIDENT_TROUGH_MAX}x budget", False, "trajectory carries no paged samples (harness predates task64 §7c?)"))
+            continue
+        runs_at_start = end_runs - runs
+        series = [
+            t["resident_leaf_bytes"] / budget
+            for t in traj
+            if t.get("resident_leaf_bytes") is not None
+            and t.get("checkpointer_runs") is not None
+            and t["checkpointer_runs"] > runs_at_start
+        ]
+        if not series:
+            results.append(check(f"{label} resident trough <= {RESIDENT_TROUGH_MAX}x budget", False, "no samples after the first checkpointer run"))
+            continue
+        trough = min(series)
+        print(
+            f"[paging/check] INFO: {label} resident/budget series after first checkpoint: "
+            f"trough={trough:.2f} max={max(series):.2f} mean={sum(series) / len(series):.2f} "
+            f"n={len(series)} end={series[-1]:.2f} (max/mean are the steady-state overshoot, task64 §14 item 5 — disclosed, not gated)"
+        )
+        results.append(
+            check(
+                f"{label} resident trough <= {RESIDENT_TROUGH_MAX}x budget",
+                trough <= RESIDENT_TROUGH_MAX,
+                f"trough={trough:.2f} paged_budget_bytes={budget} leaves_demoted={demoted} dirty_bytes_end={pr.get('dirty_bytes_end')}",
             )
         )
 

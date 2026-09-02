@@ -2018,18 +2018,18 @@ impl Store {
         // a memory budget: `None` (the default) means every leaf, once
         // faulted in, stays resident forever (spec §8), and an explicit
         // `checkpoint()` with no budget set must stay a pure write-and-root
-        // operation, not silently start evicting. The resident-bytes
-        // trigger that would call `demote_pass` on its own schedule,
-        // independent of `memory_budget_bytes` being set at all, is task12.
+        // operation, not silently start evicting.
         //
-        // Every leaf this checkpoint just wrote in phases 1-2 is exactly
-        // what makes this pass productive: those leaves went from dirty
-        // (not demotable — `paged_demote` only ever touches a slot that is
-        // both loaded *and* has a page id) to resident-clean the moment
-        // `write_dirty` assigned them ids above, so a demote pass run right
-        // after a checkpoint is the point at which the largest possible
-        // batch of newly-quiet leaves is demotable at once.
+        // Every leaf this checkpoint just wrote in phases 1-2 went from
+        // dirty (never demotable) to resident-clean the moment `write_dirty`
+        // assigned it a page id, so a pass run now sees the largest possible
+        // batch of newly-quiet leaves. The reconcile BEFORE the pass is
+        // task64 §14.1(c): a built leaf never credits `resident_leaf_bytes`
+        // (only fault-ins do), so on the first checkpoint the pass's exit
+        // check would read 0 and quit after its second-chance sweep, leaving
+        // the tree fully resident; an exact-walk re-base first makes cycle 2 run.
         if let Some(budget) = opts.memory_budget_bytes {
+            self.reconcile_paged_stats(snap.version);
             self.demote_pass()?;
 
             // Fresh reconcile right after the capped demote pass — Task 11
