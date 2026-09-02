@@ -1,5 +1,22 @@
 # fs-paged on the NVMe bench host — matrix + lever validation (2026-08-31)
 
+> **CORRECTION (2026-09-02, task64 §13.4).** `fs_paged_levers.sh` passed
+> no `--workload`, so every lever cell below ran `paging_matrix`'s default
+> **workload C (read-only zipf)**, not the pressured A this doc's headline
+> names (`data-fs-paged-nvme-levers-2026-08-31.jsonl`: `workload: "C"` on
+> all four rows). Consequences: (1) "237 -> 13,343 (~56x) from retention
+> 10 -> 1" compares A@10 against C@1; the matrix's own C/zipf/eventual
+> cell at retention 10 was **13,664** ops/s (0.859 majflt/op) vs the
+> lever's 13,343 (0.852) — **retention had no measurable effect**, which
+> agrees with the local spike's F5 probe on A. (2) "29.4k, 2.2x ReDB on
+> the same cells" compares T=8 on C against ReDB's A cell; ReDB's C cell
+> was 28.4k, so T=8 is ~parity on C. (3) What this run *did* validate:
+> on pressured read-only C, `fanout-t8` roughly doubles throughput
+> (13.3k -> 29.4k, 0.85 -> 0.10 majflt/op), mimalloc is a no-op, and
+> reopen is negative. **Nothing in this run measured a write-path
+> lever.** Points 1 and 5 under "What the NVMe host changes" are
+> retracted; the script now defaults to `--workload=A`.
+
 Provenance: c6id.2xlarge (8 vCPU, 15.7 GB, local instance-store NVMe at
 /opt/bench), kernel 7.0.0-1011-aws, rustc 1.98.0, tree b4aa1db, one
 `bench-oneshot TARGET=fs-paged` run (n=1 per cell — ordering-grade).

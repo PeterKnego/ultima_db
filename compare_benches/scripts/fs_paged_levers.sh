@@ -24,6 +24,9 @@ ROWS="${ROWS:-5000000}"
 OPS="${OPS:-500000}"
 TIMEOUT="${TIMEOUT:-60}"
 PAGED_BUDGET="${PAGED_BUDGET:-67108864}"
+# Write-path levers => workload A. The 2026-08-31 NVMe run omitted this and
+# silently measured paging_matrix's default C (read-only); see task64 §13.4.
+WORKLOAD="${WORKLOAD:-A}"
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 DRIVER="$SCRIPT_DIR/paging_matrix.sh"
 
@@ -34,7 +37,7 @@ CARGO_TARGET_DIR="$TARGET_DIR/t8"   cargo build --release -p compare-benches --b
 CARGO_TARGET_DIR="$TARGET_DIR/mi"   cargo build --release -p compare-benches --bin paging_matrix --features bench-mimalloc >&2
 CARGO_TARGET_DIR="$TARGET_DIR/mit8" cargo build --release -p compare-benches --bin paging_matrix --features bench-mimalloc,ultima-db/fanout-t8 >&2
 
-COMMON="--engine=ultima-paged --rows=$ROWS --load=insert --dist=zipf --ops=$OPS --timeout-secs=$TIMEOUT --paged-budget=$PAGED_BUDGET --snapshots-retained=1 --restart --ratio=abs"
+COMMON="--engine=ultima-paged --rows=$ROWS --load=insert --workload=$WORKLOAD --dist=zipf --ops=$OPS --timeout-secs=$TIMEOUT --paged-budget=$PAGED_BUDGET --snapshots-retained=1 --restart --ratio=abs"
 
 run_cell() {
   local name="$1" bin="$2"
