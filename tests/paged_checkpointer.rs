@@ -91,6 +91,54 @@ fn dirty_bytes_trigger_checkpoints_without_app_call() {
     );
 }
 
+/// task64 §14.1(c) follow-up: with a memory budget set and no explicit
+/// `checkpoint_dirty_bytes`, the dirty trigger is resolved to half the
+/// budget (see `PagedOptionsBuilder::build`). Here the budget is 6 MiB, so
+/// the trigger is 3 MiB; the update below dirties ~4.1 MB of clean leaves
+/// — enough to trip the scaled trigger, nowhere near the 256 MiB default —
+/// while resident stays ~4.1 MB, under the 6 MiB budget, so the memory
+/// trigger cannot be what fires (measured with the trigger unscaled: the
+/// run ends with dirty 4,118,048 / resident 4,063,552 and no checkpoint). The interval trigger is disabled. So the
+/// only way the checkpointer runs again inside the deadline is the scaled
+/// dirty trigger.
+#[test]
+fn memory_budget_scales_the_dirty_trigger_when_unset() {
+    let d = tempfile::tempdir().unwrap();
+    let s = store_with(
+        d.path(),
+        PagedOptions::builder().memory_budget_bytes(6 << 20).checkpoint_interval_disabled().build(),
+    );
+    write_rows(&s, 100_000);
+    s.checkpoint().unwrap(); // attach + assign every leaf a page id (setup, not the trigger under test)
+    let before = s.paged_stats().unwrap();
+    assert!(
+        before.resident_leaf_bytes_est < (6 << 20),
+        "precondition: the table must sit under the 6 MiB budget so due_mem cannot fire (resident={})",
+        before.resident_leaf_bytes_est
+    );
+
+    {
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update_batch((1..=100_000u64).map(|k| (k, Row { v: k + 1 })).collect()).unwrap();
+        w.commit().unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.paged_stats().unwrap().checkpointer_runs <= before.checkpointer_runs
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let after = s.paged_stats().unwrap();
+    assert!(
+        after.checkpointer_runs > before.checkpointer_runs,
+        "the scaled dirty trigger (budget/2 = 3 MiB) never fired within the deadline: dirty_bytes={} resident={}",
+        after.dirty_bytes,
+        after.resident_leaf_bytes_est
+    );
+}
+
 /// The memory-budget trigger: a *read-only* store (no writes at all through
 /// this process — every row was written and checkpointed by a prior store,
 /// then this one recovers and only reads) must still demote leaves once

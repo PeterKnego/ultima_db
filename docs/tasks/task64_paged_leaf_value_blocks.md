@@ -325,6 +325,44 @@ either. §14.1(c) is untouched by this: the ~41 MB `dirty_bytes_end`
 here is the un-demotable dirty set, and it is only the four checkpoints
 in the window (vs two) that kept the total under budget.
 
+## 7b. Dirty trigger scaled to the budget (2026-09-02, §14.1(c))
+
+`PagedOptionsBuilder::build` now resolves `checkpoint_dirty_bytes` to
+`min(budget / 2, 256 MiB)` (floor 1) when `memory_budget_bytes` is set
+and the trigger was not set explicitly (`src/persistence.rs`; the
+builder records `dirty_explicit`). An explicit value always wins, even
+above the budget, in either call order; a hand-edited
+`PagedOptions::default()` is not scaled. Why half: the dirty set is
+un-demotable until a checkpoint writes it (§14.1(c)), so with the old
+flat 256 MiB trigger a 64 MiB budget could sit under a 41 MB dirty set
+that no demote pass can touch — the cap was only ever enforceable over
+the clean remainder. Bounding dirty at half the budget leaves the other
+half for the demote pass to enforce. Cost: more frequent checkpoints
+under a small budget with a write-heavy workload — the memory-wins
+principle already ruled for the budget (spec §9.5), and a checkpoint
+only writes the pages that are dirty.
+
+Tests: `persistence::tests::dirty_trigger_scales_to_half_the_budget_unless_set_explicitly`
+(resolution rules) and
+`tests/paged_checkpointer.rs::memory_budget_scales_the_dirty_trigger_when_unset`
+(6 MiB budget, interval disabled, ~4.1 MB dirtied while resident stays
+under budget — only the scaled trigger can fire; watched fail unscaled
+with dirty 4,118,048 / resident 4,063,552 and no checkpoint).
+
+Same-host sanity cell as §7a's (A/zipf, 60 s, 198 MiB cgroup, 64 MiB
+budget → 32 MiB trigger, retention 1; n=1, ordering only):
+
+| metric | §7a (flat 256 MiB trigger) | §7b (32 MiB trigger) |
+|---|---|---|
+| `dirty_bytes_end` | 41.2 MB | **32.7 MB** |
+| `resident_leaf_bytes_end` (budget 64 MiB) | 58.9 MB | **52.2 MB** |
+| `checkpointer_runs` during the run | 4 | 5 |
+| `leaves_demoted` during the run | 24,742 | 23,736 |
+| run1 / run2 ops/s | 895 / 5,371 | 856 / 5,624 |
+
+The dirty set now ends just under its trigger, one more checkpoint fits
+the window, and throughput is unchanged inside noise.
+
 ## 8. Adaptive retention shrink (default ON) and the pin-while-latest orphan hazard
 
 **Enforcement arm (spec §5, Peter's ruling: on by default).** When the
@@ -641,8 +679,10 @@ open obligation before any published perf claim about this feature:
 Added by the Task 12 sweep (2026-09-02, details in §13):
 
 1. **Budget not enforced under pressured 60 s workloads — DIAGNOSED
-   2026-09-02; cause (a) FIXED the same day (decide/apply split, see
-   §7a below), (b) mostly removed by the same change, (c) still open.** Both local A cells ended at 174.8 MB resident
+   2026-09-02; cause (a) FIXED the same day (decide/apply split, §7a),
+   (b) mostly removed by the same change, (c) bounded the same day by
+   scaling the dirty trigger to the budget (§7b) — the floor itself is
+   inherent and stays documented.** Both local A cells ended at 174.8 MB resident
    vs a 64 MiB budget with zero demotions during the run; the gate's C
    cell ended at 93 MB. Root cause from an env-gated trace of the demote
    pass and checkpointer tick (temporary instrumentation, reverted; 30 s
