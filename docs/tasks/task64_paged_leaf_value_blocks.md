@@ -363,6 +363,154 @@ budget → 32 MiB trigger, retention 1; n=1, ordering only):
 The dirty set now ends just under its trigger, one more checkpoint fits
 the window, and throughput is unchanged inside noise.
 
+## 7c. Pre-pass reconcile and a residency assertion in the gate (2026-09-02, §14.1(c) remainder)
+
+Two follow-ups to the same diagnosis, both landed 2026-09-02.
+
+**The first checkpoint's demote pass no longer trusts a never-credited
+counter.** `Child::resident_new` credits only `dirty_bytes`; a leaf
+*built* in memory never credits `resident_leaf_bytes` (only fault-ins
+do), and the exact-walk re-base ran only *after* the demote pass. So on
+a store's very first checkpoint the pass's exit check read 0 whatever
+the tree held: if cycle 1 was a pure second-chance sweep (every leaf
+accessed since it was built — a put-loop load, or any scan), it demoted
+nothing, saw `0 <= budget`, and quit with the tree fully resident until
+the *next* checkpoint. `checkpoint_impl_paged` phase 3 now calls
+`reconcile_paged_stats` before `demote_pass` as well as after (line-neutral
+edit, no cite re-anchoring), so the first pass cycles like every later
+one. The bounded remainder of the pre-first-checkpoint gap is the
+checkpointer's `due_mem` trigger, which reads the same counter: before
+the first checkpoint it is structurally silent, and §7b's scaled dirty
+trigger is what fires that checkpoint (every built leaf is dirty).
+
+Test: `tests/paged_demotion.rs::first_checkpoint_demote_pass_cycles_past_a_never_credited_counter`
+(64 KiB budget, 20,000 rows, a full point-read scan to arm every accessed
+bit, dirty trigger explicit and huge so the background checkpointer
+cannot take the first checkpoint; watched fail with the reconcile
+reverted: `clock_cycles=1`, then passes with `clock_cycles >= 2`,
+`resident_leaf_bytes_est <= budget`, `forced_evictions > 0`).
+
+**`make paging/check` now asserts residency.** §14.1 called the gate
+blind: it asserted DB faults/op, OOM count and recover time, never
+resident bytes against `paged_budget_bytes`, so the zero-demotion
+budget miss passed every assertion. `paging_check.py` adds, per cell:
+`checkpointer_runs >= 1` (before the first checkpoint the counter reads
+0 and any ratio would pass vacuously), `leaves_demoted > 0` (the direct
+witness for passes that never land), and a **trough** assertion: the
+harness now samples `resident_leaf_bytes_est` and the checkpointer run
+count into the 5 s trajectory (`paging_matrix.rs::Trajectory`, paged
+engine only), and the minimum over samples taken after the first
+checkpointer run of the run phase must be `<= 1.25 x budget`. The
+series max and mean are printed as disclosure, not gated.
+
+Why the trough and not the end value: the end value was tried first and
+is a phase sample of a saw-tooth. Two runs of the same C/uniform cell
+on trees that differ only by the pre-pass reconcile ended at **1.44x**
+and **4.20x** budget (96.5 MB vs 281.9 MB) with every other metric
+within noise — 416k vs 438k ops, pf/op 0.62 vs 0.64, swap-ins 1.48M
+vs 1.51M, 5 checkpointer runs each, 244k vs 235k leaves demoted. The
+282 MB reading exceeds the process RSS (233 MB): the tree really held
+that many leaf bytes, with the 256 MiB cgroup pushing them to swap —
+exactly the failure the budget exists to prevent, and exactly why the
+overshoot is disclosed rather than hidden behind a loose bound. What
+the two runs agree on is the mechanism: 5 ticks in 60 s is a ~12 s
+period against a uniform read stream faulting in ~18 MB/s, and the
+tick is long because (§14 item 5, unverified) `apply_demote` derefs
+every evicted leaf under the write lock. The trough witnesses that
+passes land and pull the tree under budget; the max/mean measure how
+far the workload runs past it while a tick is in flight. Watched fail:
+the diagnosis-era A cell (ratio 3.28, `leaves_demoted=0`) fails
+`leaves_demoted > 0`; a report without counter samples fails the trough
+assertion outright (not SKIP — the checker's reason to exist is not
+passing vacuously).
+
+## 7d. `Store::drop` waits for an in-flight background checkpoint (2026-09-02, corruption fix)
+
+**Symptom.** The first `make paging/check` run after §7c's gate assertions
+panicked in the A/zipf cell's *restart* phase, reading a data leaf right
+after `recover()`:
+
+```
+cannot load page 639974952 of rows: checkpoint corrupted: page 639974952: unknown page kind 0
+```
+
+Other runs gave kinds 169, 68 and 8 at nearby offsets. Reproduction (A
+cell, 5M rows, 64 MiB budget, 256 MiB cgroup, `--restart`): **4 of 4**
+runs on the decide/apply trees (ab76e46 and the working tree), **0 of 2**
+on 2bd84b9, the commit before demote passes started landing under a
+commit stream.
+
+**Diagnosis.** An env-gated trace (temporary, reverted) at root write,
+recovery and `PageFile::set_cursor` showed every root self-consistent —
+the recovered root named `file_end = 612,546,280`, its largest referenced
+id was `612,542,748`, none past the end, cursor re-set to `file_end` — and
+then run 2 faulted an id *27 MB past that*, an offset only the recovered
+store's own checkpoints could have written, and found zeros. Two writers
+on one page file. The library's own `Checkpointer` doc describes how:
+the worker thread upgrades its `Weak` to a strong
+`Arc<RwLock<StoreInner>>` for the duration of every tick, so when the
+application drops its last `Store` mid-tick, the *worker's* later drop
+of that `Arc` runs `StoreInner`'s destructor on the worker itself, and
+`Checkpointer::drop`'s self-join guard has no choice but to detach.
+`Store::drop` had already returned; the harness's `restart()` (and any
+in-process reopen) then opened a second `Store` on the same directory
+while the first was still appending pages, writing a root and punching
+dead ranges. The guard was written as a deadlock avoidance; it was also a
+correctness hole, reachable whenever a tick is in flight at drop time —
+which the decide/apply split made routine (5 ticks per 60 s cell, each
+swap-bound for seconds).
+
+**Fix.** `CheckpointGate` (`src/store.rs`): the worker holds a strong
+reference only under the gate lock or with `in_flight` set (set and
+cleared under the lock, cleared only after the reference is gone, via an
+`InFlightGuard` that covers every exit path); the per-tick transient
+`Store` *moves* the upgraded `Arc` so the worker's count is exactly one.
+`impl Drop for Store` takes the lock, reads `Arc::strong_count - in_flight`,
+and if that says it is the last application handle it sets `stop` and
+waits for `in_flight` to clear before letting its own `Arc` go — so the
+destructor always runs on an application thread, where the join is a
+real join. The worker's transient handle skips this by thread id. A
+`Store` clone that is not the last handle pays one uncontended mutex
+acquisition on drop and nothing else. Handles held by a `VersionPin` or
+an open transaction count as application handles (no wait); that leaves
+today's behaviour for those — the destructor runs wherever the last of
+them drops — but a `Store` drop itself can no longer return while a
+checkpoint it started is still writing.
+
+**Evidence.** `tests/paged_checkpointer.rs::dropping_the_last_handle_waits_for_an_in_flight_background_checkpoint`:
+1M rows, attach, dirty every leaf in one commit, wait until
+`pages_written` shows the tick mid-write (file length is no witness —
+`pages.bin` is preallocated in large chunks), drop, assert the second
+root already exists when `drop` returns and the root set is unchanged
+500 ms later, reopen and verify rows. Watched fail before the fix:
+`left: 1, right: 2` — drop returned with the checkpoint still running.
+Fixed-tree A-cell reproduction sweep and the full gate: see the table
+below (§7d-evidence, filled from the run).
+
+| run | tree | A/zipf restart | note |
+|---|---|---|---|
+| 1-2 | working tree (gate + reconcile, no drop fix) | **panic** ×2 | kinds 68, 8 |
+| 1-2 | ab76e46 | **panic** ×2 | kinds 169, 0 |
+| 1-2 | 2bd84b9 (before decide/apply) | clean ×2 | demotes never landed, ticks rarely in flight at drop |
+| 1-3 | working tree + `CheckpointGate` | **clean ×3** | |
+
+`make paging/check` on the fixed tree (256 MiB cgroup, 64 MiB budget,
+60 s, n=1): all 12 assertions pass. Per-cell series of the sampled
+resident counter over the budget, after the first checkpoint of the run
+phase:
+
+| cell | `checkpointer_runs` | `leaves_demoted` | trough | max | mean | `recover_secs` |
+|---|---|---|---|---|---|---|
+| C/uniform (read-only) | 5 | 246,036 | **0.01** | 5.09 | 2.13 | 0.14 (was 0.7-1.2 racing the detached checkpoint) |
+| A/zipf | 6 | 31,562 | **0.69** | 1.11 | 1.01 | 0.15 |
+
+A/zipf now sits on its budget (mean 1.01, max 1.11). C/uniform is a
+saw-tooth between ~0 and 5x: each pass evicts essentially *everything*
+quiet (trough 0.01, not "down to budget" — the cycle-level exit check
+runs only after a whole-tree sweep), and the uniform read stream then
+refaults ~18 MB/s until the next tick lands seconds later. Both halves
+of that are §14 item 5.
+
 ## 8. Adaptive retention shrink (default ON) and the pin-while-latest orphan hazard
 
 **Enforcement arm (spec §5, Peter's ruling: on by default).** When the
@@ -546,7 +694,7 @@ and against the other engines' local cells. Raw logs and
 JSON were kept in the session scratchpad only; the gate's own JSON is
 `target/paging-check/{C,A}.json`.
 
-### 13.1 `make paging/check` — PASS, all six assertions
+### 13.1 `make paging/check` — PASS, all six assertions *(2026-09-02: twelve since §7c — three residency assertions per cell; numbers in §7c and §7d)*
 
 ```
 [paging/check] C/uniform: ops=360448 timed_out=True ops_per_sec=5885 pf_per_op=0.5526 majflt_per_op=4.640 recover_secs=0.911
@@ -719,7 +867,8 @@ Added by the Task 12 sweep (2026-09-02, details in §13):
      run and the A cells two. `MIN_INTER_RUN` is irrelevant at this
      scale.
    - **(c) Dirty leaves are never demotable, and the pre-first-checkpoint
-     counter is bogus.** A leaf modified since the last checkpoint has
+     counter is bogus** *(the counter half fixed 2026-09-02 by reconciling
+     before the pass, §7c)*. A leaf modified since the last checkpoint has
      no page id, so `paged_demote` skips it; in-run batches found 9-27
      demotable leaves per 1024 parents because the hot zipf set is
      dirty until the next 20 s checkpoint writes it. And because load
@@ -731,7 +880,7 @@ Added by the Task 12 sweep (2026-09-02, details in §13):
 
    **Why the gate is blind:** `paging_check.py` asserts DB faults/op,
    OOM count, and recover time — never `resident_leaf_bytes_end` against
-   the budget.
+   the budget. *(Fixed 2026-09-02, §7c: four residency assertions.)*
 
    **Fix (shipped, see §7a):** split decide from apply. Walk off-lock to *choose* (leaf-parent key,
    child page ids) with no `make_mut` and no leaf deref (measure bytes
@@ -762,6 +911,30 @@ Added by the Task 12 sweep (2026-09-02, details in §13):
    `memory_budget_bytes`** (C/uniform pf/op 0.156 -> 0.553 at 64 MiB).
    Changelog entry needed: paged mode has none at all under Unreleased
    yet, for task63 or task64.
+5. **Read-only saw-tooth between ~0 and 5x budget** (§7d table: C/uniform
+   trough 0.01, max 5.09, mean 2.13; A/zipf holds at mean 1.01). Two
+   halves: (i) a pass evicts every quiet leaf in its sweep instead of
+   stopping at the budget — `demote_pass_inner` checks `resident <=
+   budget` once per *cycle*, after a whole-tree sweep, so the cheap fix
+   is to check per applied chunk; (ii) the tick period is seconds, so
+   the workload refaults far past the budget before the next pass lands. The budget is enforced only
+   when a demote pass lands, and between the `due_mem` wake and the pass
+   landing the workload keeps faulting in. Unverified hypothesis for
+   the tick cost: `apply_demote` derefs every evicted leaf
+   (`load_quiet(src).leaf_bytes()`) under `inner.write()` to debit its
+   bytes — one swap fault per leaf, serialized against all readers.
+   Candidate fix: measure in the off-lock plan (carry `PageId -> bytes`
+   in `DemoteChunk`; a leaf with a page id is content-immutable, so the
+   size cannot drift between plan and apply), leaving the apply to
+   touch slot atomics and parent clones only. Needs an env-gated
+   per-tick timing trace to confirm before implementing; then tighten
+   `RESIDENT_TROUGH_MAX` in `paging_check.py` (and start gating the
+   series max) to whatever the measured floor supports.
+6. **`Store::drop` gate residual (§7d).** A last handle held by a
+   `VersionPin` or an open transaction is not a `Store`, so its drop does
+   not go through the gate; the destructor then runs wherever that last
+   reference drops, worker included. Not reachable by the harness or any
+   test today; a `Store::close()`-style explicit wait would close it.
 
 ## 15. Files touched (feature-wide, Tasks 1-12)
 
