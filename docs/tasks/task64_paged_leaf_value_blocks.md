@@ -261,6 +261,70 @@ for multi-table bit-clearing staggering), observable via the
 within 8 cycles **always**, no exceptions — traded against
 earliest-possible-eviction slack under the pathological concurrent case.
 
+## 7a. Decide/apply demote batches (2026-09-02 follow-up to §14.1)
+
+The pre-fix batch read `latest_version`, walked `paged_demote` off-lock,
+and installed the demoted clone into *that* version. §14.1's trace showed
+that under a per-op commit stream every batch loses: a swap-bound walk
+of 0.3-4.5 s sees hundreds to thousands of commits, so the install
+targets a version that is gc'd (`None`, nothing counted) or stale
+(counted but unreachable from any reader — silent counter drift).
+
+Now a batch is two halves (`src/btree.rs` `plan_demote`/`apply_demote`,
+`src/table.rs` `paged_demote_plan`/`paged_demote_apply`, `src/store.rs`
+`demote_pass_inner` + `demote_apply_chunk`):
+
+- **Decide (off-lock):** walk at most `demote_batch` leaf-parents after
+  the cursor touching only slot atomics — `is_loaded`, `page_id`,
+  `take_accessed` — no `make_mut`, no leaf deref. Output: key-ordered
+  `DemoteChunk { from, to, ids: HashSet<PageId> }` of at most
+  `Store::DEMOTE_APPLY_CHUNK` (64) parents each, plus the next cursor.
+- **Apply (under `inner.write()`, one chunk per acquisition):** re-read
+  the *current* latest, evict every loaded leaf whose page id is in the
+  chunk under a parent whose max key lies in `(from, to]`, and re-publish
+  at that version. The descent is pruned to the chunk's key range by the
+  inner nodes' separators; only a parent with at least one hit is
+  `make_mut`'d. The superseded table/snapshot `Arc`s leave the lock
+  scope before they drop, so leaf frees (which touch possibly swapped
+  memory) never stall a commit. Bytes are still `leaf_bytes()` of the
+  leaf actually dropped (credit/debit symmetry, §5).
+
+A plan made against version *v* applying to a later version is sound
+because it is only a set of page ids in a key range: a leaf split,
+merged, rewritten (new id), re-faulted dirty, or already demoted since
+is simply not matched. `install_paged_tables` is untouched and still
+serves the checkpoint. The single-shot `demote_leaves`/`paged_demote`
+became plan-then-apply on one version and is the tree/table-level
+regression surface (the table trait method is now `cfg(test)`).
+
+Regression test: `store::tests::demote_pass_lands_on_current_latest_when_captured_version_is_evicted_mid_batch`
+(the former `..._dropped_install_does_not_bump_stats`, whose assertions
+pinned the lose-the-race behaviour as correct and were inverted): the
+race hook commits, checkpoints and gc's the planned version between
+decide and apply; the pass must still demote, count exactly what
+landed, and the live latest's dedup walk must shrink. Watched fail
+before the change (`demoted=0`), passes after.
+
+**Post-fix sanity cell** (same host, config and 60 s window as §13.3's
+A/zipf retention-1 cell; n=1, local, ordering only):
+
+| metric | pre-fix | post-fix |
+|---|---|---|
+| `resident_leaf_bytes_end` (budget 64 MiB) | 174.8 MB | **58.9 MB** |
+| `leaves_demoted` during the run | 0 | **24,742** |
+| `checkpointer_runs` during the run | 2 | 4 |
+| run1 ops/s (timed out both) | 1,263 | 895 |
+| run2 ops/s after restart | 2,195 | 5,371 |
+| pf/op (DB) | 0.374 | 0.442 |
+
+The budget is honoured at run end for the first time in a pressured
+write cell. Run1 throughput is lower — evicting under pressure costs
+re-faults the old pass never paid because it never evicted — and that
+is inside the local noise band besides; the run2 gain is not a claim
+either. §14.1(c) is untouched by this: the ~41 MB `dirty_bytes_end`
+here is the un-demotable dirty set, and it is only the four checkpoints
+in the window (vs two) that kept the total under budget.
+
 ## 8. Adaptive retention shrink (default ON) and the pin-while-latest orphan hazard
 
 **Enforcement arm (spec §5, Peter's ruling: on by default).** When the
@@ -577,7 +641,8 @@ open obligation before any published perf claim about this feature:
 Added by the Task 12 sweep (2026-09-02, details in §13):
 
 1. **Budget not enforced under pressured 60 s workloads — DIAGNOSED
-   2026-09-02, not fixed.** Both local A cells ended at 174.8 MB resident
+   2026-09-02; cause (a) FIXED the same day (decide/apply split, see
+   §7a below), (b) mostly removed by the same change, (c) still open.** Both local A cells ended at 174.8 MB resident
    vs a 64 MiB budget with zero demotions during the run; the gate's C
    cell ended at 93 MB. Root cause from an env-gated trace of the demote
    pass and checkpointer tick (temporary instrumentation, reverted; 30 s
@@ -628,8 +693,7 @@ Added by the Task 12 sweep (2026-09-02, details in §13):
    OOM count, and recover time — never `resident_leaf_bytes_end` against
    the budget.
 
-   **Fix direction (design, not started — needs a ruling):** split
-   decide from apply. Walk off-lock to *choose* (leaf-parent key,
+   **Fix (shipped, see §7a):** split decide from apply. Walk off-lock to *choose* (leaf-parent key,
    child page ids) with no `make_mut` and no leaf deref (measure bytes
    from the slot's cached length or accept `NODE_BYTES + n*size_of::<V>`
    from the parent's entry count); then under `inner.write()` re-read

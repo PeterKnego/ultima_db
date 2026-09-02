@@ -2,6 +2,7 @@
 // Copyright 2026 Peter Knego
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -1048,141 +1049,225 @@ impl<K: Ord + Clone, V> BTree<K, V> {
         go(&self.root, self.source.as_deref(), write)
     }
 
-    /// Build a new version in which leaf slots with a page id and a clear
-    /// accessed bit are on-disk. Processes at most `budget` leaf-parents,
-    /// starting after `cursor` (the max key of the last parent processed).
-    /// Returns (new tree, leaves demoted, demoted bytes, next cursor / `None`
-    /// when done). The bytes figure is `Σ BTreeNode::leaf_bytes()` of every
-    /// leaf actually demoted this call — computed from the demoted leaf
-    /// itself, symmetric by construction with the fault-in credit
-    /// (`PagedSource::read_node`, task 4) and the dirty-bytes credit
-    /// (`Child::resident_new`/`make_mut`, task 8) that both already speak
-    /// `leaf_bytes()`. Task 8, spec §5.
+    /// Decide half of a demote pass (task64 follow-up, decide/apply split):
+    /// walk at most `budget` leaf-parents after `cursor` (the max key of
+    /// the last parent processed), touching only slot atomics — no node is
+    /// cloned, no leaf is dereferenced, so a pressured walk pays no swap
+    /// faults and no CoW — and return the plan as key-ordered
+    /// [`DemoteChunk`]s of at most `chunk` parents each, plus the next
+    /// cursor (`None` when the table is exhausted). A leaf is planned when
+    /// it is loaded, has a page id, and its accessed bit was clear
+    /// (`take_accessed` clears it either way: second chance). A parent
+    /// counts against `budget` when it has any loaded+paged leaf at all,
+    /// planned or not — identical to the old single-shot walk, so a pass
+    /// covers the table in the same number of batches.
     ///
-    /// Demotion never assigns a *new* page id — a leaf keeps whatever id it
-    /// already had, it just stops being resident — so a demote pass never
-    /// invalidates anything on disk. The walk is conservative about CoW: a
-    /// leaf-parent (and every ancestor above it) is `make_mut`'d as soon as
-    /// it looks like it *might* have something to demote, before the
-    /// per-leaf accessed check runs — so a parent whose leaves all turn out
-    /// to be accessed (nothing demoted under it) is still left dirty by the
-    /// walk. [`restore_unchanged_ids`] undoes that afterward: it walks the
-    /// CoW'd path bottom-up and gives back the old page id to any node whose
-    /// children came out identical to the original's, so a pass that ends
-    /// up (fully or partially) demoting nothing forces no rewrite.
-    // Real caller (`Table::paged_demote`, via `Store::demote_pass`) is in
-    // `persistence`-gated code — see `set_source`'s note above.
-    #[allow(dead_code)]
-    pub(crate) fn demote_leaves(&self, cursor: Option<&K>, budget: usize) -> (BTree<K, V>, usize, usize, Option<K>) {
+    /// The plan is made against *this* tree version but is meant to be
+    /// applied by [`Self::apply_demote`] to whatever version is current
+    /// when the store takes its write lock — the two are decoupled on
+    /// purpose, see `Store::demote_pass_inner`.
+    pub(crate) fn plan_demote(&self, cursor: Option<&K>, budget: usize, chunk: usize) -> (Vec<DemoteChunk<K>>, Option<K>) {
         let src = self.source.as_deref();
         let h = self.height();
-        if h == 0 {
-            return (self.clone(), 0, 0, None);
+        if h == 0 || budget == 0 {
+            return (Vec::new(), None);
         }
-        let mut out = self.clone();
-        let mut demoted = 0usize;
-        let mut demoted_bytes = 0usize;
+        let mut parents: Vec<(K, Vec<PageId>)> = Vec::new();
         let mut left = budget;
-        let mut last: Option<K> = None;
 
-        // depth counts down; at depth 1 a node's children are leaves.
-        // Returns whether the budget was exhausted (there is more to do).
-        #[allow(clippy::too_many_arguments)]
         fn go<K: Ord + Clone, V>(
-            slot: &mut Child<K, V>,
+            slot: &Child<K, V>,
             depth: usize,
             src: Option<&dyn NodeSource<K, V>>,
             cursor: Option<&K>,
             left: &mut usize,
-            demoted: &mut usize,
-            demoted_bytes: &mut usize,
-            last: &mut Option<K>,
+            parents: &mut Vec<(K, Vec<PageId>)>,
         ) -> bool {
             if *left == 0 {
                 return true;
             }
+            let node = slot.load(src);
             if depth == 1 {
-                let node_ref = slot.load(src);
-                if let (Some(c), Some(maxk)) = (cursor, node_ref.entries.last().map(|e| &e.0))
+                let Some(maxk) = node.entries.last().map(|e| &e.0) else {
+                    return false;
+                };
+                if let Some(c) = cursor
                     && maxk <= c
                 {
-                    return false; // already processed in an earlier pass
+                    return false; // already processed in an earlier batch
                 }
-                let any = node_ref.children.iter().any(|c| c.is_loaded() && c.page_id().is_some());
-                if !any {
-                    return false;
-                }
-                // Conservative CoW: this parent is dirtied here even if
-                // every child below turns out to be accessed (nothing
-                // demoted). `None` so the CoW isn't reported as new dirty
-                // data — it's bookkeeping, not a write — and
-                // `restore_unchanged_ids` gives the id back afterward if
-                // nothing actually changed.
-                // `None` is safe here specifically because `depth == 1` means
-                // `slot` is a leaf's *parent* (an inner node) — the loop below
-                // only ever demotes its `children` (the leaves) by page id,
-                // never CoWs a leaf itself. `make_mut(None)` must never reach
-                // a block leaf (see I-B / `BTreeNode::clone_with`).
-                let n = slot.make_mut(None);
-                for c in n.children.iter_mut() {
+                let mut any = false;
+                let mut ids = Vec::new();
+                for c in node.children.iter() {
                     if let (true, Some(id)) = (c.is_loaded(), c.page_id()) {
-                        if c.take_accessed() {
-                            // second chance: bit cleared, stays resident
-                        } else {
-                            // Bytes before the slot is overwritten (task 8):
-                            // `c` is already loaded, so this is a plain peek
-                            // (`load_quiet`, no fault, no accessed bump) at
-                            // the exact leaf about to be dropped.
-                            *demoted_bytes += c.load_quiet(src).leaf_bytes();
-                            *c = Child::on_disk(id);
-                            *demoted += 1;
+                        any = true;
+                        if !c.take_accessed() {
+                            ids.push(id);
                         }
                     }
                 }
-                *last = n.entries.last().map(|(k, _)| k.clone());
+                if !any {
+                    return false;
+                }
+                parents.push((maxk.clone(), ids));
                 *left -= 1;
                 return *left == 0;
             }
-            slot.load(src); // ensure resident; may fault a never-visited branch
-            // `None` is safe here for the same reason as the depth == 1 arm
-            // above: `depth > 1` means `slot` is an internal node, never a
-            // leaf, so this CoW can never reach a block leaf.
-            let n = slot.make_mut(None);
-            for c in n.children.iter_mut() {
-                if go(c, depth - 1, src, cursor, left, demoted, demoted_bytes, last) {
+            for c in node.children.iter() {
+                if go(c, depth - 1, src, cursor, left, parents) {
                     return true;
                 }
             }
             false
         }
-        let exhausted = go(&mut out.root, h, src, cursor, &mut left, &mut demoted, &mut demoted_bytes, &mut last);
-        restore_unchanged_ids(&out.root, &self.root, h, src);
-        (out, demoted, demoted_bytes, if exhausted { last } else { None })
+        let exhausted = go(&self.root, h, src, cursor, &mut left, &mut parents);
+        let next = if exhausted { parents.last().map(|(k, _)| k.clone()) } else { None };
+
+        let mut chunks = Vec::new();
+        let mut from = cursor.cloned();
+        for group in parents.chunks(chunk.max(1)) {
+            let to = group.last().map(|(k, _)| k.clone()).expect("chunks() never yields an empty group");
+            let ids: HashSet<PageId> = group.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            // A group whose leaves were all accessed (second chance) plans
+            // nothing; leave it out so the apply never takes the write lock
+            // for it. The next group's `from` still advances past it.
+            if !ids.is_empty() {
+                chunks.push(DemoteChunk { from: from.clone(), to: to.clone(), ids });
+            }
+            from = Some(to);
+        }
+        (chunks, next)
     }
 
-    /// Page ids referenced by `prev` and not by `self`, walking only inner
-    /// subtrees whose page id differs between the two (identical-id
-    /// subtrees are skipped whole).
+    /// Apply half of a demote pass: build a new version of *this* tree in
+    /// which every loaded leaf whose page id is in `chunk.ids`, under a
+    /// leaf-parent whose max key lies in `(chunk.from, chunk.to]`, is
+    /// on-disk. Returns (new tree, leaves demoted, demoted bytes); the
+    /// bytes figure is `Σ BTreeNode::leaf_bytes()` of every leaf actually
+    /// demoted here — computed from the demoted leaf itself, symmetric by
+    /// construction with the fault-in credit (`PagedSource::read_node`,
+    /// task 4) and the dirty-bytes credit (`Child::resident_new`/`make_mut`,
+    /// task 8) that both already speak `leaf_bytes()`. Task 8, spec §5.
     ///
-    /// # Precondition
+    /// The tree this runs on may be a *later* version than the one the
+    /// plan was made from (the store applies under its write lock against
+    /// the current latest): a leaf that was split, merged, rewritten
+    /// (new id) or already demoted since simply isn't matched, and the
+    /// descent is pruned to the chunk's key range by the inner nodes'
+    /// separators, so the cost is proportional to the chunk, not the
+    /// table. Only a leaf-parent with at least one hit is `make_mut`'d;
+    /// inner nodes on the way down are (their children are inner nodes,
+    /// always resident, so those clones never touch a leaf), and
+    /// [`restore_unchanged_ids`] gives any inner node whose children came
+    /// out identical its page id back, so a chunk that hits nothing
+    /// forces no rewrite.
     ///
-    /// Both trees' inner levels must be resident — `inner_ids`'s own walk
-    /// below treats a not-yet-loaded slot as a leaf, since a *leaf* is the
-    /// only thing this task ever leaves on disk. A tree fresh off
-    /// `from_root_page` violates that (its whole spine may still be on
-    /// disk), and calling this without the fix below would report every
-    /// page of two otherwise-identical trees as dead. So this calls
-    /// `load_inner_levels` on both trees first — a no-op once they already
-    /// are resident, so callers that already loaded them (or built them
-    /// in-memory) pay nothing extra.
-    ///
-    /// Read-only otherwise: uses [`Child::load_quiet`] throughout, so a
-    /// checkpoint-diff or GC walk never marks a leaf "recently used" just
-    /// by looking at it — only a real workload touch (`get`, `insert_mut`,
-    /// ...) should be able to give a leaf a second chance in
-    /// [`BTree::demote_leaves`].
-    // Real caller (`Table::paged_changed_pages`, via `Store::checkpoint_impl_paged`)
-    // is in `persistence`-gated code — see `set_source`'s note above.
+    /// Demotion never assigns a *new* page id — a leaf keeps whatever id
+    /// it already had, it just stops being resident — so applying a plan
+    /// never invalidates anything on disk.
+    pub(crate) fn apply_demote(&self, chunk: &DemoteChunk<K>) -> (BTree<K, V>, usize, usize) {
+        let src = self.source.as_deref();
+        let h = self.height();
+        if h == 0 || chunk.ids.is_empty() {
+            return (self.clone(), 0, 0);
+        }
+        let mut out = self.clone();
+        let mut demoted = 0usize;
+        let mut demoted_bytes = 0usize;
+
+        /// Returns `true` once the walk has passed `chunk.to` (stop).
+        fn go<K: Ord + Clone, V>(
+            slot: &mut Child<K, V>,
+            depth: usize,
+            src: Option<&dyn NodeSource<K, V>>,
+            chunk: &DemoteChunk<K>,
+            demoted: &mut usize,
+            demoted_bytes: &mut usize,
+        ) -> bool {
+            let node = slot.load(src);
+            if depth == 1 {
+                let Some(maxk) = node.entries.last().map(|e| &e.0) else {
+                    return false;
+                };
+                if let Some(f) = &chunk.from
+                    && maxk <= f
+                {
+                    return false;
+                }
+                if let Some(mink) = node.entries.as_slice().first().map(|e| &e.0)
+                    && *mink > chunk.to
+                {
+                    return true;
+                }
+                let done = *maxk >= chunk.to;
+                let hit = node
+                    .children
+                    .iter()
+                    .any(|c| c.is_loaded() && c.page_id().is_some_and(|id| chunk.ids.contains(&id)));
+                if !hit {
+                    return done;
+                }
+                let n = slot.make_mut(None);
+                for c in n.children.iter_mut() {
+                    if let (true, Some(id)) = (c.is_loaded(), c.page_id())
+                        && chunk.ids.contains(&id)
+                    {
+                        *demoted_bytes += c.load_quiet(src).leaf_bytes();
+                        *c = Child::on_disk(id);
+                        *demoted += 1;
+                    }
+                }
+                return done;
+            }
+            // Inner level: child `i` holds keys below `entries[i].0` and
+            // above `entries[i - 1].0`, so prune by those separators.
+            let n = slot.make_mut(None);
+            let len = n.entries.len();
+            for i in 0..n.children.len() {
+                if let Some(f) = &chunk.from
+                    && i < len
+                    && n.entries[i].0 <= *f
+                {
+                    continue; // every parent below has maxk < from
+                }
+                if i > 0 && n.entries[i - 1].0 > chunk.to {
+                    return true; // every parent below has mink > to
+                }
+                if go(&mut n.children[i], depth - 1, src, chunk, demoted, demoted_bytes) {
+                    return true;
+                }
+            }
+            false
+        }
+        go(&mut out.root, h, src, chunk, &mut demoted, &mut demoted_bytes);
+        restore_unchanged_ids(&out.root, &self.root, h, src);
+        (out, demoted, demoted_bytes)
+    }
+
+    /// Single-shot demote: [`Self::plan_demote`] followed by
+    /// [`Self::apply_demote`] on the same version. Processes at most
+    /// `budget` leaf-parents after `cursor`; returns (new tree, leaves
+    /// demoted, demoted bytes, next cursor / `None` when done). The store's
+    /// pass no longer uses this (it plans and applies against different
+    /// versions); it stays as the tree-level regression surface for the
+    /// pair.
+    // Real callers are in `persistence`-gated code — see `set_source`'s
+    // note above.
+    #[allow(dead_code)]
+    pub(crate) fn demote_leaves(&self, cursor: Option<&K>, budget: usize) -> (BTree<K, V>, usize, usize, Option<K>) {
+        let (chunks, next) = self.plan_demote(cursor, budget, usize::MAX);
+        let mut out = self.clone();
+        let mut demoted = 0usize;
+        let mut demoted_bytes = 0usize;
+        for chunk in &chunks {
+            let (t, d, b) = out.apply_demote(chunk);
+            out = t;
+            demoted += d;
+            demoted_bytes += b;
+        }
+        (out, demoted, demoted_bytes, next)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn changed_page_ids(&self, prev: &BTree<K, V>) -> Vec<PageId> {
         use std::collections::HashSet;
@@ -1546,6 +1631,19 @@ impl<K: Ord + Clone, V> BTree<K, V> {
 /// a leaf resident<->on-disk keeps its id, which is all `Child::same_node`
 /// compares), so in practice this restores the entire touched path whenever
 /// nothing above the leaf level structurally changed.
+/// One apply-able unit of a demote plan (task64 follow-up, decide/apply
+/// split): the leaf page ids to evict under the leaf-parents whose max keys
+/// fall in `(from, to]`, in key order. Built off-lock by
+/// [`BTree::plan_demote`] against one tree version; applied under the store
+/// write lock by [`BTree::apply_demote`] against whatever tree is *current*
+/// then — the two need not be the same version, which is the point (see
+/// `Store::demote_pass_inner`).
+pub(crate) struct DemoteChunk<K> {
+    pub(crate) from: Option<K>,
+    pub(crate) to: K,
+    pub(crate) ids: HashSet<PageId>,
+}
+
 fn restore_unchanged_ids<K: Ord + Clone, V>(new: &Child<K, V>, orig: &Child<K, V>, depth: usize, src: Option<&dyn NodeSource<K, V>>) {
     if depth == 0 || new.page_id().is_some() {
         // Leaf level (demotion never touches a leaf's id), or a node this

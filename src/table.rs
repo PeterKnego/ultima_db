@@ -77,6 +77,12 @@ pub enum Residency {
     Lazy,
 }
 
+/// A demote plan crossing the `MergeableTable` boundary: key-ordered,
+/// type-erased `btree::DemoteChunk<K>`s plus the next cursor (`None` when
+/// the table is exhausted). See [`MergeableTable::paged_demote_plan`].
+#[cfg(feature = "persistence")]
+pub(crate) type ErasedDemotePlan = (Vec<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>);
+
 pub(crate) trait MergeableTable: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -203,14 +209,13 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     ///
     /// Production caller: [`crate::Store::demote_pass`].
     ///
-    /// Does **not** touch `PagedStats` itself — the caller (`demote_pass`)
-    /// owns that, and only applies the delta this call reports once its own
-    /// `install_paged_tables` of the returned table actually lands. A
-    /// concurrent `gc()` can evict the version this call's caller captured
-    /// before the install runs, in which case the demotion this returns is
-    /// never reachable from any live snapshot; mutating shared counters
-    /// here unconditionally would record a demotion nothing reflects.
-    #[cfg(feature = "persistence")]
+    /// Does **not** touch `PagedStats` itself — the caller owns that.
+    /// Test-only since the task64 decide/apply split: `Store::demote_pass`
+    /// plans ([`Self::paged_demote_plan`]) against one version and applies
+    /// ([`Self::paged_demote_apply`]) against the current latest under the
+    /// write lock; this single-shot form (plan + apply on the same version)
+    /// is kept as the table-level regression surface for the pair.
+    #[cfg(all(test, feature = "persistence"))]
     #[allow(clippy::type_complexity)]
     fn paged_demote(
         &self,
@@ -230,6 +235,31 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// appear in `MergeableTable`'s signature — so this stays exposed as a
     /// cheap (`size_of`-only, no I/O) accessor for the one caller that still
     /// needs a flat estimate.
+    /// Decide half of a demote batch (task64 follow-up): plan at most
+    /// `budget` leaf-parents after `cursor`, as key-ordered chunks of at
+    /// most `chunk` parents (each a type-erased `btree::DemoteChunk<K>`),
+    /// plus the next cursor. Off-lock, touches no leaf. A
+    /// [`Residency::Resident`] table plans nothing.
+    ///
+    /// Production caller: [`crate::Store::demote_pass`].
+    #[cfg(feature = "persistence")]
+    fn paged_demote_plan(
+        &self,
+        cursor: Option<&dyn Any>,
+        budget: usize,
+        chunk: usize,
+    ) -> ErasedDemotePlan;
+
+    /// Apply half: evict the chunk's leaves from *this* table (which may
+    /// be a later version than the one the chunk was planned from) and
+    /// return (new table, leaves demoted, demoted bytes). No `PagedStats`
+    /// mutation here — the caller applies the counters once the install
+    /// has landed.
+    ///
+    /// Production caller: [`crate::Store::demote_pass`].
+    #[cfg(feature = "persistence")]
+    fn paged_demote_apply(&self, chunk: &dyn Any) -> (Box<dyn MergeableTable>, usize, usize);
+
     #[cfg(feature = "persistence")]
     fn paged_node_bytes(&self) -> usize;
 
@@ -425,7 +455,7 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         }
     }
 
-    #[cfg(feature = "persistence")]
+    #[cfg(all(test, feature = "persistence"))]
     #[allow(clippy::type_complexity)]
     fn paged_demote(
         &self,
@@ -450,6 +480,45 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         out.data = new_data;
         let next_boxed: Option<Box<dyn Any + Send>> = next.map(|k| Box::new(k) as Box<dyn Any + Send>);
         (Box::new(out), demoted, demoted_bytes, next_boxed)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_demote_plan(
+        &self,
+        cursor: Option<&dyn Any>,
+        budget: usize,
+        chunk: usize,
+    ) -> ErasedDemotePlan {
+        if self.residency == Residency::Resident {
+            return (Vec::new(), None);
+        }
+        let cursor_k: Option<&K> = cursor.and_then(|c| c.downcast_ref::<K>());
+        debug_assert!(
+            cursor.is_none() || cursor_k.is_some(),
+            "paged_demote_plan: cursor did not downcast to this table's key type (a caller \
+             handed back a cursor from a different table's pass); release builds \
+             silently restart the pass instead of resuming"
+        );
+        let (chunks, next) = self.data.plan_demote(cursor_k, budget, chunk);
+        (
+            chunks.into_iter().map(|c| Box::new(c) as Box<dyn Any + Send>).collect(),
+            next.map(|k| Box::new(k) as Box<dyn Any + Send>),
+        )
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_demote_apply(&self, chunk: &dyn Any) -> (Box<dyn MergeableTable>, usize, usize) {
+        if self.residency == Residency::Resident {
+            return (Box::new(self.clone()), 0, 0);
+        }
+        let Some(chunk) = chunk.downcast_ref::<crate::btree::DemoteChunk<K>>() else {
+            debug_assert!(false, "paged_demote_apply: chunk did not downcast to this table's key type");
+            return (Box::new(self.clone()), 0, 0);
+        };
+        let (new_data, demoted, demoted_bytes) = self.data.apply_demote(chunk);
+        let mut out = self.clone();
+        out.data = new_data;
+        (Box::new(out), demoted, demoted_bytes)
     }
 
     #[cfg(feature = "persistence")]
