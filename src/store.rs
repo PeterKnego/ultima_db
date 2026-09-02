@@ -631,6 +631,12 @@ pub struct Store {
     /// only covering checkpoint the slower one then deletes.
     #[cfg(feature = "persistence")]
     checkpoint_lock: Arc<Mutex<()>>,
+    /// Paged stores only (task64 §7d): the gate that lets the LAST
+    /// application handle's `Drop` wait for an in-flight background
+    /// checkpoint instead of leaving it running detached on the worker —
+    /// see [`CheckpointGate`] and `impl Drop for Store`.
+    #[cfg(feature = "persistence")]
+    ckpt_gate: Option<Arc<CheckpointGate>>,
 }
 
 /// A point-in-time snapshot of a paged store's paging counters. See
@@ -913,7 +919,8 @@ impl Store {
         });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
-        let store = Self {
+        #[allow(unused_mut)]
+        let mut store = Self {
             inner: Arc::new(RwLock::new(StoreInner {
                 snapshots,
                 latest_version: 0,
@@ -950,6 +957,8 @@ impl Store {
             table_locks: Arc::new(TableLockTable::new()),
             #[cfg(feature = "persistence")]
             checkpoint_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "persistence")]
+            ckpt_gate: None,
         };
 
         // Start the background checkpointer (task12) whenever this store
@@ -964,6 +973,7 @@ impl Store {
         {
             let has_paged = store.inner.read().paged.is_some();
             if has_paged {
+                store.ckpt_gate = Some(Arc::new(CheckpointGate::default()));
                 let checkpointer = Checkpointer::start(&store)?;
                 store.inner.write().checkpointer = Some(checkpointer);
             }
@@ -4176,6 +4186,12 @@ impl Checkpointer {
         let next_writer_id = Arc::clone(&store.next_writer_id);
         let table_locks = Arc::clone(&store.table_locks);
         let checkpoint_lock = Arc::clone(&store.checkpoint_lock);
+        let gate = Arc::clone(
+            store
+                .ckpt_gate
+                .as_ref()
+                .expect("Store::new installs the checkpoint gate before starting the checkpointer"),
+        );
         let thread_stop = Arc::clone(&stop);
         let thread_wake = Arc::clone(&wake);
 
@@ -4190,11 +4206,86 @@ impl Checkpointer {
                     checkpoint_lock,
                     thread_stop,
                     thread_wake,
+                    gate,
                 );
             })
             .map_err(|e| Error::Persistence(format!("spawn background checkpointer thread: {e}")))?;
 
         Ok(Checkpointer { stop, wake, handle: Some(handle) })
+    }
+}
+
+/// task64 §7d — the drop/checkpoint gate. `Checkpointer`'s thread holds a
+/// strong `Arc<RwLock<StoreInner>>` for the duration of every checkpoint it
+/// runs, so if the application drops its last [`Store`] while one is in
+/// flight, the *worker's* later drop of that `Arc` is what runs
+/// `StoreInner`'s destructor — on the worker itself, where the self-join
+/// guard in `Checkpointer::drop` has no choice but to detach. `Store::drop`
+/// then returned while the checkpoint was still appending pages, writing a
+/// root and punching dead ranges, and the very next thing a re-opener does
+/// (`paging_matrix --restart`, any in-process reopen) is put a second
+/// `Store` on the same page file: two writers, one `pages.bin`. The gate's
+/// A cell read zeros at an offset only the second store's own checkpoints
+/// could have written.
+///
+/// Protocol: the worker holds a strong reference only (a) under
+/// `state`'s lock, or (b) with `in_flight` set — set and cleared under the
+/// lock, and cleared only after the reference is gone. `Store::drop` takes
+/// the lock, reads `Arc::strong_count` minus `in_flight`, and if that says
+/// it is the last application handle it sets `stop` and waits for
+/// `in_flight` to clear before letting its own `Arc` go — so the
+/// destructor always runs on an application thread, where the join is a
+/// real join. The worker's own transient `Store` skips all of that by
+/// thread id.
+#[cfg(feature = "persistence")]
+#[derive(Default)]
+pub(crate) struct CheckpointGate {
+    state: Mutex<GateState>,
+    cv: Condvar,
+}
+
+#[cfg(feature = "persistence")]
+#[derive(Default)]
+struct GateState {
+    /// The worker holds a strong `Arc<RwLock<StoreInner>>` outside the lock.
+    in_flight: bool,
+    /// Set by the last application handle's drop; the worker never
+    /// upgrades again once it sees this.
+    stop: bool,
+    /// The checkpointer thread's id, so its own transient `Store` is
+    /// recognised in `Store::drop`.
+    worker: Option<std::thread::ThreadId>,
+}
+
+/// Clears `in_flight` (and wakes any waiting `Store::drop`) when dropped —
+/// on every exit path out of a tick, including the early `return`s.
+#[cfg(feature = "persistence")]
+struct InFlightGuard<'a>(&'a CheckpointGate);
+
+#[cfg(feature = "persistence")]
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.state.lock();
+        g.in_flight = false;
+        self.0.cv.notify_all();
+    }
+}
+
+#[cfg(feature = "persistence")]
+impl Drop for Store {
+    fn drop(&mut self) {
+        let Some(gate) = self.ckpt_gate.as_ref() else { return };
+        let mut g = gate.state.lock();
+        if g.worker == Some(std::thread::current().id()) {
+            return; // the worker's own transient handle
+        }
+        let app_handles = Arc::strong_count(&self.inner) - usize::from(g.in_flight);
+        if app_handles <= 1 {
+            g.stop = true;
+            while g.in_flight {
+                gate.cv.wait(&mut g);
+            }
+        }
     }
 }
 
@@ -4348,6 +4439,10 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// timeout, waking only on an explicit notify (a crossed threshold, or
 /// `Drop`) or the interval elapsing.
 #[cfg(feature = "persistence")]
+// Each argument is one of the `Arc` handles the per-tick transient `Store`
+// is rebuilt from (plus the drop gate); bundling them into a struct would
+// only move the same list one indirection away.
+#[allow(clippy::too_many_arguments)]
 fn checkpointer_loop(
     weak_inner: Weak<RwLock<StoreInner>>,
     intents: Arc<IntentMap>,
@@ -4356,7 +4451,11 @@ fn checkpointer_loop(
     checkpoint_lock: Arc<Mutex<()>>,
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<bool>, Condvar)>,
+    gate: Arc<CheckpointGate>,
 ) {
+    // Lets `impl Drop for Store` recognise the transient handle this thread
+    // builds per tick as its own and skip the wait (see `CheckpointGate`).
+    gate.state.lock().worker = Some(std::thread::current().id());
     // Only a *transition* to a new error string is logged (mirrors the WAL
     // poison latch's "don't spam" shape, but this is not itself a poison
     // latch — a failed background checkpoint just means the next attempt
@@ -4380,15 +4479,26 @@ fn checkpointer_loop(
         // vanished while this thread was parked is caught here rather than
         // only on the next section's `upgrade()`.
         {
-            let interval = match weak_inner.upgrade() {
-                Some(inner) => {
-                    let g = inner.read();
-                    match g.paged.as_ref() {
-                        Some(p) => p.opts.checkpoint_interval.unwrap_or(std::time::Duration::from_secs(1)),
-                        None => return, // paged state torn down out from under us
-                    }
+            // The upgrade lives entirely under the gate lock (task64 §7d):
+            // `impl Drop for Store` counts strong references under that
+            // same lock, and this idle probe must never be a reference it
+            // cannot see — the only strong `Arc` this thread ever holds
+            // outside the lock is the one `in_flight` announces below.
+            let interval = {
+                let g = gate.state.lock();
+                if g.stop {
+                    return;
                 }
-                None => return, // store dropped while we were idle
+                match weak_inner.upgrade() {
+                    Some(inner) => {
+                        let r = inner.read();
+                        match r.paged.as_ref() {
+                            Some(p) => p.opts.checkpoint_interval.unwrap_or(std::time::Duration::from_secs(1)),
+                            None => return, // paged state torn down out from under us
+                        }
+                    }
+                    None => return, // store dropped while we were idle
+                }
             };
             let mut has_work = wake.0.lock();
             if !*has_work {
@@ -4413,7 +4523,20 @@ fn checkpointer_loop(
             }
         }
 
-        let Some(inner) = weak_inner.upgrade() else { return };
+        // In-flight window (task64 §7d). Declared BEFORE `inner` so it is
+        // dropped AFTER it: `in_flight` is cleared only once this thread
+        // holds no strong reference at all, which is what lets a waiting
+        // `Store::drop` be the one that runs `StoreInner`'s destructor.
+        let _flight = InFlightGuard(&gate);
+        let inner = {
+            let mut g = gate.state.lock();
+            if g.stop {
+                return;
+            }
+            let Some(inner) = weak_inner.upgrade() else { return };
+            g.in_flight = true;
+            inner
+        };
         let (due_dirty, due_mem, due_time, stats) = {
             let g = inner.read();
             let Some(paged) = g.paged.as_ref() else { return };
@@ -4456,12 +4579,16 @@ fn checkpointer_loop(
             // A transient `Store`, alive only for this one checkpoint call
             // — see the struct doc for why nothing here is held any longer
             // than that.
+            // `inner` is MOVED, not cloned: while `in_flight` is set this
+            // thread holds exactly one strong reference, which is the
+            // count `impl Drop for Store` subtracts.
             let store = Store {
-                inner: Arc::clone(&inner),
+                inner,
                 intents: Arc::clone(&intents),
                 next_writer_id: Arc::clone(&next_writer_id),
                 table_locks: Arc::clone(&table_locks),
                 checkpoint_lock: Arc::clone(&checkpoint_lock),
+                ckpt_gate: Some(Arc::clone(&gate)),
             };
             // I-5 (final-review wave): `checkpoint_impl` can still panic —
             // the dirty-node walk it drives faults pages in through the

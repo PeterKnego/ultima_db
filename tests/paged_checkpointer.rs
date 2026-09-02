@@ -365,3 +365,76 @@ fn dirty_bytes_trigger_fires_for_newly_created_nodes_on_a_live_attached_table() 
          that was credited in: settled at {settled} bytes"
     );
 }
+
+/// task64 §7d: dropping the LAST `Store` handle while the background
+/// checkpointer is mid-checkpoint must block until that checkpoint has
+/// finished. Nothing may still be writing `pages.bin` or a root after
+/// `drop` returns, because the next thing an application (or
+/// `paging_matrix --restart`) does is open a second `Store` on the same
+/// directory, and two writers on one page file corrupt it: the paging
+/// gate's A cell recovered a self-consistent root and then read zeros at an
+/// offset only the second store's own checkpoints could have written.
+/// Before the fix the worker's transient strong `Arc` was the last
+/// reference, `StoreInner` dropped on the worker itself, and the self-join
+/// guard turned the join into a detach.
+#[test]
+fn dropping_the_last_handle_waits_for_an_in_flight_background_checkpoint() {
+    let d = tempfile::tempdir().unwrap();
+    let opts = || {
+        PagedOptions::builder()
+            .checkpoint_dirty_bytes(1)
+            .checkpoint_interval_disabled()
+            .build()
+    };
+    const ROWS: u64 = 1_000_000;
+    let s = store_with(d.path(), opts());
+    write_rows(&s, ROWS);
+    s.checkpoint().unwrap(); // attach + page ids (a never-attached table cannot trip the dirty trigger)
+
+    let roots = || {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "root"))
+            .count()
+    };
+    let pages_after_first = s.paged_stats().unwrap().pages_written;
+    assert_eq!(roots(), 1);
+
+    {
+        // Every leaf CoW'd in one commit: far over the 1-byte trigger, so the
+        // background tick starts right behind the commit and has a million
+        // rows of leaves to rewrite — seconds of work, so it is still
+        // mid-write when we drop below.
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update_batch((1..=ROWS).map(|k| (k, Row { v: k + 1 })).collect()).unwrap();
+        w.commit().unwrap();
+    }
+    // Wait until the tick is demonstrably mid-write (pages appended past the
+    // first checkpoint's count); the file length is no witness, the page
+    // file is preallocated in large chunks.
+    let t0 = std::time::Instant::now();
+    while s.paged_stats().unwrap().pages_written <= pages_after_first {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "background checkpoint never started writing"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(roots(), 1, "precondition: the second checkpoint is still in flight (no second root yet) at drop time");
+
+    drop(s);
+
+    let r0 = roots();
+    assert_eq!(r0, 2, "drop must have waited for the in-flight checkpoint to finish: its root must already exist when drop returns");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(roots(), r0, "the root set changed after drop returned: a detached checkpoint is still writing");
+
+    let s2 = store_with(d.path(), opts());
+    s2.recover().unwrap();
+    let r = s2.begin_read(None).unwrap();
+    let t = r.open_table::<Row>("rows").unwrap();
+    for k in (1..=ROWS).step_by(997) {
+        assert_eq!(t.get(k), Some(&Row { v: k + 1 }), "key {k} wrong or missing after reopen");
+    }
+}

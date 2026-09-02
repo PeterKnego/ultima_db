@@ -397,6 +397,11 @@ impl<V> Value<V> {
     pub(crate) fn as_arc(&self) -> Option<&Arc<V>> {
         self.0.as_ref()
     }
+    // Real callers are the page codec (`persistence`-gated) and the
+    // block-leaf invariant checks in `persistence`-gated/test code, so
+    // without the feature this is dead — same shape as `Child::on_disk`'s
+    // note in `src/child.rs`.
+    #[allow(dead_code)]
     pub(crate) fn is_in_block(&self) -> bool {
         self.0.is_none()
     }
