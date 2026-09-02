@@ -576,13 +576,75 @@ open obligation before any published perf claim about this feature:
 
 Added by the Task 12 sweep (2026-09-02, details in §13):
 
-1. **Budget not enforced under pressured 60 s workloads (undiagnosed).**
-   Both local A cells ended at 174.8 MB resident vs a 64 MiB budget with
-   zero demotions during the run; the gate's C cell ended at 93 MB. Needs
-   a systematic-debugging pass, and `paging_check.py` should gain a
-   `resident_leaf_bytes_end <= budget * slack` assertion so the gate can
-   see it. Until then "hard cap" is a unit-test property, not a
-   demonstrated workload property.
+1. **Budget not enforced under pressured 60 s workloads — DIAGNOSED
+   2026-09-02, not fixed.** Both local A cells ended at 174.8 MB resident
+   vs a 64 MiB budget with zero demotions during the run; the gate's C
+   cell ended at 93 MB. Root cause from an env-gated trace of the demote
+   pass and checkpointer tick (temporary instrumentation, reverted; 30 s
+   A/zipf and C/zipf cells, 198 MiB cgroup, retention 1, same host as
+   §13.3), three compounding causes:
+
+   - **(a) Every demote batch loses the install race under a commit
+     stream.** `demote_pass_inner` reads `latest_version`, walks
+     `paged_demote` off-lock, then `install_paged_tables(version, ..)`
+     into *that* version. The harness commits once per write op
+     (~600 commits/s). Traced batches walked 272-2113 ms each and by
+     install time `latest_now` was 200-3000 versions past `version`;
+     under retention 1 the version was already gc'd, so all four
+     in-run batches returned `None` (`landed=false`) — nothing counted,
+     nothing freed from the live snapshot. Under retention N > 1 the
+     same batch *lands in the stale version* (`install_paged_tables`
+     only checks presence, not latest-ness), so it is counted and
+     `resident_leaf_bytes` is debited while the live latest keeps every
+     leaf — a silent counter drift, and the reason the retention-10 A
+     cell also showed zero: at 600 commits/s a 300 ms walk is already
+     >10 versions behind. The demote doc's "the next batch reads
+     `latest_version` fresh ... so the pass converges regardless"
+     assumes batches are faster than commits; under memory pressure
+     they are three orders of magnitude slower.
+   - **(b) The walk is 0.3-4.5 s per 1024 leaf-parents under swap**
+     (C: seven batches, median 1.56 s, max 4.53 s; A: median 0.74 s).
+     `demote_leaves` `make_mut`s every parent on the path (a fresh
+     ~1.5 KB node per leaf-parent), and calls `load_quiet(src).leaf_bytes()`
+     on every demotable leaf — one swap fault per leaf just to measure
+     it. At 5M rows / T=32 one batch is ~45% of the tree. The first tick
+     (also the *first checkpoint ever*: 87k pages written, load never
+     tripped the 256 MiB dirty trigger) took 20 s of A's 30 s window and
+     did not finish inside C's; that is why the 60 s C cell logged one
+     run and the A cells two. `MIN_INTER_RUN` is irrelevant at this
+     scale.
+   - **(c) Dirty leaves are never demotable, and the pre-first-checkpoint
+     counter is bogus.** A leaf modified since the last checkpoint has
+     no page id, so `paged_demote` skips it; in-run batches found 9-27
+     demotable leaves per 1024 parents because the hot zipf set is
+     dirty until the next 20 s checkpoint writes it. And because load
+     never credits `resident_leaf_bytes` for created leaves (the task63
+     F1 gap, reconciled only at checkpoint end), the very first pass
+     debited 478 MB from a 67 MB counter, read `-360,631,696`, decided
+     it was under budget after two batches, and quit — the end-of-tick
+     reconcile then reported 128.8 MB real.
+
+   **Why the gate is blind:** `paging_check.py` asserts DB faults/op,
+   OOM count, and recover time — never `resident_leaf_bytes_end` against
+   the budget.
+
+   **Fix direction (design, not started — needs a ruling):** split
+   decide from apply. Walk off-lock to *choose* (leaf-parent key,
+   child page ids) with no `make_mut` and no leaf deref (measure bytes
+   from the slot's cached length or accept `NODE_BYTES + n*size_of::<V>`
+   from the parent's entry count); then under `inner.write()` re-read
+   latest, re-apply to the *current* latest's parents (inner levels are
+   resident, so this is cheap), install at the current version, and
+   drop the superseded table outside the lock. That makes (a) land
+   every time and removes most of (b); (c)'s dirty-leaf floor is
+   inherent — under a sustained write workload the enforceable budget
+   is `budget` only *between* checkpoints, so either the checkpointer
+   must run far more often under pressure (dirty trigger scaled to the
+   budget, not a fixed 256 MiB) or the doc must say the cap excludes
+   the dirty set. The existing
+   `demote_pass_race_hook_dropped_install_does_not_bump_stats` test
+   pins today's lose-the-race behavior as correct and would have to
+   flip to "re-applies and lands".
 2. **Re-rule `shrink_retention_under_pressure` default.** Peter's
    2026-08-31 ruling (spec §9.5) was made on the 56x figure, which §13.4
    retracts. Keep-on is defensible on principle (budget declares memory
