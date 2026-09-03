@@ -948,3 +948,54 @@ every other `tests/paged_*.rs` file and
 `compare_benches/src/bin/paging_matrix.rs`. Formal-verification
 re-anchor: `formal/tla/wal/{cite-anchors.tsv,README.md,RESULTS.md,WalCrash.tla}`
 and its `mutations/`/`modes/`/root `.cfg` files.
+
+## 16. Scope ruling (Peter, 2026-09-03): ship as checkpoint format + lazy recovery
+
+**Ruling:** *"stop here, ship paged as checkpoint format + lazy recovery."*
+
+**Evidence that prompted it** — first same-host, durability-fair A/B of
+paged UltimaDB against RocksDB with the data set larger than the cgroup
+(5M rows, zipf, eventual, cgroup = in-memory footprint / 4 = 198 MiB, 64
+MiB leaf budget, n=1, ordering only; tree = 5f5ee20):
+
+| workload | ultima-paged | rocksdb |
+|---|---|---|
+| A (50/50) | 842 ops/s, p99 32 ms | 171,131 ops/s, p99 67 µs |
+| B (95/5) | 2,827 ops/s, p99 1.2 ms | 102,233 ops/s, p99 67 µs |
+
+RocksDB streamed its load to SSTs (17 MiB RSS at load, 229 MB on disk,
+70 MiB RSS in the run, ~3k swap-ins). Paged UltimaDB built the tree in
+memory (1,726 MiB RSS), was squeezed to ~190 MiB by the cgroup, and took
+1.5-1.6M swap-ins per minute with the page-file fault rate at only
+0.41-0.46/op: the leaf budget held, the memory *outside* it thrashed. The
+fairest paged number — the gate cells' post-restart phase, where the tree
+is recovered lazily and nothing is swapped — is 7.3k ops/s on A and 18k
+on C (§7d run), i.e. ~23x behind RocksDB on A even without the load-path
+artifact. That gap is structural (whole-leaf faults with a decode and an
+allocation each, CoW'd leaves that cannot leave memory until a checkpoint
+rewrites them, checkpointer ticks that stall readers), not a tuning
+residue. Raw data: `target/fs-paged/quick-ab-20260903-053531.{jsonl,md}`
+(untracked; local sandbox).
+
+**What ships.** Paged mode as: a self-contained checkpoint format
+(`pages.bin` + root records), lazy recovery (inner levels eager, leaves
+on first touch; ~0.15 s for 5M rows in the gate), a soft resident-leaf
+budget with a background checkpointer, per-table residency pinning, and
+the drop/checkpoint gate (§7d). All `make paging/check` assertions stay
+as shipped shape gates.
+
+**What is withdrawn.** Every "data set bigger than RAM stays reachable"
+throughput framing (README, crate doc, CLAUDE.md, task63 §1) is
+rewritten to "checkpoint format + lazy recovery; the working set still
+has to fit". The §14 items are re-classified:
+
+| item | status under this ruling |
+|---|---|
+| 1. NVMe lever re-run | not required — no throughput claim to validate |
+| 2. `shrink_retention_under_pressure` default | unchanged (on); principle-only, no lever claim |
+| 3. F6 confirmation | moot |
+| 4. honest-budget residency shrink | documented (changelog) |
+| 5. read-only saw-tooth / tick period / over-demotion | **known limitation, not planned** |
+| 6. drop-gate residual (pin / open tx as last reference) | documented, not planned |
+
+The two superpowers specs stay as design history (CLAUDE.md policy).

@@ -1,5 +1,8 @@
 # task63: Paged B-tree (stages 1+2) — config, metrics, and the consolidated record
 
+**Scope ruling (Peter, 2026-09-03):** paged mode ships as a *checkpoint format plus lazy
+recovery*, not as a larger-than-memory throughput mode — see task64 §16 for the RocksDB A/B
+that settled it. Read §1's "bigger than RAM stays reachable" as *reachable*, not *fast*.
 **Status:** Implemented (Tasks 1–14) and accepted (Task 16, `make paging/check` — all six
 assertions PASS, local/shape-only; see the "Acceptance (Task 16, local, shape only)" section at
 the end of this doc). §7 below is unchanged from Task 14 and still describes itself as

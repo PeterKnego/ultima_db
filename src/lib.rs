@@ -54,11 +54,14 @@
 //!   [`Store::bulk_load_batch`].
 //! - [`Persistence::paged`] opts a `Standalone`/`Smr` store into paged
 //!   checkpoints: table B-trees page against an on-disk node file instead
-//!   of a full-row checkpoint, so a data set bigger than RAM stays
-//!   reachable — quiet leaves demote back to disk under a
-//!   [`PagedOptions::memory_budget_bytes`] budget, and a background
-//!   checkpointer thread runs on dirty-bytes/interval triggers. See
-//!   `docs/tasks/task63_paged_btree.md` for the design.
+//!   of a full-row checkpoint, and recovery is lazy — inner levels load
+//!   eagerly, data leaves fault in on first touch. Quiet leaves demote
+//!   back to disk under a soft [`PagedOptions::memory_budget_bytes`]
+//!   budget, and a background checkpointer thread runs on
+//!   dirty-bytes/budget/interval triggers. It is a checkpoint format and a
+//!   recovery path, not a larger-than-memory throughput mode: the working
+//!   set still has to fit in memory. See `docs/tasks/task63_paged_btree.md`
+//!   for the design.
 //!
 //! # Correctness
 //!
