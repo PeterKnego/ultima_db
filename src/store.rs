@@ -631,12 +631,19 @@ pub struct Store {
     /// only covering checkpoint the slower one then deletes.
     #[cfg(feature = "persistence")]
     checkpoint_lock: Arc<Mutex<()>>,
+    /// Paged stores only (task64 §7d): the gate that lets the LAST
+    /// application handle's `Drop` wait for an in-flight background
+    /// checkpoint instead of leaving it running detached on the worker —
+    /// see [`CheckpointGate`] and `impl Drop for Store`.
+    #[cfg(feature = "persistence")]
+    ckpt_gate: Option<Arc<CheckpointGate>>,
 }
 
 /// A point-in-time snapshot of a paged store's paging counters. See
 /// [`Store::paged_stats`].
 #[cfg(feature = "persistence")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PagedStatsSnapshot {
     /// Total pages faulted in (data + index).
     pub page_faults: u64,
@@ -648,10 +655,36 @@ pub struct PagedStatsSnapshot {
     pub pages_written: u64,
     /// Leaves demoted back to on-disk by the evictor.
     pub leaves_demoted: u64,
+    /// Task 10, spec §6 ("Hard-cap clock eviction"): full sweeps performed
+    /// across every `demote_pass` call since the store opened, cumulative.
+    /// A pass with a memory budget configured cycles — repeats the sweep —
+    /// until the reconciled resident estimate is under budget or a whole
+    /// cycle proves nothing more is evictable (see
+    /// `Store::demote_pass_inner`'s doc), so this can jump by more than
+    /// one per checkpoint.
+    pub clock_cycles: u64,
+    /// Task 10: of `leaves_demoted`, how many landed on a pass's second
+    /// (or later) cycle rather than its first. `0` for a store whose
+    /// demote passes never need more than one cycle. The dominant source
+    /// is leaves still accessed-marked when the pass began, second-chanced
+    /// on cycle 1, evicted for real once nothing re-touched them by a
+    /// later cycle — but see [`crate::pagecodec::PagedStats::forced_evictions`]'s
+    /// doc (fix round 1, review Minor-5) for two rarer, non-second-chance
+    /// sources of the same counter.
+    pub forced_evictions: u64,
     /// Bytes reported dirty (a clean node CoW'd by a write).
     pub dirty_bytes: u64,
     /// Estimated resident (not-yet-demoted) leaf bytes, clamped to `0`.
     pub resident_leaf_bytes_est: u64,
+    /// Resident bytes reachable ONLY from a retained snapshot older than
+    /// the latest (task 9, spec §5 "Snapshot pins") — un-evictable by
+    /// `demote_pass` as it exists today, since it only ever demotes the
+    /// latest snapshot's tables. An exact walk total (dedup'd by node
+    /// pointer across every retained snapshot), re-based every checkpoint
+    /// alongside `resident_leaf_bytes_est` — see the F1 reconciliation walk
+    /// in `Store::checkpoint_impl_paged`. `0` for a store with
+    /// `num_snapshots_retained(1)` (nothing but the latest ever retained).
+    pub pinned_leaf_bytes: u64,
     /// Number of times the background checkpointer thread (task12) has
     /// actually invoked a checkpoint — bumped once per attempt, whether or
     /// not it succeeded. `0` for a store with no memory budget, no dirty
@@ -697,8 +730,11 @@ impl PagedStatsSnapshot {
             index_page_faults: s.index_page_faults.load(Ordering::Relaxed),
             pages_written: s.pages_written.load(Ordering::Relaxed),
             leaves_demoted: s.leaves_demoted.load(Ordering::Relaxed),
+            clock_cycles: s.clock_cycles.load(Ordering::Relaxed),
+            forced_evictions: s.forced_evictions.load(Ordering::Relaxed),
             dirty_bytes: s.dirty_bytes.load(Ordering::Relaxed),
             resident_leaf_bytes_est: s.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64,
+            pinned_leaf_bytes: s.pinned_leaf_bytes.load(Ordering::Relaxed),
             checkpointer_runs: s.checkpointer_runs.load(Ordering::Relaxed),
             dead_pages_punched: s.dead_pages_punched.load(Ordering::Relaxed),
             dead_pages_dropped: s.dead_pages_dropped.load(Ordering::Relaxed),
@@ -883,7 +919,8 @@ impl Store {
         });
         let mut snapshots = BTreeMap::new();
         snapshots.insert(0, empty);
-        let store = Self {
+        #[allow(unused_mut)]
+        let mut store = Self {
             inner: Arc::new(RwLock::new(StoreInner {
                 snapshots,
                 latest_version: 0,
@@ -920,6 +957,8 @@ impl Store {
             table_locks: Arc::new(TableLockTable::new()),
             #[cfg(feature = "persistence")]
             checkpoint_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "persistence")]
+            ckpt_gate: None,
         };
 
         // Start the background checkpointer (task12) whenever this store
@@ -934,6 +973,7 @@ impl Store {
         {
             let has_paged = store.inner.read().paged.is_some();
             if has_paged {
+                store.ckpt_gate = Some(Arc::new(CheckpointGate::default()));
                 let checkpointer = Checkpointer::start(&store)?;
                 store.inner.write().checkpointer = Some(checkpointer);
             }
@@ -991,6 +1031,31 @@ impl Store {
     /// API targets) there is no interleaved committer, so the direct call is
     /// safe.
     ///
+    /// **Paged-store caveat (task 11 finding, tracked, not yet fixed):** in a
+    /// store configured with [`Persistence::paged`](crate::persistence::Persistence::paged)
+    /// and `memory_budget_bytes`, a checkpoint's demote pass can *re-publish*
+    /// a version — installing a **new** `Arc<Snapshot>` at that version's map
+    /// key — whenever that version is still [`Store::latest_version`] at the
+    /// moment the pass runs. A [`VersionPin`] taken **before** that
+    /// re-publish keeps only the old, now-disconnected `Arc` alive; the
+    /// store's own snapshot map holds a *different* `Arc` under the same
+    /// key, which the pin does not protect. With the default
+    /// [`PagedOptions::shrink_retention_under_pressure`](crate::persistence::PagedOptions::shrink_retention_under_pressure)
+    /// (`true`), adaptive retention shrink can then collect that
+    /// now-unprotected map entry immediately, and a later
+    /// `Store::begin_read(Some(pin.version()))` fails with
+    /// [`Error::VersionNotFound`] even though the pin is still alive and
+    /// still (invisibly) holding the stale snapshot's memory — see
+    /// `paged_shrink_orphans_latest_version_pin` in
+    /// `tests/paged_accounting.rs` for a reproduction. Two safe patterns:
+    /// pin a version only **after** a newer commit has superseded it (once a
+    /// version is no longer `latest_version`, the demote pass never touches
+    /// its snapshot again, so the `Arc` identity is permanently stable); or,
+    /// for the SMR pin-while-latest handoff pattern this API targets above,
+    /// configure `shrink_retention_under_pressure(false)` so retention never
+    /// shrinks below the configured `StoreConfig::num_snapshots_retained`
+    /// window.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1006,7 +1071,10 @@ impl Store {
     ///     let store = store.clone();
     ///     move || {
     ///         // While `pin` is alive this cannot fail with VersionNotFound,
-    ///         // no matter how far the writer has committed past it.
+    ///         // no matter how far the writer has committed past it --
+    ///         // this store is neither paged nor budget-limited, so the
+    ///         // paged-store re-publish caveat documented above this
+    ///         // example does not apply here.
     ///         let rtx = store.begin_read(Some(pin.version())).unwrap();
     ///         // ... stream the snapshot from `rtx`, then drop both ...
     ///         drop(rtx);
@@ -1215,6 +1283,12 @@ impl Store {
     /// [`Store::register_table_keyed`]. (This method cannot itself take the
     /// key parameter: Rust has no default type parameters on functions, so
     /// `register_table::<R>(..)` would stop compiling.)
+    ///
+    /// On a store built with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged), this
+    /// returns [`Error::PagedNeedsClone`] — use
+    /// [`Store::register_table_paged`] instead, which also works (as plain
+    /// registration) on a non-paged store.
     #[cfg(feature = "persistence")]
     pub fn register_table<R: crate::persistence::Record>(&self, name: &str) -> Result<()> {
         self.register_table_keyed::<R, u64>(name)
@@ -1234,12 +1308,72 @@ impl Store {
     /// without this check the registry and the snapshot could drift apart —
     /// and every consumer that trusts the registry, notably the snapshot wire
     /// format, would then act on the wrong key type.
+    ///
+    /// On a store built with
+    /// [`Persistence::paged`](crate::persistence::Persistence::paged), this
+    /// returns [`Error::PagedNeedsClone`] — use
+    /// [`Store::register_table_paged_keyed`] instead.
     #[cfg(feature = "persistence")]
     pub fn register_table_keyed<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
         &self,
         name: &str,
     ) -> Result<()> {
+        self.register_table_impl::<R, K>(name, None)
+    }
+
+    /// Register a table type for persistence on a store whose paged leaves
+    /// need `R: Clone` for their block-CoW (`NodeSource::clone_value`) — the
+    /// required registration for a paged store's tables. Also correct (and
+    /// unconditionally accepted) on a non-paged store: it behaves exactly
+    /// like [`Store::register_table`] there, since `clone_value` is never
+    /// called on a tree with no paged source attached. There is no reason
+    /// *not* to use this over [`Store::register_table`] for a table type
+    /// that implements `Clone` — it is strictly additive.
+    ///
+    /// Registers the `u64`-keyed table `Table<R>`. For a table with an
+    /// explicit primary-key type, use
+    /// [`Store::register_table_paged_keyed`].
+    #[cfg(feature = "persistence")]
+    pub fn register_table_paged<R: crate::persistence::Record + Clone>(
+        &self,
+        name: &str,
+    ) -> Result<()> {
+        self.register_table_paged_keyed::<R, u64>(name)
+    }
+
+    /// [`Store::register_table_paged`] for a table keyed by `K`. See
+    /// [`Store::register_table_keyed`]'s doc for the key-type-match and
+    /// registration-ordering rules this shares.
+    #[cfg(feature = "persistence")]
+    pub fn register_table_paged_keyed<
+        R: crate::persistence::Record + Clone,
+        K: crate::primary_key::PrimaryKey,
+    >(
+        &self,
+        name: &str,
+    ) -> Result<()> {
+        self.register_table_impl::<R, K>(name, Some(<R as Clone>::clone as fn(&R) -> R))
+    }
+
+    /// Shared body of `register_table_keyed`/`register_table_paged_keyed`.
+    /// `clone` is `Some` only from the paged-registration entry points; a
+    /// `None` on a store whose persistence is paged is refused up front
+    /// with [`Error::PagedNeedsClone`] (checked here, under the same write
+    /// lock as the rest of the registration, so it can never race a
+    /// concurrent `Persistence` change — there is none: paged-ness is fixed
+    /// at `Store::new`).
+    #[cfg(feature = "persistence")]
+    fn register_table_impl<R: crate::persistence::Record, K: crate::primary_key::PrimaryKey>(
+        &self,
+        name: &str,
+        clone: Option<fn(&R) -> R>,
+    ) -> Result<()> {
         let mut inner = self.inner.write();
+        if clone.is_none() && inner.paged.is_some() {
+            return Err(Error::PagedNeedsClone {
+                table: name.to_string(),
+            });
+        }
         if let Some(live) = inner
             .snapshots
             .get(&inner.latest_version)
@@ -1254,7 +1388,7 @@ impl Store {
                     "cannot register table: registry is in use (checkpoint in progress?)".into(),
                 )
             })?
-            .register::<R, K>(name)
+            .register_impl::<R, K>(name, clone)
     }
 
     /// Write a checkpoint of the latest snapshot to disk.
@@ -1471,6 +1605,152 @@ impl Store {
         Ok(version)
     }
 
+    /// Task 9's F1 reconciliation walk (pin-aware, spec §5 "Fault-in,
+    /// demotion, and pin-aware accounting") plus the M-1 `last_root`
+    /// refresh, factored out of `checkpoint_impl_paged`'s phase 3 so task
+    /// 11's shrink decision (spec §6 "order of weapons") can call this
+    /// TWICE within one checkpoint tick: once right after `demote_pass` to
+    /// learn the FRESH `resident_leaf_bytes`/`pinned_leaf_bytes` that
+    /// decision needs (`demote_pass` only ever updates `resident_leaf_bytes`
+    /// live, via its own per-batch `fetch_sub` — `pinned_leaf_bytes` is
+    /// exclusively this walk's output), and again afterward — "the next
+    /// reconcile settles the counters" — to publish the post-shrink truth.
+    /// Safe to call any number of times in a row: the M-1 `last_root`
+    /// re-point is idempotent (a harmless no-op re-point when nothing
+    /// changed since the last call — see its own comment below), and the F1
+    /// walk always re-derives both counters from scratch against whatever
+    /// `inner.snapshots` currently holds.
+    ///
+    /// `version` is the version whose live snapshot `last_root` should
+    /// point at — always `checkpoint_impl_paged`'s own `snap.version`, the
+    /// version this checkpoint call is naming.
+    ///
+    /// Returns the `(resident, pinned)` pair it just stored (in
+    /// `PagedStats`' own units — `resident_leaf_bytes` is a signed counter
+    /// that can transiently go negative, see the F1 comment below, but a
+    /// walk-derived value never is) so a caller that needs the numbers
+    /// (task 11's shrink decision) doesn't have to re-load the atomics
+    /// right back out.
+    #[cfg(feature = "persistence")]
+    fn reconcile_paged_stats(&self, version: u64) -> (u64, u64) {
+        // M-1 (final-review wave): `demote_pass` just published a demoted
+        // table (or several) as a same-version re-publish at `version` (see
+        // `PagedState::last_root`'s doc) via `install_paged_tables` — but
+        // `last_root` may still point at the *pre*-demotion snapshot, which
+        // keeps every leaf `demote_pass` just replaced pinned alive in
+        // memory through that stale `Arc` for a whole extra checkpoint
+        // cycle (until the *next* checkpoint's `p.last_root = Some((current,
+        // ..))` finally drops it). Re-reading the live snapshot at this
+        // same version and re-pointing `last_root` at it releases that pin
+        // one checkpoint early. Safe regardless of whether `demote_pass`
+        // actually touched `version` (a concurrent commit can move
+        // `latest_version` past it before `demote_pass` reads its own
+        // target — see `demote_pass_inner`'s doc): either it demoted this
+        // exact version, in which case this is exactly the freed-pin update
+        // intended, or it demoted a newer one, in which case re-reading
+        // `version` yields the same content `last_root` already held (a
+        // harmless no-op re-point). Guarded with `if let` (not `.expect`)
+        // for the version being gone from `inner.snapshots` entirely —
+        // cannot happen from `checkpoint_impl_paged`'s own calls (the `Arc`
+        // `last_root` already holds keeps `gc()`'s `strong_count == 1`
+        // eviction check from ever collecting it while `checkpoint_lock`
+        // still serializes against any other checkpoint call), but costs
+        // nothing to handle rather than assume.
+        let mut inner = self.inner.write();
+        let refreshed = inner.snapshots.get(&version).cloned();
+        if let (Some(p), Some(refreshed)) = (inner.paged.as_mut(), refreshed) {
+            p.last_root = Some((refreshed, version));
+        }
+
+        // F1 (spike/paged-write-path, 2026-08-31): reconcile the
+        // resident-leaf soft counter against an exact walk of the
+        // post-demote tables. `Child::resident_new` credits only
+        // `dirty_bytes` — a node CREATED in memory (bulk load, insert
+        // traffic, CoW splits) never credits `resident_leaf_bytes`, while
+        // the demote debit is unconditional, so a store built by writes
+        // drives the i64 counter permanently negative after its first
+        // demote-everything checkpoint. The `.max(0)` clamp then reads 0
+        // forever: `due_mem` (the checkpointer's memory-budget trigger) and
+        // the fault-in budget wake in `PagedSource::read_node` both go
+        // structurally silent, so between interval ticks nothing ever
+        // demotes and the resident set grows unbounded under write load —
+        // kernel-swap thrash in any bounded-memory deployment. Re-basing
+        // the counter here (the walk touches only always-resident inner
+        // levels via `load_quiet` + `is_loaded` leaf checks — no fault-ins)
+        // makes fault-in credits start from an accurate floor each
+        // checkpoint; drift until the next reconcile is only the
+        // CoW-created leaves of the interval, and the store() racing a
+        // concurrent fault-in's fetch_add costs at most one NODE_BYTES of
+        // that bounded drift — this is a soft trigger, not an invariant.
+        //
+        // Task 9 (pin-aware reconciliation, spec §5 "Snapshot pins"):
+        // `demote_pass` only demotes the LATEST snapshot's tables, but a
+        // leaf it "frees" can still be reachable — same `Child` Arc — from
+        // an older snapshot `num_snapshots_retained` keeps alive; that
+        // share never gets a demote debit, so the bytes stay resident while
+        // `resident_leaf_bytes` reports them gone. Walking every retained
+        // snapshot newest-first against ONE shared ptr-identity `seen` set
+        // (the `Child::same_node`/`BTree::diff` trick, across snapshot
+        // roots) recovers the true total cheaply (CoW sharing means most of
+        // an older snapshot's walk just retraces already-`seen` pointers):
+        // the latest snapshot's own deduped total is `resident`; the rest,
+        // counted only once an older snapshot's walk runs, is `pinned` —
+        // un-evictable by `demote_pass` today, enforced on directly by task
+        // 11 (this function's caller). Same no-fault-in contract as the
+        // walk above.
+        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        // `.rev()`: `inner.snapshots` is a `BTreeMap<version, _>`, so this
+        // visits highest version first. First iteration peeled out (review
+        // M-3): "resident" IS "the latest snapshot's own walk", and writing
+        // that directly (rather than an `if i == 0` inside a loop that runs
+        // for every snapshot) says so.
+        let mut retained = inner.snapshots.values().rev();
+        let resident = match retained.next() {
+            Some(latest_snap) => {
+                // Review M-1: the split above between "first iteration =
+                // latest" and "the rest = older, retained" relies on
+                // `inner.snapshots`' max key always being `latest_version`
+                // — true by construction (every insert site pairs with
+                // `latest_version = v.max(..)`), but only ever stated in
+                // prose before this. Enforce it.
+                debug_assert_eq!(
+                    latest_snap.version, inner.latest_version,
+                    "F1 reconcile: the highest-versioned retained snapshot must be \
+                     latest_version -- resident is only correct as latest's own walk \
+                     if this holds"
+                );
+                latest_snap
+                    .tables
+                    .iter()
+                    .filter(|(n, _)| inner.registry.contains(n))
+                    .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                    .sum::<usize>()
+            }
+            // No snapshots at all: nothing to reconcile. Shouldn't happen
+            // in practice (a store always has at least its initial
+            // version), but a walk over nothing is a well-defined 0, not a
+            // panic.
+            None => 0,
+        };
+        let mut total = resident;
+        for retained_snap in retained {
+            total += retained_snap
+                .tables
+                .iter()
+                .filter(|(n, _)| inner.registry.contains(n))
+                .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                .sum::<usize>();
+        }
+        let pinned = total - resident;
+        if let Some(p) = inner.paged.as_ref() {
+            p.stats
+                .resident_leaf_bytes
+                .store(resident as i64, Ordering::Relaxed);
+            p.stats.pinned_leaf_bytes.store(pinned as u64, Ordering::Relaxed);
+        }
+        (resident as u64, pinned as u64)
+    }
+
     /// The paged checkpoint path: writes every registered table's dirty
     /// (never-yet-on-disk) B-tree nodes to the page file, then a single
     /// root record (`checkpoint_{version}.root`) naming each table's
@@ -1629,16 +1909,31 @@ impl Store {
             let needs_install = newly_attached || flushed.is_some() || wrote_pages > 0;
             let final_table = flushed.unwrap_or(boxed);
             // Each page this table just wrote corresponds to one dirtied
-            // node `note_dirty` already credited into `dirty_bytes` at the
-            // same `Child::NODE_BYTES`-per-node estimate (see
-            // `PagedSource::note_dirty`/`Child::make_mut`) — `paged_node_bytes`
-            // is this table's own `(K, R)` node size, the type-erased
-            // accessor `Store::demote_pass` already relies on for the same
-            // reason (`MergeableTable::paged_node_bytes`'s doc). Approximate
-            // like `resident_leaf_bytes` already is (see its doc): `wrote_pages`
-            // covers this table's secondary indexes too, whose `(IK, K)` node
-            // size can differ from the data tree's, applied uniformly here —
-            // fine for a trigger-threshold comparison, not exact accounting.
+            // node `note_dirty` already credited into `dirty_bytes` — but
+            // (task 8) not uniformly: `Child::resident_new`/`make_mut`
+            // credit a data-tree *block* leaf at its real
+            // `BTreeNode::leaf_bytes()` (`NODE_BYTES` plus its value
+            // block), and everything else (inner nodes, every node of a
+            // secondary index tree — never block-backed) at flat
+            // `Child::NODE_BYTES`. This subtraction stays flat regardless:
+            // `paged_node_bytes` is this table's own `(K, R)` node size —
+            // the same type-erased accessor `Store::demote_pass` relies on
+            // for the same reason (`MergeableTable::paged_node_bytes`'s
+            // doc) — applied uniformly to every page this call wrote,
+            // `wrote_pages` covering this table's data leaves *and* its
+            // secondary indexes' differently-shaped `(IK, K)` nodes alike.
+            // So a table with real block leaves is now credited high (real
+            // bytes) and always debited low (flat) here: `dirty_bytes`
+            // trends to over-report for such a table, and
+            // `checkpoint_dirty_bytes`-triggered checkpoints fire somewhat
+            // more eagerly than the configured threshold strictly implies.
+            // Accepted, not fixed: safe direction (an early trigger costs
+            // an extra checkpoint, never a missed one — unlike the
+            // `resident_leaf_bytes` debit task 8 *did* fix, whose old flat
+            // math could leave the memory-budget trigger silent), and
+            // matches `resident_leaf_bytes`'s own pre-task-8 doc precedent
+            // of trading exactness for a cheap, no-I/O trigger-threshold
+            // comparison rather than precise accounting.
             dirty_bytes_written = dirty_bytes_written
                 .saturating_add(wrote_pages.saturating_mul(final_table.paged_node_bytes() as u64));
             if needs_install {
@@ -1733,84 +2028,79 @@ impl Store {
         // a memory budget: `None` (the default) means every leaf, once
         // faulted in, stays resident forever (spec §8), and an explicit
         // `checkpoint()` with no budget set must stay a pure write-and-root
-        // operation, not silently start evicting. The resident-bytes
-        // trigger that would call `demote_pass` on its own schedule,
-        // independent of `memory_budget_bytes` being set at all, is task12.
+        // operation, not silently start evicting.
         //
-        // Every leaf this checkpoint just wrote in phases 1-2 is exactly
-        // what makes this pass productive: those leaves went from dirty
-        // (not demotable — `paged_demote` only ever touches a slot that is
-        // both loaded *and* has a page id) to resident-clean the moment
-        // `write_dirty` assigned them ids above, so a demote pass run right
-        // after a checkpoint is the point at which the largest possible
-        // batch of newly-quiet leaves is demotable at once.
-        if opts.memory_budget_bytes.is_some() {
+        // Every leaf this checkpoint just wrote in phases 1-2 went from
+        // dirty (never demotable) to resident-clean the moment `write_dirty`
+        // assigned it a page id, so a pass run now sees the largest possible
+        // batch of newly-quiet leaves. The reconcile BEFORE the pass is
+        // task64 §14.1(c): a built leaf never credits `resident_leaf_bytes`
+        // (only fault-ins do), so on the first checkpoint the pass's exit
+        // check would read 0 and quit after its second-chance sweep, leaving
+        // the tree fully resident; an exact-walk re-base first makes cycle 2 run.
+        if let Some(budget) = opts.memory_budget_bytes {
+            self.reconcile_paged_stats(snap.version);
             self.demote_pass()?;
 
-            // M-1 (final-review wave): `demote_pass` just published a
-            // demoted table (or several) as a same-version re-publish at
-            // `snap.version` (see `PagedState::last_root`'s doc) via
-            // `install_paged_tables` — but `last_root` above still points
-            // at `current`, the *pre*-demotion snapshot, which keeps every
-            // leaf `demote_pass` just replaced pinned alive in memory
-            // through that stale `Arc` for a whole extra checkpoint cycle
-            // (until the *next* checkpoint's `p.last_root = Some((current,
-            // ..))` finally drops it). Re-reading the live snapshot at this
-            // same version and re-pointing `last_root` at it releases that
-            // pin one checkpoint early. Safe regardless of whether
-            // `demote_pass` actually touched `snap.version` (a concurrent
-            // commit can move `latest_version` past it before `demote_pass`
-            // reads its own target — see `demote_pass_inner`'s doc): either
-            // it demoted this exact version, in which case this is exactly
-            // the freed-pin update intended, or it demoted a newer one, in
-            // which case re-reading `snap.version` yields the same content
-            // `current` already held (a harmless no-op re-point). Guarded
-            // with `if let` (not `.expect`) for the version being gone from
-            // `inner.snapshots` entirely — cannot happen from *this* call
-            // (the `Arc` `last_root` already holds keeps `gc()`'s
-            // `strong_count == 1` eviction check from ever collecting it
-            // while `checkpoint_lock` still serializes against any other
-            // checkpoint call), but costs nothing to handle rather than
-            // assume.
-            let mut inner = self.inner.write();
-            let refreshed = inner.snapshots.get(&snap.version).cloned();
-            if let (Some(p), Some(refreshed)) = (inner.paged.as_mut(), refreshed) {
-                p.last_root = Some((refreshed, snap.version));
-            }
+            // Fresh reconcile right after the capped demote pass — Task 11
+            // (spec §6 "order of weapons", step 2) needs an up-to-date
+            // `pinned_leaf_bytes` to decide whether to shrink, and
+            // `demote_pass` never updates that counter itself (only this
+            // walk does): without running it here first, the decision below
+            // would be judging pin pressure off whatever the PREVIOUS
+            // checkpoint's walk happened to leave behind. See
+            // `Store::reconcile_paged_stats`'s doc for the walk itself.
+            let (resident, pinned) = self.reconcile_paged_stats(snap.version);
 
-            // F1 (spike/paged-write-path, 2026-08-31): reconcile the
-            // resident-leaf soft counter against an exact walk of the
-            // post-demote tables. `Child::resident_new` credits only
-            // `dirty_bytes` — a node CREATED in memory (bulk load, insert
-            // traffic, CoW splits) never credits `resident_leaf_bytes`,
-            // while the demote debit above is unconditional, so a store
-            // built by writes drives the i64 counter permanently negative
-            // after its first demote-everything checkpoint. The `.max(0)`
-            // clamp then reads 0 forever: `due_mem` (the checkpointer's
-            // memory-budget trigger) and the fault-in budget wake in
-            // `PagedSource::read_node` both go structurally silent, so
-            // between interval ticks nothing ever demotes and the resident
-            // set grows unbounded under write load — kernel-swap thrash in
-            // any bounded-memory deployment. Re-basing the counter here
-            // (the walk touches only always-resident inner levels via
-            // `load_quiet` + `is_loaded` leaf checks — no fault-ins) makes
-            // fault-in credits start from an accurate floor each
-            // checkpoint; drift until the next reconcile is only the
-            // CoW-created leaves of the interval, and the store() racing a
-            // concurrent fault-in's fetch_add costs at most one
-            // NODE_BYTES of that bounded drift — this is a soft trigger,
-            // not an invariant.
-            let latest = inner.latest_version;
-            let resident: usize = inner.snapshots[&latest]
-                .tables
-                .iter()
-                .filter(|(n, _)| inner.registry.contains(n))
-                .map(|(_, t)| t.paged_resident_leaf_bytes())
-                .sum();
-            if let Some(p) = inner.paged.as_ref() {
-                p.stats
-                    .resident_leaf_bytes
-                    .store(resident as i64, Ordering::Relaxed);
+            // Task 11 (spec §5 "enforcement arm" / §6 "order of weapons"
+            // step 2, `PagedOptions::shrink_retention_under_pressure`,
+            // default ON — Peter's ruling): the capped demote pass above
+            // only ever walks LATEST's own tree, so a leaf orphaned by
+            // writes and kept alive only by an older RETAINED snapshot
+            // (`pinned`, task 9) is invisible to it by construction. When
+            // pins are large enough that they alone could cover the whole
+            // remaining excess over budget, shrinking retention is the only
+            // lever left: gc down to a floor of latest — **plus possibly
+            // one more** (review fix round 1, M-2): the `reconcile_paged_stats`
+            // call just above re-points `PagedState::last_root` at
+            // `snap.version`'s live `Arc`, so if a concurrent commit moved
+            // `latest_version` past `snap.version` between that call and
+            // this gc, `snap.version`'s entry has `strong_count >= 2` (the
+            // map's own reference plus `last_root`'s) and survives this
+            // pass regardless of retention — plus every explicit
+            // `VersionPin`/live `ReadTx` — `gc_inner_with_retain`'s existing
+            // `Arc::strong_count == 1` filter already spares those (that
+            // floor IS the spec's floor; nothing new is added here).
+            //
+            // `excess = total - budget`, `pinned >= excess` — algebraically
+            // this also covers (and simplifies to) the common case where
+            // `demote_pass` already converged `resident <= budget` on its
+            // own and `pinned` alone is now the entire reason the store is
+            // still over budget, which is exactly the scenario this task
+            // exists to fix (spec §1: the NVMe 56x pin lever).
+            if opts.shrink_retention_under_pressure {
+                let total = resident.saturating_add(pinned);
+                if total > budget {
+                    let excess = total - budget;
+                    if pinned >= excess {
+                        let evicted = {
+                            let mut inner = self.inner.write();
+                            gc_inner_with_retain(&mut inner, 1)
+                        };
+                        // "the next reconcile settles the counters": only
+                        // worth re-walking if gc actually dropped something
+                        // (review fix round 1, M-1) — the all-pinned steady
+                        // state (every retained snapshot protected by a live
+                        // `ReadTx`/`VersionPin`) evicts nothing, and the
+                        // numbers this tick's first reconcile already
+                        // published above are still accurate in that case,
+                        // so a second full snapshot walk would be pure
+                        // waste on every such tick.
+                        if evicted > 0 {
+                            self.reconcile_paged_stats(snap.version);
+                        }
+                    }
+                }
             }
         }
 
@@ -2043,32 +2333,40 @@ impl Store {
     /// [`PagedOptions::memory_budget_bytes`](crate::persistence::PagedOptions::memory_budget_bytes)
     /// is `Some` — see that call site.
     ///
-    /// Each batch is one [`Store::install_paged_tables`] call: this reads
-    /// `latest_version`'s table under a brief `inner.read()`, calls
-    /// [`MergeableTable::paged_demote`] on it *off* the store lock (the CoW
-    /// walk it performs can be large), then hands the demoted clone to
-    /// `install_paged_tables` for its own single-`inner.write()` swap. No
-    /// lock is held across the walk itself, and none is held between
-    /// batches — deliberately, so a demote pass never blocks commits (or a
-    /// checkpoint's own phase-1/2 writers) for its whole duration, only for
-    /// each swap.
+    /// Each batch is a *decide* then a chunked *apply* (task64 follow-up;
+    /// the diagnosis is in `docs/tasks/task64_paged_leaf_value_blocks.md`
+    /// §14.1). Decide: read `latest_version`'s table under a brief
+    /// `inner.read()` and call [`MergeableTable::paged_demote_plan`] on it
+    /// *off* the store lock — the plan walk touches only slot atomics
+    /// (never a leaf, never a `make_mut`), so it stays cheap even when the
+    /// leaves it is choosing are swapped out. Apply: for each planned chunk
+    /// of [`Self::DEMOTE_APPLY_CHUNK`] leaf-parents, take `inner.write()`,
+    /// re-read the *current* latest, [`MergeableTable::paged_demote_apply`]
+    /// the chunk to that table, and re-publish it at that version
+    /// ([`Self::demote_apply_chunk`]). No lock is held across the plan walk
+    /// and none between chunks, so a pass never blocks commits for its
+    /// whole duration, only for each chunk's apply.
     ///
-    /// That gap is also why `latest_version` is re-read every batch instead
-    /// of once: a commit can land between this batch's read and its
-    /// install, forking the store's `latest_version` past the version this
-    /// batch demoted. `install_paged_tables` still installs into the
-    /// version it captured (never silently redirecting to a new
-    /// `latest_version` — see its own doc), so that batch's demotion
-    /// becomes unreachable from any live snapshot the moment the commit
-    /// promotes past it: nothing is lost (the commit's fork carries the
-    /// pre-demotion, fully-resident table forward, which is simply
-    /// correct), only that batch's eviction work goes to waste. The next
-    /// batch reads `latest_version` fresh and demotes the commit's newer
-    /// table instead, so the pass converges regardless.
+    /// The apply is deliberately made against whatever is latest *at
+    /// install time*, never the version the plan was read from. The
+    /// previous design planned and installed in one step against the
+    /// version it had read, and under a per-op commit stream every batch
+    /// lost that race: a swap-bound walk of 0.3-4.5 s saw hundreds to
+    /// thousands of commits land in between, so its install targeted a
+    /// version that was either gc'd (`None`, nothing counted) or stale
+    /// (landed in a snapshot no reader would fork from, counted but
+    /// wasted — a silent `resident_leaf_bytes` drift). Pressured write
+    /// cells ended at 2.7x the budget with zero leaves demoted in 60 s.
+    /// Planning against one version and applying to a later one is sound
+    /// because a plan is just a set of leaf page ids in a key range: a
+    /// leaf that was split, merged, rewritten (new id) or re-faulted
+    /// dirty since the plan simply is not matched by the apply.
     ///
-    /// Returns the total number of leaves demoted across every table —
-    /// counting only batches whose [`Store::install_paged_tables`] call
-    /// actually landed (see below for why that matters).
+    /// Returns the total number of leaves demoted across every table and
+    /// every cycle (see [`Store::demote_pass_inner`]'s doc for what a
+    /// "cycle" is) — counting only chunks whose apply actually installed
+    /// (a chunk that matches nothing on the current tree installs nothing
+    /// and counts nothing).
     #[cfg(feature = "persistence")]
     pub(crate) fn demote_pass(&self) -> Result<usize> {
         self.demote_pass_inner(
@@ -2077,16 +2375,143 @@ impl Store {
         )
     }
 
+    /// Task 10 hard cap (fix round 1, review Critical-1): the maximum
+    /// cycles one [`Store::demote_pass_inner`] call runs before returning
+    /// regardless of `resident <= budget` or the two-consecutive-zero
+    /// termination clause — see that function's doc for why, under
+    /// concurrent readers, both of those can stay unsatisfied forever.
+    /// This is the backstop that makes `demote_pass_inner` (and so
+    /// `checkpoint()`, which holds `checkpoint_lock` across it) always
+    /// return. The documented convergence case needs exactly 2 cycles;
+    /// this is pure headroom for multi-table staggering (one table's own
+    /// convergence landing on a different cycle than another's), not a
+    /// value tuned to any specific workload — raising it only trades a
+    /// longer worst-case pass for a better chance of landing exactly on
+    /// budget, never correctness (a pass that hits the cap still leaves
+    /// the store correct, just possibly still over budget until the next
+    /// checkpoint's pass tries again).
+    #[cfg(feature = "persistence")]
+    const MAX_DEMOTE_CYCLES: u64 = 8;
+
+    /// Leaf-parents per `inner.write()` acquisition when a demote plan is
+    /// applied (task64 follow-up, decide/apply split). Bounds how long one
+    /// apply holds the store write lock — each applied parent is one
+    /// `make_mut` (its resident children's `Arc` counts are bumped, which
+    /// touches those leaves) — while keeping the per-chunk fixed cost
+    /// (root-to-parent path clone, snapshot re-publish) amortised over
+    /// enough parents to matter. `PagedOptions::demote_batch` (1024) is
+    /// the *plan* granularity, i.e. one clock-hand step; this is the
+    /// *install* granularity inside it.
+    #[cfg(feature = "persistence")]
+    const DEMOTE_APPLY_CHUNK: usize = 64;
+
+    /// Apply one planned demote chunk to the CURRENT latest snapshot's
+    /// table `name`, under a single `inner.write()`, and re-publish the
+    /// result at that same version (no WAL entry, no version bump — the
+    /// same re-publish `install_paged_tables` does for a checkpoint).
+    /// Returns `None` when the table is gone from latest or has become
+    /// [`Residency::Resident`](crate::table::Residency::Resident) (stop
+    /// the pass for this table), `Some(None)` when the chunk matched
+    /// nothing on the current tree (nothing installed), and
+    /// `Some(Some((leaves, bytes)))` for a landed install. The superseded
+    /// table and snapshot `Arc`s are dropped after the lock is released.
+    #[cfg(feature = "persistence")]
+    fn demote_apply_chunk(&self, name: &str, chunk: &dyn std::any::Any) -> Option<Option<(usize, usize)>> {
+        let (result, _old_tbl, _old_snap) = {
+            let mut inner = self.inner.write();
+            let latest = inner.latest_version;
+            let cur = Arc::clone(inner.snapshots.get(&latest)?);
+            let cur_tbl = cur.tables.get(name)?;
+            if cur_tbl.residency() == crate::table::Residency::Resident {
+                return None;
+            }
+            let (new_tbl, demoted, demoted_bytes) = cur_tbl.paged_demote_apply(chunk);
+            if demoted == 0 {
+                return Some(None);
+            }
+            let mut tables = cur.tables.clone();
+            let old_tbl = tables.insert(name.to_string(), Arc::from(new_tbl));
+            let old_snap = inner
+                .snapshots
+                .insert(latest, Arc::new(Snapshot { version: latest, tables }));
+            if let Some(p) = inner.paged.as_ref() {
+                p.installs.fetch_add(1, Ordering::Relaxed);
+            }
+            (Some(Some((demoted, demoted_bytes))), old_tbl, old_snap)
+        };
+        result
+    }
+
     /// [`Store::demote_pass`]'s real body. Split out so tests can pass a
-    /// `race_hook` — invoked once per batch, right after that batch's
-    /// `(version, tbl)` is captured but before `paged_demote`/
-    /// `install_paged_tables` run — that deterministically forces the
-    /// window IMPORTANT-#1's fix closes: a `gc()` evicting `version` in
-    /// between the read above and the install below, which a plain
-    /// multi-threaded race test cannot reliably hit. `race_hook` is always
+    /// `race_hook` — invoked once per batch, after its plan is made against
+    /// the latest table but before any chunk is applied — that forces the
+    /// window the decide/apply split closes (task64 §7a): a commit + `gc()`
+    /// moving `latest_version` past, and evicting, the version the plan was
+    /// read from, which a multi-threaded race test cannot reliably hit. The
+    /// apply must land on the *new* latest regardless. `race_hook` is always
     /// `None` in production (the `demote_pass` wrapper above never passes
     /// one); see `demote_pass_race_hook_dropped_install_does_not_bump_stats`
     /// in this module's test suite for the one caller that does.
+    ///
+    /// Task 10, spec §6 ("Hard-cap clock eviction"): one call to this
+    /// function is a *pass*, and when a memory budget is configured, a
+    /// pass **cycles** — it repeats the full per-table sweep below, with
+    /// every table's cursor reset back to `None`, until the reconciled
+    /// resident estimate is back under budget or a whole cycle proves
+    /// nothing more is evictable. Cycling is needed because
+    /// `BTree::demote_leaves`'s eviction is second-chance: a leaf whose
+    /// accessed bit is set survives a sweep with the bit merely cleared
+    /// (see `tests/paged_demotion.rs::accessed_leaf_survives_one_pass`),
+    /// so a tree that was read all over just before a checkpoint demotes
+    /// ~0 bytes on the first sweep no matter how far over budget it is —
+    /// the clock hand has to come back around a second time to actually
+    /// harvest what the first sweep only cleared.
+    ///
+    /// Termination: stop when `resident <= budget`, or when two
+    /// *consecutive* cycles each evict 0 bytes, or when
+    /// [`Self::MAX_DEMOTE_CYCLES`] is reached. One zero-byte cycle alone
+    /// does not prove nothing is left — it may be the clear half of every
+    /// leaf's second chance, with the harvest one cycle away (exactly the
+    /// scenario above). But two zero-byte cycles back to back do prove it
+    /// **single-threaded**: if the first of the two had cleared even one
+    /// leaf's accessed bit, the very next cycle would evict that leaf for
+    /// real (nonzero) unless something re-touched it in between — so
+    /// back-to-back zeros mean the first of the two cleared nothing
+    /// either, i.e. every remaining
+    /// loaded, paged leaf is exempt from demotion today (a
+    /// `Residency::Resident` table, skipped wholesale before any leaf is
+    /// even looked at, or a leaf re-touched every single cycle). Note what
+    /// is *not* in that list: a leaf pinned by an older retained snapshot
+    /// (task 9) is still demoted from latest and debited normally — pinning
+    /// exempts it from *freeing memory* (another snapshot's `Arc` keeps the
+    /// bytes resident), not from this pass's eviction, so it produces a
+    /// nonzero cycle, never a zero one, and was wrongly listed here before
+    /// fix round 1 (review Minor-7).
+    ///
+    /// Fix round 1 (review Critical-1): the two-consecutive-zero argument
+    /// above assumes nothing re-credits `resident_leaf_bytes` mid-pass —
+    /// true only single-threaded. This function holds no lock that
+    /// excludes concurrent readers (just a brief `inner.read()` per batch's
+    /// plan, `inner.write()` only inside `demote_apply_chunk`), and every
+    /// data-leaf fault-in credits `resident_leaf_bytes`
+    /// (`PagedSource::read_node`). A `Residency::Resident` (or otherwise
+    /// permanently un-evictable) floor that alone exceeds budget, combined
+    /// with concurrent *random-key* reads against a different, evictable
+    /// table, keeps `resident <= budget` false and re-arms that table's
+    /// leaves' accessed bits every cycle (cycle N clears one, cycle N+1
+    /// evicts it — nonzero), so neither exit clause ever fires. Reproduced
+    /// in review: 62k+ cycles, 6+ seconds, `checkpoint_impl`'s
+    /// `checkpoint_lock` held the whole time, returning only when the read
+    /// workload stopped. `MAX_DEMOTE_CYCLES` is the backstop that makes
+    /// this function unconditionally return regardless.
+    ///
+    /// With no budget configured (`opts.memory_budget_bytes` is `None` —
+    /// reachable only by calling this directly, as
+    /// `demote_pass_race_hook_dropped_install_does_not_bump_stats` does;
+    /// `checkpoint_impl_paged`'s phase 3 never calls `demote_pass` at all
+    /// without a budget) this runs exactly one cycle: there is no target
+    /// to converge toward, so cycling has nothing to decide by, matching
+    /// this function's pre-task-10 behavior.
     #[cfg(feature = "persistence")]
     fn demote_pass_inner(&self, #[cfg(test)] race_hook: Option<&dyn Fn()>) -> Result<usize> {
         let (registry, opts, stats) = {
@@ -2101,73 +2526,127 @@ impl Store {
             )
         };
 
-        // Only registered tables are ever paged-attached (mirrors
-        // `checkpoint_impl_paged`'s own filter) — an unregistered table's
-        // `paged_demote` would be a genuine no-op every time (never
-        // attached, so `paged_demote`'s `is_loaded() && page_id().is_some()`
-        // check on every child never holds), so skipping it here just
-        // avoids the wasted per-table lock round trip.
-        let names: Vec<String> = {
-            let inner = self.inner.read();
-            let latest = inner.latest_version;
-            inner.snapshots[&latest]
-                .table_names()
-                .into_iter()
-                .filter(|n| registry.contains(n))
-                .collect()
-        };
-
         let mut total_demoted = 0usize;
-        for name in names {
-            let mut cursor: Option<Box<dyn std::any::Any + Send>> = None;
-            loop {
-                let found = {
-                    let inner = self.inner.read();
-                    let latest = inner.latest_version;
-                    inner.snapshots[&latest]
-                        .tables
-                        .get(&name)
-                        .map(|t| (latest, Arc::clone(t)))
-                };
-                let Some((version, tbl)) = found else {
-                    break; // table no longer present at latest — nothing to demote
-                };
-                if tbl.residency() == crate::table::Residency::Resident {
-                    break;
-                }
-                #[cfg(test)]
-                if let Some(hook) = race_hook {
-                    hook();
-                }
-                let cursor_ref: Option<&dyn std::any::Any> =
-                    cursor.as_deref().map(|c| c as &dyn std::any::Any);
-                let node_bytes = tbl.paged_node_bytes();
-                let (new_tbl, demoted, next) = tbl.paged_demote(cursor_ref, opts.demote_batch);
-                // `MergeableTable::paged_demote` deliberately does not touch
-                // `PagedStats` itself (see its doc): a concurrent `gc()` can
-                // evict `version` between the read above and this install,
-                // in which case `install_paged_tables` returns `None` and
-                // the demoted table this batch built is unreachable from
-                // any live snapshot. Applying the counters only when the
-                // install actually lands keeps `leaves_demoted`/
-                // `resident_leaf_bytes` in sync with what a reader can
-                // actually observe, instead of recording eviction work that
-                // never took effect.
-                if self
-                    .install_paged_tables(version, vec![(name.clone(), new_tbl)])
-                    .is_some()
-                {
-                    total_demoted += demoted;
-                    stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
-                    stats
-                        .resident_leaf_bytes
-                        .fetch_sub(demoted as i64 * node_bytes as i64, Ordering::Relaxed);
-                }
-                match next {
-                    Some(c) => cursor = Some(c),
-                    None => break,
+        let mut cycle = 0u64;
+        // `None` until the first cycle completes — see the termination
+        // doc above: cycle 1's own zero (if any) never stops the pass on
+        // its own, only a *second* zero right after it does.
+        let mut prev_cycle_bytes: Option<u64> = None;
+        loop {
+            cycle += 1;
+            let mut cycle_bytes = 0u64;
+
+            // Only registered tables are ever paged-attached (mirrors
+            // `checkpoint_impl_paged`'s own filter) — an unregistered
+            // table's `paged_demote` would be a genuine no-op every time
+            // (never attached, so `paged_demote`'s `is_loaded() &&
+            // page_id().is_some()` check on every child never holds), so
+            // skipping it here just avoids the wasted per-table lock round
+            // trip. Re-read every cycle (not just once outside this loop)
+            // for the same reason every batch below re-reads
+            // `latest_version`: a concurrent commit can register or drop a
+            // table between cycles.
+            let names: Vec<String> = {
+                let inner = self.inner.read();
+                let latest = inner.latest_version;
+                inner.snapshots[&latest]
+                    .table_names()
+                    .into_iter()
+                    .filter(|n| registry.contains(n))
+                    .collect()
+            };
+
+            for name in names {
+                let mut cursor: Option<Box<dyn std::any::Any + Send>> = None;
+                loop {
+                    // Decide (off-lock): plan against whatever is latest
+                    // *right now*. Only slot atomics are touched, so this
+                    // walk is cheap even when the leaves are swapped out.
+                    let planned = {
+                        let inner = self.inner.read();
+                        let latest = inner.latest_version;
+                        inner.snapshots[&latest].tables.get(&name).map(Arc::clone)
+                    };
+                    let Some(tbl) = planned else {
+                        break; // table no longer present at latest — nothing to demote
+                    };
+                    if tbl.residency() == crate::table::Residency::Resident {
+                        break;
+                    }
+                    let cursor_ref: Option<&dyn std::any::Any> =
+                        cursor.as_deref().map(|c| c as &dyn std::any::Any);
+                    let (chunks, next) =
+                        tbl.paged_demote_plan(cursor_ref, opts.demote_batch, Self::DEMOTE_APPLY_CHUNK);
+                    drop(tbl);
+                    #[cfg(test)]
+                    if let Some(hook) = race_hook {
+                        hook();
+                    }
+                    // Apply (under the write lock), one chunk per
+                    // acquisition, against the CURRENT latest — never the
+                    // version the plan was made from. A commit that landed
+                    // since the plan simply means this chunk is applied to
+                    // the commit's fork; nothing is wasted and the install
+                    // can never target a stale or evicted version. The
+                    // superseded table/snapshot `Arc`s are returned out of
+                    // the lock scope and dropped off-lock, so their leaf
+                    // frees (which touch possibly swapped memory) never
+                    // stall a commit.
+                    let mut table_gone = false;
+                    for chunk in &chunks {
+                        match self.demote_apply_chunk(&name, chunk.as_ref()) {
+                            None => {
+                                table_gone = true;
+                                break;
+                            }
+                            Some(None) => {}
+                            Some(Some((demoted, demoted_bytes))) => {
+                                total_demoted += demoted;
+                                cycle_bytes += demoted_bytes as u64;
+                                stats.leaves_demoted.fetch_add(demoted as u64, Ordering::Relaxed);
+                                stats
+                                    .resident_leaf_bytes
+                                    .fetch_sub(demoted_bytes as i64, Ordering::Relaxed);
+                                if cycle >= 2 {
+                                    stats
+                                        .forced_evictions
+                                        .fetch_add(demoted as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    if table_gone {
+                        break;
+                    }
+                    match next {
+                        Some(c) => cursor = Some(c),
+                        None => break,
+                    }
                 }
             }
+
+            stats.clock_cycles.fetch_add(1, Ordering::Relaxed);
+
+            let Some(budget) = opts.memory_budget_bytes else {
+                break; // no budget: one cycle, matching pre-task-10 behavior
+            };
+            // Fix round 1 (review Critical-1): checked before either
+            // "real" exit clause below can look at concurrently-mutated
+            // state — a hard, workload-independent bound so this function
+            // always returns. See `Self::MAX_DEMOTE_CYCLES`'s doc for why
+            // the two clauses below cannot be trusted to do that alone
+            // under concurrent readers.
+            if cycle >= Self::MAX_DEMOTE_CYCLES {
+                break;
+            }
+            let resident = stats.resident_leaf_bytes.load(Ordering::Relaxed).max(0) as u64;
+            if resident <= budget {
+                break;
+            }
+            if prev_cycle_bytes == Some(0) && cycle_bytes == 0 {
+                break; // two zero-byte cycles in a row: un-evictable floor proven
+            }
+            prev_cycle_bytes = Some(cycle_bytes);
         }
         Ok(total_demoted)
     }
@@ -3707,6 +4186,12 @@ impl Checkpointer {
         let next_writer_id = Arc::clone(&store.next_writer_id);
         let table_locks = Arc::clone(&store.table_locks);
         let checkpoint_lock = Arc::clone(&store.checkpoint_lock);
+        let gate = Arc::clone(
+            store
+                .ckpt_gate
+                .as_ref()
+                .expect("Store::new installs the checkpoint gate before starting the checkpointer"),
+        );
         let thread_stop = Arc::clone(&stop);
         let thread_wake = Arc::clone(&wake);
 
@@ -3721,11 +4206,86 @@ impl Checkpointer {
                     checkpoint_lock,
                     thread_stop,
                     thread_wake,
+                    gate,
                 );
             })
             .map_err(|e| Error::Persistence(format!("spawn background checkpointer thread: {e}")))?;
 
         Ok(Checkpointer { stop, wake, handle: Some(handle) })
+    }
+}
+
+/// task64 §7d — the drop/checkpoint gate. `Checkpointer`'s thread holds a
+/// strong `Arc<RwLock<StoreInner>>` for the duration of every checkpoint it
+/// runs, so if the application drops its last [`Store`] while one is in
+/// flight, the *worker's* later drop of that `Arc` is what runs
+/// `StoreInner`'s destructor — on the worker itself, where the self-join
+/// guard in `Checkpointer::drop` has no choice but to detach. `Store::drop`
+/// then returned while the checkpoint was still appending pages, writing a
+/// root and punching dead ranges, and the very next thing a re-opener does
+/// (`paging_matrix --restart`, any in-process reopen) is put a second
+/// `Store` on the same page file: two writers, one `pages.bin`. The gate's
+/// A cell read zeros at an offset only the second store's own checkpoints
+/// could have written.
+///
+/// Protocol: the worker holds a strong reference only (a) under
+/// `state`'s lock, or (b) with `in_flight` set — set and cleared under the
+/// lock, and cleared only after the reference is gone. `Store::drop` takes
+/// the lock, reads `Arc::strong_count` minus `in_flight`, and if that says
+/// it is the last application handle it sets `stop` and waits for
+/// `in_flight` to clear before letting its own `Arc` go — so the
+/// destructor always runs on an application thread, where the join is a
+/// real join. The worker's own transient `Store` skips all of that by
+/// thread id.
+#[cfg(feature = "persistence")]
+#[derive(Default)]
+pub(crate) struct CheckpointGate {
+    state: Mutex<GateState>,
+    cv: Condvar,
+}
+
+#[cfg(feature = "persistence")]
+#[derive(Default)]
+struct GateState {
+    /// The worker holds a strong `Arc<RwLock<StoreInner>>` outside the lock.
+    in_flight: bool,
+    /// Set by the last application handle's drop; the worker never
+    /// upgrades again once it sees this.
+    stop: bool,
+    /// The checkpointer thread's id, so its own transient `Store` is
+    /// recognised in `Store::drop`.
+    worker: Option<std::thread::ThreadId>,
+}
+
+/// Clears `in_flight` (and wakes any waiting `Store::drop`) when dropped —
+/// on every exit path out of a tick, including the early `return`s.
+#[cfg(feature = "persistence")]
+struct InFlightGuard<'a>(&'a CheckpointGate);
+
+#[cfg(feature = "persistence")]
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.state.lock();
+        g.in_flight = false;
+        self.0.cv.notify_all();
+    }
+}
+
+#[cfg(feature = "persistence")]
+impl Drop for Store {
+    fn drop(&mut self) {
+        let Some(gate) = self.ckpt_gate.as_ref() else { return };
+        let mut g = gate.state.lock();
+        if g.worker == Some(std::thread::current().id()) {
+            return; // the worker's own transient handle
+        }
+        let app_handles = Arc::strong_count(&self.inner) - usize::from(g.in_flight);
+        if app_handles <= 1 {
+            g.stop = true;
+            while g.in_flight {
+                gate.cv.wait(&mut g);
+            }
+        }
     }
 }
 
@@ -3879,6 +4439,10 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// timeout, waking only on an explicit notify (a crossed threshold, or
 /// `Drop`) or the interval elapsing.
 #[cfg(feature = "persistence")]
+// Each argument is one of the `Arc` handles the per-tick transient `Store`
+// is rebuilt from (plus the drop gate); bundling them into a struct would
+// only move the same list one indirection away.
+#[allow(clippy::too_many_arguments)]
 fn checkpointer_loop(
     weak_inner: Weak<RwLock<StoreInner>>,
     intents: Arc<IntentMap>,
@@ -3887,7 +4451,11 @@ fn checkpointer_loop(
     checkpoint_lock: Arc<Mutex<()>>,
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<bool>, Condvar)>,
+    gate: Arc<CheckpointGate>,
 ) {
+    // Lets `impl Drop for Store` recognise the transient handle this thread
+    // builds per tick as its own and skip the wait (see `CheckpointGate`).
+    gate.state.lock().worker = Some(std::thread::current().id());
     // Only a *transition* to a new error string is logged (mirrors the WAL
     // poison latch's "don't spam" shape, but this is not itself a poison
     // latch — a failed background checkpoint just means the next attempt
@@ -3911,15 +4479,26 @@ fn checkpointer_loop(
         // vanished while this thread was parked is caught here rather than
         // only on the next section's `upgrade()`.
         {
-            let interval = match weak_inner.upgrade() {
-                Some(inner) => {
-                    let g = inner.read();
-                    match g.paged.as_ref() {
-                        Some(p) => p.opts.checkpoint_interval.unwrap_or(std::time::Duration::from_secs(1)),
-                        None => return, // paged state torn down out from under us
-                    }
+            // The upgrade lives entirely under the gate lock (task64 §7d):
+            // `impl Drop for Store` counts strong references under that
+            // same lock, and this idle probe must never be a reference it
+            // cannot see — the only strong `Arc` this thread ever holds
+            // outside the lock is the one `in_flight` announces below.
+            let interval = {
+                let g = gate.state.lock();
+                if g.stop {
+                    return;
                 }
-                None => return, // store dropped while we were idle
+                match weak_inner.upgrade() {
+                    Some(inner) => {
+                        let r = inner.read();
+                        match r.paged.as_ref() {
+                            Some(p) => p.opts.checkpoint_interval.unwrap_or(std::time::Duration::from_secs(1)),
+                            None => return, // paged state torn down out from under us
+                        }
+                    }
+                    None => return, // store dropped while we were idle
+                }
             };
             let mut has_work = wake.0.lock();
             if !*has_work {
@@ -3944,7 +4523,20 @@ fn checkpointer_loop(
             }
         }
 
-        let Some(inner) = weak_inner.upgrade() else { return };
+        // In-flight window (task64 §7d). Declared BEFORE `inner` so it is
+        // dropped AFTER it: `in_flight` is cleared only once this thread
+        // holds no strong reference at all, which is what lets a waiting
+        // `Store::drop` be the one that runs `StoreInner`'s destructor.
+        let _flight = InFlightGuard(&gate);
+        let inner = {
+            let mut g = gate.state.lock();
+            if g.stop {
+                return;
+            }
+            let Some(inner) = weak_inner.upgrade() else { return };
+            g.in_flight = true;
+            inner
+        };
         let (due_dirty, due_mem, due_time, stats) = {
             let g = inner.read();
             let Some(paged) = g.paged.as_ref() else { return };
@@ -3987,12 +4579,16 @@ fn checkpointer_loop(
             // A transient `Store`, alive only for this one checkpoint call
             // — see the struct doc for why nothing here is held any longer
             // than that.
+            // `inner` is MOVED, not cloned: while `in_flight` is set this
+            // thread holds exactly one strong reference, which is the
+            // count `impl Drop for Store` subtracts.
             let store = Store {
-                inner: Arc::clone(&inner),
+                inner,
                 intents: Arc::clone(&intents),
                 next_writer_id: Arc::clone(&next_writer_id),
                 table_locks: Arc::clone(&table_locks),
                 checkpoint_lock: Arc::clone(&checkpoint_lock),
+                ckpt_gate: Some(Arc::clone(&gate)),
             };
             // I-5 (final-review wave): `checkpoint_impl` can still panic —
             // the dirty-node walk it drives faults pages in through the
@@ -4076,17 +4672,59 @@ fn prune_write_sets(inner: &mut StoreInner) {
     }
 }
 
-/// Run GC on an already-locked `StoreInner`.
+/// Run GC on an already-locked `StoreInner`, retaining
+/// `inner.config.num_snapshots_retained` recent versions — the ordinary,
+/// configured-retention entry point every ordinary caller uses (`Store::gc`,
+/// commit-time auto-gc, etc). A thin wrapper over
+/// [`gc_inner_with_retain`], which see for the actual eviction logic.
 fn gc_inner(inner: &mut StoreInner) {
-    // The N most recent versions to retain unconditionally.
     // latest_version is always kept (even if num_snapshots_retained is 0).
     let retain_count = inner.config.num_snapshots_retained.max(1);
+    // Return value (how many snapshots were actually collected) is only
+    // useful to the task 11 shrink call site below, which gates a second
+    // reconcile walk on it (review fix round 1, M-1) — every other caller
+    // of this ordinary wrapper has nothing to gate on it, so it is
+    // discarded here.
+    gc_inner_with_retain(inner, retain_count);
+}
+
+/// [`gc_inner`]'s body, parameterized on the retain count instead of always
+/// reading it from `inner.config.num_snapshots_retained`. Added for task 11
+/// (adaptive retention shrink under pin pressure, spec §5 "enforcement
+/// arm"): `Store::checkpoint_impl_paged` calls this directly with
+/// `retain = 1` when pin pressure (`PagedStats::pinned_leaf_bytes`, task 9)
+/// is keeping a paged store over its configured `memory_budget_bytes` even
+/// after the checkpointer's hard-capped demote pass — see that call site's
+/// doc for the full trigger condition ("order of weapons", spec §6).
+///
+/// The `Arc::strong_count == 1` filter below is unconditional either way:
+/// it already spares every live `ReadTx`/`VersionPin` holder regardless of
+/// what `retain_count` is asked for, which is exactly the floor spec §5
+/// requires ("a floor of the latest version plus every explicit
+/// `VersionPin`") — passing `retain_count = 1` only changes how many
+/// snapshots beyond that floor this call is WILLING to keep, never whether
+/// a pinned one can be collected. No second mechanism is needed on top of
+/// the existing one. **Documented exception, not this function's concern:**
+/// a pin taken while its target was still `latest_version` can be silently
+/// orphaned by an earlier demote-pass re-publish — see [`Store::pin_version`]'s
+/// doc. This filter still behaves exactly as specified against whichever
+/// `Arc` is actually in `inner.snapshots` at the moment it runs; the hazard
+/// is that a stale pin's `Arc` may no longer be the one there to protect.
+///
+/// Returns the number of snapshots actually removed (review fix round 1,
+/// M-1) — the task 11 shrink call site uses this to skip a second reconcile
+/// walk when a shrink attempt evicted nothing (e.g. every retained
+/// snapshot is protected by a live `ReadTx`/`VersionPin`).
+fn gc_inner_with_retain(inner: &mut StoreInner, retain_count: usize) -> usize {
+    // The N most recent versions to retain unconditionally.
+    // latest_version is always kept (even if retain_count is 0).
+    let retain_count = retain_count.max(1);
 
     // Fast path: nothing to collect.
     let len = inner.snapshots.len();
     if len <= retain_count {
         inner.metrics.inc_gc_run();
-        return;
+        return 0;
     }
 
     // Only the oldest `len - retain_count` entries lie outside the
@@ -4109,6 +4747,7 @@ fn gc_inner(inner: &mut StoreInner) {
     if !doomed.is_empty() {
         inner.metrics.inc_snapshots_collected(doomed.len() as u64);
     }
+    doomed.len()
 }
 
 impl Default for Store {
@@ -4126,8 +4765,14 @@ impl Default for Store {
 /// Created by [`Store::pin_version`]. Holds a strong reference to the
 /// snapshot, which is the same mechanism GC uses to protect versions held by
 /// an active [`ReadTx`] — a pinned version is never collected, regardless of
-/// [`StoreConfig::num_snapshots_retained`]. Dropping the last pin (and any
-/// clones) makes the version collectable again.
+/// [`StoreConfig::num_snapshots_retained`]. **Exception, tracked and not yet
+/// fixed:** in a paged store with `memory_budget_bytes` and the default
+/// [`PagedOptions::shrink_retention_under_pressure`](crate::persistence::PagedOptions::shrink_retention_under_pressure)
+/// (`true`), a pin taken while its version is still
+/// [`Store::latest_version`] can be silently orphaned by a later
+/// demote-pass re-publish of that same version — see [`Store::pin_version`]'s
+/// doc for the mechanism and the two safe patterns. Dropping the last pin
+/// (and any clones) makes the version collectable again.
 ///
 /// `VersionPin` is `Send + Sync + Clone`, unlike [`ReadTx`]: use it to hand a
 /// version across threads, then open a [`ReadTx`] on the receiving thread via
@@ -10206,7 +10851,7 @@ mod tests {
     /// `latest_version` nor within retention and gc drops it.
     #[cfg(feature = "persistence")]
     #[test]
-    fn demote_pass_race_hook_dropped_install_does_not_bump_stats() {
+    fn demote_pass_lands_on_current_latest_when_captured_version_is_evicted_mid_batch() {
         use crate::persistence::PagedOptions;
         use crate::{Durability, Persistence, WalWrite};
 
@@ -10221,7 +10866,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        store.register_table::<String>("rows").unwrap();
+        store.register_table_paged::<String>("rows").unwrap();
 
         // Bulk insert (not a loop of single inserts — see
         // `tests/paged_demotion.rs`'s `write_rows` doc for why: a put-loop
@@ -10244,6 +10889,18 @@ mod tests {
         store.checkpoint().unwrap();
 
         let before = store.paged_stats().unwrap();
+        // The live-snapshot oracle: an exact dedup walk of latest's table,
+        // not `resident_leaf_bytes_est` — with no `memory_budget_bytes`
+        // configured nothing ever reconciles that counter, so it reads 0
+        // here regardless (the task63 F1 gap) and cannot witness anything.
+        let live_resident = || {
+            let inner = store.inner.read();
+            let latest = inner.latest_version;
+            let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+            inner.snapshots[&latest].tables["rows"].paged_resident_leaf_bytes_dedup(&mut seen)
+        };
+        let live_before = live_resident();
+        assert!(live_before > 0, "precondition: the checkpointed table starts fully resident");
 
         let evicted_version = store.latest_version();
         let hook = || {
@@ -10270,30 +10927,41 @@ mod tests {
 
         let demoted = store.demote_pass_inner(Some(&hook)).unwrap();
 
-        assert_eq!(
-            demoted, 0,
-            "the only batch's install must have been dropped (its version was evicted mid-batch)"
-        );
-        let after = store.paged_stats().unwrap();
-        assert_eq!(
-            after.leaves_demoted, before.leaves_demoted,
-            "a dropped install must not bump leaves_demoted"
-        );
-        assert_eq!(
-            after.resident_leaf_bytes_est, before.resident_leaf_bytes_est,
-            "a dropped install must not shrink resident_leaf_bytes_est"
-        );
-
-        // Sanity check that the hook really did force a real eviction, not
-        // a no-op: the captured version is gone from `inner.snapshots`, so
-        // a direct `install_paged_tables` targeting it (the exact call
-        // `demote_pass_inner`'s dropped batch made) returns `None` too.
+        // The version the plan was made against is gone (the hook's
+        // commit + checkpoint + gc evicted it) — the sanity check below
+        // proves that. The pass must nevertheless have applied its plan to
+        // the CURRENT latest and installed there: the demotion is not
+        // allowed to go to waste just because a commit landed mid-batch.
         assert!(
             store
                 .install_paged_tables(evicted_version, Vec::new())
                 .is_none(),
-            "the evicted version must no longer be installable"
+            "precondition: the captured version must really have been evicted"
         );
+        assert!(
+            demoted > 0,
+            "a batch whose captured version was evicted mid-batch must still demote \
+             (applied against the current latest), got demoted={demoted}"
+        );
+        let after = store.paged_stats().unwrap();
+        assert_eq!(
+            after.leaves_demoted,
+            before.leaves_demoted + demoted as u64,
+            "leaves_demoted must count exactly the leaves the landed install demoted"
+        );
+        // The demotion is visible in the live snapshot, not just in the
+        // counters: the latest table's data tree now has on-disk leaves,
+        // which the hook's own post-commit checkpoint had left fully
+        // resident.
+        let live_after = live_resident();
+        assert!(
+            live_after < live_before,
+            "the live latest must carry the demoted leaves: resident walk before={live_before} after={live_after}"
+        );
+        let rtx = store.begin_read(None).unwrap();
+        let t = rtx.open_table::<String>("rows").unwrap();
+        // Auto-increment ids start at 1, so id 4321 holds the row inserted as "4320".
+        assert_eq!(t.get(4_321).map(String::as_str), Some("4320"), "reads still fault through");
     }
 
     /// I-1 (spec conformance): `recover()`'s EAGER load of a paged table's
@@ -10322,7 +10990,7 @@ mod tests {
 
         let version = {
             let store = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-            store.register_table::<String>("rows").unwrap();
+            store.register_table_paged::<String>("rows").unwrap();
             let mut w = store.begin_write(None).unwrap();
             let mut t = w.open_table::<String>("rows").unwrap();
             // Enough rows to force an inner level (MAX_KEYS is 63 at T=32) —
@@ -10354,7 +11022,7 @@ mod tests {
         drop(f);
 
         let store2 = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-        store2.register_table::<String>("rows").unwrap();
+        store2.register_table_paged::<String>("rows").unwrap();
         let err = store2.recover().unwrap_err();
         assert!(
             matches!(err, Error::CheckpointCorrupted(_) | Error::Persistence(_)),
@@ -10381,7 +11049,7 @@ mod tests {
 
         let version = {
             let store = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-            store.register_table::<String>("rows").unwrap();
+            store.register_table_paged::<String>("rows").unwrap();
             {
                 let mut w = store.begin_write(None).unwrap();
                 let mut t = w.open_table::<String>("rows").unwrap();
@@ -10417,7 +11085,7 @@ mod tests {
         drop(f);
 
         let store2 = Store::new(StoreConfig::builder().persistence(build_persistence()).build()).unwrap();
-        store2.register_table::<String>("rows").unwrap();
+        store2.register_table_paged::<String>("rows").unwrap();
         store2.recover().unwrap();
 
         let mut w = store2.begin_write(None).unwrap();
@@ -10462,7 +11130,7 @@ mod tests {
             .paged(PagedOptions::builder().checkpoint_interval(Duration::from_millis(20)).build())
             .unwrap();
         let store = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-        store.register_table::<String>("rows").unwrap();
+        store.register_table_paged::<String>("rows").unwrap();
 
         // Arm the hook before any commit exists to check, so the
         // background thread's first eligible tick is the one that panics.
@@ -10768,5 +11436,284 @@ mod tests {
             );
         }
         assert_eq!(t.get(101).map(String::as_str), Some("d101"));
+    }
+    /// **The store-level representation assertion** (Task 5 review, warning
+    /// 3; Task 6). `tests/paged_block_leaves.rs` proves a paged table's
+    /// *values* survive every mutation; it cannot prove the leaves are still
+    /// **block**-backed afterwards, because nothing on the public surface
+    /// exposes a node's representation. This does, from inside the crate,
+    /// against a real `Store` -> `WriteTx` -> `Table` workload — which is
+    /// what drives the in-place (`_mut`) mutation family that Task 6 made
+    /// block-aware.
+    ///
+    /// Before Task 6 this failed with `block_leaves == 0`: `Child::make_mut`
+    /// ran the Task 4 `materialize()` stopgap, so the very first write to a
+    /// recovered leaf de-blocked it and the store gave the whole
+    /// memory-honesty win back on contact with a workload.
+    ///
+    /// `MultiWriter` for the reason `tests/paged_block_leaves.rs` documents:
+    /// the SingleWriter overlay (`src/overlay.rs`, cap 32) would buffer the
+    /// single-row writes and keep most of them out of the B-tree entirely.
+    ///
+    /// Deliberately no `insert_batch` in the workload: an auto-id bulk
+    /// append goes through `BulkBuilder`, which still builds all-Arc leaves
+    /// — that is Task 7's scope, and including it here would assert a
+    /// property this task does not yet own.
+    ///
+    /// Task 7 update: this exclusion is a permanent property of the bulk
+    /// path, not a gap to close later. `BulkBuilder::freeze_leaf`/
+    /// `freeze_internal` (`src/btree.rs`) always build `block: None` nodes
+    /// — a bulk-built (or bulk-appended) tree is all-Arc by construction,
+    /// regardless of whether it carries an attached paged source, and only
+    /// becomes block-backed the same way every other leaf does: written to
+    /// `pages.bin` by a checkpoint, then decoded back by `NodeCodec::decode`
+    /// on the next fault-in. Asserting `blocks == leaves` right after an
+    /// `insert_batch` would therefore assert something that is never true
+    /// pre-checkpoint. `tests/paged_block_leaves.rs`'s
+    /// `insert_batch_on_a_fresh_paged_table_clones_zero_values` is the
+    /// positive-side counterpart: it proves the bulk path costs zero
+    /// `clone_value` calls (there is no block to clone out of) and that the
+    /// batch still reads back correctly after checkpoint + recover, which is
+    /// where the leaves do turn block-shaped.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn paged_table_leaves_stay_block_backed_across_a_mixed_table_workload() {
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+
+        let dir = crate::test_scratch::scratch_dir();
+        let open = || {
+            let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+                .paged(PagedOptions::builder().build())
+                .unwrap();
+            let s = Store::new(
+                StoreConfig::builder()
+                    .persistence(p)
+                    .writer_mode(WriterMode::MultiWriter)
+                    .build(),
+            )
+            .unwrap();
+            s.register_table_paged::<String>("rows").unwrap();
+            s
+        };
+        // `(leaves, block_leaves)` of the row tree in the latest snapshot.
+        // Faults in every leaf on the way, which is exactly what a workload
+        // read would do — a leaf still on disk comes back block-shaped from
+        // `NodeCodec::decode`, a resident one is reported as it stands.
+        let repr = |s: &Store| {
+            let r = s.begin_read(None).unwrap();
+            let t = r.open_table::<String>("rows").unwrap();
+            t.table.data_tree().leaf_representation()
+        };
+        let put = |s: &Store, k: u64, v: String| {
+            let mut w = s.begin_write(None).unwrap();
+            w.open_table::<String>("rows").unwrap().put(k, v).unwrap();
+            w.commit().unwrap();
+        };
+        let delete = |s: &Store, k: u64| {
+            let mut w = s.begin_write(None).unwrap();
+            w.open_table::<String>("rows").unwrap().delete(k).unwrap();
+            w.commit().unwrap();
+        };
+
+        {
+            let store = open();
+            {
+                let mut w = store.begin_write(None).unwrap();
+                let mut t = w.open_table::<String>("rows").unwrap();
+                for k in 0..2_000u64 {
+                    t.put(k, format!("v{k}")).unwrap();
+                }
+                w.commit().unwrap();
+            }
+            store.checkpoint().unwrap();
+        }
+
+        // Cold: every leaf comes back off `pages.bin` block-shaped.
+        let store = open();
+        store.recover().unwrap();
+        let (leaves, blocks) = repr(&store);
+        assert!(leaves > 8, "the tree must span many leaves, not one: {leaves}");
+        assert_eq!(blocks, leaves, "every recovered leaf starts block-backed");
+
+        // 1. Updates of existing keys — the O(1) `block[pos] = v` hot path.
+        for k in (0..2_000u64).step_by(37) {
+            put(&store, k, format!("u{k}"));
+        }
+        // 2. Inserts of new keys between existing ones — block rebuilds,
+        //    and enough of them (all in one narrow range) to force splits.
+        for k in 0..300u64 {
+            put(&store, 2_000 + k, format!("n{k}"));
+        }
+        // 3. Deletes clustered enough to drive underflow -> rotate -> merge.
+        for k in 300..1_500u64 {
+            delete(&store, k);
+        }
+
+        let (leaves, blocks) = repr(&store);
+        assert!(leaves > 8, "still a multi-leaf tree: {leaves}");
+        assert_eq!(
+            blocks, leaves,
+            "a Table workload must leave every data leaf block-backed ({blocks}/{leaves})"
+        );
+
+        // The values are right too, and stay right across a second
+        // checkpoint + recover of the mutated (block-rebuilt) leaves.
+        let expect = |s: &Store| {
+            let r = s.begin_read(None).unwrap();
+            let t = r.open_table::<String>("rows").unwrap();
+            assert_eq!(t.len(), 2_000 + 300 - 1_200);
+            for k in 0..2_000u64 {
+                let want = if (300..1_500).contains(&k) {
+                    None
+                } else if k % 37 == 0 {
+                    Some(format!("u{k}"))
+                } else {
+                    Some(format!("v{k}"))
+                };
+                assert_eq!(t.get(k).cloned(), want, "row {k}");
+            }
+            for k in 0..300u64 {
+                assert_eq!(t.get(2_000 + k).cloned(), Some(format!("n{k}")), "row {}", 2_000 + k);
+            }
+        };
+        expect(&store);
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let again = open();
+        again.recover().unwrap();
+        expect(&again);
+        let (leaves, blocks) = repr(&again);
+        assert_eq!(blocks, leaves, "re-encoded mutated leaves decode block-backed again");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 9: pin-aware reconciliation accounting oracle.
+    //
+    // `tests/paged_accounting.rs` (an integration test crate) has no
+    // access to `Store::inner`/`BTree::resident_leaf_bytes_dedup` — the
+    // brief's "reference implementation recomputed in the test" needs a
+    // walk that is genuinely independent of `checkpoint_impl_paged`'s own
+    // F1 reconcile call, which is only possible with same-crate access.
+    // This lives here (not in `tests/paged_accounting.rs`, which still
+    // gets the brief's black-box retention-4 scenario test) for that
+    // reason.
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "persistence")]
+    mod pin_aware_reconcile {
+        use super::*;
+        use crate::persistence::PagedOptions;
+        use crate::{Durability, Persistence, WalWrite};
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Insert(u64),
+            Update(u64),
+            Checkpoint,
+            Gc,
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                3 => any::<u64>().prop_map(Op::Insert),
+                5 => any::<u64>().prop_map(Op::Update),
+                2 => Just(Op::Checkpoint),
+                1 => Just(Op::Gc),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: if cfg!(miri) { 4 } else { 40 }, ..ProptestConfig::default() })]
+            #[test]
+            fn oracle(ops in prop::collection::vec(op_strategy(), 1..25)) {
+                let dir = crate::test_scratch::scratch_dir();
+                let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+                    .paged(PagedOptions::builder().memory_budget_bytes(1 << 20).build())
+                    .unwrap();
+                let store = Store::new(
+                    StoreConfig::builder()
+                        .persistence(p)
+                        .writer_mode(WriterMode::MultiWriter)
+                        .num_snapshots_retained(3)
+                        .build(),
+                )
+                .unwrap();
+                store.register_table_paged::<String>("rows").unwrap();
+
+                let mut n_inserted: u64 = 0;
+                for op in ops {
+                    match op {
+                        Op::Insert(v) => {
+                            let mut w = store.begin_write(None).unwrap();
+                            {
+                                let mut t = w.open_table::<String>("rows").unwrap();
+                                t.insert(format!("v{v}")).unwrap();
+                            }
+                            w.commit().unwrap();
+                            n_inserted += 1;
+                        }
+                        Op::Update(k) => {
+                            if n_inserted > 0 {
+                                // Auto-increment keys start at 1 (`AutoKey
+                                // for u64`), so live keys are `1..=n_inserted`.
+                                let key = 1 + (k % n_inserted);
+                                let mut w = store.begin_write(None).unwrap();
+                                {
+                                    let mut t = w.open_table::<String>("rows").unwrap();
+                                    // No op here ever deletes, so every key
+                                    // in `1..=n_inserted` is always present.
+                                    t.update(key, format!("u{k}")).unwrap();
+                                }
+                                w.commit().unwrap();
+                            }
+                        }
+                        Op::Checkpoint => {
+                            store.checkpoint().unwrap();
+                        }
+                        Op::Gc => store.gc(),
+                    }
+                }
+                // Force a final reconcile against the sequence's exact end
+                // state, whether or not the last op was a checkpoint.
+                store.checkpoint().unwrap();
+                let stats = store.paged_stats().unwrap();
+
+                // Independent reference: a FRESH oldest-first walk (F1's
+                // own reconcile walks newest-first) over the SAME retained
+                // snapshots, deduped by its own `seen` set. Different
+                // iteration order over the same underlying data proves the
+                // deduped total is order-independent (a set, not an
+                // accumulation order artifact) -- and re-derives the total
+                // from scratch rather than trusting whatever
+                // `checkpoint_impl_paged` last stored.
+                let reference_total: u64 = {
+                    let inner = store.inner.read();
+                    let registry = &inner.registry;
+                    let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+                    inner
+                        .snapshots
+                        .values() // BTreeMap ascending by version == oldest-first
+                        .map(|snap| {
+                            snap.tables
+                                .iter()
+                                .filter(|(n, _)| registry.contains(n))
+                                .map(|(_, t)| t.paged_resident_leaf_bytes_dedup(&mut seen))
+                                .sum::<usize>() as u64
+                        })
+                        .sum()
+                };
+
+                prop_assert_eq!(
+                    stats.resident_leaf_bytes_est + stats.pinned_leaf_bytes,
+                    reference_total,
+                    "resident + pinned must equal the full dedup walk over every retained \
+                     snapshot, regardless of which order (newest-first in production, \
+                     oldest-first here) the walk visits them in"
+                );
+            }
+        }
     }
 }

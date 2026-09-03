@@ -238,6 +238,29 @@ pub enum Error {
         /// Which field disagreed (`ik_type_id` or `kind`) and how.
         reason: String,
     },
+    /// `Store::register_table`/`register_table_keyed` was called for a table
+    /// on a store built with [`Persistence::paged`](crate::persistence::Persistence::paged).
+    ///
+    /// A paged leaf's block-CoW clones one value out of the block on every
+    /// mutation (`NodeSource::clone_value`, task 2), and plain registration
+    /// carries no way to produce that clone — only
+    /// [`Store::register_table_paged`](crate::Store::register_table_paged)
+    /// (or its `_keyed` sibling) captures `R: Clone`'s clone fn and hands it
+    /// to the attached `PagedSource`. Fix:
+    /// register with `Store::register_table_paged` instead (it also works,
+    /// as plain registration, on a non-paged store — so it is always the
+    /// right call once a table might ever be paged).
+    #[error(
+        "table '{table}' cannot be registered with register_table on a paged store: paged \
+         leaves need a clone fn to CoW their value blocks. Use \
+         Store::register_table_paged::<R>(..) instead (R: Clone) — it also works on non-paged \
+         stores."
+    )]
+    PagedNeedsClone {
+        /// Name of the table that was registered without a clone fn on a
+        /// paged store.
+        table: String,
+    },
 }
 
 /// Crate-wide result alias: `std::result::Result<T, Error>`.

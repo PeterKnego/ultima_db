@@ -23,7 +23,7 @@ fn store_with(dir: &std::path::Path, opts: PagedOptions) -> Store {
         .paged(opts)
         .unwrap();
     let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
     s
 }
 
@@ -79,7 +79,7 @@ fn dead_list_equals_replaced_path_and_is_punched_after_retention() {
 fn dropped_table_pages_are_dead() {
     let d = tempfile::tempdir().unwrap();
     let s = store_with(d.path(), PagedOptions::builder().build());
-    s.register_table::<Row>("extra").unwrap();
+    s.register_table_paged::<Row>("extra").unwrap();
 
     // Only "extra" gets rows — "rows" stays empty (no root page, no pages
     // written for it either way) so every page this first checkpoint writes

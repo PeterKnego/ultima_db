@@ -1,0 +1,1237 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! Task 8: one accounting unit everywhere — credit (fault-in,
+//! `PagedSource::read_node`, task 4), debit (demote, `BTree::demote_leaves`),
+//! dirty-credit (`Child::resident_new`/`make_mut`), and the checkpoint-end
+//! reconciliation walk (`resident_leaf_estimate`) must all speak
+//! `BTreeNode::leaf_bytes()` — not a flat `NODE_BYTES` that under-credits
+//! any leaf holding a value block. See
+//! `docs/superpowers/specs/2026-08-31-paged-leaf-arena-memory-honesty-design.md`
+//! §5 and `docs/tasks/task*_paged_leaf_value_blocks.md`.
+//!
+//! Pre-task-8, the debit side (`Store::demote_pass_inner`) multiplied
+//! `demoted_count * paged_node_bytes()` (a flat per-node estimate), while
+//! the credit side already used `leaf_bytes()` (task 4) — a real block leaf
+//! is under-debited by its block bytes on every demote, so the resident
+//! estimate drifts upward every checkpoint→fault→checkpoint cycle instead
+//! of returning to the same value. The first test below is exactly that
+//! regression, run for three cycles.
+
+#![cfg(feature = "persistence")]
+
+use ultima_db::{Durability, PagedOptions, Persistence, Residency, Store, StoreConfig, WalWrite, WriterMode};
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Row {
+    v: u64,
+}
+
+fn store_with(dir: &std::path::Path, opts: PagedOptions) -> Store {
+    let p = Persistence::standalone(dir, Durability::Eventual, WalWrite::Coalesced)
+        .paged(opts)
+        .unwrap();
+    let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+    s
+}
+
+/// Like [`store_with`], but `MultiWriter` — whose write-overlay cap is
+/// unconditionally `0` (see `CLAUDE.md`: "MultiWriter stores... overlay cap
+/// is always 0"). A single-row `update()` on a `SingleWriter` table this
+/// small buffers in the bounded write overlay (`src/overlay.rs`, cap 32) and
+/// never touches `Child::make_mut` at all, which would make the dirty-credit
+/// test below observe nothing. `MultiWriter` sends every single-row write
+/// straight to the tree, exercising the real block-leaf CoW path.
+fn multiwriter_store_with(dir: &std::path::Path, opts: PagedOptions) -> Store {
+    let p = Persistence::standalone(dir, Durability::Eventual, WalWrite::Coalesced)
+        .paged(opts)
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+    s
+}
+
+/// One batch insert (not a loop of `insert()`s): the bulk fast path builds
+/// leaves directly with no leaf marked "accessed" just from being built —
+/// see the identical helper and its doc in `tests/paged_demotion.rs`. Needed
+/// here for the same reason: a put-loop-built tree's first demote pass would
+/// legitimately demote nothing (every leaf still holds its "just touched"
+/// second chance), which is not what these tests are measuring.
+fn write_rows(s: &Store, n: u64) {
+    let mut w = s.begin_write(None).unwrap();
+    let mut t = w.open_table::<Row>("rows").unwrap();
+    t.insert_batch((0..n).map(|v| Row { v }).collect()).unwrap();
+    w.commit().unwrap();
+}
+
+/// The Step 1 regression, credit/debit/reconcile as one unit.
+///
+/// A naive "does `resident_leaf_bytes_est` return to 0 after a full
+/// checkpoint→fault→checkpoint cycle" check does NOT discriminate old vs.
+/// new code here: `Store::checkpoint_impl_paged`'s F1 reconciliation
+/// (spec §5 "the safety net") re-bases the running counter from an exact
+/// tree walk (`resident_leaf_estimate`) at the end of *every* `checkpoint()`
+/// call whenever `memory_budget_bytes` is `Some` — so once every leaf is
+/// actually demoted again, the walk sums zero leaves and reports 0
+/// regardless of whether the walk's own per-leaf formula (or the demote
+/// debit that ran moments earlier) was ever correct. The debit's accuracy
+/// is invisible from outside a single `checkpoint()` call for exactly that
+/// reason: the very next reconcile overwrites whatever it left behind.
+///
+/// So this test instead keeps a fixed set of "hot" leaves permanently
+/// resident (re-touched every cycle, so they win their second chance and
+/// are never actually demoted — same mechanic as
+/// `accessed_leaf_survives_one_pass` in `tests/paged_demotion.rs`) and
+/// checks the reconciled estimate against an *independently measured*
+/// reference: the exact fault-in credit of a single one of those leaves
+/// (task 4's `PagedSource::read_node` credit, already `leaf_bytes()`-based
+/// and unaffected by this task). Every interior leaf of a densely
+/// bulk-built tree holds exactly `MAX_KEYS` rows (only the tail leaf is
+/// underfull — see `from_sorted_tail_underfull` in `btree.rs`), so one
+/// leaf's fault-in credit is the per-leaf byte cost for all five hot
+/// leaves below, and the reconciled total across 3 repeated cycles must
+/// equal exactly `5 * unit` every time — not merely "the same wrong value
+/// every time", which the walk's own self-consistency would produce
+/// regardless of formula correctness.
+///
+/// Pre-task-8, `resident_leaf_estimate` (the walk the reconciliation calls)
+/// summed a flat `Child::NODE_BYTES` per resident leaf instead of
+/// `leaf_bytes()` — smaller than `unit` for any leaf holding rows — so the
+/// reconciled total undershoots `5 * unit`. That's this test's red.
+#[test]
+fn demote_debit_matches_fault_in_credit_across_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(1 << 30).build());
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap(); // demotes every quiet leaf (all of them, batch-built)
+    s.checkpoint().unwrap(); // sweep any stragglers
+    assert_eq!(
+        s.paged_stats().unwrap().resident_leaf_bytes_est,
+        0,
+        "fully demoted tree must report 0 resident leaf bytes"
+    );
+
+    // Five distinct, safely-interior leaves (well clear of the last ~63
+    // keys, which may make up an underfull tail leaf).
+    let hot_keys = [5u64, 200, 400, 600, 800];
+
+    // Reference unit: the exact fault-in credit of ONE of these leaves.
+    let unit = {
+        let before = s.paged_stats().unwrap().resident_leaf_bytes_est;
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(hot_keys[0]).is_some());
+        s.paged_stats().unwrap().resident_leaf_bytes_est - before
+    };
+    assert!(unit > 0, "a real leaf's fault-in credit must be nonzero");
+
+    for cycle in 0..3 {
+        // Touch every hot leaf (re-touching hot_keys[0] too, so its
+        // accessed bit is freshly set for this cycle's second chance).
+        {
+            let r = s.begin_read(None).unwrap();
+            let t = r.open_table::<Row>("rows").unwrap();
+            for &k in &hot_keys {
+                assert!(t.get(k).is_some(), "cycle {cycle}: key {k} missing");
+            }
+        }
+        // One checkpoint: demote_pass gives every hot leaf its second
+        // chance (all freshly accessed, so none actually demotes — nothing
+        // else is resident to compete with them), then the F1
+        // reconciliation re-bases the counter from the exact walk.
+        s.checkpoint().unwrap();
+        let est = s.paged_stats().unwrap().resident_leaf_bytes_est;
+        let expected = hot_keys.len() as u64 * unit;
+        assert_eq!(
+            est,
+            expected,
+            "cycle {cycle}: reconciled resident_leaf_bytes_est must equal exactly \
+             {} x the single-leaf fault-in credit; drift = {}",
+            hot_keys.len(),
+            est as i64 - expected as i64
+        );
+    }
+}
+
+/// The dirty-credit half of the same unit (spec §4's clause, assigned to
+/// this task): a block-leaf CoW must credit `dirty_bytes` by exactly
+/// `NODE_BYTES + block bytes` (`BTreeNode::leaf_bytes()`), not the flat
+/// `NODE_BYTES` a non-block node still credits.
+///
+/// No internal constant (`Child::NODE_BYTES`) is available from an
+/// integration test, so this proves the point structurally instead: fault
+/// leaf A back in and dirty it (via a committed update to the same key),
+/// which also CoWs the root — the sole internal level above a 2,000-row
+/// tree — crediting the root's own flat `NODE_BYTES` once. That leaves the
+/// root permanently dirty (until the next checkpoint), so a *second*
+/// fault+update on a different key/leaf (B) no longer re-credits the root
+/// (`Child::make_mut`'s `was_clean` gate) — isolating leaf B's dirty-credit
+/// contribution exactly. That isolated `dirty_bytes` delta must equal the
+/// `resident_leaf_bytes_est` delta the earlier fault-in credited for that
+/// same leaf B — same leaf, same entry count (a same-key update never
+/// changes `entries.len()`), so `leaf_bytes()` computed at fault time and at
+/// dirty time must be numerically identical. Pre-task-8, the dirty credit
+/// was a flat `NODE_BYTES` while the fault-in credit was already
+/// `leaf_bytes()` — the two would only coincide by construction on an
+/// (impossible, for a real row) zero-entry leaf.
+#[test]
+fn dirty_credit_matches_fault_in_credit_for_the_same_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(1 << 30).build());
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().resident_leaf_bytes_est, 0);
+
+    // Fault leaf A (key 5) and dirty it — also CoWs (and dirties) the root.
+    {
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(5).is_some());
+    }
+    {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 999 }).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    // Fault leaf B (key 1,000 — far enough from key 5 to land in a
+    // different leaf at MAX_KEYS=63-ish density) and capture the resident
+    // credit delta: exactly leaf B's `leaf_bytes()`.
+    let resident_before = s.paged_stats().unwrap().resident_leaf_bytes_est;
+    {
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(1_000).is_some());
+    }
+    let resident_after = s.paged_stats().unwrap().resident_leaf_bytes_est;
+    let resident_delta_b = resident_after - resident_before;
+    assert!(resident_delta_b > 0, "faulting a fresh leaf must raise the resident estimate");
+
+    // Dirty leaf B — the root is already dirty from the first commit above,
+    // so this commit's `dirty_bytes` delta is leaf B's contribution alone.
+    let dirty_before = s.paged_stats().unwrap().dirty_bytes;
+    {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(1_000, Row { v: 999 }).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    let dirty_after = s.paged_stats().unwrap().dirty_bytes;
+    let dirty_delta_b = dirty_after - dirty_before;
+
+    assert_eq!(
+        dirty_delta_b, resident_delta_b,
+        "a block-leaf CoW must credit dirty_bytes by exactly the same leaf_bytes() the \
+         fault-in credited to resident_leaf_bytes for the identical leaf (pre-task-8 the \
+         dirty credit was a flat NODE_BYTES, smaller than leaf_bytes() for any leaf with \
+         entries)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: pin-aware reconciliation + `pinned_leaf_bytes`.
+//
+// Retained snapshots older than the latest CoW-share pre-demotion leaves
+// with it; `demote_pass` only ever demotes the LATEST snapshot's tables
+// (`Store::demote_pass_inner` reads `inner.snapshots[&latest]`), so a leaf
+// that only an older retained snapshot still references never gets a
+// demote debit — the bytes stay resident in memory, invisible to
+// `resident_leaf_bytes_est`. `pinned_leaf_bytes` is the checkpoint-end
+// reconciliation's answer to "how much of that is there right now".
+// ---------------------------------------------------------------------------
+
+/// Like [`multiwriter_store_with`], but with a caller-chosen
+/// `num_snapshots_retained` — needed here to control exactly how many
+/// older snapshots stay retained (and therefore pinned) at a time.
+fn multiwriter_store_with_retention(dir: &std::path::Path, opts: PagedOptions, retained: usize) -> Store {
+    let p = Persistence::standalone(dir, Durability::Eventual, WalWrite::Coalesced)
+        .paged(opts)
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .num_snapshots_retained(retained)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+    s
+}
+
+/// Task 9 review I-1: the accounting proptest oracle
+/// (`store::tests::pin_aware_reconcile` in `src/store.rs`) is tautological
+/// — `pinned := total - resident` makes `resident + pinned == total` true
+/// by construction, and its "independent" reference walk re-invokes the
+/// very dedup function under test, so it proves only that a set union is
+/// order-independent. Mutation-proven: with dedup disabled entirely (the
+/// `seen` check ignored), the whole suite — including that proptest —
+/// stayed green.
+///
+/// This is the point test that actually exercises dedup: two retained
+/// snapshots whose "rows" table is not merely *unmodified since*, but
+/// LITERALLY the same tree — same `Child` pointers all the way down. `v2`
+/// (latest) only ever opens "other", never "rows", so `v1`'s and `v2`'s
+/// "rows" entries are the identical `Arc`-shared table (see
+/// `untouched_tables_survive_commit` in `tests/store_integration.rs` for
+/// the same guarantee this relies on).
+///
+/// "rows" is pinned `Residency::Resident` so `demote_pass` skips it
+/// entirely. This was not just belt-and-suspenders while getting this test
+/// right: a first version without it failed even on CORRECT (deduped)
+/// code, because `demote_pass` demotes by CoW-replacing the parent chain
+/// of whatever it demotes in latest's OWN tree (never mutating a shared
+/// `Child` in place — see the review's own Priority-1 soundness note on
+/// `BTree::demote_leaves`) — so demoting "rows" from `v2` (latest) would
+/// itself orphan `v1`'s still-resident original copy, which is exactly the
+/// pin *mechanism* this whole feature exists to detect, just triggered by
+/// the demote pass instead of a write. `Residency::Resident` sidesteps
+/// that entirely so this test isolates the ONE thing it's here to check:
+/// dedup of content that never diverges at all.
+///
+/// With dedup working, `v1`'s walk retraces `v2`'s already-`seen` pointers
+/// and contributes nothing new: `pinned_leaf_bytes` must be exactly `0`.
+/// Without dedup, `v1`'s walk would independently re-sum "rows"'s full
+/// resident bytes, and `pinned_leaf_bytes` would equal that (nonzero)
+/// amount instead.
+///
+/// Verified red against the mutant this targets (dedup disabled — see
+/// task-9-report.md's fix-round-1 section for the exact mutation and
+/// failure output).
+#[test]
+fn pinned_leaf_bytes_is_zero_for_a_fully_shared_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().memory_budget_bytes(1 << 30).build())
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .num_snapshots_retained(4)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("other").unwrap();
+
+    // v1: "rows" populated (2,000 rows). "other" does not exist yet.
+    write_rows(&s, 2_000);
+    s.set_residency("rows", Residency::Resident).unwrap();
+    // v2 (latest): a commit that opens ONLY "other" — "rows" is never
+    // touched, so v2's "rows" entry is v1's exact same Arc-shared table,
+    // not a clone that merely happens to still agree.
+    {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("other").unwrap();
+            t.insert(Row { v: 1 }).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    // A checkpoint writes every dirty leaf (both tables, first time either
+    // has been checkpointed) and would normally run demote_pass — but
+    // "rows" is pinned Resident, so demote_pass skips it unconditionally;
+    // its leaves stay resident, real bytes for a broken dedup to
+    // double-count, and structurally UNTOUCHED (no CoW divergence risk
+    // from the demote pass itself).
+    s.checkpoint().unwrap();
+
+    let stats = s.paged_stats().unwrap();
+    assert!(
+        stats.resident_leaf_bytes_est > 0,
+        "rows' leaves must still be resident (Residency::Resident, never demoted) -- \
+         otherwise there is nothing here for a broken dedup to double-count, and this test \
+         would pass vacuously either way"
+    );
+    assert_eq!(
+        stats.pinned_leaf_bytes, 0,
+        "v1 (retained, non-latest) and v2 (latest) share the IDENTICAL rows tree -- a \
+         correctly deduped walk counts it once (as v2's own resident), not once per \
+         retained snapshot"
+    );
+}
+
+/// The Step 1 scenario: `num_snapshots_retained(4)`, several commits that
+/// each CoW the SAME key's leaf (so every commit orphans the previous
+/// leaf, rather than superseding it the way distinct-key updates would —
+/// see this test's own walkthrough below), checkpoints that demote the
+/// latest snapshot's own leaves but cannot reach the 3 older retained
+/// snapshots' orphaned ones.
+///
+/// Every commit below is immediately followed by its own `checkpoint()`
+/// call, deliberately — not batched at the end. Batching would let
+/// `PagedState::last_root` (the checkpoint diff base held for the
+/// dead-page-punch schedule; it also keeps its target version's `Arc`
+/// alive across `gc()` regardless of the retention window) lag several
+/// versions behind `latest_version` for the whole batch, during which
+/// EVERY leaf any of those commits touches gets faulted in as a shared
+/// `Child` before its own commit's CoW splits it away — orphaning a copy
+/// in the stale, artificially-extended-lifetime snapshot `last_root` is
+/// still pointing at, on top of whatever this test intends to measure.
+/// Checkpointing every commit keeps `last_root == latest_version`
+/// throughout, so retention behaves exactly like "keep the `N` most
+/// recent snapshots" with no extra lag term to account for.
+///
+/// This test does NOT try to bring `pinned_leaf_bytes` back to `0` by
+/// committing more writes to this same store — see
+/// `pinned_leaf_bytes_returns_to_zero_once_not_retained` below for why
+/// that specific approach (suggested as one option in the original task
+/// brief) does not work, and what does.
+#[test]
+fn pinned_leaf_bytes_reflects_older_retained_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(1 << 30).build(),
+        4,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap(); // demote everything, second sweeps stragglers
+    let base = s.paged_stats().unwrap();
+    assert_eq!(base.resident_leaf_bytes_est, 0, "fully demoted base tree");
+    assert_eq!(base.pinned_leaf_bytes, 0, "nothing retained yet diverges from latest");
+
+    // Reference unit: the exact fault-in credit of one safely-interior leaf
+    // (key 200 — same safe pick `demote_debit_matches_fault_in_credit_across_cycles`
+    // uses), independent of the key (5) this test repeatedly updates below.
+    let unit = {
+        let before = s.paged_stats().unwrap().resident_leaf_bytes_est;
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(200).is_some());
+        s.paged_stats().unwrap().resident_leaf_bytes_est - before
+    };
+    assert!(unit > 0, "a real leaf's fault-in credit must be nonzero");
+    // Demote the key-200 leaf back out so it doesn't pollute the counts below.
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().resident_leaf_bytes_est, 0);
+    assert_eq!(s.paged_stats().unwrap().pinned_leaf_bytes, 0);
+
+    // Update the SAME key (5) six times, checkpointing after each: every
+    // commit CoWs a brand-new in-memory leaf for it, orphaning the leaf the
+    // PREVIOUS commit just created — that previous leaf is referenced only
+    // by the snapshot version that commit produced, never again touched,
+    // and never demoted (demote_pass only walks the latest snapshot's
+    // tree, and the orphaned leaf isn't part of it once superseded).
+    // `auto_snapshot_gc` (default on, runs at commit time) plus
+    // `num_snapshots_retained(4)` keeps only the most recent 4 snapshots at
+    // any point, so once six updates have gone by, exactly 3 non-latest
+    // snapshots remain, each pinning its own distinct orphaned key-5 leaf.
+    // Each commit's own checkpoint gives its freshly-touched leaf a second
+    // chance (the accessed bit set at creation/fault-in survives one
+    // sweep) rather than demoting it immediately — that's fine, it just
+    // means the LAST commit's checkpoint leaves latest's own key-5 leaf
+    // resident for one more cycle, cleaned up by the extra checkpoint
+    // below.
+    for i in 0..6u64 {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        w.commit().unwrap();
+        s.checkpoint().unwrap();
+    }
+    s.checkpoint().unwrap(); // one more pass: demotes latest's own now-quiet key-5 leaf
+
+    let stats = s.paged_stats().unwrap();
+    assert_eq!(
+        stats.resident_leaf_bytes_est, 0,
+        "latest's own key-5 leaf must be fully demoted after the extra checkpoint"
+    );
+    assert_eq!(
+        stats.pinned_leaf_bytes,
+        3 * unit,
+        "exactly the 3 non-latest retained snapshots' own orphaned key-5 leaves, each the \
+         size of one interior leaf, must be counted pinned"
+    );
+
+    // ------------------------------------------------------------------
+    // What does NOT bring this back to 0, and why (investigated, not
+    // guessed): committing more writes to keep `latest_version` moving,
+    // hoping the 3 pinning snapshots above age out of the retention
+    // window. They DO age out — but EVERY further write that touches an
+    // on-disk (previously-demoted) leaf shared with its own base snapshot
+    // faults that leaf in for BOTH before its own CoW splits them apart,
+    // permanently pinning a fresh orphan in whichever snapshot it was
+    // built from. With `num_snapshots_retained(4)` (3 non-latest slots
+    // always occupied) this is a steady state, not a transient: each new
+    // write's own predecessor becomes a new pin at the same moment the
+    // oldest one ages out — this is exactly the spec's "56x" pin
+    // phenomenon (§1), not a test artifact, and Task 11's enforcement
+    // (adaptive retention shrink) exists because ordinary retry/backoff
+    // traffic cannot self-resolve it. `s.gc()` alone doesn't help either:
+    // with exactly `num_snapshots_retained` snapshots present,
+    // `gc_inner`'s `len <= retain_count` fast path has nothing to evict —
+    // every one of the 4 present is legitimately within the configured
+    // window.
+    //
+    // Review M-5: asserted below, not left as prose — two different
+    // continuations of the SAME steady state, matching what the review's
+    // own probe measured (§0/§6 of task-9-review.md).
+    // ------------------------------------------------------------------
+
+    // Same-key continuation: 6 more update+checkpoint rounds, still all on
+    // key 5. The review's probe confirmed this holds EXACTLY at `3 * unit`
+    // for 12 further rounds — a genuine steady state, not a one-off
+    // snapshot of this test's own specific setup.
+    for i in 6..12u64 {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        w.commit().unwrap();
+        s.checkpoint().unwrap();
+        s.checkpoint().unwrap();
+        assert_eq!(
+            s.paged_stats().unwrap().pinned_leaf_bytes,
+            3 * unit,
+            "round {i}: same-key updates hold pinned_leaf_bytes at EXACTLY 3 * unit — a real \
+             steady state, each round's new orphan replacing the one that just aged out"
+        );
+    }
+
+    // Spread-key continuation — the review's empirical CORRECTION to this
+    // test's own original framing: updating a DIFFERENT key each round is
+    // NOT bounded to the same-key case's exact `3 * unit`. Every commit's
+    // base snapshot still picks up its own orphan (same mechanism as
+    // above), but a spread of keys touches MORE distinct leaves per
+    // retained snapshot before that snapshot ages out — the review
+    // measured `4-5 * unit` here, oscillating, never settling. What DOES
+    // still hold is the floor: `(num_snapshots_retained - 1) * unit`
+    // (== `3 * unit`) is a lower bound regardless of key pattern, since
+    // this mechanism only ever ADDS orphans relative to the same-key case,
+    // never fewer — assert that, not an exact value the workload doesn't
+    // actually hit.
+    for key in [400u64, 600, 800, 1_000, 1_200, 1_400] {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(key, Row { v: 2_000 + key }).unwrap();
+        }
+        w.commit().unwrap();
+        s.checkpoint().unwrap();
+        s.checkpoint().unwrap();
+        let pinned = s.paged_stats().unwrap().pinned_leaf_bytes;
+        assert!(
+            pinned >= 3 * unit,
+            "key {key}: pinned_leaf_bytes ({pinned}) must never drop below the \
+             (num_snapshots_retained - 1) * unit floor ({}) — spread-key writes can and do \
+             oscillate ABOVE it (the review measured 4-5x unit here), never below",
+            3 * unit
+        );
+    }
+}
+
+/// What DOES bring `pinned_leaf_bytes` back to `0`: retention no longer
+/// keeping a diverged snapshot alive at all. A fresh store with
+/// `num_snapshots_retained(1)` runs the identical divergent-update
+/// workload as the test above; once writes stop and the one WriteTx-held
+/// reference to its own base snapshot (kept alive across exactly the
+/// `gc()` call inside its own `commit()` — see the walkthrough below) is
+/// dropped, an explicit `Store::gc()` call collects it and
+/// `pinned_leaf_bytes` reads `0`.
+///
+/// The mid-loop stats prove the WriteTx-reference mechanism, not just the
+/// end state: `num_snapshots_retained(1)` still shows exactly 2 retained
+/// snapshots (`latest` and its immediate predecessor) and `pinned_leaf_bytes
+/// == unit` after every single update+checkpoint in the loop — never 0
+/// mid-stream, even though only 1 snapshot was asked to be retained. Each
+/// iteration's `WriteTx` holds its own base snapshot's `Arc` alive
+/// internally until it is dropped at the end of its scope, so the `gc()`
+/// call inside that SAME `commit()` still sees `Arc::strong_count > 1` on
+/// it and skips it; only the FOLLOWING iteration's commit (after the
+/// previous `WriteTx` has gone out of scope) finds it unprotected. A plain
+/// `checkpoint()` cannot substitute for the final explicit `gc()` here —
+/// checkpointing reconciles whatever `inner.snapshots` currently holds, it
+/// does not itself evict; only `gc()` (automatic at commit, or called
+/// explicitly) removes a map entry.
+#[test]
+fn pinned_leaf_bytes_returns_to_zero_once_not_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(1 << 30).build(),
+        1,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().resident_leaf_bytes_est, 0);
+    assert_eq!(s.paged_stats().unwrap().pinned_leaf_bytes, 0);
+
+    let unit = {
+        let before = s.paged_stats().unwrap().resident_leaf_bytes_est;
+        let r = s.begin_read(None).unwrap();
+        assert!(r.open_table::<Row>("rows").unwrap().get(200).is_some());
+        s.paged_stats().unwrap().resident_leaf_bytes_est - before
+    };
+    assert!(unit > 0);
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(s.paged_stats().unwrap().pinned_leaf_bytes, 0);
+
+    for i in 0..6u64 {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        w.commit().unwrap();
+        s.checkpoint().unwrap();
+        s.checkpoint().unwrap();
+        let stats = s.paged_stats().unwrap();
+        assert_eq!(
+            stats.resident_leaf_bytes_est, 0,
+            "iteration {i}: latest's own leaf must be fully demoted by the second checkpoint"
+        );
+        assert_eq!(
+            stats.pinned_leaf_bytes, unit,
+            "iteration {i}: exactly one trailing snapshot (this commit's own base, still \
+             referenced by its now-out-of-scope WriteTx at commit time) stays pinned even \
+             under num_snapshots_retained(1)"
+        );
+    }
+
+    // Writes have stopped; the last iteration's WriteTx is out of scope, so
+    // nothing protects its base snapshot from gc() anymore.
+    s.gc();
+    s.checkpoint().unwrap();
+    s.checkpoint().unwrap();
+    let aged = s.paged_stats().unwrap();
+    assert_eq!(
+        aged.pinned_leaf_bytes, 0,
+        "with nothing but latest ever retained, an explicit gc() after writes stop must \
+         collect the one trailing snapshot and bring pinned_leaf_bytes to 0"
+    );
+    assert_eq!(aged.resident_leaf_bytes_est, 0);
+}
+
+/// Task 10, spec §6 ("Hard-cap clock eviction"): a single demote sweep
+/// under second-chance semantics can evict ~0 bytes even while deeply over
+/// budget — every leaf that was resident and read since the last pass
+/// survives sweep 1 with its accessed bit merely cleared, not evicted (the
+/// same mechanic `tests/paged_demotion.rs::accessed_leaf_survives_one_pass`
+/// checks at one-leaf scale, here at whole-table scale). Pre-task-10,
+/// `demote_pass` only ever swept once per `checkpoint()`, so a store like
+/// this one — read all over right before a checkpoint under real budget
+/// pressure — would stay over budget forever, one checkpoint after
+/// another, since every pass's lone sweep just re-clears the same bits
+/// its predecessor cleared without ever harvesting them. This is that red:
+/// touch every leaf, then checkpoint under a budget the whole resident set
+/// overshoots, and require the pass to converge within the ONE
+/// `checkpoint()` call — not merely make another checkpoint's worth of
+/// progress next time.
+///
+/// Fix round 1 (review Important-2, Important-3): a `Store` with
+/// `memory_budget_bytes` set wakes the background checkpointer the moment
+/// a fault-in crosses budget (`PagedSource::read_node`, edge-triggered —
+/// see `PagedStats::wake_checkpointer`), and that thread's own
+/// `checkpoint()` call runs its own cycling `demote_pass` concurrently
+/// with the read-scan below — the review instrumented this exact test
+/// body and measured `clock_cycles`/`forced_evictions` already nonzero
+/// (3 / 29) by the time the scan finished, so asserting on raw totals
+/// after the *measured* `checkpoint()` call cannot tell that call's own
+/// work apart from the background thread's. Both counters are captured
+/// immediately before the measured call and asserted as **deltas**. The
+/// review also measured the pre-measurement precondition
+/// (`resident_leaf_bytes_est > BUDGET`) holding by only a ~2x margin at
+/// 5,000 rows (126,960 vs 65,536) even after that background activity —
+/// thin enough that a slightly more effective background pass could shave
+/// it under budget before the measured call ever starts pressure. 50,000
+/// rows (10x the tree) widens that margin by roughly the same factor,
+/// without changing what either counter measures.
+#[test]
+fn hard_cap_clock_cycles_to_convergence() {
+    const BUDGET: u64 = 64 * 1024;
+    const ROWS: u64 = 50_000;
+    let dir = tempfile::tempdir().unwrap();
+    let s = store_with(dir.path(), PagedOptions::builder().memory_budget_bytes(BUDGET).build());
+    write_rows(&s, ROWS);
+    // Writes every leaf to disk and assigns page ids; demotes everything
+    // (freshly batch-built, nothing accessed yet — see `write_rows`'s doc),
+    // so resident starts back at ~0 going into the read-scan below.
+    s.checkpoint().unwrap();
+
+    // Read-scan every row: faults every leaf back in and marks it
+    // accessed, right before the checkpoint this test actually measures.
+    {
+        let r = s.begin_read(None).unwrap();
+        let t = r.open_table::<Row>("rows").unwrap();
+        for k in 1..=ROWS {
+            assert!(t.get(k).is_some(), "key {k} missing");
+        }
+    }
+    let before = s.paged_stats().unwrap();
+    assert!(
+        before.resident_leaf_bytes_est > BUDGET,
+        "the read-scan above must put the whole table back over budget, or this test proves \
+         nothing (resident {}, budget {BUDGET})",
+        before.resident_leaf_bytes_est
+    );
+
+    s.checkpoint().unwrap();
+
+    let after = s.paged_stats().unwrap();
+    assert!(
+        after.resident_leaf_bytes_est <= BUDGET,
+        "resident {} must converge back under budget {BUDGET} within this one checkpoint's \
+         pass, not merely clear second-chance bits for a later pass to harvest",
+        after.resident_leaf_bytes_est
+    );
+    assert!(
+        after.forced_evictions - before.forced_evictions > 0,
+        "leaves that survived cycle 1's second chance must be evicted on a later cycle of \
+         THIS pass — before={}, after={}",
+        before.forced_evictions, after.forced_evictions
+    );
+    assert!(
+        after.clock_cycles - before.clock_cycles >= 2,
+        "convergence here needs at least 2 cycles within THIS pass: cycle 1 only clears \
+         second-chance bits (every leaf was just read), cycle 2 harvests them — before={}, \
+         after={}",
+        before.clock_cycles, after.clock_cycles
+    );
+}
+
+/// Task 10 un-evictable floor: a `Residency::Resident` table is exempt
+/// from demotion outright (`demote_pass_inner`'s per-table check, from
+/// before this task) — the clock must recognize that and terminate rather
+/// than spin forever chasing bytes it can never reclaim.
+///
+/// Fix round 1 (review Important-4): a lone `Resident` table short-circuits
+/// `demote_pass_inner`'s per-table loop before it ever calls `paged_demote`
+/// or looks at a single leaf (`src/store.rs`, the `if tbl.residency() ==
+/// Residency::Resident { break; }` check) — so the original version of
+/// this test only proved the pass terminates when there is *nothing to
+/// sweep at all*. It never exercised "swept a real tree, every leaf came
+/// back second-chanced or pinned", which is exactly Critical-1's shape
+/// (this same `Resident`-floor-over-budget setup, but with a SECOND,
+/// evictable table under concurrent *random-key* point reads that keep
+/// re-arming its leaves' accessed bits every cycle — a sequential reader
+/// would settle into the zero-cycle exit; random access does not). Before
+/// the `Store::MAX_DEMOTE_CYCLES` hard cap landed, this exact
+/// configuration measured 60k+ cycles / 6+ seconds in review, returning
+/// only when the reader workload stopped — a regression here would hang,
+/// not fail, so this now asserts the pass is bounded by the cap rather
+/// than merely "eventually returns" (which a hang trivially also does,
+/// from the test harness's perspective, once it times out).
+#[test]
+fn hard_cap_clock_bounded_under_concurrent_random_access() {
+    // Mirrors `Store::MAX_DEMOTE_CYCLES` (private to the crate, not part
+    // of the public API — hardcoded here, not imported).
+    const MAX_DEMOTE_CYCLES: u64 = 8;
+    const BUDGET: u64 = 64 * 1024;
+    const HOT_ROWS: u64 = 200_000; // un-evictable floor, well over BUDGET alone
+    const COLD_ROWS: u64 = 200_000; // evictable, spread across many leaves -- scale matters:
+    // review's repro needed ~200k rows (thousands of leaves) for random-key
+    // reader pressure to reliably outrun the sweep; smaller trees (tried
+    // 20k) sometimes settle under the cap on their own even without it,
+    // which would make this a flaky, not reliable, regression check.
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().memory_budget_bytes(BUDGET).build())
+        .unwrap();
+    let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
+    s.register_table_paged::<Row>("hot").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+
+    {
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("hot").unwrap();
+        t.insert_batch((0..HOT_ROWS).map(|v| Row { v }).collect()).unwrap();
+        w.commit().unwrap();
+    }
+    write_rows(&s, COLD_ROWS);
+    s.checkpoint().unwrap(); // writes+demotes both tables while still Lazy
+    s.set_residency("hot", Residency::Resident).unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..4u64)
+        .map(|seed| {
+            let s = s.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // xorshift64 — no external RNG dependency, deterministic
+                // per-thread seed, genuinely non-sequential key order
+                // (the property Critical-1's repro needs; a sequential
+                // scan would re-touch each leaf in a tight window and
+                // settle into the zero-cycle exit instead).
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (seed.wrapping_mul(0x1000_0001) | 1);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let k = 1 + (x % COLD_ROWS);
+                    let r = s.begin_read(None).unwrap();
+                    let _ = r.open_table::<Row>("rows").unwrap().get(k);
+                }
+            })
+        })
+        .collect();
+
+    // Give the readers a moment to actually start hammering before the
+    // measured checkpoint begins.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let before = s.paged_stats().unwrap();
+    s.checkpoint().unwrap(); // must return, bounded by MAX_DEMOTE_CYCLES
+    let after = s.paged_stats().unwrap();
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in readers {
+        h.join().unwrap();
+    }
+
+    assert!(
+        after.clock_cycles - before.clock_cycles <= MAX_DEMOTE_CYCLES,
+        "one demote_pass must never exceed MAX_DEMOTE_CYCLES ({MAX_DEMOTE_CYCLES}) cycles, \
+         even under sustained concurrent random-key pressure — before={}, after={}",
+        before.clock_cycles, after.clock_cycles
+    );
+    assert!(
+        after.resident_leaf_bytes_est > BUDGET,
+        "the un-evictable 'hot' table alone exceeds budget, so pressure must remain even \
+         after the pass returns (resident {})",
+        after.resident_leaf_bytes_est
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: adaptive retention shrink under pin pressure (spec §5
+// "enforcement arm", §6 "order of weapons" step 2).
+//
+// Task 9's own tests above (`pinned_leaf_bytes_reflects_older_retained_snapshots`
+// et al.) deliberately configure `memory_budget_bytes(1 << 30)` -- a budget
+// the store never gets anywhere near -- precisely so this task's default-on
+// shrink never fires for them; they stay untouched here. These tests use a
+// TINY budget instead, small enough that a single leaf's pinned bytes alone
+// puts the store over it, and a `num_snapshots_retained` window wide enough
+// (8) that ORDINARY commit-time auto-gc (`gc_inner`, unconditional on
+// budget) would keep every retained snapshot on its own -- so any eviction
+// these tests observe is specifically Task 11's shrink path, not ordinary
+// retention aging a version out.
+//
+// A paged store with `memory_budget_bytes` configured always runs a
+// background checkpointer thread (`Checkpointer::start`, spawned
+// unconditionally alongside `inner.paged`, independent of
+// `checkpoint_interval` -- see its own doc), which races these tests' own
+// explicit `checkpoint()` calls: the tiny budget below wakes it almost
+// immediately (`due_mem`), and a background run can land at any point in
+// the sequence, including mid-commit. `checkpoint_impl_paged` serializes
+// every caller (foreground or background) through the same
+// `checkpoint_lock`, so calls never truly overlap, but which thread's call
+// lands at which moment is not deterministic -- so these tests poll for
+// convergence with a generous bound instead of assuming a fixed call count
+// (see `hard_cap_clock_cycles_to_convergence`'s own doc for the same
+// interaction, there handled via before/after deltas instead).
+// ---------------------------------------------------------------------------
+
+/// Same-key update+checkpoint, `rounds` times starting at round index
+/// `start` -- identical mechanism to task 9's
+/// `pinned_leaf_bytes_reflects_older_retained_snapshots` (proven reliable
+/// there, under a huge budget, to produce real nonzero pinned bytes): each
+/// commit CoWs a brand-new leaf for key 5, orphaning the previous round's
+/// leaf into a snapshot that is now non-latest. Several rounds (not just
+/// one) make the resulting pin pressure robust rather than depending on a
+/// single update's fault-in timing. Returns every version in commit order —
+/// index 0 is `baseline` (the caller-supplied version before any round in
+/// *this call* ran), the rest are rounds `start..start + rounds`.
+///
+/// `start` lets a caller land one or more rounds by hand first (e.g. to
+/// interleave a `pin_version` call between a commit and its checkpoint --
+/// see `adaptive_retention_shrink_honors_version_pin`, review M-5) and then
+/// continue the same `1_000 + i` value numbering through this helper
+/// instead of duplicating its loop body.
+fn same_key_update_rounds(s: &Store, baseline: u64, start: u64, rounds: u64) -> Vec<u64> {
+    let mut versions = vec![baseline];
+    for i in start..start + rounds {
+        let mut w = s.begin_write(None).unwrap();
+        {
+            let mut t = w.open_table::<Row>("rows").unwrap();
+            t.update(5, Row { v: 1_000 + i }).unwrap();
+        }
+        let v = w.commit().unwrap();
+        versions.push(v);
+        s.checkpoint().unwrap();
+    }
+    versions
+}
+
+/// (a) Shrink fires: several update rounds orphan a run of older snapshots
+/// that `num_snapshots_retained(8)` alone would keep (8 total versions --
+/// the store's implicit initial empty version 0, `write_rows`' own version
+/// 1 (`v0` below), and the 6 update rounds -- landing exactly AT that
+/// window's boundary, not one below it: `gc_inner`'s fast path is
+/// `len <= retain_count`, a no-op at `len == retain_count == 8` too) -- but
+/// the tiny budget makes pin pressure alone the excess, so adaptive shrink
+/// collapses retention to 1. The oldest orphaned version becomes
+/// unreadable, latest stays readable, and resident+pinned settle to fit
+/// the budget.
+#[test]
+fn adaptive_retention_shrink_fires_under_pin_pressure() {
+    const RETENTION: usize = 8;
+    // Small enough that a single interior leaf's fault-in credit alone
+    // exceeds it -- see `store_with`'s Row (one u64 field): a real leaf at
+    // T=32 is comfortably larger than this.
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(BUDGET).build(),
+        RETENTION,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    let versions = same_key_update_rounds(&s, v0, 0, 6);
+    let v_old = versions[0]; // == v0: the oldest, first-orphaned version
+    let v_new = *versions.last().unwrap();
+    assert_ne!(v_old, v_new);
+
+    // Ordinary commit-time auto-gc already ran inside every `commit()`
+    // above with `num_snapshots_retained(8)` -- 8 total versions (the
+    // implicit initial empty version 0, `v0`, and the 6 update rounds) sit
+    // exactly AT that window's boundary, so `gc_inner`'s `len <= retain_count`
+    // fast path was always a no-op and v_old is still in `inner.snapshots`.
+    // Only Task 11's shrink path (triggered by the tiny BUDGET making
+    // pinned bytes the whole excess once the capped demote pass settles
+    // latest's own leaf) can evict it. Poll rather than assume a fixed
+    // call count converges (see this section's header comment for why).
+    let mut converged = false;
+    for _ in 0..50 {
+        s.checkpoint().unwrap();
+        if s.begin_read(Some(v_old)).is_err() {
+            converged = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        converged,
+        "v_old must eventually be gone: shrink must collapse retention despite \
+         num_snapshots_retained(8), which alone would have kept every one of these 8 \
+         versions (the initial empty version, v0, and 6 update rounds)"
+    );
+    // Settle: one more checkpoint so the reconcile reflects the converged
+    // state (the loop above may have broken right after the eviction, on a
+    // call whose OWN reconcile ran before the eviction it triggered -- see
+    // `Store::reconcile_paged_stats`'s doc: shrink's own gc happens between
+    // that call's first and second reconcile, so the SAME call's second
+    // reconcile already reflects it, but an extra call costs nothing and
+    // removes any doubt).
+    s.checkpoint().unwrap();
+
+    assert!(
+        s.begin_read(Some(v_new)).is_ok(),
+        "latest must always survive adaptive shrink"
+    );
+
+    let stats = s.paged_stats().unwrap();
+    assert_eq!(
+        stats.pinned_leaf_bytes, 0,
+        "no non-latest snapshot remains after shrink -- nothing left to pin"
+    );
+    assert!(
+        stats.resident_leaf_bytes_est <= BUDGET,
+        "resident {} must fit the budget once shrink settles (pins were the only excess)",
+        stats.resident_leaf_bytes_est
+    );
+}
+
+/// (b) An explicit `VersionPin` survives adaptive shrink: pinning `v0`
+/// keeps its `Arc` strong count above 1, which `gc_inner_with_retain`'s
+/// existing filter already spares regardless of the retain count it is
+/// asked for -- Task 11 adds no second mechanism on top of it. Also
+/// asserts shrink actually FIRES against `v1` (unpinned) before checking
+/// `v0` survives it -- otherwise a build in which the trigger never runs
+/// at all would pass this test identically, proving nothing about the pin
+/// (review, I-1).
+#[test]
+fn adaptive_retention_shrink_honors_version_pin() {
+    const RETENTION: usize = 8;
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(BUDGET).build(),
+        RETENTION,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    // Land the first update commit BEFORE pinning v0 -- pinning while v0 is
+    // still `latest_version` would race `demote_pass`'s own "same-version
+    // re-publish" (`install_paged_tables`; see `Store::reconcile_paged_stats`'s
+    // M-1 doc): a demote pass that re-publishes v0 while it is STILL latest
+    // installs a brand-new `Arc<Snapshot>` at that version's map key, which
+    // would silently orphan a pin taken beforehand (a pre-existing hazard,
+    // independent of Task 11: a `VersionPin` protects only the exact `Arc`
+    // it cloned, and re-publish swaps that `Arc` for a fresh one under the
+    // same key -- reproduced deterministically by
+    // `paged_shrink_orphans_latest_version_pin` below, and documented on
+    // `Store::pin_version`). This tiny-budget setup makes that window
+    // realistic -- demote_pass runs on every checkpoint whenever a budget
+    // is configured at all -- so this test sidesteps it by construction
+    // instead: pinning strictly AFTER v0 stops being latest is safe,
+    // because `demote_pass_inner` only ever reads/writes
+    // `inner.latest_version`, never an older, already-superseded version,
+    // so v0's map entry is permanently stable (same `Arc` identity) from
+    // the moment a newer commit lands.
+    let mut w = s.begin_write(None).unwrap();
+    {
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update(5, Row { v: 1_000 }).unwrap();
+    }
+    let v1 = w.commit().unwrap();
+    assert_ne!(v0, v1);
+
+    // `_pin`, not `pin`: never referenced again below (only its side effect
+    // of keeping v0's `Arc` alive matters), and plain scope-end drop at the
+    // end of this function does exactly what an explicit trailing `drop`
+    // would (review, M-5).
+    let _pin = s.pin_version(Some(v0)).unwrap();
+    assert_eq!(_pin.version(), v0);
+
+    // Round 1's own checkpoint, then five more same-key update rounds via
+    // the shared helper (review, M-5: no more inlined loop-body copy),
+    // continuing from v1 (unpinned -- expected to be shrunk away, in
+    // contrast to the pinned v0).
+    s.checkpoint().unwrap();
+    let versions = same_key_update_rounds(&s, v1, 1, 5);
+    let v_new = *versions.last().unwrap();
+
+    // I-1 (review): assert shrink actually FIRES -- bounded poll until v1
+    // (unpinned) is gone.
+    let mut fired = false;
+    for _ in 0..50 {
+        s.checkpoint().unwrap();
+        if s.begin_read(Some(v1)).is_err() {
+            fired = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        fired,
+        "shrink must actually fire: v1 (unpinned) must eventually be gone, otherwise \
+         v0's survival below proves nothing"
+    );
+
+    // Sustained pressure: several more rounds after shrink has already
+    // fired once -- the pin must keep protecting v0, not just survive up to
+    // the moment shrink first ran.
+    for _ in 0..20 {
+        s.checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(
+        s.begin_read(Some(v0)).is_ok(),
+        "VersionPin must survive adaptive shrink even though retention was collapsed to 1 \
+         for everything else"
+    );
+    assert!(
+        s.begin_read(Some(v_new)).is_ok(),
+        "latest must always be readable"
+    );
+}
+
+/// (c) `shrink_retention_under_pressure(false)`: nothing gets gc'd beyond
+/// the configured `num_snapshots_retained` window. The store stays over
+/// budget, and `pinned_leaf_bytes` reports the excess honestly instead of
+/// silently shrinking around it.
+#[test]
+fn adaptive_retention_shrink_knob_false_leaves_store_over_budget() {
+    const RETENTION: usize = 8;
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(
+            PagedOptions::builder()
+                .memory_budget_bytes(BUDGET)
+                .shrink_retention_under_pressure(false)
+                .build(),
+        )
+        .unwrap();
+    let s = Store::new(
+        StoreConfig::builder()
+            .persistence(p)
+            .writer_mode(WriterMode::MultiWriter)
+            .num_snapshots_retained(RETENTION)
+            .build(),
+    )
+    .unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    let versions = same_key_update_rounds(&s, v0, 0, 6);
+    let v_old = versions[0];
+    let v_new = *versions.last().unwrap();
+
+    for _ in 0..10 {
+        s.checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(
+        s.begin_read(Some(v_old)).is_ok(),
+        "knob false: only ordinary retention (num_snapshots_retained(8)) governs eviction, \
+         and 8 total versions (the initial empty version, v0, and 6 update rounds) sit \
+         exactly AT that window's boundary -- v_old must still be readable"
+    );
+    assert!(
+        s.begin_read(Some(v_new)).is_ok(),
+        "latest must always be readable"
+    );
+
+    let stats = s.paged_stats().unwrap();
+    assert!(
+        stats.pinned_leaf_bytes > 0,
+        "with shrink disabled, pinned_leaf_bytes must honestly report the un-shrunk excess \
+         instead of the store silently freeing it out from under num_snapshots_retained"
+    );
+    // I-2 (review): the brief's actual claim is "the store stays over
+    // budget" -- `pinned_leaf_bytes > 0` alone is a weaker statement (only
+    // equivalent to "over budget" by an unstated argument about leaf size
+    // vs. this tiny BUDGET). Assert the real contract the knob's own doc
+    // promises directly.
+    assert!(
+        stats.resident_leaf_bytes_est + stats.pinned_leaf_bytes > BUDGET,
+        "knob false: the store must stay over budget indefinitely under sustained pin \
+         pressure -- resident {} + pinned {} must exceed BUDGET {BUDGET}",
+        stats.resident_leaf_bytes_est, stats.pinned_leaf_bytes
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 11 review (task-11-review.md), Critical C-1.
+// ---------------------------------------------------------------------------
+
+/// UNRESOLVED — needs a ruling before it is fixed. **This is task 11's
+/// review finding C-1**, and `#[ignore]` means "reproduced, not yet ruled
+/// on", **not** "known broken, ignore forever" (same convention as task
+/// 60's F1, `tests/wal_fault_torn_tail.rs`). The test passes: it reliably
+/// reproduces the hazard now documented on `Store::pin_version`,
+/// `VersionPin`, and `PagedOptions::shrink_retention_under_pressure`.
+///
+/// # The question
+///
+/// `Store::install_paged_tables` (`src/store.rs`) always builds a *brand
+/// new* `Arc<Snapshot>` and inserts it at the same version key — this is
+/// the pre-existing "same-version re-publish" mechanism `demote_pass`'s
+/// per-table loop relies on (`Store::reconcile_paged_stats`'s own M-1
+/// doc), and it is unconditional: it runs at least once per non-`Resident`
+/// table on *every* `checkpoint()` call that has a `memory_budget_bytes`
+/// configured, whether or not anything was actually demoted. A
+/// [`VersionPin`](ultima_db::Store) taken on a version *while it is still
+/// `latest_version`* holds only the `Arc` it cloned at that moment; the
+/// very next checkpoint's re-publish (if any) installs a *different* `Arc`
+/// under the same map key, silently disconnecting the pin's copy from the
+/// store's own. From that point, `gc_inner_with_retain`'s
+/// `Arc::strong_count == 1` filter sees only the map's own (now
+/// unprotected) reference — so once that version ages out of retention
+/// (ordinary auto-gc, or, with the task-11 default
+/// `shrink_retention_under_pressure(true)`, adaptive shrink acting almost
+/// immediately under budget pressure), the map entry is collected **while
+/// the pin is still alive**. `Store::begin_read(Some(pin.version()))` then
+/// fails with `Error::VersionNotFound`, even though the pin's own `Arc`
+/// (and every leaf it reaches) is still resident in memory — dead weight,
+/// invisible to `pinned_leaf_bytes` (whose reconcile walk only ever visits
+/// `inner.snapshots`, so an orphaned pin's bytes are uncounted by exactly
+/// the mechanism spec §5 exists to make honest).
+///
+/// The root cause (re-publish) predates task 11 and is not itself a
+/// defect: it is what keeps `demote_pass` and `Store::reconcile_paged_stats`'s
+/// `last_root` refresh correct. What is unruled is what to do about the
+/// `VersionPin` contract gap it opens — candidates include re-resolving a
+/// pin against the live map entry at gc time, or restricting
+/// `pin_version` to reject pinning a version that is still latest in a
+/// budget-limited paged store. Two safe patterns already exist and are
+/// documented (`Store::pin_version`'s doc): pin only a version that is no
+/// longer latest, or set `shrink_retention_under_pressure(false)` for a
+/// pin-while-latest / SMR handoff store.
+///
+/// # Reproduction shape
+///
+/// Deterministic, not a timing race: `pin_version` is called while `v0`
+/// is still latest, then exactly one more `checkpoint()` — still before
+/// any further commit — is enough to re-publish `v0`'s map entry (the
+/// per-table loop's first batch always calls `install_paged_tables`).
+/// Several further update+checkpoint rounds and a tiny budget then let
+/// adaptive shrink (default on) collect the now-orphaned entry.
+#[test]
+#[ignore = "unresolved: see the doc comment; task 11 review C-1, do not pin until ruled on"]
+fn paged_shrink_orphans_latest_version_pin() {
+    const RETENTION: usize = 8;
+    const BUDGET: u64 = 256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = multiwriter_store_with_retention(
+        dir.path(),
+        PagedOptions::builder().memory_budget_bytes(BUDGET).build(),
+        RETENTION,
+    );
+    write_rows(&s, 2_000);
+    s.checkpoint().unwrap();
+    let v0 = s.checkpoint().unwrap();
+
+    // The unsafe pattern: pin WHILE v0 is still latest_version.
+    let pin = s.pin_version(Some(v0)).unwrap();
+    assert_eq!(pin.version(), v0);
+
+    // Deterministically orphans the pin: `demote_pass`'s per-table loop
+    // calls `install_paged_tables` at least once per non-`Resident` table
+    // on this checkpoint (still v0 == latest_version, since no further
+    // commit has landed), unconditionally building a brand-new
+    // `Arc<Snapshot>` for v0. `pin`'s `Arc` and `inner.snapshots[&v0]`'s
+    // `Arc` are now two different allocations.
+    s.checkpoint().unwrap();
+    assert!(
+        s.begin_read(Some(v0)).is_ok(),
+        "sanity: still readable immediately after the re-publish -- the map entry moved \
+         to a new Arc, but nothing has tried to evict it yet"
+    );
+
+    // Land enough further commits+checkpoints that adaptive shrink (default
+    // on, tiny budget) tries to collect the now-orphaned map entry.
+    let _versions = same_key_update_rounds(&s, v0, 0, 6);
+    for _ in 0..50 {
+        s.checkpoint().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // The bug: begin_read fails even though `pin` is alive and still
+    // holding the STALE snapshot's memory.
+    assert!(
+        s.begin_read(Some(v0)).is_err(),
+        "reproduction did not reproduce: v0 was expected to become unreadable despite the \
+         live VersionPin (task 11 review, C-1) -- if this now passes, the hazard may have \
+         been fixed; update Store::pin_version's, VersionPin's, and \
+         PagedOptions::shrink_retention_under_pressure's docs, then un-ignore this test"
+    );
+    drop(pin);
+}

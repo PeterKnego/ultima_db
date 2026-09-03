@@ -28,7 +28,7 @@ fn store(dir: &std::path::Path) -> Store {
         .paged(PagedOptions::builder().build())
         .unwrap();
     let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
     s
 }
 
@@ -49,7 +49,7 @@ fn checkpoint_chain_max_is_inert_in_paged_mode() {
     // paged mode ignores it rather than merely never having been asked.
     let s = Store::new(StoreConfig::builder().persistence(p).checkpoint_chain_max(4).build())
         .unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
 
     for round in 0..4u64 {
         let mut w = s.begin_write(None).unwrap();
@@ -94,7 +94,7 @@ fn standalone_fast_paged_end_to_end() {
     {
         let p = Persistence::standalone_fast(d.path()).paged(PagedOptions::builder().build()).unwrap();
         let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-        s.register_table::<Row>("rows").unwrap();
+        s.register_table_paged::<Row>("rows").unwrap();
 
         let mut w = s.begin_write(None).unwrap();
         {
@@ -109,7 +109,7 @@ fn standalone_fast_paged_end_to_end() {
 
     let p = Persistence::standalone_fast(d.path()).paged(PagedOptions::builder().build()).unwrap();
     let s2 = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s2.register_table::<Row>("rows").unwrap();
+    s2.register_table_paged::<Row>("rows").unwrap();
     s2.recover().unwrap();
 
     let rtx = s2.begin_read(None).unwrap();
@@ -139,7 +139,7 @@ fn multiwriter_disjoint_writers_with_interleaved_checkpoints_survive_recovery() 
             StoreConfig::builder().persistence(p).writer_mode(WriterMode::MultiWriter).build(),
         )
         .unwrap();
-        s.register_table::<Row>("rows").unwrap();
+        s.register_table_paged::<Row>("rows").unwrap();
 
         let barrier = Arc::new(Barrier::new(THREADS as usize));
         let handles: Vec<_> = (0..THREADS)
@@ -191,7 +191,7 @@ fn multiwriter_disjoint_writers_with_interleaved_checkpoints_survive_recovery() 
         .paged(PagedOptions::builder().build())
         .unwrap();
     let s2 = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s2.register_table::<Row>("rows").unwrap();
+    s2.register_table_paged::<Row>("rows").unwrap();
     s2.recover().unwrap();
 
     let rtx = s2.begin_read(None).unwrap();
@@ -235,4 +235,45 @@ fn bulk_load_then_checkpoint_then_recover() {
     for i in 0..2_000u64 {
         assert_eq!(t.get(i), Some(&Row { v: i }));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: `register_table_paged` + `Error::PagedNeedsClone`. See
+// `docs/tasks/task64_paged_leaf_value_blocks.md` (or the task's
+// `docs/superpowers/specs/2026-08-31-paged-leaf-arena-memory-honesty-design.md`
+// §4 "Public surface") for the design this locks in.
+// ---------------------------------------------------------------------------
+
+/// Plain `Store::register_table` on a paged store cannot produce the clone
+/// fn a block-leaf CoW needs (`NodeSource::clone_value`) — it must be
+/// refused up front with `Error::PagedNeedsClone`, not silently accepted
+/// and left to fail (or panic) the first time a leaf actually needs to
+/// clone a value.
+#[test]
+fn plain_register_on_paged_store_errors_needs_clone() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().build())
+        .unwrap();
+    let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
+    let e = s.register_table::<Row>("rows").unwrap_err();
+    assert!(matches!(e, Error::PagedNeedsClone { .. }), "{e:?}");
+}
+
+/// `Store::register_table_paged` is the required registration on a paged
+/// store, and additive elsewhere: it also succeeds, behaving as plain
+/// registration, on a non-paged store.
+#[test]
+fn register_table_paged_works_on_paged_and_plain_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = Persistence::standalone(dir.path(), Durability::Eventual, WalWrite::Coalesced)
+        .paged(PagedOptions::builder().build())
+        .unwrap();
+    let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
+
+    // Harmless (compiles and succeeds, behaving as plain registration) on a
+    // non-paged store too.
+    let plain = Store::default();
+    plain.register_table_paged::<Row>("rows").unwrap();
 }

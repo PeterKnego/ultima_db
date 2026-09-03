@@ -151,7 +151,7 @@ without providing one is outside this model. L1 (liveness) is inexpressible
 until that action exists.
 
 **Checkpoint and prune are absent.** `checkpointVersion` is carried and
-honoured as the replay floor (`src/store.rs:2600-2603`), but no action moves
+honoured as the replay floor (`src/store.rs:3079-3082`), but no action moves
 it off 0, so no config exercises a non-zero floor — and checkpoint/prune/crash
 interleaving is exactly where this class of bug historically bites.
 
@@ -187,9 +187,9 @@ two affected.
 
 `scan_wal` treats a CRC mismatch as end-of-log only when `tail_tolerant`,
 which `Store::recover` passes for `CoalescedPrealloc` and nothing else
-(`src/store.rs:2590-2595`). Every other sink gets `Err(WalCorrupted)`
+(`src/store.rs:3069-3074`). Every other sink gets `Err(WalCorrupted)`
 (`src/wal.rs:709-711`), which `recover` propagates with `?`
-(`src/store.rs:2596`) **before applying any entry** — so frames the scan had
+(`src/store.rs:3075`) **before applying any entry** — so frames the scan had
 already accepted, at offsets *before* the tear, are discarded with it. A
 full-length-but-CRC-bad tail is physically ordinary on an appending sink.
 
@@ -254,7 +254,7 @@ disposition it states is not.*
 that call is `src/wal.rs:1196` today, routed through
 `WalSinkKind::CoalescedPrealloc.tail_tolerant()`.
 `Store::recover` decided tolerance **separately**, from the configured
-`WalWrite` — that call site is `src/store.rs:2590-2595` today and now derives
+`WalWrite` — that call site is `src/store.rs:3069-3074` today and now derives
 from the same `sink_kind().tail_tolerant()`, so the two decisions are no longer
 independent.
 
@@ -417,7 +417,7 @@ mutation is a green with nothing behind it.
 | **`M2Fork.cfg`** | — (`MaxCommits = 3`) | `ForkFromPromotePredecessor` | 11 | M2's documented **symptom**: the disjoint-table erasure. |
 | `M3.cfg` | `WalCrashMW.cfg` | `PromotionFaithful` | 7 | The version bump reverts to the pre-fix form verbatim (`e60f8ce^`): compare against `latest_version` alone **and** allocate `latest_version + 1`. |
 | **`M3Dup.cfg`** | — (`MaxCommits = 3`) | `NoDupLive` | 12 | M3's documented **symptom**: two writers bumped to the same version, the second `snapshots.insert(v, ..)` silently replacing the first. |
-| `M4.cfg` | `WalCrashPrealloc.cfg` | `TailTolerance` | 9 | `ScanIsTolerant` loses its `CoalescedPrealloc` arm (`src/store.rs:2590-2595`), so a preallocated WAL is scanned strictly and a legal torn tail aborts recovery — task37 §7. |
+| `M4.cfg` | `WalCrashPrealloc.cfg` | `TailTolerance` | 9 | `ScanIsTolerant` loses its `CoalescedPrealloc` arm (`src/store.rs:3069-3074`), so a preallocated WAL is scanned strictly and a legal torn tail aborts recovery — task37 §7. |
 | `M4Abort.cfg` | `modes/ConsistentPrealloc.cfg` | `StrictScanErrLosesDurableAck` | 10 | M4's **harm**: a durably-acked commit made unreachable because a later frame tore. |
 | `M5.cfg` | `WalCrashPrealloc.cfg` | `PreallocInvariant` | 5 | `SyncData` loses its `metaDurable` guard — a batch written into a freshly extended region under a bare `fdatasync`, i.e. `preallocate_to`'s `sync_all` (`src/wal.rs:669`) never ran before the positioned write at `:1249`. task37 §4 invariant 2. |
 | **`M5Strand.cfg`** | `modes/ConsistentPrealloc3.cfg` | `NoAckLossAfterLiveExtend` | 16 | M5's **harm** rather than its mechanism: an acked commit lost behind an un-synced *live-log* extend. |
@@ -584,9 +584,9 @@ the model or the Rust is wrong. This is the full list, classified.
 
 | # | Finding | Cites | Disposition |
 |---|---|---|---|
-| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:2590-2595`, `:2596`; `src/wal.rs:709-711` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
+| A1 | Torn tail loses durable acked commits on strict scan — 2 of the 3 `WalWrite` variants, incl. the `#[default]` one, under either durable tier (§3 F1) | `src/store.rs:3069-3074`, `:3075`; `src/wal.rs:709-711` | **F1** — committed as checked owed property `StrictScanErrLosesDurableAck` |
 | A2 | `preallocate_to` not idempotent under ENOSPC; never-synced size adopted on next open | `src/wal.rs:632-671`, `:1196-1197`, `:1211-1232`; the error path as described is `1e5d2b7^ src/wal.rs:1130-1136` | **F2** — code-reading finding, outside the model's state space; adjudicated low severity and **fixed in `1e5d2b7`** (see F2) |
-| A3 | Scan tolerance decided independently in two modules | `5df6d23^ src/wal.rs:1119` vs `src/store.rs:2590-2595` (both route through `WalSinkKind::tail_tolerant()` today) | **F3** — code-reading finding; adjudicated low severity and **fixed in `5df6d23`** (see F3) |
+| A3 | Scan tolerance decided independently in two modules | `5df6d23^ src/wal.rs:1119` vs `src/store.rs:3069-3074` (both route through `WalSinkKind::tail_tolerant()` today) | **F3** — code-reading finding; adjudicated low severity and **fixed in `5df6d23`** (see F3) |
 
 ### Model artifacts and methodology corrections
 
@@ -596,7 +596,7 @@ the model or the Rust is wrong. This is the full list, classified.
 | B2 | `TailTolerance` clause 2 ("stops at the last good frame, not before it") has **no independent detection power**: `Replay` *is* the accepted prefix by construction. An earlier draft justified it by pointing at the strict path throwing the whole log away — that justification was **wrong**, because the strict path always sets `recoverErr`, which clause 1 already catches | Kept as future-proofing, and **labelled as such out loud** rather than counted as a check doing work |
 | B3 | `RecoverySound` clause (a) was asserted to be covered by "M1/M2, the ordering mutations". **False.** `RecoverySound` is clean on both: their break lands on `PromotionFaithful`, a claim about the **live promotion chain**, whereas clause (a) is about the **recovered prefix** after a crash. Different property, different variable, no overlap | Retracted; hole closed in Task 5c by M7. The retraction is preserved in README "Closed calibration holes" because *how* it went unnoticed is the reusable lesson |
 | B4 | A bare order reversal for M7 would also descend the versions, reddening `PromoteOrderIsSubmitOrder`, `ForkFromPromotePredecessor` and clause (d) at the same depth — the red would not be clause (a)'s alone | M7 permutes identity at **monotone** versions instead |
-| B5 | Post-`Recover`, `promoted` is the **replay sequence, not the Rust's snapshot chain** — recovery installs exactly one snapshot, at `latest_version` (`src/store.rs:2733-2739`) | Documented as a caution in `WalCrash.tla`; a property like "every acked version is *readable* after recovery" must not be built on it |
+| B5 | Post-`Recover`, `promoted` is the **replay sequence, not the Rust's snapshot chain** — recovery installs exactly one snapshot, at `latest_version` (`src/store.rs:3212-3218`) | Documented as a caution in `WalCrash.tla`; a property like "every acked version is *readable* after recovery" must not be built on it |
 | B6 | `ConsistentInline` under MultiWriter model-checked cleanly (exit 0) over a store `Store::new` rejects (task38) | `ASSUME` added; now exit 10, which fails every table entry |
 | B7 | Mutating only M3's *comparison* cannot produce the documented duplicate; both halves of the pre-fix form are the bug | M3 reverts the version bump verbatim to `e60f8ce^` |
 | B8 | M2/M3/M5's shallowest counterexample is a shallower **consequence** (M5: the mechanism rather than the harm), not the documented symptom | Four clause-focused secondary configs, each with a same-bound control — and now the §7 manifest |

@@ -41,10 +41,14 @@ point-in-time reads are zero-copy and old versions stay alive for free.
   CRC-protected checkpoints, crash recovery, and a checkpoint-only SMR mode
   for Raft/Paxos deployments where the consensus log owns durability.
 - **Paged checkpoints** — opt-in `.paged(PagedOptions)` backs a table's
-  B-tree nodes with an on-disk page file instead of full-row checkpoints, so
-  a data set bigger than RAM stays reachable: quiet leaves demote under a
-  memory budget, hot ones can be pinned resident, and a background
-  checkpointer thread runs on dirty-bytes/interval triggers.
+  B-tree nodes with an on-disk page file instead of full-row checkpoints,
+  and recovery is lazy: inner levels load eagerly, data leaves fault in on
+  first touch, so restart time is bounded by the inner levels rather than
+  the row count. Quiet leaves demote under a soft memory budget, hot tables
+  can be pinned resident, and a background checkpointer thread runs on
+  dirty-bytes/budget/interval triggers. This is a checkpoint format and a
+  recovery path, not a larger-than-memory throughput mode: the working set
+  still needs to fit (see the benchmark caveat below).
 - **Bulk loads & snapshot streaming** — O(N) sorted rebuilds for restores
   and deltas, multi-table atomic installs, and a streaming wire format for
   replication.

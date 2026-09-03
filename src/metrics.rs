@@ -22,8 +22,15 @@ pub struct MetricsSnapshot {
     /// Total `WriteTx::rollback` calls plus implicit rollbacks on `Drop`
     /// (a `WriteTx` dropped without calling `commit`).
     pub rollbacks: u64,
-    /// Total `Store::gc` invocations, regardless of how many snapshots each
-    /// run actually collected.
+    /// Total internal gc passes (`gc_inner_with_retain`), regardless of how
+    /// many snapshots each run actually collected. Despite the name, this
+    /// is not just explicit [`Store::gc`](crate::Store::gc) calls — every
+    /// caller of the shared `gc_inner`/`gc_inner_with_retain` machinery
+    /// counts here: commit-time auto-gc (`StoreConfig::auto_snapshot_gc`,
+    /// on by default) on every commit, and (task 11) a paged checkpoint's
+    /// adaptive retention shrink
+    /// (`PagedOptions::shrink_retention_under_pressure`, also on by
+    /// default) whenever it decides to gc down to a floor of 1.
     pub gc_runs: u64,
     /// Total number of retained snapshots reclaimed across all `gc` runs.
     pub snapshots_collected: u64,
@@ -405,8 +412,16 @@ pub(crate) fn emit_paged_stats(s: &crate::store::PagedStatsSnapshot) {
     metrics::gauge!("ultima.paged.index_page_faults").set(s.index_page_faults as f64);
     metrics::gauge!("ultima.paged.pages_written").set(s.pages_written as f64);
     metrics::gauge!("ultima.paged.leaves_demoted").set(s.leaves_demoted as f64);
+    // Task 10 fix round 1 (review Minor-6): `clock_cycles` is the operator
+    // signal for a runaway pass (see `Store::MAX_DEMOTE_CYCLES`'s doc,
+    // review Critical-1) — a delta that keeps landing at the cap across
+    // successive checkpoints means a permanently-over-budget floor plus
+    // concurrent readers, not transient pressure.
+    metrics::gauge!("ultima.paged.clock_cycles").set(s.clock_cycles as f64);
+    metrics::gauge!("ultima.paged.forced_evictions").set(s.forced_evictions as f64);
     metrics::gauge!("ultima.paged.dirty_bytes").set(s.dirty_bytes as f64);
     metrics::gauge!("ultima.paged.resident_leaf_bytes_est").set(s.resident_leaf_bytes_est as f64);
+    metrics::gauge!("ultima.paged.pinned_leaf_bytes").set(s.pinned_leaf_bytes as f64);
     metrics::gauge!("ultima.paged.checkpointer_runs").set(s.checkpointer_runs as f64);
     metrics::gauge!("ultima.paged.dead_pages_punched").set(s.dead_pages_punched as f64);
     metrics::gauge!("ultima.paged.dead_pages_dropped").set(s.dead_pages_dropped as f64);

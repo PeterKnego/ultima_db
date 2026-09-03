@@ -37,7 +37,7 @@ fn store(dir: &std::path::Path) -> Store {
         .paged(PagedOptions::builder().retained_checkpoints(1).build())
         .unwrap();
     let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
     s
 }
 

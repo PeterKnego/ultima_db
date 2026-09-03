@@ -1,5 +1,8 @@
 # task63: Paged B-tree (stages 1+2) — config, metrics, and the consolidated record
 
+**Scope ruling (Peter, 2026-09-03):** paged mode ships as a *checkpoint format plus lazy
+recovery*, not as a larger-than-memory throughput mode — see task64 §16 for the RocksDB A/B
+that settled it. Read §1's "bigger than RAM stays reachable" as *reachable*, not *fast*.
 **Status:** Implemented (Tasks 1–14) and accepted (Task 16, `make paging/check` — all six
 assertions PASS, local/shape-only; see the "Acceptance (Task 16, local, shape only)" section at
 the end of this doc). §7 below is unchanged from Task 14 and still describes itself as
@@ -456,9 +459,14 @@ leaves sat *under* budget throughout.
   - **Low `num_snapshots_retained`** for memory-budgeted paged deployments: retention 10 vs 1
     is **237 vs 13,343 ops/s (~56×)** on the NVMe host — older retained snapshots CoW-pin the
     pre-demotion tree, invisible to the budget. THE dominant lever there.
+    **RETRACTED 2026-09-02** (task64 §13.4): the 13,343 was a read-only C cell (the lever
+    script passed no `--workload`); the matrix's C cell at retention 10 was 13,664. Retention
+    is not a measured lever on any workload on any host; the F5 refutation below stands.
   - **`fanout-t8`** for write-heavy paged deployments: +2.2× on NVMe, +3.2× locally — the one
     lever that replicates across boxes. Best validated config (t8 + retention 1): 29.4k ops/s,
-    2.2× ReDB on the same cells.
+    2.2× ReDB on the same cells. **CORRECTED 2026-09-02:** the +2.2× NVMe figure and the 29.4k
+    are read-only C cells (ReDB C = 28.4k, so ~parity); the +3.2× local figure is the real
+    write-path (A) evidence for t8.
   - ~~mimalloc~~: no effect on the NVMe host (local kernel/glibc swap-path artifact).
   - ~~Ingest-then-serve reopen~~: NEGATIVE on NVMe (run2 20-45% below run1 — cold recovery
     never re-warms inside the window). Do not recommend.
@@ -476,3 +484,8 @@ leaves sat *under* budget throughout.
 - **Open observation**: one ≥4.29 s op (u32-saturated `max_us`) per pressured write cell,
   present with zero checkpointer runs — suspect first-gc drop of load-era memory under swap or
   cgroup direct-reclaim; also raise the harness latency counter above u32 ns.
+
+**Both deferred items above shipped as the stage-3 memory-honesty slice** — per-leaf value
+blocks (kills F6 structurally, no reopen needed) and hard-cap clock eviction (bounded, ignores
+the accessed bit once the cap is hit) plus pin-aware, memory-honest accounting. See
+`docs/tasks/task64_paged_leaf_value_blocks.md`.

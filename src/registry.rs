@@ -173,6 +173,14 @@ pub(crate) struct TableTypeInfo {
     pub attach_paged: AttachPagedFn,
     /// See [`AttachPagedEntryFn`].
     pub attach_paged_entry: AttachPagedEntryFn,
+    /// Whether this table was registered via
+    /// [`TableRegistry::register_paged`] (`Store::register_table_paged`) —
+    /// i.e. whether `attach_paged`/`attach_paged_entry` above capture a real
+    /// clone fn (`Some`) rather than `None`. Purely informational (nothing
+    /// in this crate branches on it today): it names, at the registry
+    /// entry itself, which registration path produced the closures a
+    /// caller is about to invoke.
+    pub paged_clone: bool,
 }
 
 /// Registry mapping table names to their type-erased serializers.
@@ -198,7 +206,50 @@ fn hex<K: PrimaryKey>(key: &K) -> String {
 impl TableRegistry {
     /// Register a table type. Stores closures that can serialize/deserialize
     /// records and full tables for the record type `R` keyed by `K`.
+    ///
+    /// No paged-leaf clone capability: `attach_paged`/`attach_paged_entry`
+    /// on the stored entry hand `PagedSource` a `None` clone fn, so a table
+    /// registered this way must never reach a paged store's data tree with
+    /// `Some` needed (`Store::register_table_keyed` refuses that case up
+    /// front with `Error::PagedNeedsClone` before ever calling this).
     pub fn register<R: Record, K: PrimaryKey>(&mut self, name: &str) -> Result<()> {
+        self.register_impl::<R, K>(name, None)
+    }
+
+    /// Register a table type with the paged-leaf clone capability wired
+    /// through — the counterpart of [`Self::register`] that
+    /// `Store::register_table_paged`/`register_table_paged_keyed` call.
+    /// `attach_paged`/`attach_paged_entry` on the stored entry capture
+    /// `Some(<R as Clone>::clone as fn(&R) -> R)`, which
+    /// `Table::attach_paged_source`/`from_paged_entry` hand to the built
+    /// `PagedSource` so a block-leaf CoW on this table's data tree has a
+    /// way to clone a displaced value out of the block. Also correct (as
+    /// plain registration) on a non-paged store: `PagedSource::clone_value`
+    /// is never called on a tree with no paged source at all.
+    pub fn register_paged<R: Record + Clone, K: PrimaryKey>(&mut self, name: &str) -> Result<()> {
+        self.register_impl::<R, K>(name, Some(<R as Clone>::clone as fn(&R) -> R))
+    }
+
+    /// Shared body of [`Self::register`]/[`Self::register_paged`] — `clone`
+    /// is `Some` only from the latter, and rides into the stored
+    /// `attach_paged`/`attach_paged_entry` closures (see [`AttachPagedFn`]/
+    /// [`AttachPagedEntryFn`]) so a later `Store::checkpoint`/`recover` paged
+    /// branch has it without needing `R: Clone` at its own (type-erased)
+    /// call site.
+    ///
+    /// `pub(crate)`, not private: `Store::register_table_impl` calls this
+    /// directly with a `clone` value it already built at its own call site
+    /// (where `R: Clone` is either present, from `register_table_paged*`, or
+    /// deliberately absent, from `register_table*`) — going through
+    /// `register`/`register_paged` from there would need an `R: Clone`
+    /// bound on a function body that only conditionally needs it, which
+    /// Rust's generic bound-checking (checked at every call site,
+    /// regardless of which runtime branch actually runs) does not allow.
+    pub(crate) fn register_impl<R: Record, K: PrimaryKey>(
+        &mut self,
+        name: &str,
+        clone: Option<fn(&R) -> R>,
+    ) -> Result<()> {
         use std::collections::btree_map::Entry;
         match self.entries.entry(name.to_string()) {
             Entry::Occupied(e) => {
@@ -388,18 +439,19 @@ impl TableRegistry {
                         let table = Table::<R, K>::from_bulk(sorted, next_id, index_defs)?;
                         Ok(Box::new(table))
                     }),
-                    attach_paged: Box::new(|table_any, file, stats, name| {
+                    attach_paged: Box::new(move |table_any, file, stats, name| {
                         let table = table_any.downcast_mut::<Table<R, K>>().ok_or_else(|| {
                             Error::TypeMismatch("attach_paged downcast failed".into())
                         })?;
                         let was_attached = table.is_paged_attached();
-                        table.attach_paged_source(file, stats, name);
+                        table.attach_paged_source(file, stats, name, clone);
                         Ok(!was_attached)
                     }),
-                    attach_paged_entry: Box::new(|entry, file, stats| {
-                        let table = Table::<R, K>::from_paged_entry(entry, file, stats)?;
+                    attach_paged_entry: Box::new(move |entry, file, stats| {
+                        let table = Table::<R, K>::from_paged_entry(entry, file, stats, clone)?;
                         Ok(Box::new(table) as Box<dyn MergeableTable>)
                     }),
+                    paged_clone: clone.is_some(),
                 });
                 Ok(())
             }

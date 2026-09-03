@@ -24,7 +24,7 @@ fn store_with(dir: &std::path::Path, opts: PagedOptions) -> Store {
         .paged(opts)
         .unwrap();
     let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
     s
 }
 
@@ -88,6 +88,54 @@ fn dirty_bytes_trigger_checkpoints_without_app_call() {
             .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".root")),
         "no .root file appeared in {}",
         d.path().display()
+    );
+}
+
+/// task64 §14.1(c) follow-up: with a memory budget set and no explicit
+/// `checkpoint_dirty_bytes`, the dirty trigger is resolved to half the
+/// budget (see `PagedOptionsBuilder::build`). Here the budget is 6 MiB, so
+/// the trigger is 3 MiB; the update below dirties ~4.1 MB of clean leaves
+/// — enough to trip the scaled trigger, nowhere near the 256 MiB default —
+/// while resident stays ~4.1 MB, under the 6 MiB budget, so the memory
+/// trigger cannot be what fires (measured with the trigger unscaled: the
+/// run ends with dirty 4,118,048 / resident 4,063,552 and no checkpoint). The interval trigger is disabled. So the
+/// only way the checkpointer runs again inside the deadline is the scaled
+/// dirty trigger.
+#[test]
+fn memory_budget_scales_the_dirty_trigger_when_unset() {
+    let d = tempfile::tempdir().unwrap();
+    let s = store_with(
+        d.path(),
+        PagedOptions::builder().memory_budget_bytes(6 << 20).checkpoint_interval_disabled().build(),
+    );
+    write_rows(&s, 100_000);
+    s.checkpoint().unwrap(); // attach + assign every leaf a page id (setup, not the trigger under test)
+    let before = s.paged_stats().unwrap();
+    assert!(
+        before.resident_leaf_bytes_est < (6 << 20),
+        "precondition: the table must sit under the 6 MiB budget so due_mem cannot fire (resident={})",
+        before.resident_leaf_bytes_est
+    );
+
+    {
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update_batch((1..=100_000u64).map(|k| (k, Row { v: k + 1 })).collect()).unwrap();
+        w.commit().unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.paged_stats().unwrap().checkpointer_runs <= before.checkpointer_runs
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let after = s.paged_stats().unwrap();
+    assert!(
+        after.checkpointer_runs > before.checkpointer_runs,
+        "the scaled dirty trigger (budget/2 = 3 MiB) never fired within the deadline: dirty_bytes={} resident={}",
+        after.dirty_bytes,
+        after.resident_leaf_bytes_est
     );
 }
 
@@ -316,4 +364,77 @@ fn dirty_bytes_trigger_fires_for_newly_created_nodes_on_a_live_attached_table() 
          must cancel down to a small bounded residual, not stay pinned near the ~1 MiB \
          that was credited in: settled at {settled} bytes"
     );
+}
+
+/// task64 §7d: dropping the LAST `Store` handle while the background
+/// checkpointer is mid-checkpoint must block until that checkpoint has
+/// finished. Nothing may still be writing `pages.bin` or a root after
+/// `drop` returns, because the next thing an application (or
+/// `paging_matrix --restart`) does is open a second `Store` on the same
+/// directory, and two writers on one page file corrupt it: the paging
+/// gate's A cell recovered a self-consistent root and then read zeros at an
+/// offset only the second store's own checkpoints could have written.
+/// Before the fix the worker's transient strong `Arc` was the last
+/// reference, `StoreInner` dropped on the worker itself, and the self-join
+/// guard turned the join into a detach.
+#[test]
+fn dropping_the_last_handle_waits_for_an_in_flight_background_checkpoint() {
+    let d = tempfile::tempdir().unwrap();
+    let opts = || {
+        PagedOptions::builder()
+            .checkpoint_dirty_bytes(1)
+            .checkpoint_interval_disabled()
+            .build()
+    };
+    const ROWS: u64 = 1_000_000;
+    let s = store_with(d.path(), opts());
+    write_rows(&s, ROWS);
+    s.checkpoint().unwrap(); // attach + page ids (a never-attached table cannot trip the dirty trigger)
+
+    let roots = || {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "root"))
+            .count()
+    };
+    let pages_after_first = s.paged_stats().unwrap().pages_written;
+    assert_eq!(roots(), 1);
+
+    {
+        // Every leaf CoW'd in one commit: far over the 1-byte trigger, so the
+        // background tick starts right behind the commit and has a million
+        // rows of leaves to rewrite — seconds of work, so it is still
+        // mid-write when we drop below.
+        let mut w = s.begin_write(None).unwrap();
+        let mut t = w.open_table::<Row>("rows").unwrap();
+        t.update_batch((1..=ROWS).map(|k| (k, Row { v: k + 1 })).collect()).unwrap();
+        w.commit().unwrap();
+    }
+    // Wait until the tick is demonstrably mid-write (pages appended past the
+    // first checkpoint's count); the file length is no witness, the page
+    // file is preallocated in large chunks.
+    let t0 = std::time::Instant::now();
+    while s.paged_stats().unwrap().pages_written <= pages_after_first {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "background checkpoint never started writing"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(roots(), 1, "precondition: the second checkpoint is still in flight (no second root yet) at drop time");
+
+    drop(s);
+
+    let r0 = roots();
+    assert_eq!(r0, 2, "drop must have waited for the in-flight checkpoint to finish: its root must already exist when drop returns");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(roots(), r0, "the root set changed after drop returned: a detached checkpoint is still writing");
+
+    let s2 = store_with(d.path(), opts());
+    s2.recover().unwrap();
+    let r = s2.begin_read(None).unwrap();
+    let t = r.open_table::<Row>("rows").unwrap();
+    for k in (1..=ROWS).step_by(997) {
+        assert_eq!(t.get(k), Some(&Row { v: k + 1 }), "key {k} wrong or missing after reopen");
+    }
 }

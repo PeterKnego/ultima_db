@@ -276,10 +276,15 @@ struct WorkloadResult {
     version: u64,
 }
 
+// `register_table_paged` (not plain `register_table`): this helper backs
+// both `run_workload` (row-format/chained config) and `run_workload_paged`
+// (paged config, task 9's third matrix arm) — `register_table_paged` is
+// correct for both, since it behaves as plain registration whenever the
+// store is not paged.
 fn open_workload_store(config: StoreConfig) -> Store {
     let store = Store::new(config).unwrap();
-    store.register_table::<User>(TABLE_NAMES[0]).unwrap();
-    store.register_table::<User>(TABLE_NAMES[1]).unwrap();
+    store.register_table_paged::<User>(TABLE_NAMES[0]).unwrap();
+    store.register_table_paged::<User>(TABLE_NAMES[1]).unwrap();
     store.recover().unwrap();
     store
 }

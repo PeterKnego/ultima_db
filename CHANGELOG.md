@@ -25,6 +25,33 @@ path in
 [the migration how-to](docs/how-to/migrate-from-0-2-to-0-3.md). See
 `docs/tasks/task62_persistence_format_compat.md`.
 
+Paged checkpoints (opt-in): `Persistence::standalone(..)`/`::smr(..)`
+`.paged(PagedOptions)` makes a store's tables page their B-tree nodes
+against an on-disk page file (`pages.bin`) with one self-contained root
+record per checkpoint, instead of a full-row checkpoint, and recovery is
+**lazy** — inner levels load eagerly, data leaves fault in on first touch,
+so restart time is bounded by the inner levels rather than the row count
+(the acceptance cells recover 5M rows in ~0.15 s). A background
+checkpointer thread checkpoints on dirty-bytes / memory-budget / interval
+triggers with no application call; `PagedOptions::memory_budget_bytes` is
+a **soft cap** on resident data-leaf bytes (quiet leaves demote back to
+disk under it; `Store::set_residency` pins a table resident); paged
+tables are registered with `Store::register_table_paged::<R: Record +
+Clone>` (plain `register_table` on a paged store errors
+`PagedNeedsClone`). Dropping the last `Store` handle now blocks until an
+in-flight background checkpoint finishes, so an in-process reopen of the
+same directory can never race it. **Scope, ruled 2026-09-03: this ships as
+a checkpoint format plus lazy recovery, not as a larger-than-memory
+throughput mode.** On a same-host YCSB A/zipf cell under a 198 MiB
+cgroup, paged UltimaDB ran ~200x behind RocksDB (842 vs 171k ops/s), and
+its lazily-recovered best case is still ~20x behind; the budget is a soft
+cap on a soft counter (heap inside `V`, stale-`ReadTx` leaves and the
+not-yet-checkpointed dirty set sit outside it), and a read-only working
+set saw-tooths between ~0 and 5x the budget between demote passes. If the
+data outgrows memory, use a disk engine. Design and measurements:
+`docs/tasks/task63_paged_btree.md`, `docs/tasks/task64_paged_leaf_value_blocks.md`
+(§16 for the ruling).
+
 ### Breaking — on-disk format
 
 - **Checkpoint format v2.** `FORMAT_VERSION` 1 → 2, adding an explicit

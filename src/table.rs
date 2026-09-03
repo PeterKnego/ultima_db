@@ -77,6 +77,12 @@ pub enum Residency {
     Lazy,
 }
 
+/// A demote plan crossing the `MergeableTable` boundary: key-ordered,
+/// type-erased `btree::DemoteChunk<K>`s plus the next cursor (`None` when
+/// the table is exhausted). See [`MergeableTable::paged_demote_plan`].
+#[cfg(feature = "persistence")]
+pub(crate) type ErasedDemotePlan = (Vec<Box<dyn Any + Send>>, Option<Box<dyn Any + Send>>);
+
 pub(crate) trait MergeableTable: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -187,9 +193,12 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     /// the start of a pass — see [`Self::merge_keys_from`] for why the key
     /// type can't appear in this signature). Returns the demoted table (as
     /// a fresh `MergeableTable` so callers never need to downcast just to
-    /// hold the result), the leaf count demoted, and the next cursor
-    /// (`None` once the pass reaches the end). A `Residency::Resident`
-    /// table always returns `(clone of self, 0, None)`.
+    /// hold the result), the leaf count demoted, the exact bytes demoted
+    /// (`Σ BTreeNode::leaf_bytes()` over the demoted leaves — task 8,
+    /// forwarded straight from [`crate::btree::BTree::demote_leaves`]), and
+    /// the next cursor (`None` once the pass reaches the end). A
+    /// `Residency::Resident` table always returns `(clone of self, 0, 0,
+    /// None)`.
     ///
     /// `cursor`, once erased to `&dyn Any`, is only ever checked against
     /// `K` by a fallible downcast: a caller that hands back a cursor from
@@ -200,25 +209,57 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     ///
     /// Production caller: [`crate::Store::demote_pass`].
     ///
-    /// Does **not** touch `PagedStats` itself — the caller (`demote_pass`)
-    /// owns that, and only applies the delta this call reports once its own
-    /// `install_paged_tables` of the returned table actually lands. A
-    /// concurrent `gc()` can evict the version this call's caller captured
-    /// before the install runs, in which case the demotion this returns is
-    /// never reachable from any live snapshot; mutating shared counters
-    /// here unconditionally would record a demotion nothing reflects.
-    #[cfg(feature = "persistence")]
+    /// Does **not** touch `PagedStats` itself — the caller owns that.
+    /// Test-only since the task64 decide/apply split: `Store::demote_pass`
+    /// plans ([`Self::paged_demote_plan`]) against one version and applies
+    /// ([`Self::paged_demote_apply`]) against the current latest under the
+    /// write lock; this single-shot form (plan + apply on the same version)
+    /// is kept as the table-level regression surface for the pair.
+    #[cfg(all(test, feature = "persistence"))]
+    #[allow(clippy::type_complexity)]
     fn paged_demote(
         &self,
         cursor: Option<&dyn Any>,
         budget: usize,
-    ) -> (Box<dyn MergeableTable>, usize, Option<Box<dyn Any + Send>>);
+    ) -> (Box<dyn MergeableTable>, usize, usize, Option<Box<dyn Any + Send>>);
 
-    /// Bytes reported per demoted leaf: [`Child::NODE_BYTES`] for this
-    /// table's own `(K, R)`. Type-erased callers (`Store::demote_pass`)
-    /// cannot compute this themselves — `K`/`R` don't appear in
-    /// `MergeableTable`'s signature — so it is exposed as a cheap
-    /// (`size_of`-only, no I/O) accessor instead.
+    /// Flat per-node byte estimate — [`Child::NODE_BYTES`] for this table's
+    /// own `(K, R)` — used only by the checkpoint-write dirty-bytes
+    /// subtraction estimate (`Store::checkpoint_impl_paged`'s
+    /// `dirty_bytes_written`, an approximate trigger-threshold comparison
+    /// across the data tree and every secondary index's differently-shaped
+    /// nodes uniformly). **Not** the demote-side accounting: since task 8,
+    /// [`Self::paged_demote`] reports its own exact
+    /// `Σ BTreeNode::leaf_bytes()` instead of this flat constant. Type-erased
+    /// callers cannot compute either figure themselves — `K`/`R` don't
+    /// appear in `MergeableTable`'s signature — so this stays exposed as a
+    /// cheap (`size_of`-only, no I/O) accessor for the one caller that still
+    /// needs a flat estimate.
+    /// Decide half of a demote batch (task64 follow-up): plan at most
+    /// `budget` leaf-parents after `cursor`, as key-ordered chunks of at
+    /// most `chunk` parents (each a type-erased `btree::DemoteChunk<K>`),
+    /// plus the next cursor. Off-lock, touches no leaf. A
+    /// [`Residency::Resident`] table plans nothing.
+    ///
+    /// Production caller: [`crate::Store::demote_pass`].
+    #[cfg(feature = "persistence")]
+    fn paged_demote_plan(
+        &self,
+        cursor: Option<&dyn Any>,
+        budget: usize,
+        chunk: usize,
+    ) -> ErasedDemotePlan;
+
+    /// Apply half: evict the chunk's leaves from *this* table (which may
+    /// be a later version than the one the chunk was planned from) and
+    /// return (new table, leaves demoted, demoted bytes). No `PagedStats`
+    /// mutation here — the caller applies the counters once the install
+    /// has landed.
+    ///
+    /// Production caller: [`crate::Store::demote_pass`].
+    #[cfg(feature = "persistence")]
+    fn paged_demote_apply(&self, chunk: &dyn Any) -> (Box<dyn MergeableTable>, usize, usize);
+
     #[cfg(feature = "persistence")]
     fn paged_node_bytes(&self) -> usize;
 
@@ -229,16 +270,27 @@ pub(crate) trait MergeableTable: Any + Send + Sync {
     #[cfg(feature = "persistence")]
     fn paged_changed_pages(&self, prev: &dyn MergeableTable) -> Vec<PageId>;
 
-    /// Estimated resident (not-yet-demoted) leaf bytes of the data tree.
-    // Still no caller anywhere, production or test (final-review wave, I-4
-    // re-check — the earlier "exercised by this file's paged test module"
-    // claim did not hold up to a grep: nothing calls this). `PagedStats::
-    // resident_leaf_bytes` (a running counter maintained on fault-in/demote)
-    // is what `Store` actually reports and budgets against; this per-call
-    // tree walk (`BTree::resident_leaf_estimate`) is unused on both sides.
+    /// Resident (not-yet-demoted) leaf bytes of the data tree, as `Σ
+    /// BTreeNode::leaf_bytes()` over loaded leaves (task 8), deduped
+    /// against a shared `seen` set spanning every retained snapshot's walk
+    /// (task 9's pin-aware reconciliation — see
+    /// `BTree::resident_leaf_bytes_dedup`'s doc for the dedup mechanics,
+    /// including the review-I-2 inner-node pruning). Type-erased mirror of
+    /// `merge_keys_from`'s `&dyn Any` pattern: `K`/`R` don't appear in
+    /// `MergeableTable`'s signature, so the caller's `seen:
+    /// HashSet<*const ()>` — a type independent of any table's `K`/`V`,
+    /// since the dedup key is a raw node pointer — crosses the trait object
+    /// boundary as `&mut dyn Any` and the impl downcasts it back.
+    ///
+    /// Task 9 review I-3: this replaced a non-deduped
+    /// `paged_resident_leaf_bytes` (task 8) as the F1 reconciliation's only
+    /// caller; that method was deleted rather than left as dead code — a
+    /// fresh, empty `seen` set makes this exactly equivalent to what it did
+    /// (nothing to dedup against yet), so keeping both was pure duplication.
+    // Production caller: the F1 reconciliation walk in
+    // `Store::checkpoint_impl_paged`.
     #[cfg(feature = "persistence")]
-    #[allow(dead_code)]
-    fn paged_resident_leaf_bytes(&self) -> usize;
+    fn paged_resident_leaf_bytes_dedup(&self, seen: &mut dyn Any) -> usize;
 
     /// Current residency policy — see [`Residency`].
     ///
@@ -403,14 +455,15 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         }
     }
 
-    #[cfg(feature = "persistence")]
+    #[cfg(all(test, feature = "persistence"))]
+    #[allow(clippy::type_complexity)]
     fn paged_demote(
         &self,
         cursor: Option<&dyn Any>,
         budget: usize,
-    ) -> (Box<dyn MergeableTable>, usize, Option<Box<dyn Any + Send>>) {
+    ) -> (Box<dyn MergeableTable>, usize, usize, Option<Box<dyn Any + Send>>) {
         if self.residency == Residency::Resident {
-            return (Box::new(self.clone()), 0, None);
+            return (Box::new(self.clone()), 0, 0, None);
         }
         let cursor_k: Option<&K> = cursor.and_then(|c| c.downcast_ref::<K>());
         debug_assert!(
@@ -422,11 +475,50 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
         // No `PagedStats` mutation here — see the trait doc: the counters
         // are only meaningful once `demote_pass`'s `install_paged_tables`
         // of the table this returns has actually landed.
-        let (new_data, demoted, next) = self.data.demote_leaves(cursor_k, budget);
+        let (new_data, demoted, demoted_bytes, next) = self.data.demote_leaves(cursor_k, budget);
         let mut out = self.clone();
         out.data = new_data;
         let next_boxed: Option<Box<dyn Any + Send>> = next.map(|k| Box::new(k) as Box<dyn Any + Send>);
-        (Box::new(out), demoted, next_boxed)
+        (Box::new(out), demoted, demoted_bytes, next_boxed)
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_demote_plan(
+        &self,
+        cursor: Option<&dyn Any>,
+        budget: usize,
+        chunk: usize,
+    ) -> ErasedDemotePlan {
+        if self.residency == Residency::Resident {
+            return (Vec::new(), None);
+        }
+        let cursor_k: Option<&K> = cursor.and_then(|c| c.downcast_ref::<K>());
+        debug_assert!(
+            cursor.is_none() || cursor_k.is_some(),
+            "paged_demote_plan: cursor did not downcast to this table's key type (a caller \
+             handed back a cursor from a different table's pass); release builds \
+             silently restart the pass instead of resuming"
+        );
+        let (chunks, next) = self.data.plan_demote(cursor_k, budget, chunk);
+        (
+            chunks.into_iter().map(|c| Box::new(c) as Box<dyn Any + Send>).collect(),
+            next.map(|k| Box::new(k) as Box<dyn Any + Send>),
+        )
+    }
+
+    #[cfg(feature = "persistence")]
+    fn paged_demote_apply(&self, chunk: &dyn Any) -> (Box<dyn MergeableTable>, usize, usize) {
+        if self.residency == Residency::Resident {
+            return (Box::new(self.clone()), 0, 0);
+        }
+        let Some(chunk) = chunk.downcast_ref::<crate::btree::DemoteChunk<K>>() else {
+            debug_assert!(false, "paged_demote_apply: chunk did not downcast to this table's key type");
+            return (Box::new(self.clone()), 0, 0);
+        };
+        let (new_data, demoted, demoted_bytes) = self.data.apply_demote(chunk);
+        let mut out = self.clone();
+        out.data = new_data;
+        (Box::new(out), demoted, demoted_bytes)
     }
 
     #[cfg(feature = "persistence")]
@@ -543,8 +635,11 @@ impl<R: Record, K: PrimaryKey> MergeableTable for Table<R, K> {
     }
 
     #[cfg(feature = "persistence")]
-    fn paged_resident_leaf_bytes(&self) -> usize {
-        self.data.resident_leaf_estimate()
+    fn paged_resident_leaf_bytes_dedup(&self, seen: &mut dyn Any) -> usize {
+        let seen = seen
+            .downcast_mut::<std::collections::HashSet<*const ()>>()
+            .expect("paged_resident_leaf_bytes_dedup: seen set is always HashSet<*const ()>, independent of K/R");
+        self.data.resident_leaf_bytes_dedup(seen)
     }
 
     #[cfg(feature = "persistence")]
@@ -955,6 +1050,18 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         Ok(())
     }
 
+    /// The row tree, for crate-internal tests only.
+    ///
+    /// `store.rs`'s paged block-leaf tests need to walk the tree's *node
+    /// representation* (`BTree::leaf_representation`) after driving a real
+    /// `Table` workload — whether a leaf's values live in a block or behind
+    /// per-entry `Arc`s is deliberately invisible from outside the crate, so
+    /// that assertion cannot be made from `tests/`.
+    #[cfg(test)]
+    pub(crate) fn data_tree(&self) -> &BTree<K, R> {
+        &self.data
+    }
+
     /// Insert-or-replace at an explicit key, reusing an existing `Arc<R>`.
     /// Maintains secondary indexes (routing to `on_insert` or `on_update`
     /// depending on whether a prior record exists at the key), and advances
@@ -1019,6 +1126,39 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
 
     /// Delete a record by its key. Returns the deleted record, or an error if
     /// the key does not exist.
+    ///
+    /// **Value-block leaves (task: paged-leaf-value-blocks, Task 7; cost
+    /// model corrected in fix round 1).** On a block-backed leaf the
+    /// removed value has no per-entry `Arc` to hand back — `merged_get_arc`
+    /// below already clones it out via `BTree::get_arc`'s `clone_value`
+    /// fallback (`get_arc_in_node`, Task 4), the same clone-out boundary
+    /// every other `Arc<R>`-returning read uses. That is always exactly one
+    /// `clone_value` call, but it is **not** the only one on this path in
+    /// the common case:
+    ///
+    /// - **Leaf uniquely owned** by this `WriteTx`'s freshly-forked table
+    ///   (nothing else has faulted this leaf in since the last checkpoint —
+    ///   the atypical case in practice) — the subsequent `remove_mut` ->
+    ///   `Child::make_mut` finds `Arc::get_mut` succeeds and edits in
+    ///   place; `remove_from_block_leaf_mut` drops the removed slot without
+    ///   cloning it. Total: **1** clone (the boundary clone-out above).
+    /// - **Leaf shared** with the store's live snapshot — the ordinary
+    ///   case whenever *any* prior read or write (this transaction's own or
+    ///   another's) already faulted the leaf in — `make_mut`'s CoW takes
+    ///   the `clone_with` branch (`src/btree.rs`), which clones **every**
+    ///   surviving entry of the block (up to `MAX_KEYS`) via `clone_value`
+    ///   before `remove_from_block_leaf_mut` drops the one being removed —
+    ///   including that entry's own now-wasted clone. Total: **1 + n**,
+    ///   where `n` is the leaf's entry count at CoW time. This is the same
+    ///   "whole block via `clone_with`" cost already documented and pinned
+    ///   at `rotate_right`/`rotate_left`/`merge_with_*`'s
+    ///   `TODO(perf, review round 1 Minor 1)` comments — `delete` was not
+    ///   special-cased to avoid it, and fusing it away needs the same
+    ///   `Child`-level "CoW straight into the edited shape" entry point
+    ///   those note as future work. Pinned by
+    ///   `tests/paged_block_leaves.rs`'s
+    ///   `delete_on_a_unique_block_leaf_clones_only_the_returned_value` and
+    ///   `delete_on_a_shared_block_leaf_clones_the_whole_block`.
     pub fn delete(&mut self, key: &K) -> Result<Arc<R>> {
         let old = self.merged_get_arc(key).ok_or(Error::KeyNotFound)?;
         // Remove from all indexes before removing from data tree.
@@ -1608,6 +1748,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         file: Arc<PageFile>,
         stats: Arc<PagedStats>,
         table_name: &str,
+        clone: Option<fn(&R) -> R>,
     ) {
         let codec = NodeCodec::<K, R>::records::<R>();
         let source: Arc<PagedSource<K, R>> = Arc::new(PagedSource {
@@ -1615,11 +1756,14 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
             codec,
             name: table_name.to_string(),
             stats: stats.clone(),
+            clone,
         });
         self.data.set_source(Some(source));
         self.stats = Some(stats.clone());
         self.paged_name = Some(Arc::from(table_name));
         self.paged_file = Some(file.clone());
+        // Index trees never carry block leaves (I-B) — the index-side
+        // `attach_paged_source` signature stays clone-free.
         for idx in self.indexes.values_mut() {
             idx.attach_paged_source(file.clone(), stats.clone(), table_name);
         }
@@ -1732,6 +1876,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
         e: &PagedTableEntry,
         file: Arc<PageFile>,
         stats: Arc<PagedStats>,
+        clone: Option<fn(&R) -> R>,
     ) -> Result<Self> {
         if e.key_type_id != K::KEY_TYPE_ID {
             return Err(Error::Persistence(format!(
@@ -1749,6 +1894,7 @@ impl<R: Record, K: PrimaryKey> Table<R, K> {
                     codec,
                     name: e.name.clone(),
                     stats: stats.clone(),
+                    clone,
                 });
                 let tree =
                     BTree::from_root_page(root_page, e.len as usize, e.height as usize, source);
@@ -5192,7 +5338,7 @@ mod paged {
         let mut t: Table<u64, u64> = Table::new();
         let ids = t.insert_batch((1..=20_000u64).map(|i| i * 2).collect()).unwrap();
         assert_eq!(ids, (1..=20_000u64).collect::<Vec<_>>());
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.attach_paged_source(file.clone(), stats.clone(), "rows", Some(u64::clone as fn(&u64) -> u64));
         let (_entry, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
         assert!(flushed.is_none(), "a freshly bulk-built table has no overlay to flush");
         t
@@ -5207,8 +5353,9 @@ mod paged {
         let written = stats.pages_written.load(Ordering::Relaxed);
         assert!(written > 300, "expected > 300 pages written for 20,000 rows, got {written}");
 
-        let (t2, demoted, done) = t.paged_demote(None, usize::MAX);
+        let (t2, demoted, demoted_bytes, done) = t.paged_demote(None, usize::MAX);
         assert!(done.is_none() && demoted > 300, "demoted={demoted}, done={done:?}");
+        assert!(demoted_bytes > 0, "a real demote pass must report nonzero bytes");
         let t2 = t2.as_any().downcast_ref::<Table<u64, u64>>().unwrap();
         assert_eq!(t2.get(&777), Some(&1554));
         assert_eq!(stats.page_faults.load(Ordering::Relaxed), 1);
@@ -5237,7 +5384,7 @@ mod paged {
         // `Error::DuplicateKey` while backfilling — irrelevant to what this
         // "plain index is skipped by paged_write" test is checking.
         t.define_index("plain", IndexKind::NonUnique, |r: &u64| *r + 1_000_000).unwrap();
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.attach_paged_source(file.clone(), stats.clone(), "rows", Some(u64::clone as fn(&u64) -> u64));
         let (e, flushed) = t.paged_write(&PagedCtx { file: &file, stats: &stats }).unwrap();
         assert!(flushed.is_none());
         assert_eq!(e.indexes.len(), 1);
@@ -5255,8 +5402,9 @@ mod paged {
         let mut t = bulk_paged_table(file, stats);
 
         t.set_residency(Residency::Resident);
-        let (_t2, demoted, done) = t.paged_demote(None, usize::MAX);
+        let (_t2, demoted, demoted_bytes, done) = t.paged_demote(None, usize::MAX);
         assert_eq!(demoted, 0);
+        assert_eq!(demoted_bytes, 0);
         assert!(done.is_none());
     }
 
@@ -5273,8 +5421,9 @@ mod paged {
         let t = bulk_paged_table(file, stats);
         assert_eq!(t.residency(), Residency::Lazy);
 
-        let (_t2, demoted, _done) = t.paged_demote(None, usize::MAX);
+        let (_t2, demoted, demoted_bytes, _done) = t.paged_demote(None, usize::MAX);
         assert!(demoted > 300, "expected > 300 demoted leaves, got {demoted}");
+        assert!(demoted_bytes > 0, "a real demote pass must report nonzero bytes");
     }
 
     /// `Table::paged_demote` reports the demoted count in its return tuple
@@ -5293,8 +5442,9 @@ mod paged {
         let leaves_before = stats.leaves_demoted.load(Ordering::Relaxed);
         let resident_before = stats.resident_leaf_bytes.load(Ordering::Relaxed);
 
-        let (_t2, demoted, _done) = t.paged_demote(None, usize::MAX);
+        let (_t2, demoted, demoted_bytes, _done) = t.paged_demote(None, usize::MAX);
         assert!(demoted > 300, "expected > 300 demoted leaves, got {demoted}");
+        assert!(demoted_bytes > 0, "a real demote pass must report nonzero bytes");
 
         assert_eq!(
             stats.leaves_demoted.load(Ordering::Relaxed),
@@ -5308,10 +5458,11 @@ mod paged {
         );
     }
 
-    /// `paged_node_bytes` is the type-erased accessor `Store::demote_pass`
-    /// uses to compute the `resident_leaf_bytes` delta it applies itself —
-    /// must agree with the constant `Table::paged_demote`'s doc says it
-    /// mirrors.
+    /// `paged_node_bytes` is a flat per-node estimate — since task 8 it
+    /// backs only the checkpoint-write `dirty_bytes_written` approximation,
+    /// not `Store::demote_pass`'s `resident_leaf_bytes` delta (which now
+    /// uses `paged_demote`'s own exact reported bytes) — must still agree
+    /// with the constant its doc says it is.
     #[test]
     fn paged_node_bytes_matches_child_node_bytes() {
         let t: Table<u64, u64> = Table::new();
@@ -5328,15 +5479,17 @@ mod paged {
         let stats = Arc::new(PagedStats::default());
         let t = bulk_paged_table(file, stats);
 
-        let (t2, demoted1, cursor) = t.paged_demote(None, 2);
+        let (t2, demoted1, demoted_bytes1, cursor) = t.paged_demote(None, 2);
         assert!(demoted1 > 0, "a 2-leaf-parent budget must demote something");
+        assert!(demoted_bytes1 > 0, "a real demote pass must report nonzero bytes");
         let cursor = cursor.expect("a budget of 2 leaf-parents out of ~18 must not finish the pass");
         let t2 = t2.as_any().downcast_ref::<Table<u64, u64>>().unwrap().clone();
 
         let cursor_ref: Option<&dyn Any> = Some(cursor.as_ref());
-        let (_t3, demoted2, _done2) = t2.paged_demote(cursor_ref, usize::MAX);
+        let (_t3, demoted2, demoted_bytes2, _done2) = t2.paged_demote(cursor_ref, usize::MAX);
         assert!(demoted2 > 0, "the second call must resume from the cursor, not restart from nothing");
         assert!(demoted1 + demoted2 > 300, "demoted1={demoted1} demoted2={demoted2}");
+        assert!(demoted_bytes1 + demoted_bytes2 > 0, "cumulative bytes must be nonzero too");
     }
 
     /// `IndexMaintainer::empty_clone` (bulk-load's rebuild-from-empty
@@ -5382,7 +5535,7 @@ mod paged {
         let mut t: Table<u64, u64> = Table::new();
         let ids = t.insert_batch((1..=100u64).map(|i| i * 2).collect()).unwrap();
         assert_eq!(ids.len(), 100);
-        t.attach_paged_source(file.clone(), stats.clone(), "rows");
+        t.attach_paged_source(file.clone(), stats.clone(), "rows", Some(u64::clone as fn(&u64) -> u64));
         // Buffer one row directly in the overlay (bypassing the tree) so
         // `paged_write` must take the clone-and-flush path.
         t.overlay_mut_for_test(8).set_put(9_999, Arc::new(24_998), false);
@@ -5404,6 +5557,7 @@ mod paged {
             codec: NodeCodec::<u64, u64>::records::<u64>(),
             name: "rows".to_string(),
             stats: read_stats,
+            clone: Some(u64::clone as fn(&u64) -> u64),
         });
         let read_back: BTree<u64, u64> =
             BTree::from_root_page(root_id, entry.len as usize, entry.height as usize, source);

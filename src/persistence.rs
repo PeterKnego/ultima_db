@@ -260,7 +260,15 @@ pub struct PagedOptions {
     pub memory_budget_bytes: Option<u64>,
     /// A checkpoint runs once this many dirty bytes have accumulated since
     /// the last one — the background checkpointer's volume trigger.
-    /// Default: 256 MiB.
+    /// Default: 256 MiB — **scaled to the budget when one is set**: a
+    /// [`builder`](PagedOptions::builder) that sets `memory_budget_bytes`
+    /// without setting this resolves it to `budget / 2` (capped at 256 MiB,
+    /// floor 1). Leaves modified since the last checkpoint carry no page id
+    /// and cannot be demoted until one writes them, so a trigger left far
+    /// above the budget makes the budget unenforceable under a write
+    /// workload (task64 §14.1(c)). An explicit setting always wins, even
+    /// above the budget. The scaling lives in `build()` only: a
+    /// `PagedOptions::default()` edited by hand gets the flat 256 MiB.
     pub checkpoint_dirty_bytes: u64,
     /// A checkpoint runs at least this often regardless of dirty volume —
     /// the background checkpointer's time trigger (task12). Default:
@@ -292,6 +300,47 @@ pub struct PagedOptions {
     /// a floor of 1 (`Store::checkpoint_impl_paged` applies `.max(1)` at
     /// the `cleanup_old_roots` call site) rather than honoring `0` literally.
     pub retained_checkpoints: usize,
+    /// **Deliberate behavior default (Peter's ruling, 2026-08-31) — read
+    /// this before turning it off.** Task 11, spec §5 ("Fault-in,
+    /// demotion, and pin-aware accounting" — enforcement arm) and §6
+    /// ("Hard-cap clock eviction" — order of weapons, step 2): when
+    /// `memory_budget_bytes` is set and, after the checkpointer's
+    /// hard-capped demote pass, the store is *still* over budget because
+    /// bytes pinned by RETAINED (non-latest) snapshots
+    /// (`PagedStats::pinned_leaf_bytes`, task 9) are the whole reason —
+    /// demotion only ever walks the latest snapshot's own tree, so an
+    /// orphaned leaf kept alive by an older retained snapshot is
+    /// structurally invisible to it — the checkpointer shrinks retention
+    /// for that one collection pass, down to a floor of the latest
+    /// version plus every explicit [`VersionPin`](crate::VersionPin) /
+    /// live `ReadTx` (the existing `Arc::strong_count == 1` gc filter
+    /// already spares those; nothing new is added on top of it).
+    ///
+    /// **`VersionPin` caveat (tracked, not yet fixed):** that floor holds
+    /// only for a pin taken on a version that is no longer
+    /// [`Store::latest_version`](crate::Store::latest_version) at pin time.
+    /// A demote pass can re-publish (install a new `Arc<Snapshot>` for) a
+    /// version that is *still* latest, which orphans any
+    /// [`VersionPin`](crate::VersionPin) taken on it beforehand — the pin's
+    /// `Arc` and the store's own map entry silently diverge, and this
+    /// shrink can then collect the (now unprotected) map entry even while
+    /// the pin is alive. See [`Store::pin_version`](crate::Store::pin_version)'s
+    /// doc for the full mechanism and the two safe patterns (pin only a
+    /// no-longer-latest version, or set this knob `false` for a
+    /// pin-while-latest / SMR handoff store).
+    ///
+    /// **Default: `true`.** Rationale: configuring a memory budget is a
+    /// declaration that bounded memory matters more than history depth,
+    /// and the NVMe bench-host data
+    /// (`docs/benchmarks/fs-paged-nvme-2026-08-31.md`) showed that
+    /// leaving pins unenforced misses that declaration by **56x** (237
+    /// vs. 13,343 ops/s at retention 10 vs. 1) — see spec §1 ("Pins
+    /// (NVMe dominant)"). Set `false` to keep
+    /// [`StoreConfig::num_snapshots_retained`](crate::StoreConfig) an
+    /// unconditional floor regardless of budget pressure; the store then
+    /// stays over budget indefinitely under sustained pin pressure, and
+    /// `PagedStats::pinned_leaf_bytes` reports the excess.
+    pub shrink_retention_under_pressure: bool,
 }
 
 impl Default for PagedOptions {
@@ -304,6 +353,7 @@ impl Default for PagedOptions {
             page_prefetch_bytes: 4096,
             prealloc_chunk_bytes: 16 << 20,
             retained_checkpoints: 2,
+            shrink_retention_under_pressure: true,
         }
     }
 }
@@ -321,6 +371,9 @@ impl PagedOptions {
 #[derive(Clone, Debug, Default)]
 pub struct PagedOptionsBuilder {
     opts: PagedOptions,
+    /// `checkpoint_dirty_bytes(..)` was called — `build()` then leaves the
+    /// trigger alone instead of scaling it to the budget.
+    dirty_explicit: bool,
 }
 
 impl PagedOptionsBuilder {
@@ -332,6 +385,7 @@ impl PagedOptionsBuilder {
     /// See [`PagedOptions::checkpoint_dirty_bytes`].
     pub fn checkpoint_dirty_bytes(mut self, n: u64) -> Self {
         self.opts.checkpoint_dirty_bytes = n;
+        self.dirty_explicit = true;
         self
     }
     /// See [`PagedOptions::checkpoint_interval`].
@@ -368,8 +422,23 @@ impl PagedOptionsBuilder {
         self.opts.retained_checkpoints = n;
         self
     }
-    /// Finalize the configuration.
-    pub fn build(self) -> PagedOptions {
+    /// See [`PagedOptions::shrink_retention_under_pressure`] — **read that
+    /// field's doc before calling this with `false`**: the default (`true`)
+    /// is a deliberate behavior choice (spec §5, Peter's ruling), not an
+    /// arbitrary default.
+    pub fn shrink_retention_under_pressure(mut self, enabled: bool) -> Self {
+        self.opts.shrink_retention_under_pressure = enabled;
+        self
+    }
+    /// Finalize the configuration. With `memory_budget_bytes` set and
+    /// `checkpoint_dirty_bytes` left unset, the dirty trigger is resolved
+    /// to `min(budget / 2, 256 MiB)` (floor 1) — see the field's doc.
+    pub fn build(mut self) -> PagedOptions {
+        if let Some(budget) = self.opts.memory_budget_bytes
+            && !self.dirty_explicit
+        {
+            self.opts.checkpoint_dirty_bytes = (budget / 2).clamp(1, 256 << 20);
+        }
         self.opts
     }
 }
@@ -428,6 +497,48 @@ mod tests {
     }
 
     #[test]
+    fn shrink_retention_under_pressure_builder_setter() {
+        let o = PagedOptions::builder().shrink_retention_under_pressure(false).build();
+        assert!(!o.shrink_retention_under_pressure);
+        let o = PagedOptions::builder().shrink_retention_under_pressure(true).build();
+        assert!(o.shrink_retention_under_pressure);
+    }
+
+    /// task64 §14.1(c) follow-up: the dirty set (leaves modified since the
+    /// last checkpoint) is un-demotable until a checkpoint writes it, so a
+    /// dirty trigger left at its 256 MiB default under a 64 MiB budget
+    /// makes the budget unenforceable. With a budget set and no explicit
+    /// trigger, `build()` resolves the trigger to half the budget (capped
+    /// at the old default); an explicit setting always wins, in either
+    /// builder-call order, even when it exceeds the budget.
+    #[test]
+    fn dirty_trigger_scales_to_half_the_budget_unless_set_explicitly() {
+        let o = PagedOptions::builder().memory_budget_bytes(64 << 20).build();
+        assert_eq!(o.checkpoint_dirty_bytes, 32 << 20, "unset trigger under a budget = budget / 2");
+
+        let o = PagedOptions::builder().memory_budget_bytes(4 << 30).build();
+        assert_eq!(o.checkpoint_dirty_bytes, 256 << 20, "budget / 2 is capped at the 256 MiB default");
+
+        let o = PagedOptions::builder()
+            .memory_budget_bytes(64 << 20)
+            .checkpoint_dirty_bytes(100 << 20)
+            .build();
+        assert_eq!(o.checkpoint_dirty_bytes, 100 << 20, "explicit wins, even above the budget");
+
+        let o = PagedOptions::builder()
+            .checkpoint_dirty_bytes(100 << 20)
+            .memory_budget_bytes(64 << 20)
+            .build();
+        assert_eq!(o.checkpoint_dirty_bytes, 100 << 20, "explicit wins regardless of call order");
+
+        let o = PagedOptions::builder().memory_budget_bytes(1).build();
+        assert_eq!(o.checkpoint_dirty_bytes, 1, "floor of 1: a zero trigger would fire on every tick");
+
+        let o = PagedOptions::builder().build();
+        assert_eq!(o.checkpoint_dirty_bytes, 256 << 20, "no budget: the default is untouched");
+    }
+
+    #[test]
     fn paged_options_builder_defaults() {
         let o = PagedOptions::builder().build();
         assert_eq!(o.memory_budget_bytes, None);
@@ -441,6 +552,11 @@ mod tests {
         assert_eq!(o.page_prefetch_bytes, 4096);
         assert_eq!(o.prealloc_chunk_bytes, 16 << 20);
         assert_eq!(o.retained_checkpoints, 2);
+        assert!(
+            o.shrink_retention_under_pressure,
+            "task11: adaptive retention shrink under pin pressure is ON by default -- \
+             spec §5, Peter's ruling (2026-08-31)"
+        );
 
         assert_eq!(
             PagedOptions::builder().checkpoint_interval_disabled().build().checkpoint_interval,

@@ -26,7 +26,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use crate::btree::BTreeNode;
+use crate::btree::{BTreeNode, Value};
 use crate::child::{Child, NodeSource, PageId};
 use crate::pagefile::{PageFile, PageKind};
 use crate::persistence::Record;
@@ -178,14 +178,14 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
             .map_err(|_| Error::Persistence(format!("page payload: {n} entries, over u16 range")))?;
         buf.extend_from_slice(&n16.to_le_bytes());
         for i in 0..n {
-            let (k, v) = &node.entries[i];
+            let k = &node.entries[i].0;
             let kb = k.encode();
             check_encoded_key_len(kb.len(), "page payload")?;
             let klen = u16::try_from(kb.len())
                 .map_err(|_| Error::Persistence(format!("page payload: key encodes to {} bytes, over u16 range", kb.len())))?;
             buf.extend_from_slice(&klen.to_le_bytes());
             buf.extend_from_slice(&kb);
-            let vb = (self.value.enc)(v)?;
+            let vb = (self.value.enc)(node.value_at(i))?;
             let vlen = u32::try_from(vb.len())
                 .map_err(|_| Error::Persistence(format!("page payload: value encodes to {} bytes, over u32 range", vb.len())))?;
             buf.extend_from_slice(&vlen.to_le_bytes());
@@ -252,7 +252,26 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
                 crate::btree::MAX_KEYS + 1
             )));
         }
+        // Spec §5: only a data leaf (`PageKind::DataLeaf`) decodes into a
+        // block leaf — `DataInner` keeps `Value::arc` (inner nodes are
+        // always resident and carry Arc values, never blocks — spec §3),
+        // and both index kinds are untouched (indexes never carry block
+        // leaves; I-B). This function has no way to see whether the tree
+        // it's decoding for even *has* a cloning source (`NodeCodec` is
+        // generic over `K`/`V` only, not over a `PagedSource`) — that's
+        // fine, because building a block here never needs to clone
+        // anything: every value below comes straight out of
+        // `(self.value.dec)`, already owned. The only place a block leaf's
+        // values are ever cloned is a later CoW rebuild
+        // (`BTreeNode::clone_with`), which *does* require a source whose
+        // `clone_value` is `Some` — guaranteed for every paged data tree
+        // reaching this decode path because `register_table_paged`
+        // (Task 3) is the only way to attach one, and it requires `R:
+        // Clone` up front (I-B holds by construction, not by anything
+        // decode itself checks).
+        let is_data_leaf = kind == PageKind::DataLeaf;
         let mut entries = Vec::with_capacity(n);
+        let mut block: Vec<V> = if is_data_leaf { Vec::with_capacity(n) } else { Vec::new() };
         for _ in 0..n {
             let key_len = read_u16(payload, &mut at)? as usize;
             let key_bytes = read_bytes(payload, &mut at, key_len)?;
@@ -260,7 +279,12 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
             let val_len = read_u32(payload, &mut at)? as usize;
             let val_bytes = read_bytes(payload, &mut at, val_len)?;
             let val = (self.value.dec)(val_bytes)?;
-            entries.push((key, Arc::new(val)));
+            if is_data_leaf {
+                entries.push((key, Value::in_block()));
+                block.push(val);
+            } else {
+                entries.push((key, Value::arc(Arc::new(val))));
+            }
         }
         let mut children = Vec::new();
         if is_inner {
@@ -275,7 +299,20 @@ impl<K: PrimaryKey, V> NodeCodec<K, V> {
                 payload.len() - at
             )));
         }
-        Ok(BTreeNode { entries: entries.into_iter().collect(), children: children.into_iter().collect() })
+        let node = BTreeNode {
+            entries: entries.into_iter().collect(),
+            children: children.into_iter().collect(),
+            block: if is_data_leaf { Some(block.into_boxed_slice()) } else { None },
+        };
+        // I-A, enforced at every block-leaf build site (spec §3): a node's
+        // entries are all-Arc or all-in-block, never mixed. Cheap
+        // (`entries.len()` bounded by `MAX_KEYS + 1`) and only runs under
+        // `debug_assertions`.
+        debug_assert!(
+            (0..node.entries.len()).all(|i| node.entries[i].1.is_in_block() == is_data_leaf),
+            "I-A violated: block leaf must have every entry in-block, non-block leaf none"
+        );
+        Ok(node)
     }
 }
 
@@ -305,10 +342,46 @@ pub(crate) struct PagedStats {
     /// read rather than reporting the raw (nonsensical, wrapped-looking)
     /// negative as a `u64`.
     pub resident_leaf_bytes: AtomicI64,
+    /// Resident bytes reachable ONLY from a retained snapshot older than
+    /// the latest (task 9, spec §5's "Snapshot pins"): un-evictable by
+    /// `demote_pass`, which only ever touches the latest snapshot's tables,
+    /// yet still live in memory via the older snapshot's own `Arc` share of
+    /// the CoW-shared leaf. Re-based every checkpoint by the same F1
+    /// reconciliation walk that re-bases `resident_leaf_bytes`
+    /// (`Store::checkpoint_impl_paged`), via
+    /// `BTree::resident_leaf_bytes_dedup`: `resident` is the latest
+    /// snapshot's own deduped walk total, `pinned` is however much of the
+    /// all-snapshots deduped total lies outside that. Unlike
+    /// `resident_leaf_bytes` this is a plain `AtomicU64`, not signed — an
+    /// exact walk total (not a running increment/decrement estimate), so it
+    /// can never go negative between reconciles.
+    pub pinned_leaf_bytes: AtomicU64,
     /// Pages written by the checkpoint writer.
     pub pages_written: AtomicU64,
     /// Leaves demoted back to on-disk by a demote pass.
     pub leaves_demoted: AtomicU64,
+    /// Task 10, spec §6 ("Hard-cap clock eviction"): full sweeps performed
+    /// across every `demote_pass` call so far, cumulative. One pass is one
+    /// or more cycles — see `Store::demote_pass_inner`'s doc for the
+    /// termination rule — so this can advance by more than one per
+    /// checkpoint when a budget is configured and the first sweep doesn't
+    /// clear it.
+    pub clock_cycles: AtomicU64,
+    /// Task 10: of `leaves_demoted`, how many landed on a pass's second (or
+    /// later) cycle rather than its first. Cumulative across every
+    /// `demote_pass` call. The dominant source is second-chance survivors:
+    /// a leaf still resident and accessed-marked when the pass began
+    /// clears its bit (not evicted) on cycle 1, then is evicted for real
+    /// on a later cycle once nothing re-touches it. Fix round 1
+    /// (review Minor-5): not the *only* source — a table first listed on
+    /// cycle 2 (a concurrent commit registered it mid-pass; `names` is
+    /// re-read every cycle) or a cycle-1 batch whose `install_paged_tables`
+    /// was dropped (a concurrent `gc()` raced it, see
+    /// `Store::demote_pass_inner`'s doc) also count leaves here without
+    /// ever having had a cycle-1 second chance. Both are rare, cost only a
+    /// small over-count, and don't change the field's use as a signal that
+    /// cycling did real work beyond sweep 1.
+    pub forced_evictions: AtomicU64,
     /// Dead-page byte ranges actually hole-punched (task11) — counted in
     /// ranges, not bytes, matching `PagedRoot::dead_pages`'s own unit. Only
     /// incremented once a range's retention gate clears (the root that
@@ -432,6 +505,17 @@ pub(crate) struct PagedSource<K, V> {
     pub(crate) codec: NodeCodec<K, V>,
     pub(crate) name: String,
     pub(crate) stats: Arc<PagedStats>,
+    /// The row type's clone fn, captured at `register_table_paged` time
+    /// (`TableRegistry::register_paged`, Task 3) and threaded down through
+    /// `Table::attach_paged_source`/`from_paged_entry`. `None` for every
+    /// index `PagedSource` (indexes never carry block leaves — see
+    /// `NodeSource::clone_value`'s doc, I-B) and for a data-tree source
+    /// built on a store that was never told `R: Clone` (`register_table`'s
+    /// plain path is refused up front by `Error::PagedNeedsClone` on a
+    /// paged store, so this only stays `None` off that plain path on a
+    /// *non*-paged store, where a table's tree never holds block leaves in
+    /// the first place).
+    pub(crate) clone: Option<fn(&V) -> V>,
 }
 
 impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K, V> {
@@ -446,6 +530,11 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
                 self.stats.index_page_faults.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Decode before crediting: the real-bytes credit below is computed
+        // from the decoded node itself (`leaf_bytes`, task 4), so the node
+        // has to exist first. Cheap either way — this was always the next
+        // line of work regardless of the credit's shape.
+        let node = self.codec.decode(kind, &bytes)?;
         // Only a *data leaf* fault-in grows `resident_leaf_bytes`: that
         // counter tracks the data tree's demotable leaves specifically
         // (`BTree::demote_leaves`/`resident_leaf_estimate` never touch
@@ -453,10 +542,16 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
         // here would inflate the estimate against a demote pass that can
         // never claim those bytes back.
         if kind == PageKind::DataLeaf {
-            let prev = self
-                .stats
-                .resident_leaf_bytes
-                .fetch_add(Child::<K, V>::NODE_BYTES as i64, Ordering::Relaxed);
+            // Real-bytes credit (task 4, spec §5): `NODE_BYTES + n *
+            // size_of::<V>()` via `BTreeNode::leaf_bytes`, not the flat
+            // `Child::<K, V>::NODE_BYTES` this used to credit — a block
+            // leaf's value bytes are real resident memory the old flat
+            // credit ignored entirely. Task 8 makes the debit symmetric
+            // (demote still subtracts the flat `NODE_BYTES` until then);
+            // the F1 checkpoint-end reconciliation is the safety net for
+            // that transient asymmetry in the meantime.
+            let credit = node.leaf_bytes() as i64;
+            let prev = self.stats.resident_leaf_bytes.fetch_add(credit, Ordering::Relaxed);
             // Wake the background checkpointer (task12) the moment this
             // fault-in pushes resident bytes at/over the memory budget —
             // only when a budget is actually configured (`mem_budget_bytes`
@@ -465,17 +560,21 @@ impl<K: PrimaryKey, V: Send + Sync + 'static> NodeSource<K, V> for PagedSource<K
             // store that never crosses the budget never wakes the thread
             // early at all, just falls back to the interval poll.
             if let Some(&budget) = self.stats.mem_budget_bytes.get() {
-                let resident = (prev + Child::<K, V>::NODE_BYTES as i64).max(0) as u64;
+                let resident = (prev + credit).max(0) as u64;
                 if resident >= budget {
                     self.stats.wake_checkpointer();
                 }
             }
         }
-        Ok(Arc::new(self.codec.decode(kind, &bytes)?))
+        Ok(Arc::new(node))
     }
 
     fn note_dirty(&self, bytes: usize) {
         self.stats.dirty_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn clone_value(&self, v: &V) -> Option<V> {
+        self.clone.map(|f| f(v))
     }
 
     fn name(&self) -> &str {
@@ -568,7 +667,11 @@ mod tests {
     }
 
     fn leaf<K: Clone, V>(pairs: Vec<(K, V)>) -> BTreeNode<K, V> {
-        BTreeNode { entries: pairs.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(), children: Default::default() }
+        BTreeNode {
+            entries: pairs.into_iter().map(|(k, v)| (k, Value::arc(Arc::new(v)))).collect(),
+            children: Default::default(),
+            block: None,
+        }
     }
 
     #[test]
@@ -579,7 +682,65 @@ mod tests {
         assert_eq!(kind, PageKind::DataLeaf);
         let back = c.decode(kind, &bytes).unwrap();
         assert_eq!(back.entries.len(), 2);
-        assert_eq!(*back.entries[1].1, Row { a: 2, s: "yy".into() });
+        assert_eq!(*back.value_at(1), Row { a: 2, s: "yy".into() });
+    }
+
+    /// Task 4 / spec §3: decoding a `DataLeaf` payload through a records
+    /// codec must yield a block leaf — every entry `is_in_block()`, `block`
+    /// populated with the same values in the same order. A `DataInner`
+    /// payload (encoded from the same node once it has children) must keep
+    /// the old all-Arc representation instead: inner nodes are always
+    /// resident and never carry blocks (I-B).
+    #[test]
+    fn data_leaf_decodes_to_block_data_inner_stays_arc() {
+        let c = NodeCodec::<u64, Row>::records::<Row>();
+        let n = leaf(vec![(1, Row { a: 1, s: "x".into() }), (2, Row { a: 2, s: "yy".into() })]);
+        let (kind, bytes) = c.encode(&n).unwrap();
+        assert_eq!(kind, PageKind::DataLeaf);
+        let back = c.decode(kind, &bytes).unwrap();
+        assert!(back.block.is_some(), "DataLeaf decode must build a block");
+        for i in 0..back.entries.len() {
+            assert!(back.entries[i].1.is_in_block(), "entry {i} must be in-block");
+        }
+        assert_eq!(back.block.as_ref().unwrap().as_ref(), &[Row { a: 1, s: "x".into() }, Row { a: 2, s: "yy".into() }]);
+
+        let mut inner = leaf(vec![("m".to_string(), Row { a: 9, s: "".into() })]);
+        inner.children.push(Child::on_disk(100));
+        inner.children.push(Child::on_disk(200));
+        let ic = NodeCodec::<String, Row>::records::<Row>();
+        let (ikind, ibytes) = ic.encode(&inner).unwrap();
+        assert_eq!(ikind, PageKind::DataInner);
+        let iback = ic.decode(ikind, &ibytes).unwrap();
+        assert!(iback.block.is_none(), "DataInner decode must stay all-Arc");
+        assert!(iback.entries[0].1.as_arc().is_some());
+    }
+
+    /// Spec §3: "wire format unchanged in both directions" — encode must
+    /// serialize identically from either representation. Build the same
+    /// logical leaf two ways: all-Arc (the `leaf` test constructor) and
+    /// block-backed (decode of the first's own encoding, per the test
+    /// above); re-encoding both must produce byte-identical output. This is
+    /// the golden-bytes oracle for decode-to-block: the wire format must
+    /// not leak which in-memory representation produced it.
+    #[test]
+    fn encode_bytes_identical_across_representations() {
+        let c = NodeCodec::<u64, Row>::records::<Row>();
+        let all_arc = leaf(vec![
+            (1, Row { a: 1, s: "x".into() }),
+            (2, Row { a: 2, s: "yy".into() }),
+            (3, Row { a: 3, s: "zzz".into() }),
+        ]);
+        let (kind, arc_bytes) = c.encode(&all_arc).unwrap();
+        assert_eq!(kind, PageKind::DataLeaf);
+
+        // Decode those bytes back through the same records codec — this is
+        // now a block leaf (the test above pins that behavior).
+        let block_leaf = c.decode(kind, &arc_bytes).unwrap();
+        assert!(block_leaf.block.is_some(), "sanity: decode of a DataLeaf payload is block-backed");
+
+        let (kind2, block_bytes) = c.encode(&block_leaf).unwrap();
+        assert_eq!(kind2, kind);
+        assert_eq!(block_bytes, arc_bytes, "encode output must not depend on the source representation");
     }
 
     #[test]
@@ -595,7 +756,7 @@ mod tests {
         assert_eq!(back.children[0].page_id(), Some(100));
         assert_eq!(back.children[1].page_id(), Some(200));
         assert!(!back.children[0].is_loaded());
-        assert_eq!(back.entries[0].1.a, 9);
+        assert_eq!(back.value_at(0).a, 9);
     }
 
     #[test]
@@ -613,7 +774,7 @@ mod tests {
         let n = leaf(vec![("a".to_string(), 5u64)]);
         let (k, b) = u.encode(&n).unwrap();
         assert_eq!(k, PageKind::IndexLeaf);
-        assert_eq!(*u.decode(k, &b).unwrap().entries[0].1, 5);
+        assert_eq!(*u.decode(k, &b).unwrap().value_at(0), 5);
 
         let nu = NodeCodec::<(i32, Vec<u8>), ()>::non_unique_index::<i32, Vec<u8>>();
         let n = leaf(vec![((-3, vec![1, 2]), ())]);
@@ -636,12 +797,48 @@ mod tests {
         let (k, b) = codec.encode(&n).unwrap();
         let id = pf.append(k, &b).unwrap();
         let stats = Arc::new(PagedStats::default());
-        let src = PagedSource { file: pf, codec, name: "t".into(), stats: stats.clone() };
+        let src = PagedSource { file: pf, codec, name: "t".into(), stats: stats.clone(), clone: None };
         let back = crate::child::NodeSource::read_node(&src, id).unwrap();
         assert_eq!(back.entries.len(), 1);
         assert_eq!(stats.page_faults.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(stats.data_page_faults.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(stats.index_page_faults.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// Task 4 / spec §5: a data-leaf fault-in must credit
+    /// `resident_leaf_bytes` with the decoded node's real `leaf_bytes()`
+    /// (`NODE_BYTES + n * size_of::<V>()`), not the old flat
+    /// `Child::<K, V>::NODE_BYTES` — a leaf with several rows in it must
+    /// credit strictly more than a flat, value-blind credit would.
+    #[test]
+    fn read_node_credits_real_leaf_bytes_not_flat_node_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        let pf = Arc::new(crate::pagefile::PageFile::open(&crate::pagefile::page_file_path(d.path()), 0, 1 << 16, 4096).unwrap());
+        let codec = NodeCodec::<u64, Row>::records::<Row>();
+        let n = leaf(vec![
+            (1, Row { a: 1, s: "".into() }),
+            (2, Row { a: 2, s: "".into() }),
+            (3, Row { a: 3, s: "".into() }),
+        ]);
+        let (k, b) = codec.encode(&n).unwrap();
+        assert_eq!(k, PageKind::DataLeaf);
+        let id = pf.append(k, &b).unwrap();
+        let stats = Arc::new(PagedStats::default());
+        let src = PagedSource { file: pf, codec, name: "t".into(), stats: stats.clone(), clone: None };
+        let back = crate::child::NodeSource::read_node(&src, id).unwrap();
+
+        let credited = stats.resident_leaf_bytes.load(Ordering::Relaxed);
+        assert_eq!(
+            credited,
+            back.leaf_bytes() as i64,
+            "credit must be exactly the decoded node's leaf_bytes()"
+        );
+        assert!(
+            credited > Child::<u64, Row>::NODE_BYTES as i64,
+            "a 3-row leaf must credit strictly more than the flat, value-blind NODE_BYTES \
+             (credited {credited}, flat {})",
+            Child::<u64, Row>::NODE_BYTES
+        );
     }
 
     /// I-2(a): an entry count beyond this build's node capacity (`MAX_KEYS +

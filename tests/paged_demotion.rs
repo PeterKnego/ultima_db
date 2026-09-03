@@ -21,7 +21,7 @@ fn store_with(dir: &std::path::Path, opts: PagedOptions) -> Store {
         .paged(opts)
         .unwrap();
     let s = Store::new(StoreConfig::builder().persistence(p).build()).unwrap();
-    s.register_table::<Row>("rows").unwrap();
+    s.register_table_paged::<Row>("rows").unwrap();
     s
 }
 
@@ -85,7 +85,17 @@ fn demotion_keeps_version_and_frees_after_gc() {
 #[test]
 fn accessed_leaf_survives_one_pass() {
     let d = tempfile::tempdir().unwrap();
-    let s = store_with(d.path(), PagedOptions::builder().memory_budget_bytes(1).build());
+    // Task 10 (spec §6, hard-cap clock eviction): a `memory_budget_bytes(1)`
+    // store is *always* over budget, so `demote_pass` would now cycle past
+    // this test's single second-chance sweep and evict key 5's leaf for
+    // real on cycle 2 of the very same "second chance" `checkpoint()` call
+    // below — collapsing the exact one-pass-survives/next-pass-goes distinction
+    // this test exists to check. A budget comfortably above the resident
+    // set (one leaf is a few KB; this is 1 MiB) keeps every checkpoint
+    // here under budget after its first cycle, so cycling never engages
+    // and second-chance is exercised under no budget pressure, same as
+    // before task 10.
+    let s = store_with(d.path(), PagedOptions::builder().memory_budget_bytes(1 << 20).build());
     write_rows(&s, 20_000);
     s.checkpoint().unwrap(); // demotes everything (freshly batch-built, nothing accessed yet)
     {
@@ -346,4 +356,61 @@ fn refaulted_leaves_raise_resident_estimate_after_full_demotion() {
         "refaulted leaves must raise the resident estimate (pre-F1-fix it \
          stayed clamped at 0 off a negative-saturated counter): est1={est1}"
     );
+}
+
+/// task64 §14.1(c), the pre-first-checkpoint half of the F1 gap: a leaf
+/// *built* in memory never credits `resident_leaf_bytes` (only fault-ins
+/// do), so on a store's very first checkpoint the demote pass's exit check
+/// reads a counter that says "0 resident" whatever the tree holds. If cycle
+/// 1 demotes nothing — every leaf accessed since it was built, exactly the
+/// put-loop/scan shape a real workload leaves behind — the pass sees
+/// `0 <= budget`, quits, and the tree stays fully resident until the next
+/// checkpoint, however far over budget it is. Reconciling the counter from
+/// an exact walk *before* the pass (not only after it) makes the first
+/// pass's clock cycle 2 run like every later one. A full point-read scan
+/// arms every leaf's accessed bit through the ordinary `Child::load` path,
+/// so cycle 1 is guaranteed to be a pure second-chance sweep here.
+#[test]
+fn first_checkpoint_demote_pass_cycles_past_a_never_credited_counter() {
+    let d = tempfile::tempdir().unwrap();
+    let budget = 64u64 << 10; // 64 KiB: 20,000 rows are a few hundred leaves, far over it
+    let s = store_with(
+        d.path(),
+        PagedOptions::builder()
+            .memory_budget_bytes(budget)
+            // Explicit, huge: the builder would otherwise scale the dirty
+            // trigger to budget/2 = 32 KiB and the background checkpointer
+            // would take the "first checkpoint" away from this test.
+            .checkpoint_dirty_bytes(u64::MAX)
+            .checkpoint_interval_disabled()
+            .build(),
+    );
+    write_rows(&s, 20_000);
+    {
+        let r = s.begin_read(None).unwrap();
+        let t = r.open_table::<Row>("rows").unwrap();
+        for k in 1..=20_000u64 {
+            assert!(t.get(k).is_some(), "key {k} missing"); // auto ids start at 1
+        }
+    }
+    assert_eq!(s.paged_stats().unwrap().clock_cycles, 0, "precondition: no pass has run yet");
+
+    s.checkpoint().unwrap(); // the store's FIRST checkpoint: phases 1-2 assign ids, phase 3 demotes
+
+    let st = s.paged_stats().unwrap();
+    assert!(
+        st.clock_cycles >= 2,
+        "the first pass must cycle past its second-chance sweep when the tree is over budget: \
+         clock_cycles={}",
+        st.clock_cycles
+    );
+    assert!(
+        st.resident_leaf_bytes_est <= budget,
+        "the first checkpoint must leave the tree under budget: resident={} budget={budget} \
+         leaves_demoted={} forced_evictions={}",
+        st.resident_leaf_bytes_est,
+        st.leaves_demoted,
+        st.forced_evictions
+    );
+    assert!(st.forced_evictions > 0, "cycle-2 evictions are what got it there");
 }
